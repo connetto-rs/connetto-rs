@@ -1,28 +1,152 @@
 //! The screen. Every component reads the one view signal and sends its
-//! control through [`act`]. None of them touches the connetto client.
+//! control through [`act`]. The panes follow their live queries with
+//! `use_live` on the source the platform gives, the tab's client in a browser
+//! and the page source in Tauri, so one pane's code serves both.
 
 use connetto_demo_support as support;
+use connetto_leptos::{UseLive, keyed, use_live};
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::HtmlInputElement;
 
 use crate::icons::{Fa, Icon};
-use crate::platform::act;
+use crate::platform::{self, Source, act};
 use connetto_demo_support::view::{Action, LogoutState, Session, View};
 
 /// The whole page with the stylesheet, the header, the account bar, and the
 /// panes or their skeleton.
 #[component]
 pub fn App(view: RwSignal<View>) -> impl IntoView {
+    provide_context(view);
+    let standing = Memo::new(move |_| view.with(|state| (state.identity.clone(), state.attached)));
     view! {
         <style>{support::CSS}</style>
         <div class="wrap">
-            <Header view=view />
-            <AccountBar view=view />
-            <Dashboard view=view />
+            <header><h1>{APP_TITLE}</h1></header>
+            {move || {
+                standing.track();
+                view! { <Screen view=view /> }
+            }}
         </div>
     }
+}
+
+/// The account and panes sharing one live names subscription.
+#[component]
+fn Screen(view: RwSignal<View>) -> impl IntoView {
+    if view.with_untracked(|state| state.attached && state.identity.is_some())
+        && let Some(source) = platform::source()
+    {
+        let names = use_live(&source, support::UserNames);
+        provide_context(Memo::new(move |_| {
+            names.value().with(|rows| {
+                rows.iter()
+                    .map(|user| (user.id.to_string(), user.login_name.clone()))
+                    .collect::<std::collections::BTreeMap<String, String>>()
+            })
+        }));
+    }
+    let nearby_stands = Memo::new(move |_| view.with(|state| state.nearby.is_some()));
+    let team_stands = Memo::new(move |_| view.with(|state| state.attached && state.team.is_some()));
+    view! {
+            <AccountBar view=view />
+            {move || nearby_stands.get().then(|| view! { <NearbyPane view=view /> })}
+            {move || {
+                team_stands
+                    .get()
+                    .then(platform::source)
+                    .flatten()
+                    .map(|source| view! { <TeamNotesPane view=view source=source /> })
+            }}
+            <Dashboard view=view />
+
+    }
+}
+
+/// Resolve a synced name before the device's stored name.
+fn badge_name(account: String) -> Memo<Option<String>> {
+    let names = use_context::<Memo<std::collections::BTreeMap<String, String>>>();
+    let state = expect_context::<RwSignal<View>>();
+    Memo::new(move |_| {
+        names
+            .and_then(|names| names.with(|names| names.get(&account).cloned()))
+            .or_else(|| {
+                state.with(|state| {
+                    state
+                        .account
+                        .iter()
+                        .chain(state.stored_account.iter())
+                        .chain(state.known_accounts.iter())
+                        .chain(state.picking.iter().flatten())
+                        .find_map(|entry| {
+                            (entry.label == account)
+                                .then(|| entry.name.clone())
+                                .flatten()
+                        })
+                })
+            })
+    })
+}
+
+/// The account glyph, name and short identity.
+#[component]
+fn Badge(account: String) -> impl IntoView {
+    let name = badge_name(account.clone());
+    let badge = support::badge::AccountBadge::of(&account);
+    view! {
+        <span class="badge" data-account=account style=format!("--badge-hue: {}", badge.hue)>
+            <Fa icon=Icon::Animal(badge.animal) />
+            {move || name.get().map(|name| view! { <span class="badge-name">{name}</span> " " })}
+            <span class="badge-short">{badge.short}</span>
+        </span>
+    }
+}
+
+/// The confirmation or failure for one stored account.
+#[component]
+fn StoredDeleteControls(view: RwSignal<View>, account: String) -> impl IntoView {
+    use support::view::StoredDeleteState;
+    move || {
+        let state = view.with(|state| {
+            state
+                .stored_delete
+                .as_ref()
+                .filter(|delete| delete.account == account)
+                .map(|delete| delete.state.clone())
+        });
+        let confirm = |line: String, button: &'static str| {
+            let account_key = account.clone();
+            view! {
+                <div class="confirm">
+                    <p>{line}</p>
+                    <button class="danger" on:click=move |_| act(Action::DeleteStoredAccount { account: account_key.clone(), force: true })>{button}</button>
+                    <button on:click=move |_| act(Action::CancelStoredDelete)>"Cancel"</button>
+                </div>
+            }.into_any()
+        };
+        state.map(|state| match state {
+            StoredDeleteState::Working => view! { <p>"Working..."</p> }.into_any(),
+            StoredDeleteState::Error(error) => view! {
+                <p class="error">"Error: " {error}</p>
+                <button on:click=move |_| act(Action::CancelStoredDelete)>"Cancel"</button>
+            }
+            .into_any(),
+            StoredDeleteState::Confirm { unsynced_count } => confirm(
+                support::logout_confirm_line(u64::try_from(unsynced_count).unwrap_or(u64::MAX)),
+                "Confirm: delete this account",
+            ),
+            StoredDeleteState::Unreadable(reason) => confirm(
+                format!("This account's local data cannot be read: {reason}"),
+                "Delete anyway",
+            ),
+        })
+    }
+}
+
+/// The error that ended a live query, nothing while it follows.
+fn live_error(error: ReadSignal<Option<String>>) -> impl IntoView {
+    move || error.get().map(|err| view! { <p class="error">{err}</p> })
 }
 
 /// A status paragraph for an optional line, nothing while it is absent.
@@ -36,16 +160,25 @@ fn short_code(id: String) -> impl IntoView {
     view! { <code class="id" title=id>{short}</code> }
 }
 
-/// The app name, and the status, gate, device, storage, custody and expiry
-/// lines.
+/// The app's name in its header, the same `connetto demo` the native dioxus
+/// demo shows in the Tauri app.
+#[cfg(feature = "tauri")]
+const APP_TITLE: &str = "connetto demo";
+/// The app's name in its header.
+#[cfg(not(feature = "tauri"))]
+const APP_TITLE: &str = "connetto web demo (Leptos)";
+
+/// The status and account security controls. The device line stands here
+/// whenever the page has no nearby panel to carry it.
 #[component]
-fn Header(view: RwSignal<View>) -> impl IntoView {
+fn AccountStatus(view: RwSignal<View>) -> impl IntoView {
     view! {
-        <header>
-            <h1>"connetto web demo (Leptos)"</h1>
+        <div>
             <p class="status">"status: " {move || view.with(|v| v.status.clone())}</p>
             {move || status_line(view.with(|v| v.gate_line.clone()))}
-            <p class="status">"device: " {move || view.with(|v| v.device_line.clone())}</p>
+            <Show when=move || view.with(|state| state.nearby.is_none())>
+                <p class="status">"device: " {move || view.with(|state| state.device_line.clone())}</p>
+            </Show>
             <p class="status">{move || view.with(|v| v.storage.clone())}</p>
             <Show when=move || view.with(|v| v.offers_unlock)>
                 <button on:click=move |_| act(Action::Unlock)>
@@ -58,7 +191,7 @@ fn Header(view: RwSignal<View>) -> impl IntoView {
                 view.with(|v| v.expiry_warning.clone())
                     .map(|warn| view! { <p class="warn">{warn}</p> })
             }}
-        </header>
+        </div>
     }
 }
 
@@ -81,6 +214,9 @@ fn AccountBar(view: RwSignal<View>) -> impl IntoView {
                     view! { <SignIn view=view /> }.into_any()
                 }
             }}
+            <Show when=move || session() != Session::SignedIn>
+                <AccountStatus view=view />
+            </Show>
         </section>
     }
 }
@@ -103,12 +239,8 @@ fn SignIn(view: RwSignal<View>) -> impl IntoView {
 /// The stored account a restoring page is signing back in as.
 #[component]
 fn Restoring(view: RwSignal<View>) -> impl IntoView {
-    let label = move || {
-        view.with(|v| v.stored_account.as_ref().map(|entry| entry.label.clone()))
-            .unwrap_or_default()
-    };
     view! {
-        <p>"Signed in as " {move || short_code(label())}</p>
+        <p>"Signed in as " {move || view.with(|state| state.stored_account.as_ref().map(|entry| view! { <Badge account=entry.label.clone() /> }))}</p>
     }
 }
 
@@ -132,7 +264,7 @@ fn Picker(view: RwSignal<View>) -> impl IntoView {
                                     })
                                 }>
                                     <Fa icon=Icon::RightToBracket />
-                                    "Sign in as " {label}
+                                    "Sign in as " <Badge account=label />
                                 </button>
                             }
                         })
@@ -151,15 +283,7 @@ fn Picker(view: RwSignal<View>) -> impl IntoView {
 /// logout controls.
 #[component]
 fn SignedIn(view: RwSignal<View>) -> impl IntoView {
-    let uid = move || view.with(|v| v.identity.clone().unwrap_or_default());
-    let account_tag = move || {
-        view.with(|v| {
-            v.account
-                .as_ref()
-                .map(|entry| entry.label.clone())
-                .filter(|label| Some(label) != v.identity.as_ref())
-        })
-    };
+    let identity = move || view.with(|state| state.identity.clone().unwrap_or_default());
     let switches = move || {
         view.with(|v| {
             v.known_accounts
@@ -172,25 +296,33 @@ fn SignedIn(view: RwSignal<View>) -> impl IntoView {
     view! {
         <p>
             "Signed in as "
-            {move || short_code(uid())}
-            {move || {
-                account_tag().map(|label| view! { " (account: " {short_code(label)} ")" })
-            }}
+            {move || view! { <Badge account=identity() /> }}
         </p>
+        <AccountStatus view=view />
         <div class="row">
             {move || {
                 switches()
                     .into_iter()
                     .map(|(key, label)| {
+                        let delete_key = key.clone();
+                        let controls_key = key.clone();
+                        let badge_label = label.clone();
+                        let name = badge_name(label.clone());
                         view! {
-                            <button on:click=move |_| {
-                                act(Action::SwitchAccount {
-                                    account: key.clone(),
-                                })
-                            }>
-                                <Fa icon=Icon::ArrowRightArrowLeft />
-                                "Switch to " {label}
-                            </button>
+                            <div>
+                                <button on:click=move |_| {
+                                    act(Action::SwitchAccount { account: key.clone() })
+                                }>
+                                    <Fa icon=Icon::ArrowRightArrowLeft />
+                                    "Switch to " <Badge account=label />
+                                </button>
+                                <button class="danger"
+                                    aria-label=move || format!("Delete {}", support::view::badge_text(&badge_label, name.get().as_deref()))
+                                    on:click=move |_| act(Action::DeleteStoredAccount { account: delete_key.clone(), force: false })>
+                                    <Fa icon=Icon::TrashCan />
+                                </button>
+                                <StoredDeleteControls view=view account=controls_key />
+                            </div>
                         }
                     })
                     .collect_view()
@@ -206,6 +338,9 @@ fn SignedIn(view: RwSignal<View>) -> impl IntoView {
                 </button>
             </Show>
         </div>
+        {move || view.with(|state| state.stored_delete.as_ref()
+            .filter(|delete| !state.known_accounts.iter().any(|entry| entry.key == delete.account))
+            .map(|delete| view! { <StoredDeleteControls view=view account=delete.account.clone() /> }))}
         <LogoutControls view=view />
     }
 }
@@ -280,28 +415,52 @@ fn LogoutControls(view: RwSignal<View>) -> impl IntoView {
 }
 
 /// The six panes once the tab attached, the skeleton while a stored session
-/// lands, or the connecting line before either.
+/// lands, or the connecting line before either. Only the standing it reads
+/// remounts the panes, so a view change leaves their live queries running.
 #[component]
 fn Dashboard(view: RwSignal<View>) -> impl IntoView {
+    let standing = Memo::new(move |_| view.with(|v| (v.attached, v.stored_account.is_some())));
     move || {
-        let (attached, restoring) = view.with(|v| (v.attached, v.stored_account.is_some()));
-        if attached {
-            view! {
-                <div class="panes">
-                    <OrdersPane view=view />
-                    <PhotosPane view=view />
-                    <ProductsPane view=view />
-                    <NotesPane view=view />
-                    <RetentionPane view=view />
-                    <YourDataPane view=view />
-                </div>
+        let (attached, restoring) = standing.get();
+        match attached.then(platform::source).flatten() {
+            Some(source) => view! { <Panes view=view source=source /> }.into_any(),
+            None if restoring => view! { <PanesSkeleton /> }.into_any(),
+            None => {
+                view! { <p class="status">"Connecting to the connetto stack..."</p> }.into_any()
             }
-            .into_any()
-        } else if restoring {
-            view! { <PanesSkeleton /> }.into_any()
-        } else {
-            view! { <p class="status">"Connecting to the connetto stack..."</p> }.into_any()
         }
+    }
+}
+
+/// The six panes over the lists they show, followed on `source`. The storage
+/// figures are read again whenever one of the lists changes, and the
+/// retention pane counts the rows the replica mirror holds, the catalogue
+/// living in the shared store.
+#[component]
+fn Panes(view: RwSignal<View>, source: Source) -> impl IntoView {
+    let orders = use_live(&source, support::OrdersNewestFirst);
+    let notes = use_live(&source, support::NotesRows);
+    let photos = use_live(&source, support::PhotosRows);
+    let products = use_live(&source, support::ProductsByName);
+    Effect::new(move |_| {
+        orders.value().track();
+        notes.value().track();
+        photos.value().track();
+        products.value().track();
+        act(Action::RereadStorage);
+    });
+    let covered = Signal::derive(move || {
+        orders.value().with(Vec::len) + notes.value().with(Vec::len) + photos.value().with(Vec::len)
+    });
+    view! {
+        <div class="panes">
+            <OrdersPane view=view source=source orders=orders />
+            <PhotosPane view=view photos=photos />
+            <ProductsPane products=products />
+            <NotesPane view=view notes=notes />
+            <RetentionPane view=view covered=covered />
+            <YourDataPane view=view />
+        </div>
     }
 }
 
@@ -322,51 +481,68 @@ fn pane_heading(
     }
 }
 
+/// A pane footer with the info icon and the pane's purpose line.
+#[component]
+fn PaneInfo(text: &'static str) -> impl IntoView {
+    view! {
+        <p class="pane-info">
+            <Fa icon=Icon::CircleInfo size=12 />
+            <span>{text}</span>
+        </p>
+    }
+}
+
 /// The pane layout shown while a stored session is still landing.
 #[component]
 fn PanesSkeleton() -> impl IntoView {
     view! {
         <div class="panes">
-            <div class="pane">
+            <div class="pane toned tone-orders">
                 {pane_heading(Icon::CartShopping, support::ORDERS_PANE_TITLE, "badge synced", support::ORDERS_BADGE)}
                 <p>{support::orders_readout(0, 0)}</p>
                 <table>
                     <thead><tr><th>"id"</th><th>"quantity"</th></tr></thead>
                     <tbody></tbody>
                 </table>
+                <PaneInfo text=support::ORDERS_INFO />
             </div>
-            <div class="pane">
+            <div class="pane toned tone-photos">
                 {pane_heading(Icon::Images, support::PHOTOS_PANE_TITLE, "badge synced", support::PHOTOS_BADGE)}
                 <p>{support::photos_readout(0)}</p>
                 <table>
                     <thead><tr><th>"id"</th><th>"state"</th><th>"image"</th></tr></thead>
                     <tbody></tbody>
                 </table>
+                <PaneInfo text=support::PHOTOS_INFO />
             </div>
-            <div class="pane">
+            <div class="pane toned tone-catalogue">
                 {pane_heading(Icon::Tags, support::CATALOGUE_HEADING, "badge shared", "shared")}
                 <p>{support::CATALOGUE_INTRO}</p>
                 <table>
                     <thead><tr><th>"name"</th><th>"price"</th></tr></thead>
                     <tbody></tbody>
                 </table>
+                <PaneInfo text=support::CATALOGUE_INFO />
             </div>
-            <div class="pane">
+            <div class="pane toned tone-notes">
                 {pane_heading(Icon::NoteSticky, support::NOTES_PANE_TITLE, "badge local", support::NOTES_BADGE)}
                 <p>{support::notes_readout(0)}</p>
                 <table>
                     <thead><tr><th>"id"</th><th>"body"</th></tr></thead>
                     <tbody></tbody>
                 </table>
+                <PaneInfo text=support::NOTES_INFO />
             </div>
-            <div class="pane">
+            <div class="pane toned tone-retention">
                 {pane_heading(Icon::Broom, support::RETENTION_PANE_TITLE, "badge trim", support::RETENTION_BADGE)}
                 <p>{support::retention_readout(0, 0, 0)}</p>
                 <p>{support::RETENTION_EXPLAINER}</p>
+                <PaneInfo text=support::RETENTION_INFO />
             </div>
-            <div class="pane">
+            <div class="pane toned tone-your-data">
                 {pane_heading(Icon::Database, support::YOUR_DATA_PANE_TITLE, "badge local", support::YOUR_DATA_BADGE)}
                 <p>{support::YOUR_DATA_INTRO}</p>
+                <PaneInfo text=support::YOUR_DATA_INFO />
             </div>
         </div>
     }
@@ -375,36 +551,50 @@ fn PanesSkeleton() -> impl IntoView {
 /// The orders pane with the rows newest first, the server's pushed counts,
 /// and the pane's writes.
 #[component]
-fn OrdersPane(view: RwSignal<View>) -> impl IntoView {
+fn OrdersPane(
+    view: RwSignal<View>,
+    source: Source,
+    orders: UseLive<Vec<support::Order>>,
+) -> impl IntoView {
+    let count = use_live(&source, support::OrdersCount);
+    let groups = use_live(&source, support::OrdersCountsByQuantity);
+    let rows = keyed(orders.value(), |row: &support::Order| row.id);
     let no_identity = move || view.with(|v| v.identity.as_deref().is_none_or(str::is_empty));
+    let has_rows = move || orders.value().with(|rows| !rows.is_empty());
+    // The remove button names the row the pane shows newest.
+    let remove_newest = move |_| {
+        if let Some(id) = orders
+            .value()
+            .with_untracked(|rows| rows.first().map(|row| row.id))
+        {
+            act(Action::RemoveOrder { id: id.to_string() });
+        }
+    };
     view! {
-        <div class="pane">
+        <div class="pane toned tone-orders">
             {pane_heading(Icon::CartShopping, support::ORDERS_PANE_TITLE, "badge synced", support::ORDERS_BADGE)}
             <p>
                 {move || {
-                    view.with(|v| {
-                        support::orders_readout(
-                            v.orders.len(),
-                            v.orders.iter().map(|row| row.quantity).sum(),
-                        )
+                    orders.value().with(|rows| {
+                        support::orders_readout(rows.len(), rows.iter().map(|row| row.quantity).sum())
                     })
                 }}
             </p>
             <p>
                 {support::ORDERS_COUNT_PREFIX}
-                <strong>{move || view.with(|v| support::orders_count_value(v.server_count))}</strong>
+                <strong>{move || support::orders_count_value(count.value().get())}</strong>
             </p>
             <p>
                 {support::ORDERS_GROUPED_PREFIX}
-                <strong>{move || view.with(|v| v.grouped.clone())}</strong>
+                <strong>{move || groups.value().with(support::grouped_label)}</strong>
             </p>
             <div class="row">
                 <button class="primary" disabled=no_identity on:click=move |_| act(Action::AddOrder)>
                     <Fa icon=Icon::Plus />
                     "Add order"
                 </button>
-                <Show when=move || view.with(|v| !v.orders.is_empty())>
-                    <button class="danger" on:click=move |_| act(Action::RemoveNewest)>
+                <Show when=has_rows>
+                    <button class="danger" on:click=remove_newest>
                         <Fa icon=Icon::Minus />
                         "Remove newest"
                     </button>
@@ -419,24 +609,24 @@ fn OrdersPane(view: RwSignal<View>) -> impl IntoView {
             <table>
                 <thead><tr><th>"id"</th><th>"quantity"</th></tr></thead>
                 <tbody>
-                    {move || {
-                        view.with(|v| {
-                            v.orders
-                                .iter()
-                                .map(|row| {
-                                    let quantity = row.quantity.to_string();
-                                    view! {
-                                        <tr>
-                                            <td>{short_code(row.id.clone())}</td>
-                                            <td>{quantity}</td>
-                                        </tr>
-                                    }
-                                })
-                                .collect_view()
-                        })
-                    }}
+                    <For
+                        each=move || rows.get()
+                        key=|(id, _)| *id
+                        children=move |(id, row)| {
+                            view! {
+                                <tr>
+                                    <td>{short_code(id.to_string())}</td>
+                                    <td>{move || row.with(|row| row.quantity.to_string())}</td>
+                                </tr>
+                            }
+                        }
+                    />
                 </tbody>
             </table>
+            {live_error(orders.error())}
+            {live_error(count.error())}
+            {live_error(groups.error())}
+            <PaneInfo text=support::ORDERS_INFO />
         </div>
     }
 }
@@ -465,13 +655,22 @@ async fn read_picked_file(file: web_sys::File) -> Option<(String, Vec<u8>)> {
 
 /// The photos pane with the rows and their display sources, the file pick
 /// that stages a photo, the storage controls, and the refused and lost files.
+/// The display sources are resolved again when the rows change or a pinned
+/// fetch finishes.
 #[component]
-fn PhotosPane(view: RwSignal<View>) -> impl IntoView {
+fn PhotosPane(view: RwSignal<View>, photos: UseLive<Vec<support::Photo>>) -> impl IntoView {
     let no_identity = move || view.with(|v| v.identity.as_deref().is_none_or(str::is_empty));
+    let rows = keyed(photos.value(), |row: &support::Photo| row.id);
+    let shown = Memo::new(move |_| photos.value().get());
+    let fetches = Memo::new(move |_| view.with(|v| v.pinned_fetches));
+    let sources = LocalResource::new(move || {
+        fetches.track();
+        platform::photo_sources(shown.get())
+    });
     view! {
-        <div class="pane">
+        <div class="pane toned tone-photos">
             {pane_heading(Icon::Images, support::PHOTOS_PANE_TITLE, "badge synced", support::PHOTOS_BADGE)}
-            <p>{move || view.with(|v| support::photos_readout(v.photos.len()))}</p>
+            <p>{move || photos.value().with(|rows| support::photos_readout(rows.len()))}</p>
             <div class="row">
                 <input
                     id="photo-file-input"
@@ -487,28 +686,34 @@ fn PhotosPane(view: RwSignal<View>) -> impl IntoView {
             <table>
                 <thead><tr><th>"id"</th><th>"state"</th><th>"image"</th></tr></thead>
                 <tbody>
-                    {move || {
-                        view.with(|v| {
-                            v.photos
-                                .iter()
-                                .map(|row| {
-                                    let state = row.state.clone();
-                                    let thumb = v
-                                        .photo_thumbs
-                                        .get(&row.id)
-                                        .cloned()
-                                        .map(|src| view! { <img class="thumb" src=src /> });
-                                    view! {
-                                        <tr>
-                                            <td>{short_code(row.id.clone())}</td>
-                                            <td>{state}</td>
-                                            <td>{thumb}</td>
-                                        </tr>
-                                    }
-                                })
-                                .collect_view()
-                        })
-                    }}
+                    <For
+                        each=move || rows.get()
+                        key=|(id, _)| *id
+                        children=move |(id, row)| {
+                            let id = id.to_string();
+                            let thumb_id = id.clone();
+                            let thumb = move || {
+                                sources
+                                    .get()
+                                    .and_then(|sources| sources.get(&thumb_id).cloned())
+                                    .map(|src| view! { <img class="thumb" src=src /> })
+                            };
+                            view! {
+                                <tr>
+                                    <td>{short_code(id)}</td>
+                                    <td>
+                                        {move || {
+                                            row.with(|row| {
+                                                support::photo_state(row.content_state.as_deref())
+                                                    .to_owned()
+                                            })
+                                        }}
+                                    </td>
+                                    <td>{thumb}</td>
+                                </tr>
+                            }
+                        }
+                    />
                 </tbody>
             </table>
             <div class="row">
@@ -530,8 +735,10 @@ fn PhotosPane(view: RwSignal<View>) -> impl IntoView {
                 </button>
             </div>
             {move || status_line(view.with(|v| v.content_line.clone()))}
+            {live_error(photos.error())}
             <RefusedUploads view=view />
             <LostBytes view=view />
+            <PaneInfo text=support::PHOTOS_INFO />
         </div>
     }
 }
@@ -603,33 +810,32 @@ fn LostBytes(view: RwSignal<View>) -> impl IntoView {
 /// The catalogue pane with the shared rows in name order, read from the one
 /// copy the shared store keeps on this device.
 #[component]
-fn ProductsPane(view: RwSignal<View>) -> impl IntoView {
+fn ProductsPane(products: UseLive<Vec<support::Product>>) -> impl IntoView {
+    let rows = keyed(products.value(), |row: &support::Product| row.id);
     view! {
-        <div class="pane">
+        <div class="pane toned tone-catalogue">
             {pane_heading(Icon::Tags, support::CATALOGUE_HEADING, "badge shared", "shared")}
             <p>{support::CATALOGUE_INTRO}</p>
             <table>
                 <thead><tr><th>"name"</th><th>"price"</th></tr></thead>
                 <tbody>
-                    {move || {
-                        view.with(|v| {
-                            v.products
-                                .iter()
-                                .map(|row| {
-                                    let name = row.name.clone();
-                                    let price = row.price.clone();
-                                    view! {
-                                        <tr>
-                                            <td>{name}</td>
-                                            <td>{price}</td>
-                                        </tr>
-                                    }
-                                })
-                                .collect_view()
-                        })
-                    }}
+                    <For
+                        each=move || rows.get()
+                        key=|(id, _)| *id
+                        children=move |(_, row)| {
+                            let price = row.clone();
+                            view! {
+                                <tr>
+                                    <td>{move || row.with(|row| row.name.clone())}</td>
+                                    <td>{move || price.with(|row| support::price_label(row.price_cents))}</td>
+                                </tr>
+                            }
+                        }
+                    />
                 </tbody>
             </table>
+            {live_error(products.error())}
+            <PaneInfo text=support::CATALOGUE_INFO />
         </div>
     }
 }
@@ -638,14 +844,15 @@ fn ProductsPane(view: RwSignal<View>) -> impl IntoView {
 /// clears once the platform reports the note saved, so a failed save keeps
 /// the text.
 #[component]
-fn NotesPane(view: RwSignal<View>) -> impl IntoView {
+fn NotesPane(view: RwSignal<View>, notes: UseLive<Vec<support::Note>>) -> impl IntoView {
     let draft = RwSignal::new(String::new());
     let saved = move || view.with(|v| v.notes_saved);
     Effect::watch(saved, move |_, _, _| draft.set(String::new()), false);
+    let rows = keyed(notes.value(), |row: &support::Note| row.id);
     view! {
-        <div class="pane">
+        <div class="pane toned tone-notes">
             {pane_heading(Icon::NoteSticky, support::NOTES_PANE_TITLE, "badge local", support::NOTES_BADGE)}
-            <p>{move || view.with(|v| support::notes_readout(v.notes.len()))}</p>
+            <p>{move || notes.value().with(|rows| support::notes_readout(rows.len()))}</p>
             <div class="row">
                 <input
                     type="text"
@@ -669,36 +876,37 @@ fn NotesPane(view: RwSignal<View>) -> impl IntoView {
             <table>
                 <thead><tr><th>"id"</th><th>"body"</th></tr></thead>
                 <tbody>
-                    {move || {
-                        view.with(|v| {
-                            v.notes
-                                .iter()
-                                .map(|row| {
-                                    view! {
-                                        <tr>
-                                            <td>{row.id.clone()}</td>
-                                            <td>{row.body.clone()}</td>
-                                        </tr>
-                                    }
-                                })
-                                .collect_view()
-                        })
-                    }}
+                    <For
+                        each=move || rows.get()
+                        key=|(id, _)| *id
+                        children=move |(id, row)| {
+                            view! {
+                                <tr>
+                                    <td>{id.to_string()}</td>
+                                    <td>{move || row.with(|row| row.body.clone())}</td>
+                                </tr>
+                            }
+                        }
+                    />
                 </tbody>
             </table>
+            {live_error(notes.error())}
+            <PaneInfo text=support::NOTES_INFO />
         </div>
     }
 }
 
-/// The retention pane with the replica mirror's footprint and the trim pass.
+/// The retention pane with the replica mirror's footprint, the rows it
+/// covers, and the trim pass.
 #[component]
-fn RetentionPane(view: RwSignal<View>) -> impl IntoView {
+fn RetentionPane(view: RwSignal<View>, covered: Signal<usize>) -> impl IntoView {
     view! {
-        <div class="pane">
+        <div class="pane toned tone-retention">
             {pane_heading(Icon::Broom, support::RETENTION_PANE_TITLE, "badge trim", support::RETENTION_BADGE)}
             <p>
                 {move || {
-                    view.with(|v| support::retention_readout(v.pages, v.free_pages, v.covered_rows))
+                    let (pages, free) = view.with(|v| (v.pages, v.free_pages));
+                    support::retention_readout(pages, free, covered.get())
                 }}
             </p>
             <p>{support::RETENTION_EXPLAINER}</p>
@@ -708,6 +916,7 @@ fn RetentionPane(view: RwSignal<View>) -> impl IntoView {
                     "Free up space"
                 </button>
             </div>
+            <PaneInfo text=support::RETENTION_INFO />
         </div>
     }
 }
@@ -716,7 +925,7 @@ fn RetentionPane(view: RwSignal<View>) -> impl IntoView {
 #[component]
 fn YourDataPane(view: RwSignal<View>) -> impl IntoView {
     view! {
-        <div class="pane">
+        <div class="pane toned tone-your-data">
             {pane_heading(Icon::Database, support::YOUR_DATA_PANE_TITLE, "badge local", support::YOUR_DATA_BADGE)}
             <p>{support::YOUR_DATA_INTRO}</p>
             <div class="row">
@@ -738,6 +947,376 @@ fn YourDataPane(view: RwSignal<View>) -> impl IntoView {
                 />
             </div>
             {move || status_line(view.with(|v| v.import_line.clone()))}
+            <PaneInfo text=support::YOUR_DATA_INFO />
         </div>
+    }
+}
+
+/// The scoped style for the nearby panel, its sections and their forms.
+const PEER_PANEL_STYLE: &str = r#".peer section + section { border-top: 1px solid var(--border); }
+.peer section { padding: 6px 0; }
+.peer h4 { display: flex; align-items: center; gap: 6px; margin: 4px 0; font-size: 0.95em; }
+.peer p { margin: 2px 0; font-size: 0.9em; }
+.peer input { display: block; width: 100%; max-width: 28em; box-sizing: border-box; margin: 4px 0; }"#;
+
+/// The nearby panel (R76): the peer link, the hotspot this device hosts with
+/// its offer as plain lines, and the forms that join a hotspot another
+/// device hosted. It stands beside the panes while the build carries the
+/// peer link.
+#[component]
+fn NearbyPane(view: RwSignal<View>) -> impl IntoView {
+    // The join forms, the typed values the controls keep locally and send
+    // with their actions.
+    let join_ssid = RwSignal::new(String::new());
+    let join_passphrase = RwSignal::new(String::new());
+    let join_port = RwSignal::new(String::new());
+    let join_payload = RwSignal::new(String::new());
+
+    view! {
+        <div class="peer panel toned tone-nearby">
+            <style>{PEER_PANEL_STYLE}</style>
+            <h2>
+                <Fa icon=Icon::SatelliteDish />
+                "nearby "
+                <span class="badge peering">"peer"</span>
+            </h2>
+            {move || {
+                let near = view.with(|v| v.nearby.clone().unwrap_or_default());
+                let support::view::NearbyView {
+                    listening,
+                    bluetooth_line,
+                    beacon_line,
+                    linked,
+                    nearby: nearby_lines,
+                    offer,
+                    outcome,
+                    vpn_line,
+                    joined,
+                    can_host,
+                    links_off,
+                } = near;
+                let hosting = offer.is_some();
+                view! {
+                    <section>
+                        <h4>
+                            <Fa icon=Icon::CircleInfo />
+                            "Status"
+                        </h4>
+                        {cfg!(feature = "tauri").then(|| view! {
+                            <p class="status">"device: " {move || view.with(|state| state.device_line.clone())}</p>
+                        })}
+                        <p>{match listening {
+                            Some(listening) => view! { "peer: listening on " {listening.port} " as " <Badge account=listening.me.account /> "/" {listening.me.key_prefix} }.into_any(),
+                            None => "peer: not serving".into_any(),
+                        }}</p>
+                        <p>{bluetooth_line.clone()}</p>
+                        <p>{beacon_line}</p>
+                        <p>{support::view::links_line(links_off)}</p>
+                        {linked.into_iter().map(|peer| view! {
+                            <p>"linked: " <Badge account=peer.peer.account /> "/" {peer.peer.key_prefix}
+                                {peer.remote.map(|remote| format!(" via {remote}"))}
+                            </p>
+                        }).collect_view()}
+                        {nearby_lines.into_iter().map(|line| view! { <p>{line}</p> }).collect_view()}
+                        {offer.map(|offer| {
+                            view! {
+                                <p>"hotspot ssid: " {offer.ssid}</p>
+                                <p>"hotspot passphrase: " {offer.passphrase}</p>
+                                <p>"hotspot port: " {offer.port}</p>
+                                <p>"hotspot payload: " {offer.payload}</p>
+                                {offer.qr_svg.map(|svg| view! { <div inner_html=svg /> })}
+                            }
+                        })}
+                        <p>"hotspot: " {outcome}</p>
+                        {vpn_line.map(|line| view! { <p>{line}</p> })}
+                        <div class="row">
+                            {support::view::offers_bluetooth_on(&bluetooth_line).then(|| view! {
+                                <button on:click=move |_| act(Action::EnableBluetooth)>
+                                    <Fa icon=Icon::PowerOff />
+                                    "Turn on Bluetooth"
+                                </button>
+                            })}
+                            <button on:click=move |_| act(Action::SetPeerLinks { on: links_off })>
+                                <Fa icon=Icon::SatelliteDish />
+                                {if links_off { "Resume nearby links" } else { "Pause nearby links" }}
+                            </button>
+                        </div>
+                    </section>
+                    {(can_host && !joined).then(|| {
+                        view! {
+                            <section>
+                                <h4>
+                                    <Fa icon=Icon::TowerBroadcast />
+                                    "Host"
+                                </h4>
+                                <div class="row">
+                                    {(!hosting).then(|| {
+                                        view! {
+                                            <button on:click=move |_| act(Action::HostHotspot)>
+                                                <Fa icon=Icon::TowerBroadcast />
+                                                "Host a hotspot"
+                                            </button>
+                                        }
+                                    })}
+                                    {hosting.then(|| {
+                                        view! {
+                                            <button on:click=move |_| act(Action::StopHotspot)>
+                                                <Fa icon=Icon::Stop />
+                                                "Stop the hotspot"
+                                            </button>
+                                        }
+                                    })}
+                                </div>
+                            </section>
+                        }
+                    })}
+                    {(!hosting && !joined).then(|| {
+                        view! {
+                            <section>
+                                <h4>
+                                    <Fa icon=Icon::Wifi />
+                                    "Join by the offer"
+                                </h4>
+                                <input
+                                    type="text"
+                                    name="ssid"
+                                    placeholder="the offer's ssid"
+                                    style="font-family: monospace;"
+                                    prop:value=move || join_ssid.get()
+                                    on:input=move |ev| join_ssid.set(event_target_value(&ev))
+                                />
+                                <input
+                                    type="text"
+                                    name="passphrase"
+                                    placeholder="the offer's passphrase"
+                                    style="font-family: monospace;"
+                                    prop:value=move || join_passphrase.get()
+                                    on:input=move |ev| join_passphrase.set(event_target_value(&ev))
+                                />
+                                <input
+                                    type="text"
+                                    name="port"
+                                    placeholder="the offer's port"
+                                    style="font-family: monospace;"
+                                    prop:value=move || join_port.get()
+                                    on:input=move |ev| join_port.set(event_target_value(&ev))
+                                />
+                                <button on:click=move |_| {
+                                    let ssid = join_ssid.get_untracked().trim().to_owned();
+                                    let passphrase = join_passphrase.get_untracked().clone();
+                                    let port = join_port.get_untracked().trim().to_owned();
+                                    act(Action::JoinHotspot { ssid, passphrase, port });
+                                }>
+                                    <Fa icon=Icon::Wifi />
+                                    "Join the hotspot"
+                                </button>
+                            </section>
+                            <section>
+                                <h4>
+                                    <Fa icon=Icon::Qrcode />
+                                    "Join by the payload"
+                                </h4>
+                                <input
+                                    type="text"
+                                    name="payload"
+                                    placeholder="WIFI: payload"
+                                    style="font-family: monospace;"
+                                    prop:value=move || join_payload.get()
+                                    on:input=move |ev| join_payload.set(event_target_value(&ev))
+                                />
+                                <button on:click=move |_| {
+                                    let payload = join_payload.get_untracked().trim().to_owned();
+                                    act(Action::JoinPayload { payload });
+                                }>
+                                    <Fa icon=Icon::Qrcode />
+                                    "Join from the payload"
+                                </button>
+                            </section>
+                        }
+                    })}
+                    {(!hosting).then(|| {
+                        view! {
+                            <section>
+                                <h4>
+                                    <Fa icon=Icon::SatelliteDish />
+                                    "Join nearby, or leave"
+                                </h4>
+                                <div class="row">
+                                    {joined.then(|| {
+                                        view! {
+                                            <button on:click=move |_| act(Action::LeaveHotspot)>
+                                                <Fa icon=Icon::RightFromBracket />
+                                                "Leave the hotspot"
+                                            </button>
+                                        }
+                                    })}
+                                    {(!joined).then(|| {
+                                        view! {
+                                            <button on:click=move |_| act(Action::JoinNearby)>
+                                                <Fa icon=Icon::SatelliteDish />
+                                                "Join the nearby host"
+                                            </button>
+                                        }
+                                    })}
+                                </div>
+                            </section>
+                        }
+                    })}
+                }
+            }}
+            <PaneInfo text=support::NEARBY_INFO />
+        </div>
+    }
+}
+
+/// The team notes panel (R77): the team the roster names, the note's field
+/// and write, the team's notes, one line per peer write, and the tidy pass.
+/// It stands beside the nearby panel and syncs through the server.
+#[component]
+fn TeamNotesPane(view: RwSignal<View>, source: Source) -> impl IntoView {
+    let roster = use_live(&source, support::TeamsOfAccount);
+    // The team picker's text, the team the panel reads and writes.
+    let team_input = RwSignal::new(String::new());
+    // Fill the picker with the roster's first team while it stands empty, so
+    // a roster landing after the panel mounts still names one.
+    Effect::new(move |_| {
+        roster.value().with(|teams| {
+            if team_input.get_untracked().is_empty()
+                && let Some(first) = teams.iter().min()
+            {
+                team_input.set(first.clone());
+            }
+        });
+    });
+    let picked = Memo::new(move |_| team_input.get());
+    // A browser's client is no `Send` value, which a view's closure must be,
+    // so the closure reaches it through a local store.
+    let source = StoredValue::new_local(source);
+
+    view! {
+        <div class="panel toned tone-team">
+            <h2>
+                <Fa icon=Icon::Users />
+                "team notes "
+                <span class="badge synced">"synced + peer"</span>
+            </h2>
+            <p>{move || support::view::team_line(&picked.get())}</p>
+            <p>{move || roster.value().with(|teams| support::view::teams_line(teams))}</p>
+            <input
+                type="text"
+                name="team"
+                placeholder="the team to read and write"
+                prop:value=move || team_input.get()
+                on:input=move |ev| team_input.set(event_target_value(&ev))
+            />
+            {move || {
+                let team = picked.get();
+                (!team.is_empty())
+                    .then(|| view! { <TeamNotes view=view source=source.get_value() team=team /> })
+            }}
+            {move || {
+                let events = view.with(|v| v.team.as_ref().map(|t| t.events.clone()).unwrap_or_default());
+                (!events.is_empty()).then(|| {
+                    view! {
+                        <h3>
+                            <Fa icon=Icon::ClockRotateLeft size=12 />
+                            "peer activity"
+                        </h3>
+                        <div class="lines">
+                            {events.into_iter().map(|event| view! { <p>{event.line}{event.by.map(|account| view! { " by " <Badge account=account /> })}</p> }).collect_view()}
+                        </div>
+                    }
+                })
+            }}
+            {move || {
+                view.with(|v| v.team.as_ref().map(|t| t.peer).unwrap_or(false)).then(|| {
+                    view! {
+                        <div class="row">
+                            <button on:click=move |_| act(Action::TidyTeam)>
+                                <Fa icon=Icon::Broom />
+                                "Tidy"
+                            </button>
+                        </div>
+                    }
+                })
+            }}
+            {live_error(roster.error())}
+            <PaneInfo text=support::TEAM_INFO />
+        </div>
+    }
+}
+
+/// One team's members, its notes and the note's write, mounted per picked
+/// team, so a new pick follows the new team's queries. Each note line names
+/// the account of a still-provisional row, read again when the notes change
+/// or a provisional event arrives.
+#[component]
+fn TeamNotes(view: RwSignal<View>, source: Source, team: String) -> impl IntoView {
+    let members = use_live(&source, support::TeamMembersOf { team: team.clone() });
+    let notes = use_live(&source, support::TeamNotesFor { team: team.clone() });
+    let note_body = RwSignal::new(String::new());
+    let ids = Memo::new(move |_| {
+        notes.value().with(|rows| {
+            rows.iter()
+                .map(|row| row.id.to_string())
+                .collect::<Vec<_>>()
+        })
+    });
+    let provisional =
+        Memo::new(move |_| view.with(|v| v.team.as_ref().map_or(0, |t| t.provisional_events)));
+    let accounts = LocalResource::new(move || {
+        provisional.track();
+        platform::team_note_accounts(ids.get())
+    });
+    let outcome = Memo::new(move |_| {
+        view.with(|v| {
+            v.team
+                .as_ref()
+                .map(|t| t.outcome.clone())
+                .unwrap_or_default()
+        })
+    });
+    let lines = move || {
+        let accounts = accounts.get().unwrap_or_default();
+        notes.value().with(|rows| {
+            rows.iter()
+                .map(|note| {
+                    let account = accounts.get(&note.id.to_string()).map(String::as_str);
+                    view! { <p>"note: " {note.body.clone()} " by " <Badge account=note.author_id.to_string() /> {account.map(|account| format!(" (provisional from {account})"))}</p> }
+                })
+                .collect_view()
+        })
+    };
+    view! {
+        <p>{move || members.value().with(|members| support::view::members_line(members))}</p>
+        <div class="lines">
+            {move || {
+                notes
+                    .value()
+                    .with(Vec::is_empty)
+                    .then(|| view! { <p class="status">"no notes in this team yet"</p> })
+            }}
+            {lines}
+        </div>
+        <div class="row">
+            <input
+                type="text"
+                name="note-body"
+                placeholder="a note for the team"
+                prop:value=move || note_body.get()
+                on:input=move |ev| note_body.set(event_target_value(&ev))
+            />
+            <button class="primary" on:click=move |_| {
+                let body = note_body.get_untracked().trim().to_owned();
+                note_body.set(String::new());
+                act(Action::AddTeamNote { team: team.clone(), body });
+            }>
+                <Fa icon=Icon::Plus />
+                "Add note"
+            </button>
+        </div>
+        <p class="status">{move || outcome.get()}</p>
+        {live_error(members.error())}
+        {live_error(notes.error())}
     }
 }

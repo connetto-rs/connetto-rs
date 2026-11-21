@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "The demo window's access to the core's events.",
+  "description": "The demo window's access to native live queries.",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "connetto:default"]
 }

@@ -7,7 +7,7 @@ use dioxus::prelude::*;
 use dioxus_free_icons::Icon;
 use dioxus_free_icons::icons::fa_solid_icons::{FaCartShopping, FaMinus, FaPlus};
 
-use super::{ClientSlot, UserId};
+use super::{ClientSlot, PaneInfo, UserId};
 
 /// The orders pane.
 #[component]
@@ -17,9 +17,9 @@ pub fn OrdersPane() -> Element {
     let UserId(user_id) = use_context::<UserId>();
     let uid = user_id.read().clone().unwrap_or_default();
 
-    let orders_live = use_live::<_, _, support::Order>(&client, support::orders_newest_first());
-    let count = use_live(&client, support::orders_count());
-    let counts_by_quantity = use_live(&client, support::orders_counts_by_quantity());
+    let orders_live = use_live(&client, support::OrdersNewestFirst);
+    let count = use_live(&client, support::OrdersCount);
+    let counts_by_quantity = use_live(&client, support::OrdersCountsByQuantity);
 
     let rows: Vec<support::Order> = orders_live.value().read().iter().cloned().collect();
     let sum: i64 = rows.iter().map(|row| row.quantity).sum();
@@ -35,7 +35,7 @@ pub fn OrdersPane() -> Element {
     let remove_client = client.clone();
 
     rsx! {
-        div { class: "pane",
+        div { class: "pane toned tone-orders",
             h2 {
                 Icon { icon: FaCartShopping, width: 14, height: 14 }
                 {support::ORDERS_PANE_TITLE} " "
@@ -104,6 +104,7 @@ pub fn OrdersPane() -> Element {
                     }
                 }
             }
+            PaneInfo { text: support::ORDERS_INFO }
         }
     }
 }

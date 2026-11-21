@@ -2,14 +2,14 @@
 //! authority.
 //!
 //! [`AuthService`] mints connetto tokens at login and rotates them at refresh
-//! over an [`AuthStore`]. [`ConnettoHandshakeAuthority`] is the real
+//! over the [`DbAuthStore`]. [`ConnettoHandshakeAuthority`] is the real
 //! [`HandshakeAuthority`] the server injects: it checks each grant's signature
 //! locally, confirms in the same store that a login grant's run is still live,
 //! so a revoked run is refused on the next handshake even while its token is
 //! time-valid, and it signs the resume blob a caller with no identity presents.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use connetto_core::SessionId;
@@ -21,16 +21,18 @@ use connetto_core::traits::{
 use serde::de::DeserializeOwned;
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::authn::hooks::{CommittedNotice, EndCause, HookError};
 use crate::authn::provider::{
     ProviderError, ProviderRegistry, RetainedProviderToken, VerifiedLogin,
 };
-use crate::authn::schema::SessionRecord;
-use crate::authn::sign_in::{LoginRequest, SessionDescriber, SignInHook, SignInNotice};
+use crate::authn::schema::{Desc, SessionRecord};
+use crate::authn::sign_in::{LoginRequest, SessionDescriber};
 use crate::authn::store::{
-    AuthStore, AuthStoreError, IssuedSession, ResolvedIdentity, SessionOrigin, split_refresh,
+    AuthStoreError, DbAuthStore, ResolvedIdentity, SessionOrigin, split_refresh,
 };
 use crate::authn::token::{TokenAuthority, TokenError};
 use crate::guard::RequestGuard;
+use crate::schema::ConnettoSchema;
 
 /// The access token plus its rotating refresh token, returned by login and
 /// refresh.
@@ -68,7 +70,7 @@ fn unix_secs(time: SystemTime) -> u64 {
 pub enum AuthError {
     /// The auth store rejected the operation.
     #[error(transparent)]
-    Store(#[from] AuthStoreError),
+    Store(AuthStoreError),
     /// Minting the access token failed.
     #[error(transparent)]
     Token(#[from] TokenError),
@@ -90,39 +92,77 @@ pub enum AuthError {
     /// than let through (R36 fails closed).
     #[error("the ban list could not be read: {0}")]
     BanList(String),
+    /// The application's hook refused the sign-in, with its reason.
+    #[error("refused by the application: {0}")]
+    Refused(String),
 }
 
-/// Mints and rotates connetto tokens over an [`AuthStore`].
-///
-/// Generic over the store so the concrete choice (in-memory or database) is
-/// made once at startup, and every awaited store future stays `Send`.
-pub struct AuthService<S: AuthStore> {
+/// A ban and an application's refusal read inside the store's transaction
+/// answer as the service's own.
+impl From<AuthStoreError> for AuthError {
+    fn from(error: AuthStoreError) -> Self {
+        match error {
+            AuthStoreError::Banned => Self::Banned,
+            AuthStoreError::BanList(error) => Self::BanList(error.detail().to_owned()),
+            AuthStoreError::Hook(HookError::Refused(reason)) => Self::Refused(reason),
+            error => Self::Store(error),
+        }
+    }
+}
+
+/// One async lock per session that callers currently hold, so a map entry
+/// lives only while some caller holds its lock and the map stays as small as
+/// the refreshes in flight.
+#[derive(Default)]
+struct SessionLocks(parking_lot::Mutex<HashMap<SessionId, Weak<AsyncMutex<()>>>>);
+
+impl SessionLocks {
+    /// The lock of `session_id`, shared with every caller still holding it.
+    ///
+    /// A new lock drops the entries of sessions nobody holds a lock for.
+    fn lock_for(&self, session_id: SessionId) -> Arc<AsyncMutex<()>> {
+        let mut locks = self.0.lock();
+        if let Some(held) = locks.get(&session_id).and_then(Weak::upgrade) {
+            return held;
+        }
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let lock = Arc::new(AsyncMutex::new(()));
+        locks.insert(session_id, Arc::downgrade(&lock));
+        lock
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0.lock().len()
+    }
+}
+
+/// Mints and rotates connetto tokens over the [`DbAuthStore`] of the
+/// deployment's schema `D`.
+pub struct AuthService<D: ConnettoSchema> {
     authority: Arc<TokenAuthority>,
-    store: Arc<S>,
+    store: Arc<DbAuthStore<D>>,
     /// The provider registry, for the lazy retained-token refresh. `None`
     /// leaves retained tokens un-refreshable (returned as stored).
     registry: Option<Arc<ProviderRegistry>>,
     /// Per-session async locks serializing retained-token refreshes so two
     /// concurrent callers on one node cannot double-refresh and trip the
     /// provider's rotation-reuse defense.
-    refresh_locks: Mutex<HashMap<SessionId, Arc<AsyncMutex<()>>>>,
+    refresh_locks: SessionLocks,
     /// Observer fired after a session is revoked, set once at startup. The
     /// deployment points it at the session manager so revocation closes the
     /// session's live connection rather than only refusing its next handshake.
     revocation_hook: std::sync::OnceLock<SessionRevocationHook>,
     /// Sink for the durable record of access changes, set once at startup.
-    /// `None` records nothing, which is what an in-memory deployment wants.
-    audit_hook: std::sync::OnceLock<crate::audit::AuditHook<S::Id>>,
-    /// The application's sign-in callback, set once at startup. `None`
-    /// tells nobody.
-    sign_in_hook: std::sync::OnceLock<SignInHook<S::Id, S::Descriptor>>,
+    /// `None` records nothing.
+    audit_hook: std::sync::OnceLock<crate::audit::AuditHook<D::Id>>,
     /// The application's describe callback, `None` when the deployment
     /// declares no description.
-    describer: Option<SessionDescriber<S::Descriptor>>,
+    describer: Option<SessionDescriber<Desc<D>>>,
     /// Every counter connetto keeps about a caller, shared with the session
     /// manager because the failed-renewal signal fires here and the other three
     /// fire there.
-    guard: Arc<RequestGuard<S::Id>>,
+    guard: Arc<RequestGuard<D::Id>>,
 }
 
 /// Observes a session revocation. Fired synchronously after the store revoke
@@ -149,25 +189,7 @@ pub enum LivenessError {
     BanList(String),
 }
 
-/// What a login row and a sign-in notice say about how a session began,
-/// taken before the store consumes the origin.
-struct Started<Desc> {
-    provider: String,
-    issuer: String,
-    description: Desc,
-}
-
-impl<Desc: Clone> Started<Desc> {
-    fn of(identity: &ResolvedIdentity, origin: &SessionOrigin<Desc>) -> Self {
-        Self {
-            provider: origin.provider.clone(),
-            issuer: identity.issuer.clone(),
-            description: origin.description.clone(),
-        }
-    }
-}
-
-impl<S: AuthStore> AuthService<S> {
+impl<D: ConnettoSchema> AuthService<D> {
     /// Build over a shared token authority and store, with no provider registry.
     ///
     /// The `guard` is the same instance the session manager holds, so a person's
@@ -175,17 +197,16 @@ impl<S: AuthStore> AuthService<S> {
     #[must_use]
     pub fn new(
         authority: Arc<TokenAuthority>,
-        store: Arc<S>,
-        guard: Arc<RequestGuard<S::Id>>,
+        store: Arc<DbAuthStore<D>>,
+        guard: Arc<RequestGuard<D::Id>>,
     ) -> Self {
         Self {
             authority,
             store,
             registry: None,
-            refresh_locks: Mutex::new(HashMap::new()),
+            refresh_locks: SessionLocks::default(),
             revocation_hook: std::sync::OnceLock::new(),
             audit_hook: std::sync::OnceLock::new(),
-            sign_in_hook: std::sync::OnceLock::new(),
             describer: None,
             guard,
         }
@@ -201,14 +222,14 @@ impl<S: AuthStore> AuthService<S> {
     /// Attach the application's describe callback, which every sign-in asks
     /// for the session's description.
     #[must_use]
-    pub fn with_session_describer(mut self, describer: SessionDescriber<S::Descriptor>) -> Self {
+    pub fn with_session_describer(mut self, describer: SessionDescriber<Desc<D>>) -> Self {
         self.describer = Some(describer);
         self
     }
 
     /// The counters this service shares with the session manager.
     #[must_use]
-    pub fn guard(&self) -> &Arc<RequestGuard<S::Id>> {
+    pub fn guard(&self) -> &Arc<RequestGuard<D::Id>> {
         &self.guard
     }
 
@@ -224,18 +245,12 @@ impl<S: AuthStore> AuthService<S> {
     /// Unset, connetto records nothing, which is the right default: the table
     /// is the deployment's and connetto emits no DDL, so a deployment that has
     /// not created it must not have writes attempted against it.
-    pub fn set_audit_hook(&self, hook: crate::audit::AuditHook<S::Id>) {
+    pub fn set_audit_hook(&self, hook: crate::audit::AuditHook<D::Id>) {
         let _ = self.audit_hook.set(hook);
     }
 
-    /// Attach the application's sign-in callback, once, after construction. A
-    /// second call is ignored, matching the audit sink beside it.
-    pub fn set_sign_in_hook(&self, hook: SignInHook<S::Id, S::Descriptor>) {
-        let _ = self.sign_in_hook.set(hook);
-    }
-
     /// Record one access change, if a sink is attached.
-    fn record(&self, event: crate::audit::AuthEvent<S::Id>) {
+    fn record(&self, event: crate::audit::AuthEvent<D::Id>) {
         if let Some(hook) = self.audit_hook.get() {
             hook(event);
         }
@@ -249,20 +264,11 @@ impl<S: AuthStore> AuthService<S> {
     ///
     /// [`AuthError::Undescribed`] when the deployment declares a description
     /// and no describe callback is attached.
-    pub async fn describe(&self, request: LoginRequest) -> Result<S::Descriptor, AuthError> {
+    pub async fn describe(&self, request: LoginRequest) -> Result<Desc<D>, AuthError> {
         match &self.describer {
             Some(describer) => Ok(describer(request).await),
-            None => S::undescribed().ok_or(AuthError::Undescribed),
+            None => DbAuthStore::<D>::undescribed().ok_or(AuthError::Undescribed),
         }
-    }
-
-    /// How `session_id` began and when it last refreshed, `None` when it
-    /// names no session.
-    pub(crate) async fn session_record(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Option<SessionRecord<S::Id, S::Descriptor>>, AuthError> {
-        Ok(self.store.session_record(session_id).await?)
     }
 
     /// Create a session for a verified identity and mint its first token pair.
@@ -273,23 +279,9 @@ impl<S: AuthStore> AuthService<S> {
     pub async fn login(
         &self,
         identity: &ResolvedIdentity,
-        origin: SessionOrigin<S::Descriptor>,
-    ) -> Result<TokenPair<S::Id>, AuthError> {
-        let now = SystemTime::now();
-        let started = Started::of(identity, &origin);
-        let user_id = self.store.resolve(identity).await?;
-        self.refuse_banned(&user_id).await?;
-        let issued = self
-            .store
-            .create_session_for(user_id, identity, origin)
-            .await?;
-        self.finish_login(issued, now, started, |issued| {
-            tracing::info!(
-                session = %issued.session_id,
-                user = %issued.context.user_id,
-                "login succeeded, session created"
-            );
-        })
+        origin: SessionOrigin<Desc<D>>,
+    ) -> Result<TokenPair<D::Id>, AuthError> {
+        self.sign_in(identity, origin, None).await
     }
 
     /// Create a session for a verified login and retain its provider tokens.
@@ -303,47 +295,39 @@ impl<S: AuthStore> AuthService<S> {
     pub async fn login_with_provider(
         &self,
         login: &VerifiedLogin,
-        origin: SessionOrigin<S::Descriptor>,
-    ) -> Result<TokenPair<S::Id>, AuthError> {
-        let now = SystemTime::now();
-        let started = Started::of(&login.identity, &origin);
-        let user_id = self.store.resolve(&login.identity).await?;
-        self.refuse_banned(&user_id).await?;
-        let issued = self
-            .store
-            .create_session_for(user_id, &login.identity, origin)
-            .await?;
-        self.store
-            .set_retained_provider_token(issued.session_id, &login.retained)
-            .await?;
-        self.finish_login(issued, now, started, |issued| {
-            tracing::info!(
-                session = %issued.session_id,
-                user = %issued.context.user_id,
-                issuer = %login.retained.issuer,
-                "login succeeded, session created with retained provider tokens"
-            );
-        })
+        origin: SessionOrigin<Desc<D>>,
+    ) -> Result<TokenPair<D::Id>, AuthError> {
+        self.sign_in(&login.identity, origin, Some(&login.retained))
+            .await
     }
 
-    /// Mint the first token pair for a freshly created session, register its
-    /// owner with the guard, record the login, tell the application, and
-    /// assemble the response.
+    /// Sign `identity` in through the store's one transaction, then mint the
+    /// first token pair, register the owner with the guard, record the login
+    /// and tell the application it committed.
     ///
-    /// `announce` runs once the mint has succeeded, so a failed mint still
-    /// logs nothing. The owner registration is what R19 attributes later abuse
-    /// through, so it must not fall off either login path.
-    fn finish_login(
+    /// The owner registration is what R19 attributes later abuse through, so
+    /// it must not fall off either login path.
+    async fn sign_in(
         &self,
-        issued: IssuedSession<S::Id>,
-        now: SystemTime,
-        started: Started<S::Descriptor>,
-        announce: impl FnOnce(&IssuedSession<S::Id>),
-    ) -> Result<TokenPair<S::Id>, AuthError> {
+        identity: &ResolvedIdentity,
+        origin: SessionOrigin<Desc<D>>,
+        retained: Option<&RetainedProviderToken>,
+    ) -> Result<TokenPair<D::Id>, AuthError> {
+        let now = SystemTime::now();
+        let (issued, record) = self
+            .store
+            .sign_in(identity, origin, retained, self.guard.ban_store())
+            .await?;
         let access_token = self
             .authority
             .mint_access(&issued.context, issued.session_id, now)?;
-        announce(&issued);
+        tracing::info!(
+            session = %issued.session_id,
+            user = %issued.context.user_id,
+            issuer = %record.issuer,
+            retained = retained.is_some(),
+            "login succeeded, session created"
+        );
         self.guard
             .learn_owner(issued.session_id, &issued.context.user_id);
         self.record(
@@ -352,19 +336,13 @@ impl<S: AuthStore> AuthService<S> {
                 Some(issued.context.user_id.clone()),
                 crate::audit::AuthOp::LoggedIn,
             )
-            .about_login(started.provider.clone(), started.issuer.clone()),
+            .about_login(record.provider.clone(), record.issuer.clone()),
         );
-        if let Some(hook) = self.sign_in_hook.get() {
-            hook(SignInNotice::SignedIn(SessionRecord {
-                session_id: issued.session_id,
-                user_id: issued.context.user_id.clone(),
-                provider: started.provider,
-                issuer: started.issuer,
-                description: started.description,
-                created_at: issued.created_at,
-                refreshed_at: None,
-            }));
-        }
+        self.store.hooks().committed(CommittedNotice::SignedIn {
+            user_id: record.user_id.clone(),
+            claims: identity.verified_claims(),
+            session: record,
+        });
         Ok(TokenPair {
             access_token,
             refresh_token: issued.refresh_token,
@@ -382,29 +360,22 @@ impl<S: AuthStore> AuthService<S> {
     /// which would break the Backend-For-Frontend boundary. Concurrent callers
     /// on one node are serialized per session. There is no background refresh.
     ///
-    /// Returns `None` when the session retained no provider token. When no
-    /// registry is attached or the issuer routes to no provider, the stored
-    /// token is returned unrefreshed.
+    /// Returns `None` when the session retained no provider token. The refresh
+    /// goes through the provider the session signed in with, by name, because
+    /// two clients of one issuer each refuse the other's refresh token.
     ///
     /// # Errors
     ///
-    /// [`AuthError`] if the store or the provider refresh fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the `refresh_locks` mutex is poisoned by a thread that panicked while holding it.
+    /// [`AuthError`] if the store or the provider refresh fails, and
+    /// [`ProviderError::Refresh`] when the stored token has expired and
+    /// nothing can renew it, because the provider issued no refresh token, no
+    /// registry is attached, the session is gone, or no provider carries the
+    /// session's provider name any longer.
     pub async fn provider_access_token(
         &self,
         session_id: SessionId,
     ) -> Result<Option<String>, AuthError> {
-        let lock = {
-            let mut locks = self.refresh_locks.lock().expect("refresh locks");
-            Arc::clone(
-                locks
-                    .entry(session_id)
-                    .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
-            )
-        };
+        let lock = self.refresh_locks.lock_for(session_id);
         let _guard = lock.lock().await;
 
         let Some(retained) = self.store.retained_provider_token(session_id).await? else {
@@ -413,15 +384,26 @@ impl<S: AuthStore> AuthService<S> {
         if retained.still_valid {
             return Ok(Some(retained.access_token));
         }
-        let (Some(refresh_token), Some(registry)) =
-            (retained.refresh_token.as_deref(), self.registry.as_ref())
-        else {
-            return Ok(Some(retained.access_token));
-        };
-        let Some(provider) = registry.by_issuer(&retained.issuer) else {
-            return Ok(Some(retained.access_token));
-        };
-        let refreshed = provider.refresh_provider_token(refresh_token).await?;
+        let unrenewable = |reason: String| AuthError::Provider(ProviderError::Refresh(reason));
+        let refresh_token = retained
+            .refresh_token
+            .ok_or_else(|| unrenewable("the provider issued no refresh token".to_owned()))?;
+        let registry = self
+            .registry
+            .as_ref()
+            .ok_or_else(|| unrenewable("no provider registry is attached".to_owned()))?;
+        let record = self
+            .store
+            .session_record(session_id)
+            .await?
+            .ok_or_else(|| unrenewable("the session no longer exists".to_owned()))?;
+        let provider = registry.by_name(&record.provider).ok_or_else(|| {
+            unrenewable(format!(
+                "the session's provider {:?} is not configured",
+                record.provider
+            ))
+        })?;
+        let refreshed = provider.refresh_provider_token(&refresh_token).await?;
         // Preserve the tenant-specific issuer resolved at login.
         let refreshed = RetainedProviderToken {
             issuer: retained.issuer,
@@ -438,7 +420,7 @@ impl<S: AuthStore> AuthService<S> {
     /// # Errors
     ///
     /// [`AuthError`] if the token is invalid, expired, reused, or the mint fails.
-    pub async fn refresh(&self, refresh_token: &str) -> Result<TokenPair<S::Id>, AuthError> {
+    pub async fn refresh(&self, refresh_token: &str) -> Result<TokenPair<D::Id>, AuthError> {
         // Parse the session id before touching the store. A token that does not
         // parse names nothing, so skip all metering and let the store return its
         // own error unchanged.
@@ -459,7 +441,11 @@ impl<S: AuthStore> AuthService<S> {
             match self.refuse_banned(&record.user_id).await {
                 Ok(()) => {}
                 Err(AuthError::Banned) => {
-                    if self.store.end_owned(&record.user_id, session_id).await? {
+                    if self
+                        .store
+                        .end_owned(&record.user_id, session_id, EndCause::Banned)
+                        .await?
+                    {
                         self.ended(
                             &record.user_id,
                             session_id,
@@ -534,8 +520,12 @@ impl<S: AuthStore> AuthService<S> {
     ///
     /// [`AuthError`] if the store fails.
     pub async fn revoke(&self, session_id: SessionId) -> Result<(), AuthError> {
-        self.revoke_as(session_id, crate::audit::AuthOp::SessionRevoked)
-            .await
+        self.revoke_as(
+            session_id,
+            crate::audit::AuthOp::SessionRevoked,
+            EndCause::Revoked,
+        )
+        .await
     }
 
     /// Revoke every live session, returning how many were live.
@@ -553,8 +543,8 @@ impl<S: AuthStore> AuthService<S> {
     /// Every live session of `user`, oldest first.
     pub(crate) async fn sessions_of(
         &self,
-        user: &S::Id,
-    ) -> Result<Vec<SessionRecord<S::Id, S::Descriptor>>, AuthError> {
+        user: &D::Id,
+    ) -> Result<Vec<SessionRecord<D::Id, Desc<D>>>, AuthError> {
         Ok(self.store.sessions_of(user).await?)
     }
 
@@ -563,10 +553,14 @@ impl<S: AuthStore> AuthService<S> {
     /// session was `user`'s and still live.
     pub(crate) async fn end_session(
         &self,
-        user: &S::Id,
+        user: &D::Id,
         session: SessionId,
     ) -> Result<bool, AuthError> {
-        if !self.store.end_owned(user, session).await? {
+        if !self
+            .store
+            .end_owned(user, session, EndCause::EndedByOwner)
+            .await?
+        {
             return Ok(false);
         }
         self.ended(user, session, crate::audit::AuthOp::EndedByOwner);
@@ -578,34 +572,41 @@ impl<S: AuthStore> AuthService<S> {
     /// is kept. Answers the sessions it ended.
     pub(crate) async fn end_sessions(
         &self,
-        user: &S::Id,
+        user: &D::Id,
         keep: Option<SessionId>,
     ) -> Result<Vec<SessionId>, AuthError> {
-        let op = if keep.is_some() {
-            crate::audit::AuthOp::EndedOthers
+        let (op, cause) = if keep.is_some() {
+            (crate::audit::AuthOp::EndedOthers, EndCause::EndedOthers)
         } else {
-            crate::audit::AuthOp::EndedAll
+            (crate::audit::AuthOp::EndedAll, EndCause::EndedAll)
         };
-        let ended = self.store.end_all_of(user, keep).await?;
+        let ended = self.store.end_all_of(user, keep, cause).await?;
         for session in &ended {
             self.ended(user, *session, op);
         }
         Ok(ended)
     }
 
-    /// End every session of the banned identity `user`, recording
-    /// `ended_by_ban` for each (R105 decision 8).
-    pub(crate) async fn end_banned(&self, user: &S::Id) -> Result<Vec<SessionId>, AuthError> {
-        let ended = self.store.end_all_of(user, None).await?;
-        for session in &ended {
-            self.ended(user, *session, crate::audit::AuthOp::EndedByBan);
+    /// Close each live connection of `sessions` of `user`, ended with `cause`
+    /// in a transaction another owner committed (a ban, an erasure, an owner
+    /// ending a session that enrolled a device), record `op` for each and
+    /// tell the hooks.
+    pub(crate) fn ended_elsewhere(
+        &self,
+        user: &D::Id,
+        sessions: &[SessionId],
+        op: crate::audit::AuthOp,
+        cause: EndCause,
+    ) {
+        for session in sessions {
+            self.ended(user, *session, op);
         }
-        Ok(ended)
+        self.store.tell_ended(user, sessions, cause);
     }
 
     /// Refuse `user` when the ban list holds a ban on it, and when the list
     /// cannot be read.
-    async fn refuse_banned(&self, user: &S::Id) -> Result<(), AuthError> {
+    async fn refuse_banned(&self, user: &D::Id) -> Result<(), AuthError> {
         match self.guard.banned(user).await {
             Ok(None) => Ok(()),
             Ok(Some(_)) => Err(AuthError::Banned),
@@ -613,20 +614,27 @@ impl<S: AuthStore> AuthService<S> {
         }
     }
 
-    /// Revoke every live session of `user` for the application's own
-    /// reasons, closing each live connection and recording
-    /// `session_revoked`, the sign-out an erasure runs first. Answers the
-    /// sessions it revoked.
-    pub(crate) async fn revoke_person(&self, user: &S::Id) -> Result<Vec<SessionId>, AuthError> {
-        let revoked = self.store.end_all_of(user, None).await?;
-        for session in &revoked {
-            self.ended(user, *session, crate::audit::AuthOp::SessionRevoked);
-        }
-        Ok(revoked)
+    /// Close the live connection of `session`, revoked in a device
+    /// revocation's transaction, and record `session_revoked`.
+    pub(crate) fn ended_with_device(&self, user: &D::Id, session: SessionId) {
+        tracing::info!(session = %session, "the revoked device's session ended");
+        self.notify_revoked(session);
+        self.record(crate::audit::AuthEvent::new(
+            session,
+            None,
+            crate::audit::AuthOp::SessionRevoked,
+        ));
+        self.store.tell_ended(user, &[session], EndCause::Revoked);
+    }
+
+    /// The store, whose transactions an erasure, a ban and a device
+    /// revocation join.
+    pub(crate) fn store(&self) -> &DbAuthStore<D> {
+        &self.store
     }
 
     /// Close an ended session's live connection and record why it ended.
-    fn ended(&self, user: &S::Id, session: SessionId, op: crate::audit::AuthOp) {
+    fn ended(&self, user: &D::Id, session: SessionId, op: crate::audit::AuthOp) {
         tracing::info!(session = %session, cause = op.label(), "session ended");
         self.notify_revoked(session);
         self.record(crate::audit::AuthEvent::new(
@@ -650,10 +658,10 @@ impl<S: AuthStore> AuthService<S> {
     pub(crate) async fn verify_live(
         &self,
         access_token: &str,
-    ) -> Result<VerifiedSession<S::Id>, LivenessError> {
+    ) -> Result<VerifiedSession<D::Id>, LivenessError> {
         let checked = self
             .authority
-            .check_grant::<S::Id, serde::de::IgnoredAny>(&Grant::new(access_token))
+            .check_grant::<D::Id, serde::de::IgnoredAny>(&Grant::new(access_token))
             .map_err(|_| LivenessError::Refused)?;
         let Subject::Identity(session) = checked.subject else {
             return Err(LivenessError::Refused);
@@ -691,8 +699,9 @@ impl<S: AuthStore> AuthService<S> {
         &self,
         session_id: SessionId,
         op: crate::audit::AuthOp,
+        cause: EndCause,
     ) -> Result<(), AuthError> {
-        self.store.revoke_session(session_id).await?;
+        self.store.revoke_session(session_id, cause).await?;
         tracing::info!(session = %session_id, cause = op.label(), "session revoked");
         self.notify_revoked(session_id);
         self.record(crate::audit::AuthEvent::new(session_id, None, op));
@@ -734,15 +743,19 @@ impl<S: AuthStore> AuthService<S> {
         let Some(session_id) = self.store.session_for_refresh(refresh_token).await? else {
             return Ok(false);
         };
-        self.revoke_as(session_id, crate::audit::AuthOp::LoggedOut)
-            .await?;
+        self.revoke_as(
+            session_id,
+            crate::audit::AuthOp::LoggedOut,
+            EndCause::LoggedOut,
+        )
+        .await?;
         Ok(true)
     }
 
     /// Build the handshake authority sharing this service's token authority
     /// and store.
     #[must_use]
-    pub fn handshake_authority(&self) -> ConnettoHandshakeAuthority<S> {
+    pub fn handshake_authority(&self) -> ConnettoHandshakeAuthority<D> {
         ConnettoHandshakeAuthority {
             authority: Arc::clone(&self.authority),
             store: Arc::clone(&self.store),
@@ -757,29 +770,40 @@ impl<S: AuthStore> AuthService<S> {
 /// It closes the spoofing hole because a caller is only ever whoever a token
 /// connetto signed says it is, and it closes the handle hole because a run with
 /// no identity resumes only on a blob connetto signed.
-pub struct ConnettoHandshakeAuthority<S: AuthStore> {
+pub struct ConnettoHandshakeAuthority<D: ConnettoSchema> {
     authority: Arc<TokenAuthority>,
-    store: Arc<S>,
+    store: Arc<DbAuthStore<D>>,
 }
 
-impl<S: AuthStore> ConnettoHandshakeAuthority<S> {
+impl<D: ConnettoSchema> ConnettoHandshakeAuthority<D> {
     /// Build over a shared token authority and store.
     #[must_use]
-    pub fn new(authority: Arc<TokenAuthority>, store: Arc<S>) -> Self {
+    pub fn new(authority: Arc<TokenAuthority>, store: Arc<DbAuthStore<D>>) -> Self {
         Self { authority, store }
     }
 }
 
-impl<S, Key> HandshakeAuthority<S::Id, Key> for ConnettoHandshakeAuthority<S>
+impl<D: ConnettoSchema> connetto_core::SessionLiveness for ConnettoHandshakeAuthority<D> {
+    fn session_is_live(&self, session_id: SessionId) -> connetto_core::LivenessFuture<'_> {
+        Box::pin(async move {
+            self.store
+                .session_is_live(session_id)
+                .await
+                .map_err(|err| connetto_core::LivenessUnknown(err.to_string()))
+        })
+    }
+}
+
+impl<D, Key> HandshakeAuthority<D::Id, Key> for ConnettoHandshakeAuthority<D>
 where
-    S: AuthStore + 'static,
+    D: ConnettoSchema,
     Key: DeserializeOwned + Send + 'static,
 {
-    fn check_grant<'a>(&'a self, grant: &'a Grant) -> GrantCheckFuture<'a, S::Id, Key> {
+    fn check_grant<'a>(&'a self, grant: &'a Grant) -> GrantCheckFuture<'a, D::Id, Key> {
         Box::pin(async move {
             let checked = self
                 .authority
-                .check_grant::<S::Id, Key>(grant)
+                .check_grant::<D::Id, Key>(grant)
                 .map_err(|err| GrantRefused::Invalid(err.to_string()))?;
             let subject = match checked.subject {
                 // Only a login has something to keep alive. A capability is
@@ -817,5 +841,25 @@ where
         self.authority
             .verify_resume(blob)
             .map_err(|err| HandleError(err.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Callers on one session share its lock while any of them holds it, and a
+    /// session nobody holds a lock for leaves the map at the next insert.
+    #[test]
+    fn a_session_lock_is_shared_while_held_and_pruned_once_released() {
+        let locks = SessionLocks::default();
+        let first = SessionId::from_uuid(uuid::Uuid::from_u128(1));
+        let held = locks.lock_for(first);
+        assert!(Arc::ptr_eq(&held, &locks.lock_for(first)));
+        drop(held);
+
+        let second = SessionId::from_uuid(uuid::Uuid::from_u128(2));
+        let _held = locks.lock_for(second);
+        assert_eq!(locks.len(), 1, "the released session's entry is gone");
     }
 }

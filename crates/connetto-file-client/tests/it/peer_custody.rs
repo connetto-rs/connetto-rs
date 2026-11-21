@@ -1,0 +1,950 @@
+//! Custody of a replicated column's files on a device other than their
+//! author: an on-demand copy entering custody within the budget, kept after
+//! its row settles until the state column reads `available`, released on a
+//! retraction or once its author lapsed, returning on `lost`, the media
+//! driver acting on each as the event behind it arrives, the reports naming
+//! a copy only to peers the gate admits, and the device archive carrying a
+//! copy with its record (R79 decisions 12, 13, 15, 16 and 18).
+
+use std::time::Duration;
+
+use connetto_client::ClientEvent;
+use connetto_client::live::ConnettoClient;
+use connetto_client::peer::PeerAuthor;
+use connetto_client::{ExportScope, ImportChoices};
+use connetto_core::device_cert::DeviceIdentity;
+use connetto_core::exchange::{RetractCause, Retraction};
+use connetto_exchange::media::Media;
+use connetto_file_client::{ContentError, ContentEvent, FileId, Resolved};
+use connetto_peer::Node;
+use diesel::prelude::*;
+use tokio::sync::mpsc;
+
+use crate::peer_support::{
+    Device, Devices, apply_entry, beside, beside_both, captured_photo, custody_state,
+    declare_replicated, deliver_state, lapse_in, link_to, listener, port, replica,
+    set_custody_state, set_state, stage,
+};
+use crate::retention::pseudorandom;
+use crate::support::Scripted;
+
+/// How long a proof waits for a report or an event before failing.
+const BOUND: Duration = Duration::from_secs(10);
+
+/// The author whose entry the receiver applies.
+fn anna() -> PeerAuthor {
+    PeerAuthor {
+        key_id: vec![7; 32],
+        account: "anna".to_owned(),
+        bot_list: Some("*".to_owned()),
+    }
+}
+
+/// Whether `device` answers `file_id` from its own store. A device that lacks
+/// it asks the scripted server, which refuses, so any other answer reads as
+/// not held.
+async fn held(device: &Device, file_id: FileId) -> bool {
+    matches!(device.resolve(file_id).await, Ok(Resolved::Local { .. }))
+}
+
+/// Settles anna's entry 1 on `client`.
+async fn settle(client: &ConnettoClient<Scripted>) {
+    client
+        .with_conn(|conn| conn.adjudicate_peer_frontier(&anna().key_id, 1))
+        .await
+        .expect("the replica is open")
+        .expect("adjudicate anna's frontier");
+}
+
+/// Retracts anna's entry 1 on `client`.
+async fn retract(client: &ConnettoClient<Scripted>) {
+    client
+        .with_conn(|conn| {
+            conn.retract_peer_entry(
+                &anna(),
+                &Retraction {
+                    seq: 1,
+                    cause: RetractCause::Abandoned,
+                },
+            )
+        })
+        .await
+        .expect("the replica is open")
+        .expect("retract anna's photo");
+}
+
+/// The next custody report `inbox` receives, room reports skipped since
+/// their timing follows a clock.
+async fn next(inbox: &mut mpsc::UnboundedReceiver<Media>) -> Media {
+    loop {
+        let message = tokio::time::timeout(BOUND, inbox.recv())
+            .await
+            .expect("a report arrives")
+            .expect("the listener runs");
+        if !matches!(message, Media::Room { .. }) {
+            return unseen(message);
+        }
+    }
+}
+
+/// `report` with its number and `seen` cleared, since the tests compare
+/// what a report says of custody and the driver numbers its reports itself.
+fn unseen(mut report: Media) -> Media {
+    if let Media::Holdings { number, seen, .. }
+    | Media::Held { number, seen, .. }
+    | Media::Room { number, seen, .. } = &mut report
+    {
+        *number = 0;
+        *seen = None;
+    }
+    report
+}
+
+/// A receiver that applied anna's provisional photo row, row 7 naming a file
+/// a linked holder serves, and fetched the file on demand, its replica
+/// attached to a scripted server that refuses every ticket.
+struct Camp {
+    _dirs: [tempfile::TempDir; 3],
+    client: ConnettoClient<Scripted>,
+    server: Scripted,
+    receiver: Device,
+    file_id: FileId,
+}
+
+impl Camp {
+    /// The camp with `budget` bytes for custody on the receiver.
+    async fn new(budget: u64) -> Self {
+        let dirs = [
+            tempfile::tempdir().expect("temp dir"),
+            tempfile::tempdir().expect("temp dir"),
+            tempfile::tempdir().expect("temp dir"),
+        ];
+        let (_, holder) = declare_replicated(replica(dirs[0].path(), None).await).await;
+        let file_id = stage(&holder, 1, "anna", &pseudorandom(61, 300_000)).await;
+        let server = Scripted::new([]);
+        let (client, receiver) = replica(dirs[1].path(), Some(server.clone())).await;
+        let receiver = receiver.with_custody_budget(budget).with_custody_reserve(0);
+        let (client, receiver) = declare_replicated((client, receiver)).await;
+        apply_entry(
+            &client,
+            &anna(),
+            1,
+            captured_photo(dirs[2].path(), 7, file_id.as_bytes().to_vec(), None).await,
+        )
+        .await;
+
+        let devices = Devices::new();
+        let (holder_node, holder_addr, holder_events) = devices.node(&devices.device("r77", 2));
+        let (receiver_node, _, receiver_events) = devices.node(&devices.device("anna", 3));
+        receiver_node
+            .link(holder_addr)
+            .await
+            .expect("the link completes");
+        beside_both(
+            (&holder, port(holder_node, holder_events)),
+            (&receiver, port(receiver_node, receiver_events)),
+            async {
+                assert!(
+                    matches!(
+                        receiver.resolve(file_id).await.expect("resolve"),
+                        Resolved::Local { .. }
+                    ),
+                    "the receiver fetches the file from the holder"
+                );
+            },
+        )
+        .await;
+        Self {
+            _dirs: dirs,
+            client,
+            server,
+            receiver,
+            file_id,
+        }
+    }
+
+    /// Runs `proof` beside the receiver's media driver with a reader in
+    /// anna's account linked to it, handing the proof the reader once its
+    /// opening report arrived.
+    async fn with_reader<F: Future<Output = ()>>(&self, proof: impl FnOnce(Reader) -> F) {
+        let devices = Devices::new();
+        let receiver = devices.device("r77", 3);
+        let (receiver_node, receiver_addr, receiver_events) = devices.node(&receiver);
+        let (node, _, reader_events) = devices.node(&devices.device("anna", 4));
+        let mut inbox = listener(reader_events);
+        beside(
+            &self.receiver,
+            port(receiver_node, receiver_events),
+            async {
+                node.link(receiver_addr).await.expect("the link completes");
+                let Media::Holdings { held, leaving, .. } = next(&mut inbox).await else {
+                    panic!("a report opens the link");
+                };
+                proof(Reader {
+                    inbox,
+                    held,
+                    leaving,
+                    node,
+                    receiver: receiver.identity,
+                })
+                .await;
+            },
+        )
+        .await;
+    }
+}
+
+/// A bare device in anna's account linked to the receiver.
+struct Reader {
+    /// Every media message the receiver sends it.
+    inbox: mpsc::UnboundedReceiver<Media>,
+    /// The files the receiver's opening report named held.
+    held: Vec<[u8; 32]>,
+    /// The files it named leaving.
+    leaving: Vec<[u8; 32]>,
+    /// The reader's node.
+    node: Node,
+    /// The receiver.
+    receiver: DeviceIdentity,
+}
+
+impl Reader {
+    /// Sends `report` to the receiver over the live link.
+    async fn send(&self, report: Media) {
+        self.node
+            .send_media(&self.receiver, link_to(&self.node, &self.receiver), report)
+            .await
+            .expect("the report queues");
+    }
+
+    /// The reader's full report holding `held` and marking `leaving`, as
+    /// report `number` of a driver that has received nothing yet.
+    fn holdings(held: &[[u8; 32]], leaving: &[[u8; 32]], number: u64) -> Media {
+        Media::Holdings {
+            room: 0,
+            rates: Vec::new(),
+            held: held.to_vec(),
+            leaving: leaving.to_vec(),
+            number,
+            seen: None,
+            last: true,
+        }
+    }
+
+    /// The next custody report, its number and `seen` kept, room reports
+    /// skipped.
+    async fn next_numbered(&mut self) -> Media {
+        loop {
+            let message = tokio::time::timeout(BOUND, self.inbox.recv())
+                .await
+                .expect("a report arrives")
+                .expect("the listener runs");
+            if !matches!(message, Media::Room { .. }) {
+                return message;
+            }
+        }
+    }
+}
+
+/// The custody change a report carries, `added` and `removed` alone.
+fn held_change(added: Vec<[u8; 32]>, removed: Vec<[u8; 32]>) -> Media {
+    Media::Held {
+        added,
+        removed,
+        staying: Vec::new(),
+        leaving: Vec::new(),
+        number: 0,
+        seen: None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replication_to_no_copies_or_a_missing_state_column_is_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (_, content) = replica(dir.path(), None).await;
+    let Err(err) = content
+        .with_peer_content("photos", "content_id")
+        .replicate(0, "content_state")
+        .await
+    else {
+        panic!("no copies is refused");
+    };
+    assert!(matches!(err, ContentError::NoCopies { .. }), "{err}");
+
+    let other = tempfile::tempdir().expect("temp dir");
+    let (_, content) = replica(other.path(), None).await;
+    let Err(err) = content
+        .with_peer_content("photos", "content_id")
+        .replicate(3, "missing_state")
+        .await
+    else {
+        panic!("a missing state column is refused");
+    };
+    assert!(
+        matches!(&err, ContentError::PeerContentColumnMissing { column, .. } if column == "missing_state"),
+        "{err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_copy_in_custody_outlives_its_settled_row_until_the_state_reads_available() {
+    let camp = Camp::new(64 * 1024 * 1024).await;
+    settle(&camp.client).await;
+    assert_eq!(camp.receiver.tidy_content().await.expect("tidy"), 0);
+    assert!(
+        held(&camp.receiver, camp.file_id).await,
+        "the server has not acknowledged the file, so custody keeps it"
+    );
+
+    set_state(&camp.client, 7, "pending").await;
+    assert_eq!(camp.receiver.tidy_content().await.expect("tidy"), 0);
+
+    set_state(&camp.client, 7, "available").await;
+    assert_eq!(camp.receiver.tidy_content().await.expect("tidy"), 1);
+    assert!(
+        !held(&camp.receiver, camp.file_id).await,
+        "an available file is ordinary cache, which the tidy removes"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_copy_over_the_budget_stays_cache() {
+    let camp = Camp::new(1000).await;
+    settle(&camp.client).await;
+    assert_eq!(camp.receiver.tidy_content().await.expect("tidy"), 1);
+    assert!(
+        !held(&camp.receiver, camp.file_id).await,
+        "a copy that did not fit never entered custody"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retracted_row_takes_its_custody_copy_with_it() {
+    let camp = Camp::new(64 * 1024 * 1024).await;
+    retract(&camp.client).await;
+    assert_eq!(camp.receiver.tidy_content().await.expect("tidy"), 1);
+    assert!(!held(&camp.receiver, camp.file_id).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_copy_whose_author_lapsed_goes_while_its_row_is_still_provisional() {
+    let camp = Camp::new(64 * 1024 * 1024).await;
+    lapse_in(&camp.client, &anna(), -3600).await;
+    assert_eq!(camp.receiver.tidy_content().await.expect("tidy"), 1);
+    assert!(
+        !held(&camp.receiver, camp.file_id).await,
+        "no courier can carry the row any more, so neither custody nor the spare keeps it"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cache_copy_of_a_lost_file_returns_to_custody() {
+    let camp = Camp::new(1000).await;
+    settle(&camp.client).await;
+    set_state(&camp.client, 7, "lost").await;
+    assert_eq!(camp.receiver.tidy_content().await.expect("tidy"), 0);
+    assert!(
+        held(&camp.receiver, camp.file_id).await,
+        "the server lacks the file, so the cache copy is kept for its re-upload"
+    );
+
+    set_state(&camp.client, 7, "available").await;
+    assert_eq!(camp.receiver.tidy_content().await.expect("tidy"), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_report_names_only_the_held_files_the_peer_may_read() {
+    let camp = Camp::new(64 * 1024 * 1024).await;
+    let devices = Devices::new();
+    let (receiver_node, receiver_addr, receiver_events) = devices.node(&devices.device("r77", 3));
+    let (reader, _, reader_events) = devices.node(&devices.device("anna", 4));
+    let (stranger, _, stranger_events) = devices.node(&devices.device("carl", 5));
+    let mut reader_inbox = listener(reader_events);
+    let mut stranger_inbox = listener(stranger_events);
+    beside(
+        &camp.receiver,
+        port(receiver_node, receiver_events),
+        async {
+            reader
+                .link(receiver_addr)
+                .await
+                .expect("the link completes");
+            stranger
+                .link(receiver_addr)
+                .await
+                .expect("the link completes");
+            let Media::Holdings {
+                held,
+                leaving,
+                last,
+                ..
+            } = next(&mut reader_inbox).await
+            else {
+                panic!("a report opens the link");
+            };
+            assert_eq!(held, [*camp.file_id.as_bytes()]);
+            assert!(leaving.is_empty() && last);
+            let Media::Holdings { held, .. } = next(&mut stranger_inbox).await else {
+                panic!("a report opens the link");
+            };
+            assert!(held.is_empty(), "carl reads none of anna's rows");
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settled_copy_leaves_custody_when_sync_says_available() {
+    let camp = Camp::new(64 * 1024 * 1024).await;
+    let (client, server, file) = (&camp.client, &camp.server, *camp.file_id.as_bytes());
+    let mut events = client.events();
+    camp.with_reader(|reader| async move {
+        // Binding the node keeps it, and the reader's link, alive through the
+        // proof.
+        let Reader {
+            mut inbox,
+            held,
+            node: _node,
+            ..
+        } = reader;
+        assert_eq!(held, [file]);
+        settle(client).await;
+        tokio::time::timeout(BOUND, async {
+            loop {
+                if let ClientEvent::ProvisionalSettled { author, seq, .. } =
+                    events.recv().await.expect("the client's events run")
+                {
+                    assert_eq!((author, seq), (anna().key_id, 1));
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("the frontier raises ProvisionalSettled");
+
+        deliver_state(server, 1, 7, "pending");
+        deliver_state(server, 2, 7, "available");
+        assert_eq!(
+            next(&mut inbox).await,
+            held_change(Vec::new(), vec![file]),
+            "the driver releases the copy and reports it once sync says available"
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cache_copy_returns_to_custody_when_sync_says_lost() {
+    let camp = Camp::new(1000).await;
+    settle(&camp.client).await;
+    let (server, file) = (&camp.server, *camp.file_id.as_bytes());
+    camp.with_reader(|reader| async move {
+        // Binding the node keeps it, and the reader's link, alive through the
+        // proof.
+        let Reader {
+            mut inbox,
+            held,
+            node: _node,
+            ..
+        } = reader;
+        assert!(held.is_empty(), "the copy did not fit, so it is cache");
+        deliver_state(server, 1, 7, "lost");
+        assert_eq!(next(&mut inbox).await, held_change(vec![file], Vec::new()));
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_copy_leaves_custody_when_its_author_lapses_under_a_running_driver() {
+    let camp = Camp::new(64 * 1024 * 1024).await;
+    lapse_in(&camp.client, &anna(), 2).await;
+    let file = *camp.file_id.as_bytes();
+    camp.with_reader(|reader| async move {
+        // Binding the node keeps it, and the reader's link, alive through the
+        // proof.
+        let Reader {
+            mut inbox,
+            held,
+            node: _node,
+            ..
+        } = reader;
+        assert_eq!(held, [file]);
+        assert_eq!(
+            next(&mut inbox).await,
+            held_change(Vec::new(), vec![file]),
+            "the driver wakes at the lapse and releases the copy"
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_copy_fetched_under_a_running_driver_leaves_custody_when_its_author_lapses() {
+    let dirs = [
+        tempfile::tempdir().expect("temp dir"),
+        tempfile::tempdir().expect("temp dir"),
+        tempfile::tempdir().expect("temp dir"),
+    ];
+    let (_, holder) = declare_replicated(replica(dirs[0].path(), None).await).await;
+    let file_id = stage(&holder, 1, "anna", &pseudorandom(63, 300_000)).await;
+    let (client, receiver) = replica(dirs[1].path(), None).await;
+    let receiver = receiver.with_custody_reserve(0);
+    let (client, receiver) = declare_replicated((client, receiver)).await;
+    apply_entry(
+        &client,
+        &anna(),
+        1,
+        captured_photo(dirs[2].path(), 7, file_id.as_bytes().to_vec(), None).await,
+    )
+    .await;
+    // Far enough out that the fetch lands first, near enough for the bound.
+    lapse_in(&client, &anna(), 6).await;
+
+    let devices = Devices::new();
+    let (holder_node, holder_addr, holder_events) = devices.node(&devices.device("r77", 2));
+    let (receiver_node, receiver_addr, receiver_events) = devices.node(&devices.device("anna", 3));
+    let (reader, _, reader_events) = devices.node(&devices.device("anna", 4));
+    let mut inbox = listener(reader_events);
+    receiver_node
+        .link(holder_addr)
+        .await
+        .expect("the link completes");
+    let file = *file_id.as_bytes();
+    beside_both(
+        (&holder, port(holder_node, holder_events)),
+        (&receiver, port(receiver_node, receiver_events)),
+        async {
+            reader
+                .link(receiver_addr)
+                .await
+                .expect("the link completes");
+            let Media::Holdings { held, .. } = next(&mut inbox).await else {
+                panic!("a report opens the link");
+            };
+            assert!(held.is_empty(), "nothing is in custody yet");
+            assert!(matches!(
+                receiver.resolve(file_id).await.expect("resolve"),
+                Resolved::Local { .. }
+            ));
+            assert_eq!(next(&mut inbox).await, held_change(vec![file], Vec::new()));
+            assert_eq!(
+                next(&mut inbox).await,
+                held_change(Vec::new(), vec![file]),
+                "the same driver wakes at the lapse of custody it took after starting"
+            );
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retraction_under_a_running_driver_reports_the_copy_removed_and_the_room_back() {
+    let budget = 64 * 1024 * 1024;
+    let camp = Camp::new(budget).await;
+    let (client, file) = (&camp.client, *camp.file_id.as_bytes());
+    camp.with_reader(|reader| async move {
+        // Binding the node keeps it, and the reader's link, alive through the
+        // proof.
+        let Reader {
+            mut inbox,
+            held,
+            node: _node,
+            ..
+        } = reader;
+        assert_eq!(held, [file]);
+        retract(client).await;
+        assert_eq!(next(&mut inbox).await, held_change(Vec::new(), vec![file]));
+        // The room is checked every 10 seconds, so the bound allows two checks.
+        let room = tokio::time::timeout(2 * BOUND, async {
+            loop {
+                if let Media::Room { room, .. } = inbox.recv().await.expect("the listener runs") {
+                    return room;
+                }
+            }
+        })
+        .await
+        .expect("the room is reported once it changed");
+        assert_eq!(room, budget, "the released copy no longer takes room");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_author_hears_how_many_devices_hold_its_file() {
+    let dirs = [
+        tempfile::tempdir().expect("temp dir"),
+        tempfile::tempdir().expect("temp dir"),
+        tempfile::tempdir().expect("temp dir"),
+    ];
+    let (_, author) = declare_replicated(replica(dirs[0].path(), None).await).await;
+    let file_id = stage(&author, 1, "anna", &pseudorandom(62, 300_000)).await;
+    let (client, receiver) = replica(dirs[1].path(), None).await;
+    let receiver = receiver.with_custody_reserve(0);
+    let (client, receiver) = declare_replicated((client, receiver)).await;
+    apply_entry(
+        &client,
+        &anna(),
+        1,
+        captured_photo(dirs[2].path(), 7, file_id.as_bytes().to_vec(), None).await,
+    )
+    .await;
+
+    let devices = Devices::new();
+    let (author_node, author_addr, author_events) = devices.node(&devices.device("anna", 2));
+    let (receiver_node, _, receiver_events) = devices.node(&devices.device("anna", 3));
+    let mut heard = author.events();
+    receiver_node
+        .link(author_addr)
+        .await
+        .expect("the link completes");
+    beside_both(
+        (&author, port(author_node, author_events)),
+        (&receiver, port(receiver_node, receiver_events)),
+        async {
+            assert!(matches!(
+                receiver.resolve(file_id).await.expect("resolve"),
+                Resolved::Local { .. }
+            ));
+            tokio::time::timeout(BOUND, async {
+                loop {
+                    if let ContentEvent::Replicated {
+                        file_id: heard_of,
+                        holders,
+                        leaving,
+                    } = heard.recv().await.expect("the author's events run")
+                    {
+                        assert_eq!(heard_of, file_id);
+                        assert_eq!((holders, leaving), (1, 0));
+                        return;
+                    }
+                }
+            })
+            .await
+            .expect("the author hears the receiver's custody");
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_holder_answers_a_newly_marked_file_at_once() {
+    let camp = Camp::new(64 * 1024 * 1024).await;
+    let file = *camp.file_id.as_bytes();
+    camp.with_reader(|mut reader| async move {
+        assert_eq!(reader.held, [file]);
+        reader.send(Reader::holdings(&[file], &[file], 7)).await;
+        let Media::Held {
+            added,
+            removed,
+            staying,
+            leaving,
+            seen,
+            ..
+        } = reader.next_numbered().await
+        else {
+            panic!("the receiver answers with a custody change");
+        };
+        assert!(
+            added.is_empty() && removed.is_empty() && staying.is_empty() && leaving.is_empty(),
+            "an idle holder's answer changes nothing"
+        );
+        assert_eq!(
+            seen,
+            Some(7),
+            "and acknowledges the report that marked the file"
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mark_on_a_file_the_holder_lacks_gets_no_answer() {
+    let camp = Camp::new(64 * 1024 * 1024).await;
+    let file = *camp.file_id.as_bytes();
+    camp.with_reader(|mut reader| async move {
+        reader
+            .send(Reader::holdings(&[[3; 32]], &[[3; 32]], 7))
+            .await;
+        reader
+            .send(Media::Held {
+                added: vec![file],
+                removed: Vec::new(),
+                staying: Vec::new(),
+                leaving: vec![file],
+                number: 8,
+                seen: None,
+            })
+            .await;
+        let Media::Held { seen, .. } = reader.next_numbered().await else {
+            panic!("the receiver answers the mark on its own copy");
+        };
+        assert_eq!(seen, Some(8), "the mark on a file it lacks went unanswered");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_whose_driver_starts_again_is_told_everything_again() {
+    let camp = Camp::new(64 * 1024 * 1024).await;
+    let file = *camp.file_id.as_bytes();
+    camp.with_reader(|mut reader| async move {
+        reader.send(Reader::holdings(&[], &[], 0)).await;
+        // A driver started again on the same link numbers on and has
+        // received nothing.
+        reader.send(Reader::holdings(&[], &[], 1)).await;
+        let Media::Holdings { held, seen, .. } = reader.next_numbered().await else {
+            panic!("the receiver reports in full again");
+        };
+        assert_eq!(held, [file]);
+        assert_eq!(seen, Some(1));
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_copy_marked_leaving_is_reported_so_and_its_withdrawal_as_staying() {
+    let camp = Camp::new(64 * 1024 * 1024).await;
+    let (client, file_id, file) = (&camp.client, camp.file_id, *camp.file_id.as_bytes());
+    // Pressed rather than surplus, since placement withdraws a surplus mark
+    // that nobody can answer at once.
+    set_custody_state(client, file_id, "pressed").await;
+    camp.with_reader(|mut reader| async move {
+        assert_eq!(
+            (&reader.held[..], &reader.leaving[..]),
+            (&[file][..], &[file][..])
+        );
+        set_custody_state(client, file_id, "held").await;
+        // The reader marking the file makes the receiver bring its custody
+        // up to date before it answers.
+        reader.send(Reader::holdings(&[file], &[file], 0)).await;
+        let Media::Held {
+            staying, leaving, ..
+        } = reader.next_numbered().await
+        else {
+            panic!("the withdrawal is reported");
+        };
+        assert_eq!((staying, leaving), (vec![file], Vec::new()));
+        assert!(
+            matches!(
+                reader.next_numbered().await,
+                Media::Held { seen: Some(0), .. }
+            ),
+            "then the answer follows"
+        );
+    })
+    .await;
+}
+
+diesel::table! {
+    /// The custody record fields an archive carries.
+    _connetto_content_custody (file_id) {
+        /// The held file.
+        file_id -> Binary,
+        /// The provisional row author's key id.
+        author_key -> Nullable<Binary>,
+    }
+}
+
+/// The author key `client`'s custody record of `file_id` names.
+async fn custody_author(client: &ConnettoClient<Scripted>, file_id: FileId) -> Option<Vec<u8>> {
+    client
+        .with_conn(move |conn| {
+            _connetto_content_custody::table
+                .filter(_connetto_content_custody::file_id.eq(file_id.as_bytes().to_vec()))
+                .select(_connetto_content_custody::author_key)
+                .first::<Option<Vec<u8>>>(conn.conn())
+        })
+        .await
+        .expect("the replica is open")
+        .expect("read the custody record")
+}
+
+/// Exports `camp`'s receiver in `scope` and imports the archive into a fresh
+/// device declaring the same replication, which `dir` holds.
+async fn round_trip(
+    camp: &Camp,
+    scope: ExportScope,
+    dir: &std::path::Path,
+) -> (ConnettoClient<Scripted>, Device) {
+    let archive = camp
+        .receiver
+        .export_local_data(scope, Vec::new())
+        .await
+        .expect("export the device");
+    let (client, restored) = declare_replicated(replica(dir, None).await).await;
+    let mut plan = restored
+        .prepare_local_data_import(std::io::Cursor::new(archive))
+        .await
+        .expect("verify the archive");
+    assert_eq!(
+        (plan.content_files(), plan.custody_files()),
+        (0, 1),
+        "{scope:?} carries the custody copy"
+    );
+    restored
+        .apply_local_data_import(&mut plan, &ImportChoices::keeping_the_file())
+        .await
+        .expect("restore the archive");
+    (client, restored)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_custody_copy_travels_in_both_export_scopes_and_returns_held() {
+    let camp = Camp::new(64 * 1024 * 1024).await;
+    // A copy leaving under pressure comes back held, in C2.
+    set_custody_state(&camp.client, camp.file_id, "pressed").await;
+    for scope in [ExportScope::Everything, ExportScope::Unsynced] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (client, restored) = round_trip(&camp, scope, dir.path()).await;
+        assert_eq!(
+            custody_state(&client, camp.file_id).await.as_deref(),
+            Some("held"),
+            "{scope:?} restores the copy held"
+        );
+        assert_eq!(
+            custody_author(&client, camp.file_id).await,
+            Some(anna().key_id),
+            "{scope:?} keeps the copy's author"
+        );
+        assert_eq!(
+            restored
+                .pending_work()
+                .await
+                .expect("read the pending work")
+                .content_files,
+            0,
+            "a copy held for another device is no unsent file of this one"
+        );
+        assert_eq!(restored.tidy_content().await.expect("tidy"), 0);
+        assert!(
+            held(&restored, camp.file_id).await,
+            "{scope:?} keeps the bytes through the first retention pass"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settled_custody_copy_survives_the_first_retention_pass_after_import() {
+    let camp = Camp::new(64 * 1024 * 1024).await;
+    settle(&camp.client).await;
+    assert_eq!(camp.receiver.tidy_content().await.expect("tidy"), 0);
+    for scope in [ExportScope::Everything, ExportScope::Unsynced] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (client, restored) = round_trip(&camp, scope, dir.path()).await;
+        assert_eq!(restored.tidy_content().await.expect("tidy"), 0);
+        assert!(
+            held(&restored, camp.file_id).await,
+            "{scope:?} keeps the copy the server may still lack"
+        );
+        assert_eq!(
+            custody_state(&client, camp.file_id).await.as_deref(),
+            Some("held"),
+            "{scope:?} keeps the copy in custody"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authored_and_custody_content_export_without_duplicate_files() {
+    let camp = Camp::new(64 * 1024 * 1024).await;
+    let Resolved::Local { bytes, .. } = camp.receiver.resolve(camp.file_id).await.expect("resolve")
+    else {
+        panic!("the custody copy must be local");
+    };
+    let own_bytes = b"a different photograph authored on the holder";
+    let own_file = stage(&camp.receiver, 8, "tester", own_bytes).await;
+    for authored in [false, true] {
+        if authored {
+            assert_eq!(
+                stage(&camp.receiver, 9, "tester", &bytes).await,
+                camp.file_id
+            );
+        }
+        assert_eq!(
+            custody_state(&camp.client, camp.file_id).await.as_deref(),
+            Some("held")
+        );
+        let (pending, custody) = if authored { (2, 0) } else { (1, 1) };
+        for scope in [ExportScope::Everything, ExportScope::Unsynced] {
+            let archive = camp
+                .receiver
+                .export_local_data(scope, Vec::new())
+                .await
+                .expect("export shared content");
+            let dir = tempfile::tempdir().expect("target directory");
+            let (client, restored) = declare_replicated(replica(dir.path(), None).await).await;
+            let mut plan = restored
+                .prepare_local_data_import(std::io::Cursor::new(archive))
+                .await
+                .expect("validate unique content records");
+            assert_eq!(
+                (plan.content_files(), plan.custody_files()),
+                (pending, custody)
+            );
+            restored
+                .apply_local_data_import(&mut plan, &ImportChoices::keeping_the_file())
+                .await
+                .expect("restore content");
+            assert_eq!(
+                restored
+                    .pending_work()
+                    .await
+                    .expect("pending files")
+                    .content_files,
+                u64::try_from(pending).expect("file count fits")
+            );
+            assert_eq!(
+                custody_state(&client, camp.file_id).await.as_deref(),
+                if authored { None } else { Some("held") }
+            );
+            assert_eq!(restored.tidy_content().await.expect("tidy"), 0);
+            for (file_id, expected) in [(camp.file_id, bytes.as_slice()), (own_file, own_bytes)] {
+                let Resolved::Local {
+                    bytes: restored_bytes,
+                    ..
+                } = restored.resolve(file_id).await.expect("resolve restored")
+                else {
+                    panic!("archived content must survive retention");
+                };
+                assert_eq!(restored_bytes, expected);
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_custody_copy_without_a_provisional_author_survives_an_archive() {
+    let camp = Camp::new(1000).await;
+    settle(&camp.client).await;
+    set_state(&camp.client, 7, "lost").await;
+    assert_eq!(
+        camp.receiver.tidy_content().await.expect("adopt lost copy"),
+        0
+    );
+    assert_eq!(
+        camp.receiver
+            .tidy_content()
+            .await
+            .expect("observe settled row"),
+        0
+    );
+    assert_eq!(custody_author(&camp.client, camp.file_id).await, None);
+    for scope in [ExportScope::Everything, ExportScope::Unsynced] {
+        let dir = tempfile::tempdir().expect("target directory");
+        let (client, restored) = round_trip(&camp, scope, dir.path()).await;
+        assert_eq!(custody_author(&client, camp.file_id).await, None);
+        assert_eq!(
+            restored.tidy_content().await.expect("tidy restored copy"),
+            0
+        );
+        assert!(held(&restored, camp.file_id).await);
+        assert_eq!(
+            restored
+                .pending_work()
+                .await
+                .expect("pending files")
+                .content_files,
+            0
+        );
+    }
+}

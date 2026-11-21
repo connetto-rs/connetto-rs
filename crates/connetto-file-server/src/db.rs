@@ -43,6 +43,9 @@ pub(crate) enum InsertManifestOutcome {
 pub(crate) enum CommitOutcome {
     /// Manifest newly committed and setter called.
     Committed,
+    /// Lost manifests restored by this commit's verified chunks and setter
+    /// called, the committing manifest committed before.
+    Restored,
     /// Another concurrent or prior commit already committed this manifest.
     /// The setter was NOT called again; treat as idempotent success.
     AlreadyCommitted,
@@ -403,6 +406,13 @@ pub(crate) async fn lost_manifest_callers<S: ConnettoFileSchema>(
         .await
 }
 
+/// The manifest a commit flips, by its uploader's key, and the carrier's key
+/// the first commit records beside it, `None` for the uploader's own upload.
+pub(crate) struct ManifestKeys<'a> {
+    pub(crate) key: &'a str,
+    pub(crate) carried_by: Option<String>,
+}
+
 /// Atomically marks the manifest committed and calls the deployment setter,
 /// all inside one Postgres transaction.
 ///
@@ -419,16 +429,23 @@ pub(crate) async fn commit_manifest_atomic<S: ConnettoFileSchema>(
     conn: &mut AsyncPgConnection,
     settings: &CallerSettings,
     file_id: &FileId,
-    key: &str,
+    keys: ManifestKeys<'_>,
     attributions: &[&str],
     lost: Vec<String>,
     chunks: &[ChunkMeta],
 ) -> Result<CommitOutcome, diesel::result::Error> {
+    let ManifestKeys { key, carried_by } = keys;
     let file_id_bytes = file_id.as_bytes().to_vec();
     let rows = chunk_rows(chunks)?;
-    let commit_stmt = S::mark_manifest_committed_stmt(file_id_bytes.clone(), key.to_owned());
+    let commit_stmt =
+        S::mark_manifest_committed_stmt(file_id_bytes.clone(), key.to_owned(), carried_by);
     let attributions: Vec<String> = attributions.iter().map(|to| (*to).to_owned()).collect();
     let key = key.to_owned();
+    let outcome = if lost.is_empty() {
+        CommitOutcome::Committed
+    } else {
+        CommitOutcome::Restored
+    };
 
     conn.transaction::<CommitOutcome, CommitTxError, _>(async move |c| {
         let told: Vec<String> = if lost.is_empty() {
@@ -467,22 +484,34 @@ pub(crate) async fn commit_manifest_atomic<S: ConnettoFileSchema>(
                 .collect()
         };
         // A raise rolls back the commit so the client can retry.
-        for attribution in &told {
-            diesel::select(crate::functions::connetto_set_content_state(
-                file_id_bytes.as_slice(),
-                "available",
-                attribution.as_str(),
-            ))
-            .get_result::<Option<Vec<u8>>>(c)
+        set_available(c, file_id, &told)
             .await
             .map_err(CommitTxError::Setter)?;
-        }
-        Ok(CommitOutcome::Committed)
+        Ok(outcome)
     })
     .await
     .map_err(|e| match e {
         CommitTxError::Db(e) | CommitTxError::Setter(e) => e,
     })
+}
+
+/// Tell the deployment's setter that `file_id` is available, once per name
+/// the commit is attributed to.
+pub(crate) async fn set_available(
+    conn: &mut AsyncPgConnection,
+    file_id: &FileId,
+    attributions: &[String],
+) -> Result<(), diesel::result::Error> {
+    for attribution in attributions {
+        diesel::select(crate::functions::connetto_set_content_state(
+            file_id.as_bytes().as_slice(),
+            "available",
+            attribution.as_str(),
+        ))
+        .get_result::<Option<Vec<u8>>>(conn)
+        .await?;
+    }
+    Ok(())
 }
 
 /// `(position, hash, len)` rows for [`ConnettoFileSchema::insert_chunk_rows_batch_stmt`].

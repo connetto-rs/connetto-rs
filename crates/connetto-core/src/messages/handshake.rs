@@ -215,6 +215,11 @@ pub struct HandshakeAck {
     /// or below the frontier and replays the rest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub writer: Option<WriterGrant>,
+    /// Whether the deployment accepts courier ranges (R78 decision 1), so a
+    /// courier learns before uploading anything whether a range can land.
+    /// Absent when off, like `sunset_at_secs`.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub courier: bool,
 }
 
 #[cfg(test)]
@@ -259,6 +264,7 @@ mod tests {
             sunset_at_secs,
             initial_credits: 64,
             writer: None,
+            courier: false,
         }
     }
 
@@ -315,5 +321,24 @@ mod tests {
         let payload = rmp_serde::to_vec_named(&legacy_ack()).expect("encode the old payload");
         let decoded: HandshakeAck = rmp_serde::from_slice(&payload).expect("decode the ack");
         assert_eq!(decoded, ack(None), "the absent field reads as none");
+    }
+
+    /// An ack from a server accepting couriers carries the flag, and one from
+    /// a server that does not omits it, so a payload from a server built
+    /// before the field reads it off.
+    #[test]
+    fn the_courier_flag_rides_the_ack_only_when_on() {
+        let on = HandshakeAck {
+            courier: true,
+            ..ack(None)
+        };
+        let encoded = rmp_serde::to_vec_named(&on).expect("encode the ack");
+        let decoded: HandshakeAck = rmp_serde::from_slice(&encoded).expect("decode the ack");
+        assert_eq!(decoded, on, "the flag rides the ack");
+        assert_ne!(
+            encoded,
+            rmp_serde::to_vec_named(&legacy_ack()).expect("encode the legacy payload"),
+            "the flag is on the wire when set"
+        );
     }
 }

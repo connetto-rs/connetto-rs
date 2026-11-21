@@ -318,7 +318,8 @@ pub trait ContentTicketSigner {
     ///
     /// `caller` is what the ticket binds to, not whoever presents it. Both of
     /// its halves ride, so a caller whose rights come from a share key rather
-    /// than a login is served.
+    /// than a login is served. `carry` rides on a write the caller uploads
+    /// for another account, which the server established before minting.
     ///
     /// # Errors
     ///
@@ -328,6 +329,7 @@ pub trait ContentTicketSigner {
         caller: &crate::auth::ContentCaller,
         file_id: [u8; 32],
         verb: ContentVerb,
+        carry: Option<&crate::auth::ContentCarry>,
     ) -> impl core::future::Future<Output = Result<String, Self::Error>> + MaybeSend;
 }
 
@@ -404,6 +406,38 @@ impl core::fmt::Display for HandleError {
 
 impl std::error::Error for HandleError {}
 
+/// The auth store could not say whether a session is live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LivenessUnknown(pub String);
+
+impl core::fmt::Display for LivenessUnknown {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "session liveness unknown: {}", self.0)
+    }
+}
+
+impl std::error::Error for LivenessUnknown {}
+
+/// Boxed future produced by [`SessionLiveness::session_is_live`].
+pub type LivenessFuture<'a> =
+    core::pin::Pin<Box<dyn Future<Output = Result<bool, LivenessUnknown>> + Send + 'a>>;
+
+/// Whether a login's session is still live in the auth store.
+///
+/// The handshake asks it of every login grant, the content ticket mint asks it
+/// before minting for a login, and the file server asks it of every ticket a
+/// login minted, so a logout or a revocation ends the session's tickets at
+/// their next request. Only a login has a session the store keeps, so a caller
+/// with no login is never asked about.
+pub trait SessionLiveness: Send + Sync {
+    /// Whether the store holds `session_id` live.
+    ///
+    /// # Errors
+    ///
+    /// [`LivenessUnknown`] when the store cannot answer.
+    fn session_is_live(&self, session_id: SessionId) -> LivenessFuture<'_>;
+}
+
 /// Everything connetto signs and checks at the handshake: the grants a caller
 /// presents, and the resume blob it hands a caller back.
 ///
@@ -417,7 +451,10 @@ impl std::error::Error for HandleError {}
 /// because none of this is on a hot path so static dispatch buys nothing, and a
 /// trait object keeps the server's public type signature stable no matter how a
 /// deployment configures identity.
-pub trait HandshakeAuthority<Id = String, Key = String>: Send + Sync {
+///
+/// The authority that checks a login grant's liveness answers the same
+/// question for the rest of the run, through [`SessionLiveness`].
+pub trait HandshakeAuthority<Id = String, Key = String>: SessionLiveness {
     /// Check one grant and resolve the [`Subject`] it names, or refuse it.
     ///
     /// This half is the generalization of the old single-credential verifier,

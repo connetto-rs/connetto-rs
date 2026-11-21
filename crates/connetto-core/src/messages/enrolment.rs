@@ -149,7 +149,7 @@ pub struct EnrolRefused {
 }
 
 /// Why an enrolment was refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EnrolRefusal {
     /// The session names no signed-in account.
     Unidentified,
@@ -169,4 +169,9 @@ pub enum EnrolRefusal {
     /// The device's attestation level is outside the set the deployment
     /// accepts (R74 decision 33).
     AttestationRequired,
+    /// The deployment's application refused the enrolment or the revocation.
+    Refused {
+        /// The application's reason, as it gave it.
+        reason: String,
+    },
 }

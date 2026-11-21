@@ -3,7 +3,7 @@ name = "connetto-wasm-smoke"
 description = "Browser smoke for the connetto client on wasm32: a web_sys WebSocket transport and a dedicated worker test driving the full sync loop against a real connetto-server."
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.95"
 license = "MIT"
 publish = false
 
@@ -58,13 +58,14 @@ web-sys = { version = "0.3", features = [
 connetto-schema = { path = "../../crates/connetto-schema" }
 
 [dev-dependencies]
+connetto-demo-support = { path = "../demo-support", features = ["web"] }
 wasm-bindgen-test = "0.3"
 # The logged-in startup test plays the tab, so it decodes the login-channel
 # message the worker broadcasts.
 serde_json = "1"
 # The full-resync parity test hand-builds snapshot patchsets to feed a fake
 # upstream through the relay hub, the same native encoding the wire carries.
-sqlite-diff-rs = { version = "0.18", default-features = false }
+sqlite-diff-rs = { version = "0.20", default-features = false }
 connetto-file-client = { path = "../../crates/connetto-file-client" }
 zstd = "0.13"
 
@@ -81,6 +82,10 @@ sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", 
 # Until a pg_walstream release carries the startup metadata API subql main
 # uses (isdaniel/pg-walstream #141) and `ChangeEvent::xid`.
 pg_walstream = { git = "https://github.com/isdaniel/pg-walstream", branch = "main" }
+# Until a sql-values release carries PostgreSQL's bpchar, which rls2fga main uses.
+sql-values = { git = "https://github.com/connetto-rs/sql-values", branch = "main" }
+# subql main follows sqlite-diff-rs main for its float4 storage form.
+sqlite-diff-rs = { git = "https://github.com/connetto-rs/sqlite-diff-rs", branch = "main" }
 
 # Fast test iteration: release-grade optimization without the fat link.
 # Mirrors the root workspace profile of the same name.

@@ -45,6 +45,7 @@ pub(super) enum Tickets {
     Grants,
     /// Every request is refused with the wire's fixed phrase.
     Refused,
+    Observed(mpsc::UnboundedSender<FileId>),
     /// Every request goes unanswered and lands on the shared list, for a
     /// test that releases one later.
     Held(Rc<RefCell<Vec<String>>>),
@@ -71,6 +72,7 @@ impl Upstream {
                     current_cursor: Cursor::new(Vec::new()),
                     schema_version: None,
                     sunset_at_secs: None,
+                    courier: false,
                     initial_credits: 64,
                     writer: Some(WriterGrant {
                         number: 1,
@@ -108,6 +110,13 @@ impl Transport for Upstream {
                     related_to: Some(request.request_id.clone()),
                     detail: CONTENT_TICKET_REFUSED.to_owned(),
                 })),
+                Tickets::Observed(observed) => {
+                    let _ = observed.unbounded_send(FileId::from_bytes(request.file_id));
+                    Some(ControlMessage::NonFatalError(NonFatalError {
+                        related_to: Some(request.request_id.clone()),
+                        detail: CONTENT_TICKET_REFUSED.to_owned(),
+                    }))
+                }
                 Tickets::Held(held) => {
                     held.borrow_mut().push(request.request_id);
                     None

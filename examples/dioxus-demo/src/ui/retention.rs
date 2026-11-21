@@ -6,7 +6,7 @@ use dioxus::prelude::*;
 use dioxus_free_icons::Icon;
 use dioxus_free_icons::icons::fa_solid_icons::FaBroom;
 
-use super::{ClientSlot, Footprint, StorageLine};
+use super::{ClientSlot, Footprint, PaneInfo, StorageLine};
 
 /// The retention pane.
 #[component]
@@ -18,15 +18,15 @@ pub fn RetentionPane() -> Element {
     let (pages, free) = *footprint.read();
     let tidy_client = client.clone();
     // The rows the live subscriptions still cover, which the trim pass spares.
-    let orders_live = use_live(&client, support::orders_newest_first());
-    let notes_live = use_live(&client, support::notes_rows());
-    let photos_live = use_live(&client, support::photos_rows());
+    let orders_live = use_live(&client, support::OrdersNewestFirst);
+    let notes_live = use_live(&client, support::NotesRows);
+    let photos_live = use_live(&client, support::PhotosRows);
     let covered = orders_live.value().read().len()
         + notes_live.value().read().len()
         + photos_live.value().read().len();
 
     rsx! {
-        div { class: "pane",
+        div { class: "pane toned tone-retention",
             h2 {
                 Icon { icon: FaBroom, width: 14, height: 14 }
                 {support::RETENTION_PANE_TITLE} " "
@@ -53,6 +53,7 @@ pub fn RetentionPane() -> Element {
                     "Free up space"
                 }
             }
+            PaneInfo { text: support::RETENTION_INFO }
         }
     }
 }

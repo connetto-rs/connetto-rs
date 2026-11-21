@@ -22,7 +22,7 @@ use connetto_core::Cursor;
 use connetto_core::auth::{CapabilityKey, CapabilitySubject};
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired, HandshakeAck, MutationPatch,
-    SnapshotBegin, SnapshotEnd, SnapshotPatch, SubscriptionPriority,
+    SnapshotBegin, SnapshotEnd, SnapshotPatch,
 };
 use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, Transport};
@@ -152,7 +152,11 @@ diesel::table! {
 
 fn options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
-        .with_session_variable(SessionVariableMapping::current_setting(
+        .with_deployment(
+            connetto_schema::deployment::<String>(connetto_test_harness::FIXTURE_READER)
+                .expect("the deployment description builds"),
+        )
+        .with_session_variable(SessionVariableMapping::new(
             "app.user_id",
             connetto_core::CALLER_FUNCTION,
         ))
@@ -263,6 +267,7 @@ async fn ack_handshake(server: &mut LoopbackTransport) {
             current_cursor: Cursor::new(Vec::new()),
             schema_version: None,
             sunset_at_secs: None,
+            courier: false,
             initial_credits: 64,
             writer: Some(connetto_core::messages::WriterGrant {
                 number: 1,
@@ -292,7 +297,6 @@ async fn send_snapshot(
     server
         .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
             sub_id: sub_id.to_owned(),
-            priority: SubscriptionPriority::default(),
         }))
         .await
         .expect("begin");

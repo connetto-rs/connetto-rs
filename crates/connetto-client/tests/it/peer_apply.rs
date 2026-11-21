@@ -8,24 +8,24 @@
 
 use std::time::Duration;
 
-use connetto_client::peer::{PeerApplyOutcome, PeerRefusal};
+use connetto_client::peer::{HeldState, PeerApplyOutcome, PeerRefusal};
 use connetto_client::provisional::ProvisionalState;
 use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection, KeyValue, SyncSchema};
 use connetto_core::Major;
 use connetto_core::exchange::{ManifestRow, RetractCause, Retraction};
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired, LivePatch, SnapshotBegin,
-    SnapshotEnd, SnapshotPatch, SubscriptionPriority,
+    SnapshotEnd, SnapshotPatch,
 };
 use connetto_core::traits::IncomingFrame;
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
-use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, PatchSet, SimpleTable, Value};
+use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, SimpleTable, Value};
 
 use super::peer_support::{
-    _connetto_peer_entry, author, board_rows, captured, cursor_byte, drain_quiet, insert_order,
-    manifest, order_rows, orders, provenance_of, pump_to, receiver, receiver_holding,
-    stored_entries, write_board,
+    _connetto_peer_entry, author, board_rows, captured, cursor_byte, drain_quiet, held_entries,
+    hold_cursor, insert_order, manifest, order_rows, orders, orders_patch, orders_payload,
+    provenance_of, pump_to, receiver, receiver_holding, stored_entries, write_board,
 };
 use super::support::{self, Script};
 
@@ -112,31 +112,6 @@ where
         .get_result(conn.conn())
         .expect("count the pending entries");
     row.count
-}
-
-/// An uncompressed insert patchset over `orders`.
-fn orders_patch(rows: &[(i64, &str, &str)]) -> Vec<u8> {
-    let mut patch = PatchSet::<SimpleTable, String, Vec<u8>>::new();
-    for (id, owner, status) in rows {
-        let insert = Insert::<_, String, Vec<u8>>::from(SimpleTable::new(
-            "orders",
-            &[("id", ""), ("owner", ""), ("status", "")],
-            &[0],
-        ))
-        .set(0, Value::<String, Vec<u8>>::Integer(*id))
-        .expect("set the key")
-        .set(1, Value::<String, Vec<u8>>::Text(owner.to_string()))
-        .expect("set the owner")
-        .set(2, Value::<String, Vec<u8>>::Text(status.to_string()))
-        .expect("set the status");
-        patch = patch.insert(insert);
-    }
-    patch.build()
-}
-
-/// A compressed insert patchset over `orders`.
-fn orders_payload(rows: &[(i64, &str, &str)]) -> Vec<u8> {
-    zstd::encode_all(orders_patch(rows).as_slice(), 3).expect("compress the patch")
 }
 
 /// A policy-passing author write lands, records its provenance, and raises
@@ -649,9 +624,9 @@ async fn a_peer_write_never_enters_the_receiver_queue() {
 }
 
 /// Adjudication at a frontier moves the frontier's records to adjudicated
-/// and deletes the entries at or below it, leaving a newer entry alone.
+/// and retains the entries at or below it, leaving a newer entry alone.
 #[tokio::test]
-async fn adjudication_at_a_frontier_moves_records_and_drops_entries() {
+async fn adjudication_at_a_frontier_moves_records_and_retains_entries() {
     let [first, second] = captured(
         PLAIN_DDL,
         [
@@ -663,6 +638,7 @@ async fn adjudication_at_a_frontier_moves_records_and_drops_entries() {
 
     let (mut recv, _) = receiver(POLICY_SCHEMA, POLICIES).await;
     let a = author("author-a", "peer-anna", Some("*"));
+    hold_cursor(&mut recv, &a.key_id);
     recv.apply_peer_entry(&a, &manifest(7, &first), &first)
         .expect("apply the first entry");
     recv.apply_peer_entry(&a, &manifest(8, &second), &second)
@@ -687,8 +663,13 @@ async fn adjudication_at_a_frontier_moves_records_and_drops_entries() {
     let rows = recv.provisional_rows().expect("read the records");
     let record = provenance_of(&rows, "orders", &[KeyValue::Int(1)]).expect("the record");
     assert_eq!(record.state, ProvisionalState::Adjudicated);
-    let entries = stored_entries(&mut recv);
-    assert_eq!(entries, Vec::new());
+    assert_eq!(
+        held_entries(&mut recv),
+        vec![
+            ("author-a".as_bytes().to_vec(), 7, HeldState::Retained),
+            ("author-a".as_bytes().to_vec(), 8, HeldState::Retained),
+        ]
+    );
     // The rows stay: adjudication hands them to ordinary coverage.
     assert_eq!(
         order_rows(&mut recv),
@@ -707,7 +688,6 @@ async fn deliver_snapshot(
     server.say(IncomingFrame::Control(ControlMessage::SnapshotBegin(
         SnapshotBegin {
             sub_id: "a".to_owned(),
-            priority: SubscriptionPriority::default(),
         },
     )));
     server.say(IncomingFrame::Bulk(BulkMessage::SnapshotPatch(
@@ -884,6 +864,70 @@ async fn a_retraction_of_an_insert_takes_the_row_away() {
         unreachable!("pump_to returns the event it matched");
     };
     assert_eq!(rows, vec![("orders".to_owned(), vec![KeyValue::Int(1)])]);
+}
+
+/// The receiver's source for an `orders` table each person reads and
+/// writes only their own rows of.
+const OWNED_ORDERS_SCHEMA: &str = "-- connetto:major 1\n \
+                                   CREATE TABLE orders (id INTEGER PRIMARY KEY, \
+                                   owner TEXT NOT NULL, status TEXT NOT NULL); \
+                                   ALTER TABLE orders ENABLE ROW LEVEL SECURITY;";
+
+/// Each person reads and writes only the orders they own.
+const OWNED_ORDERS_POLICIES: &str = "CREATE POLICY orders_owned ON orders \
+                                     USING (owner = current_setting('app.user_id', true)) \
+                                     WITH CHECK (owner = current_setting('app.user_id', true));";
+
+/// A retraction of a person's insert takes the row away on a receiver that
+/// cannot read it, since the author's own policies judged the insert.
+#[tokio::test]
+async fn a_retraction_takes_away_a_row_the_receiver_cannot_read() {
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        count: i64,
+    }
+    /// The rows the backing table stores, whoever may read them.
+    fn stored_orders<T>(conn: &mut ConnettoConnection<T>) -> i64
+    where
+        T: connetto_core::traits::Transport,
+        T::Error: core::fmt::Display,
+    {
+        diesel::sql_query("SELECT COUNT(*) AS count FROM orders_rls")
+            .get_result::<Count>(conn.conn())
+            .expect("count the stored orders")
+            .count
+    }
+
+    let [body] = captured(
+        PLAIN_DDL,
+        [&|conn| insert_order(conn, 1, "peer-anna", "open")],
+    )
+    .await;
+    let (mut recv, _) = receiver(OWNED_ORDERS_SCHEMA, OWNED_ORDERS_POLICIES).await;
+    let a = author("author-a", "peer-anna", Some("*"));
+    let outcome = recv
+        .apply_peer_entry(&a, &manifest(7, &body), &body)
+        .expect("apply the insert");
+    assert!(
+        matches!(outcome, PeerApplyOutcome::Applied { .. }),
+        "the author may insert its own order: {outcome:?}"
+    );
+    assert_eq!(stored_orders(&mut recv), 1, "the author's order lands");
+    recv.retract_peer_entry(
+        &a,
+        &Retraction {
+            seq: 7,
+            cause: RetractCause::Abandoned,
+        },
+    )
+    .expect("retract the insert");
+    assert_eq!(stored_orders(&mut recv), 0, "the retraction takes it away");
+    assert_eq!(
+        recv.provisional_rows().expect("read the records"),
+        Vec::new()
+    );
+    assert_eq!(stored_entries(&mut recv), Vec::new());
 }
 
 /// An author may neither update nor delete a row another person owns, and
@@ -1646,7 +1690,6 @@ async fn a_stored_entry_under_no_expressible_major_fails_the_reapply() {
     server.say(IncomingFrame::Control(ControlMessage::SnapshotBegin(
         SnapshotBegin {
             sub_id: "a".to_owned(),
-            priority: SubscriptionPriority::default(),
         },
     )));
     server.say(IncomingFrame::Control(ControlMessage::SnapshotEnd(
@@ -1871,16 +1914,20 @@ async fn shared_receiver() -> (ConnettoConnection<Script>, Script) {
     script.say(support::handshake_ack());
     let schema = SyncSchema::new(
         connetto_schema::translate_shared::<String, connetto_core::bots::TextIds>(
-            "-- connetto:major 1\n \
-             CREATE TABLE orders (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, \
-             status TEXT NOT NULL); \
-             CREATE TABLE vocabulary (id INTEGER PRIMARY KEY, label TEXT NOT NULL); \
-             ALTER TABLE orders ENABLE ROW LEVEL SECURITY; \
-             ALTER TABLE vocabulary ENABLE ROW LEVEL SECURITY;",
-            "CREATE POLICY orders_read ON orders FOR SELECT USING (true); \
-             CREATE POLICY orders_insert ON orders FOR INSERT \
-             WITH CHECK (owner = current_setting('app.user_id', true)); \
-             CREATE POLICY vocabulary_open ON vocabulary FOR ALL USING (true) WITH CHECK (true);",
+            connetto_schema::Documents::new(
+                "-- connetto:major 1\n \
+         CREATE TABLE orders (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, \
+         status TEXT NOT NULL); \
+         CREATE TABLE vocabulary (id INTEGER PRIMARY KEY, label TEXT NOT NULL); \
+         ALTER TABLE orders ENABLE ROW LEVEL SECURITY; \
+         ALTER TABLE vocabulary ENABLE ROW LEVEL SECURITY;",
+                "CREATE POLICY orders_read ON orders FOR SELECT USING (true); \
+         CREATE POLICY orders_insert ON orders FOR INSERT \
+         WITH CHECK (owner = current_setting('app.user_id', true)); \
+         CREATE POLICY vocabulary_open ON vocabulary FOR ALL USING (true) WITH CHECK (true);",
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
+            ),
             &["vocabulary"],
         )
         .expect("translate the shared vocabulary"),
@@ -2014,7 +2061,6 @@ async fn resync_orders(
     server.say(IncomingFrame::Control(ControlMessage::SnapshotBegin(
         SnapshotBegin {
             sub_id: "a".to_owned(),
-            priority: SubscriptionPriority::default(),
         },
     )));
     server.say(IncomingFrame::Bulk(BulkMessage::SnapshotPatch(

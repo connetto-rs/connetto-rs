@@ -38,7 +38,7 @@ use crate::replica::provision_replica_key;
 use crate::share_keys::{
     ErasedShareKeyStore, ShareKeyPersistence, ShareKeySet, ShareKeyStore, share_key_record,
 };
-use crate::{AccessTokenSource, ClientConfig, ClientError, ConnettoConnection, HeldContent};
+use crate::{AccessTokenSource, ClientConfig, ClientError, ConnettoConnection, ContentHooks};
 use crate::{GateAskOutcome, GateMechanism};
 
 /// The replica name a build with no identity uses for its client id, and the
@@ -197,7 +197,7 @@ pub(crate) struct Base<T: Transport, C> {
     /// The client id an anonymous build presents, when the app named one.
     pub(crate) client_id: Option<String>,
     /// The held-content holder a rebuild calls, when one was named (R31).
-    pub(crate) held_content: Option<HeldContent>,
+    pub(crate) content_hooks: Option<ContentHooks>,
 }
 
 impl<T: Transport, C> Base<T, C> {
@@ -212,7 +212,7 @@ impl<T: Transport, C> Base<T, C> {
             dialer: self.dialer,
             sleeper: self.sleeper,
             client_id: self.client_id,
-            held_content: self.held_content,
+            content_hooks: self.content_hooks,
         }
     }
 
@@ -228,7 +228,7 @@ impl<T: Transport, C> Base<T, C> {
             dialer,
             sleeper: self.sleeper,
             client_id: self.client_id,
-            held_content: self.held_content,
+            content_hooks: self.content_hooks,
         }
     }
 }
@@ -288,10 +288,10 @@ macro_rules! base_setters {
             self
         }
 
-        /// The held-content holder a rebuild calls, named here by a browser worker before content attaches (R31).
+        /// The content layer's hooks a rebuild and the unsynced snapshot call, named here by a browser worker before content attaches (R31).
         #[must_use]
-        pub fn with_held_content(mut self, held_content: HeldContent) -> Self {
-            self.base.held_content = Some(held_content);
+        pub fn with_content_hooks(mut self, content_hooks: ContentHooks) -> Self {
+            self.base.content_hooks = Some(content_hooks);
             self
         }
     };
@@ -360,17 +360,24 @@ pub(crate) fn build_config(
     caller: Option<&str>,
     custody: Custody,
 ) -> ClientConfig {
-    ClientConfig::new(client_id.to_owned())
+    storage_config(schema, client_id)
         .with_login(login)
         .with_caller(CALLER_FUNCTION, caller)
+        .with_tuning(*tuning)
+        .with_custody(custody)
+}
+
+/// The config every replica of `schema` opens under as `client_id`, made of
+/// the parts the schema decides. A replica opened without the live build,
+/// such as a stored account's, opens under it so its checks agree.
+pub(crate) fn storage_config(schema: &SyncSchema, client_id: &str) -> ClientConfig {
+    ClientConfig::new(client_id.to_owned())
         .with_schema_version(Some(schema.version()))
         .with_schema_major(Some(schema.major()))
         .with_tier_plan(schema.tier_plan())
         .with_sql_functions(schema.sql_functions().clone())
         .with_policy_tables(schema.policy_tables().clone())
         .with_unrecorded_tables(schema.unrecorded_tables().iter().cloned())
-        .with_tuning(*tuning)
-        .with_custody(custody)
         .with_storage_schema(schema)
         .with_relay_mirror(schema.is_relay_mirror())
 }
@@ -530,7 +537,7 @@ impl<T: Transport + MaybeSend + 'static> ClientBuilder<T, ()> {
                 dialer: BoxedDialer::injected(dialer),
                 sleeper: None,
                 client_id: None,
-                held_content: None,
+                content_hooks: None,
             },
         }
     }
@@ -1115,7 +1122,7 @@ async fn mint_key<KS>(_key_store: &KS, _name: &str) -> Result<ReplicaKey, Client
 /// Open the replica file at `location` under `key`, with the device-private
 /// tier when the build has one. The replica owns its copy of the key, and
 /// the caller keeps its own for the content root key.
-fn open_encrypted_replica<'a>(
+pub(crate) fn open_encrypted_replica<'a>(
     location: &'a str,
     key: &ReplicaKey,
     fresh: bool,
@@ -1243,7 +1250,7 @@ where
             self.custody,
         );
         fold_config_aspects(config, self.base.share_keys.clone())
-            .with_optional_held_content(self.base.held_content)
+            .with_optional_content_hooks(self.base.content_hooks)
     }
 
     /// Open the replica, then dial once, failing when the dial fails.
@@ -1490,7 +1497,7 @@ where
         sleeper,
         // Taken by the signed-in and durable stages before run_core.
         client_id: _,
-        held_content,
+        content_hooks,
     } = base;
     let config = build_config(
         &schema,
@@ -1500,9 +1507,9 @@ where
         inputs.caller.as_deref(),
         inputs.custody,
     );
-    // A browser worker names the holder before its hub installs content.
-    let held_content = held_content.or_else(|| content.is_some().then(C::held_content));
-    let config = fold_config_aspects(config, share_keys).with_optional_held_content(held_content);
+    // A browser worker names the hooks before its hub installs content.
+    let content_hooks = content_hooks.or_else(|| content.is_some().then(C::content_hooks));
+    let config = fold_config_aspects(config, share_keys).with_optional_content_hooks(content_hooks);
     // Boxed, so the open's frames never sit beside the pump in this future.
     let conn = Box::pin(offline_connect_core(
         replica,

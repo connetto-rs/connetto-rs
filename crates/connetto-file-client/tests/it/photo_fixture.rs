@@ -17,7 +17,7 @@ use connetto_file_server::{
 };
 use connetto_server::{PgSnapshotSource, RlsAuth, RuntimeWritableCatalog};
 use connetto_test_harness::{
-    Fixture, HarnessAuth, Server, ServerConfig, pool_for, spawn_server, with_user,
+    Fixture, HarnessAuth, Server, ServerConfig, engine_ddl, pool_for, spawn_server, with_user,
 };
 use diesel::prelude::*;
 
@@ -77,6 +77,13 @@ pub const DEPLOYMENT: &[&str] = &[
        UPDATE public.photos SET content_state = p_new_state WHERE content_id = p_file_id; \
        RETURN p_file_id; END; $$",
     "GRANT EXECUTE ON FUNCTION connetto_set_content_state TO file_reader",
+    "CREATE OR REPLACE FUNCTION connetto_file_owner(p_file_id BYTEA) \
+     RETURNS TEXT LANGUAGE sql SECURITY INVOKER SET search_path TO '' AS $$ \
+       SELECT CASE WHEN count(DISTINCT p.owner) = 1 THEN min(p.owner) END \
+       FROM public.photos p WHERE p.content_id = p_file_id \
+     $$",
+    "GRANT EXECUTE ON FUNCTION connetto_file_owner TO file_reader",
+    "GRANT EXECUTE ON FUNCTION connetto_file_owner TO app_writer",
 ];
 
 /// One device of alice's at `path`, presenting `grant` and dialing through
@@ -176,6 +183,9 @@ pub async fn start_file_server(
         caller_settings: connetto_file_server::CallerSettings::default(),
         quotas: connetto_file_server::QuotaSettings::default(),
         ceilings: connetto_file_server::CeilingCache::default(),
+        on_carried: None,
+        // The sync server's own checker, which keeps every login it granted live.
+        sessions: std::sync::Arc::new(connetto_core::test_support::TestGrantChecker),
         _schema: PhantomData,
     })
     .await
@@ -189,9 +199,13 @@ pub async fn start_file_server(
 /// A harness server with the file server's signer wired into its session loop.
 pub async fn spawn_sync_server(fixture: &Fixture, signer: TicketSigner) -> Server {
     let writer_pool = pool_for(&with_user(fixture.admin_url(), "app_writer", "app_writer")).await;
+    // The one catalog the server parts read, the way the harness appends it
+    // inside `spawn_server` (R77 decision 11).
+    let engine_ddl = engine_ddl(PG_DDL);
     let snapshot =
-        PgSnapshotSource::from_ddl(writer_pool.clone(), PG_DDL).expect("snapshot source");
-    let auth = HarnessAuth::rls(RlsAuth::from_ddl(writer_pool.clone(), PG_DDL).expect("rls auth"));
+        PgSnapshotSource::from_ddl(writer_pool.clone(), &engine_ddl).expect("snapshot source");
+    let auth =
+        HarnessAuth::rls(RlsAuth::from_ddl(writer_pool.clone(), &engine_ddl).expect("rls auth"));
     spawn_server(
         ServerConfig::new(PG_DDL, fixture.admin_url())
             .with_writable(

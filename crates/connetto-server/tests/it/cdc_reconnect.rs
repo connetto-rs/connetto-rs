@@ -44,6 +44,17 @@ const SQLITE_DDL: &str =
     "CREATE TABLE orders (id INTEGER PRIMARY KEY, price REAL, quantity INTEGER, status TEXT);";
 const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 
+/// The catalog DDL the engine classifies, the orders table with the bot
+/// registry and the bookkeeping tables the publication carries (R77
+/// decision 11). A publication row for a table outside the catalog wedges the
+/// change stream.
+fn catalog_ddl() -> String {
+    connetto_schema::with_bookkeeping::<connetto_core::bots::TextIds>(
+        &connetto_schema::with_registry::<connetto_core::bots::TextIds>(PG_DDL),
+        true,
+    )
+}
+
 async fn exec(pool: &Pool<AsyncPgConnection>, sql: &str) {
     let mut conn = pool.get().await.expect("admin connection");
     diesel_async::RunQueryDsl::execute(sql_query(sql), &mut *conn)
@@ -64,7 +75,7 @@ impl SnapshotSource for EmptySnapshot {
     async fn estimate(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &connetto_core::Principal,
     ) -> Result<SnapshotEstimate, Self::Error> {
         Ok(SnapshotEstimate {
@@ -80,7 +91,7 @@ impl SnapshotSource for EmptySnapshot {
     async fn snapshot_page(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _auth: &connetto_core::Principal,
         _page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {
@@ -138,7 +149,7 @@ async fn drain_until<T: Transport>(
                 let zstd = match bulk {
                     BulkMessage::LivePatch(patch) => patch.patchset_zstd,
                     BulkMessage::SnapshotPatch(patch) => patch.patchset_zstd,
-                    BulkMessage::MutationPatch(_) => continue,
+                    BulkMessage::MutationPatch(_) | BulkMessage::CourierBody(_) => continue,
                 };
                 // An empty snapshot patch may not parse; that is fine.
                 applier.apply_diffset(&zstd, replica).ok();
@@ -156,6 +167,28 @@ async fn drain_until<T: Transport>(
     }
 }
 
+/// Read frames until the server ends `sub_id`'s snapshot, which it sends only
+/// after installing the subscription's live route. Returns false on timeout,
+/// a closed transport, or a transport error.
+async fn await_snapshot_end<T: Transport>(client: &mut T, sub_id: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        match tokio::time::timeout(remaining, client.recv()).await {
+            Ok(Ok(Some(IncomingFrame::Control(ControlMessage::SnapshotEnd(end)))))
+                if end.sub_id == sub_id =>
+            {
+                return true;
+            }
+            Ok(Ok(Some(_))) => {}
+            _ => return false,
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cdc_ingest_reconnects_after_walsender_drop() {
     let fixture = Fixture::acquire().await;
@@ -165,19 +198,20 @@ async fn cdc_ingest_reconnects_after_walsender_drop() {
         .await;
     fixture.start_replication(&["orders"]).await;
 
+    let catalog = catalog_ddl();
     let manager = ManagerBuilder::new(
-        Materializer::builder(PG_DDL)
+        Materializer::builder(&catalog)
             .build()
             .expect("build materializer"),
         EmptySnapshot,
         RosterAuth::granting("reader").withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         NoConnector,
-        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), &catalog)
             .expect("build write target"),
     )
     .build();
-    let applier = Materializer::builder(PG_DDL)
+    let applier = Materializer::builder(&catalog)
         .build()
         .expect("build applier");
     let mut replica = client_replica();
@@ -199,6 +233,12 @@ async fn cdc_ingest_reconnects_after_walsender_drop() {
         }))
         .await
         .expect("send subscribe");
+    // The snapshot source is empty, so a row the ingest dispatches before the
+    // subscription's route exists would never reach the client.
+    assert!(
+        await_snapshot_end(&mut client, "orders", Duration::from_secs(15)).await,
+        "the server never ended the subscription's snapshot"
+    );
 
     // Resilient ingest: reconnect the streaming source with a brisk backoff.
     let policy = ReconnectPolicy::new()
@@ -207,12 +247,13 @@ async fn cdc_ingest_reconnects_after_walsender_drop() {
         .with_max_attempts(Some(50))
         .with_healthy_after(Duration::from_secs(1));
     let url = fixture.admin_url().to_owned();
+    let ingest_catalog = catalog.clone();
     let ingest_manager = manager.clone();
     let _ingest = tokio::spawn(async move {
         let connect = |resume: ResumePoint| {
-            let url = url.clone();
+            let (url, catalog) = (url.clone(), ingest_catalog.clone());
             async move {
-                let catalog = ParserDB::parse::<PostgreSqlDialect>(PG_DDL)
+                let catalog = ParserDB::parse::<PostgreSqlDialect>(&catalog)
                     .map_err(|err| format!("{err:?}"))?;
                 let config = PgStreamingConfig::new(url, SLOT, PUBLICATION).start(resume.get());
                 PgStreamingCdcSource::connect(config, catalog)

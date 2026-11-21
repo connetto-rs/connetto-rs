@@ -109,9 +109,16 @@ async fn the_row_settles_the_verdict_and_it_costs_no_round_trip() {
     provision(&pool).await;
     let (channel, store) = fixture.fga_store().await;
 
-    let translated =
-        Translated::of::<String, connetto_core::bots::TextIds>(SCHEMA, &policies(), "app.user_id")
-            .expect("connetto's own policy shape translates");
+    let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
+        connetto_schema::Documents::new(
+            SCHEMA,
+            &policies(),
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
+        true,
+    )
+    .expect("connetto's own policy shape translates");
     let mut setup = OpenFgaServiceClient::new(channel.clone());
     let model = translated
         .install_model(&mut setup, &store)
@@ -128,9 +135,9 @@ async fn the_row_settles_the_verdict_and_it_costs_no_round_trip() {
         Arc::clone(&shapes),
         setup,
         store.clone(),
+        model.model(),
     )
-    .expect("the index carries what the questions need")
-    .authorization_model_id(model.id().to_owned());
+    .expect("the index carries what the questions need");
     let n = translated
         .load_into(&FactSource::owner(pool.clone()), &loader)
         .await
@@ -144,9 +151,9 @@ async fn the_row_settles_the_verdict_and_it_costs_no_round_trip() {
         Arc::clone(&shapes),
         OpenFgaServiceClient::new(Counted::new(channel)),
         store,
+        model.model(),
     )
-    .expect("the index carries what the questions need")
-    .authorization_model_id(model.id().to_owned());
+    .expect("the index carries what the questions need");
     let auth = FgaAuth::new(Arc::clone(&shapes), delegate, naming);
 
     let notes = catalog_helpers::table_id::<Postgres, _>(shapes.catalog(), "r5b_notes")
@@ -184,14 +191,26 @@ async fn the_row_settles_the_verdict_and_it_costs_no_round_trip() {
 /// check itself does not.
 #[tokio::test]
 async fn a_note_that_does_not_refuse_is_logged_for_the_operator() {
-    let policies = format!("{}\nCREATE ROLE auditor BYPASSRLS;", policies());
+    // A text key has no length bound, so the row naming budget asks the
+    // operator to check the keys and refuses nothing.
+    let schema =
+        format!("{SCHEMA}\nCREATE TABLE r5b_tags (name TEXT PRIMARY KEY, owner TEXT NOT NULL);");
+    let policies = format!(
+        "{}\nALTER TABLE r5b_tags ENABLE ROW LEVEL SECURITY;\n\
+         CREATE POLICY r5b_tags_p ON r5b_tags USING (owner = current_setting('app.user_id', true));",
+        policies()
+    );
     let (translated, lines) = with_capture(
         "a_note_that_does_not_refuse_is_logged_for_the_operator",
         |capture| async move {
-            let translated = Translated::of::<String, connetto_core::bots::TextIds>(
-                SCHEMA,
-                &policies,
-                "app.user_id",
+            let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
+                connetto_schema::Documents::new(
+                    &schema,
+                    &policies,
+                    connetto_test_harness::FIXTURE_ROLES,
+                    connetto_test_harness::FIXTURE_READER,
+                ),
+                true,
             );
             (translated, capture.lines())
         },
@@ -199,7 +218,7 @@ async fn a_note_that_does_not_refuse_is_logged_for_the_operator() {
     .await;
     assert!(
         translated.is_ok(),
-        "a role bypassing the policies does not refuse the boot"
+        "a note asking the operator to check the keys does not refuse the boot"
     );
     let warned = |subject: &str| {
         lines
@@ -207,14 +226,90 @@ async fn a_note_that_does_not_refuse_is_logged_for_the_operator() {
             .any(|line| line["level"] == "WARN" && line["subject"] == subject)
     };
     assert!(
-        warned("auditor"),
-        "the bypassing role is reported: {lines:?}"
+        warned("public.r5b_tags"),
+        "the row naming budget is reported: {lines:?}"
     );
     assert!(
         !lines.iter().any(|line| line["message"]
             .as_str()
             .is_some_and(|message| message.starts_with("Every check context must carry"))),
         "the parameter connetto supplies itself is not reported: {lines:?}"
+    );
+}
+
+/// A policy for the reader role decides who sees a row, and a policy for a
+/// role outside connetto serves no caller, is left out of the model and is
+/// reported to the operator naming the policy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reader_policy_decides_and_an_outside_role_policy_is_reported_and_left_out() {
+    let fixture = Fixture::acquire().await;
+    let (channel, store) = fixture.fga_store().await;
+    let (translated, lines) = with_capture(
+        "a_reader_policy_decides_and_an_outside_role_policy_is_reported_and_left_out",
+        |capture| async move {
+            let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
+                connetto_schema::Documents::new(
+                    SCHEMA,
+                    "ALTER TABLE r5b_notes ENABLE ROW LEVEL SECURITY;\n\
+                     CREATE POLICY r5b_notes_reader ON r5b_notes FOR ALL TO app_reader \
+                       USING (owner = current_setting('app.user_id', true));\n\
+                     CREATE POLICY r5b_notes_staff ON r5b_notes FOR ALL TO support_staff \
+                       USING (true);",
+                    &format!(
+                        "{} CREATE ROLE support_staff;",
+                        connetto_test_harness::FIXTURE_ROLES
+                    ),
+                    connetto_test_harness::FIXTURE_READER,
+                ),
+                true,
+            );
+            (translated, capture.lines())
+        },
+    )
+    .await;
+    let translated = translated.expect("a policy for a role outside connetto refuses nothing");
+    let warned = |subject: &str| {
+        lines
+            .iter()
+            .any(|line| line["level"] == "WARN" && line["subject"] == subject)
+    };
+    assert!(
+        warned("r5b_notes_staff"),
+        "the policy no caller is subject to is reported: {lines:?}"
+    );
+    assert!(
+        !warned("r5b_notes_reader"),
+        "the reader's own policy is not: {lines:?}"
+    );
+
+    let mut setup = OpenFgaServiceClient::new(channel.clone());
+    let model = translated
+        .install_model(&mut setup, &store)
+        .await
+        .expect("the service accepted the rules");
+    let shapes = translated.shapes_arc();
+    let delegate = OpenFgaPolicy::new(
+        Arc::clone(&shapes),
+        OpenFgaServiceClient::new(Counted::new(channel)),
+        store,
+        model.model(),
+    )
+    .expect("the index carries what the questions need");
+    let auth = FgaAuth::new(Arc::clone(&shapes), delegate, translated.naming());
+    let notes = catalog_helpers::table_id::<Postgres, _>(shapes.catalog(), "r5b_notes")
+        .expect("in the catalog");
+    let row = [Value::Int(1), Value::String("alice".to_owned())];
+    let watchers = [caller("alice"), caller("bob")];
+    let mut verdicts = Vec::new();
+    Verdict::reset(&mut verdicts, watchers.len());
+    auth.may_see(&ValuesRow::new(notes, &row), &watchers, &mut verdicts)
+        .await
+        .expect("the composition answered");
+    assert_eq!(
+        verdicts,
+        [Verdict::Allow, Verdict::Deny],
+        "the reader's policy admits alice alone, and support_staff's policy \
+         admitting every row serves neither caller"
     );
 }
 
@@ -226,25 +321,38 @@ async fn unchanged_rules_are_adopted_rather_than_rewritten() {
     let (channel, store) = fixture.fga_store().await;
     let mut client = OpenFgaServiceClient::new(channel);
 
-    let first =
-        Translated::of::<String, connetto_core::bots::TextIds>(SCHEMA, &policies(), "app.user_id")
-            .expect("translates")
-            .install_model(&mut client, &store)
-            .await
-            .expect("written");
-    let second =
-        Translated::of::<String, connetto_core::bots::TextIds>(SCHEMA, &policies(), "app.user_id")
-            .expect("translates")
-            .install_model(&mut client, &store)
-            .await
-            .expect("adopted");
+    let first = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
+        connetto_schema::Documents::new(
+            SCHEMA,
+            &policies(),
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
+        true,
+    )
+    .expect("translates")
+    .install_model(&mut client, &store)
+    .await
+    .expect("written");
+    let second = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
+        connetto_schema::Documents::new(
+            SCHEMA,
+            &policies(),
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
+        true,
+    )
+    .expect("translates")
+    .install_model(&mut client, &store)
+    .await
+    .expect("adopted");
 
     assert!(matches!(first, ModelState::Written(_)));
-    assert_eq!(
-        second,
-        ModelState::Adopted(first.id().to_owned()),
+    assert!(
+        matches!(&second, ModelState::Adopted(held) if held.id == first.id()),
         "the same policy text produces the same rules, and a restart that \
-         rewrote them would reload every fact in the database behind them"
+         rewrote them would reload every fact in the database behind them, got {second:?}"
     );
 }
 
@@ -288,9 +396,16 @@ async fn an_adopted_boot_reconciles_a_store_left_at_another_point() {
     provision(&pool).await;
     let (channel, store) = fixture.fga_store().await;
 
-    let translated =
-        Translated::of::<String, connetto_core::bots::TextIds>(SCHEMA, &policies(), "app.user_id")
-            .expect("translates");
+    let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
+        connetto_schema::Documents::new(
+            SCHEMA,
+            &policies(),
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
+        true,
+    )
+    .expect("translates");
     let mut setup = OpenFgaServiceClient::new(channel.clone());
     let model = translated
         .install_model(&mut setup, &store)
@@ -300,9 +415,9 @@ async fn an_adopted_boot_reconciles_a_store_left_at_another_point() {
         translated.shapes_arc(),
         setup.clone(),
         store.clone(),
+        model.model(),
     )
-    .expect("the index carries what the questions need")
-    .authorization_model_id(model.id().to_owned());
+    .expect("the index carries what the questions need");
     translated
         .load_into(&FactSource::owner(pool.clone()), &loader)
         .await
@@ -326,13 +441,23 @@ async fn an_adopted_boot_reconciles_a_store_left_at_another_point() {
     }
     drop(conn);
 
-    let adopted =
-        Translated::of::<String, connetto_core::bots::TextIds>(SCHEMA, &policies(), "app.user_id")
-            .expect("translates")
-            .install_model(&mut setup, &store)
-            .await
-            .expect("adopted");
-    assert_eq!(adopted, ModelState::Adopted(model.id().to_owned()));
+    let adopted = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
+        connetto_schema::Documents::new(
+            SCHEMA,
+            &policies(),
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
+        true,
+    )
+    .expect("translates")
+    .install_model(&mut setup, &store)
+    .await
+    .expect("adopted");
+    assert!(
+        matches!(&adopted, ModelState::Adopted(held) if held.id == model.id()),
+        "{adopted:?}"
+    );
     let (added, removed) = translated
         .reconcile_store(&FactSource::owner(pool.clone()), &loader)
         .await
@@ -367,9 +492,16 @@ async fn an_adopted_boot_that_cannot_reconcile_refuses() {
     provision(&pool).await;
     let (channel, store) = fixture.fga_store().await;
 
-    let translated =
-        Translated::of::<String, connetto_core::bots::TextIds>(SCHEMA, &policies(), "app.user_id")
-            .expect("translates");
+    let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
+        connetto_schema::Documents::new(
+            SCHEMA,
+            &policies(),
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
+        true,
+    )
+    .expect("translates");
     let mut setup = OpenFgaServiceClient::new(channel);
     let model = translated
         .install_model(&mut setup, &store)
@@ -380,9 +512,9 @@ async fn an_adopted_boot_that_cannot_reconcile_refuses() {
             translated.shapes_arc(),
             setup.clone(),
             store.to_owned(),
+            model.model(),
         )
         .expect("the index carries what the questions need")
-        .authorization_model_id(model.id().to_owned())
     };
 
     let unknown = translated
@@ -430,9 +562,16 @@ async fn a_table_with_row_level_security_and_no_policy_grants_nobody() {
     let (channel, store) = fixture.fga_store().await;
 
     let policies = "ALTER TABLE r5b_notes ENABLE ROW LEVEL SECURITY;";
-    let translated =
-        Translated::of::<String, connetto_core::bots::TextIds>(SCHEMA, policies, "app.user_id")
-            .expect("nothing to translate");
+    let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
+        connetto_schema::Documents::new(
+            SCHEMA,
+            policies,
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
+        true,
+    )
+    .expect("nothing to translate");
     let mut setup = OpenFgaServiceClient::new(channel.clone());
     let model = translated
         .install_model(&mut setup, &store)
@@ -445,9 +584,9 @@ async fn a_table_with_row_level_security_and_no_policy_grants_nobody() {
         Arc::clone(&shapes),
         OpenFgaServiceClient::new(Counted::new(channel)),
         store,
+        model.model(),
     )
-    .expect("the index carries what the questions need")
-    .authorization_model_id(model.id().to_owned());
+    .expect("the index carries what the questions need");
     let auth = FgaAuth::new(Arc::clone(&shapes), delegate, naming);
 
     let notes = catalog_helpers::table_id::<Postgres, _>(shapes.catalog(), "r5b_notes")
@@ -500,9 +639,16 @@ async fn a_changed_owner_reaches_the_store_before_the_row_is_delivered() {
     provision(&pool).await;
     let (channel, store) = fixture.fga_store().await;
 
-    let translated =
-        Translated::of::<String, connetto_core::bots::TextIds>(SCHEMA, &policies(), "app.user_id")
-            .expect("connetto's own policy shape translates");
+    let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
+        connetto_schema::Documents::new(
+            SCHEMA,
+            &policies(),
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
+        true,
+    )
+    .expect("connetto's own policy shape translates");
     let mut setup = OpenFgaServiceClient::new(channel.clone());
     let model = translated
         .install_model(&mut setup, &store)
@@ -512,9 +658,9 @@ async fn a_changed_owner_reaches_the_store_before_the_row_is_delivered() {
         translated.shapes_arc(),
         setup,
         store.clone(),
+        model.model(),
     )
-    .expect("the index carries what the questions need")
-    .authorization_model_id(model.id().to_owned());
+    .expect("the index carries what the questions need");
     translated
         .load_into(&FactSource::owner(pool.clone()), &loader)
         .await
@@ -527,9 +673,9 @@ async fn a_changed_owner_reaches_the_store_before_the_row_is_delivered() {
         Arc::clone(&shapes),
         OpenFgaServiceClient::new(Counted::new(channel)),
         store,
+        model.model(),
     )
-    .expect("the index carries what the questions need")
-    .authorization_model_id(model.id().to_owned());
+    .expect("the index carries what the questions need");
     let auth = FgaAuth::new(Arc::clone(&shapes), delegate, naming);
     let upkeep = auth.upkeep(reach, translator, FactSource::owner(pool.clone()));
 
@@ -630,10 +776,14 @@ async fn cross_executor(
 ) {
     let (channel, store) = fixture.fga_store().await;
     let schema = cross_schema();
-    let translated = Translated::of::<String, connetto_core::bots::TextIds>(
-        &schema,
-        &CROSS_POLICY_STATEMENTS.join(";\n"),
-        "app.user_id",
+    let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
+        connetto_schema::Documents::new(
+            &schema,
+            &CROSS_POLICY_STATEMENTS.join(";\n"),
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
+        true,
     )
     .expect("a membership policy translates");
     let mut setup = OpenFgaServiceClient::new(channel.clone());
@@ -645,9 +795,9 @@ async fn cross_executor(
         translated.shapes_arc(),
         setup,
         store.clone(),
+        model.model(),
     )
-    .expect("the index carries what the questions need")
-    .authorization_model_id(model.id().to_owned());
+    .expect("the index carries what the questions need");
     translated
         .load_into(&FactSource::owner(pool.clone()), &loader)
         .await
@@ -660,9 +810,9 @@ async fn cross_executor(
         Arc::clone(&shapes),
         OpenFgaServiceClient::new(Counted::new(channel)),
         store,
+        model.model(),
     )
-    .expect("the index carries what the questions need")
-    .authorization_model_id(model.id().to_owned());
+    .expect("the index carries what the questions need");
     let auth = FgaAuth::new(Arc::clone(&shapes), delegate, naming);
     let upkeep = auth.upkeep(reach, translator, FactSource::owner(pool.clone()));
     (auth, upkeep, shapes)
@@ -708,7 +858,9 @@ async fn a_withdrawn_grant_is_refused_at_once_for_both_questions() {
         auth.may_write(
             RowWrite::Update {
                 old: &view,
-                new: &view
+                new: &view,
+                assigned: &[1],
+                read: &[0],
             },
             &alice[0]
         )
@@ -756,7 +908,9 @@ async fn a_withdrawn_grant_is_refused_at_once_for_both_questions() {
             .may_write(
                 RowWrite::Update {
                     old: &view,
-                    new: &view
+                    new: &view,
+                    assigned: &[1],
+                    read: &[0],
                 },
                 &alice[0]
             )
@@ -828,10 +982,14 @@ async fn a_uuid_primary_key_is_named_so_an_owned_write_is_authorized() {
     provision_orders(&pool).await;
     let (channel, store) = fixture.fga_store().await;
 
-    let translated = Translated::of::<String, connetto_core::bots::TextIds>(
-        ORDERS_SCHEMA,
-        &orders_policies(),
-        "app.user_id",
+    let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
+        connetto_schema::Documents::new(
+            ORDERS_SCHEMA,
+            &orders_policies(),
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
+        true,
     )
     .expect("connetto's own policy shape translates");
     let mut setup = OpenFgaServiceClient::new(channel.clone());
@@ -845,9 +1003,9 @@ async fn a_uuid_primary_key_is_named_so_an_owned_write_is_authorized() {
         Arc::clone(&shapes),
         setup,
         store.clone(),
+        model.model(),
     )
-    .expect("the index carries what the questions need")
-    .authorization_model_id(model.id().to_owned());
+    .expect("the index carries what the questions need");
     translated
         .load_into(&FactSource::owner(pool.clone()), &loader)
         .await
@@ -857,9 +1015,9 @@ async fn a_uuid_primary_key_is_named_so_an_owned_write_is_authorized() {
         Arc::clone(&shapes),
         OpenFgaServiceClient::new(Counted::new(channel)),
         store,
+        model.model(),
     )
-    .expect("the index carries what the questions need")
-    .authorization_model_id(model.id().to_owned());
+    .expect("the index carries what the questions need");
     let auth = FgaAuth::new(Arc::clone(&shapes), delegate, naming);
 
     let orders = catalog_helpers::table_id::<Postgres, _>(shapes.catalog(), "r40_orders")
@@ -872,10 +1030,16 @@ async fn a_uuid_primary_key_is_named_so_an_owned_write_is_authorized() {
     let typed: [Value<Postgres>; 2] = [Value::Uuid(id), Value::String("alice".to_owned())];
     let typed_view = ValuesRow::new(orders, &typed);
     assert!(
-        auth.may_write(RowWrite::Insert { new: &typed_view }, &alice)
-            .await
-            .expect("the composition answered")
-            .allowed(),
+        auth.may_write(
+            RowWrite::Insert {
+                new: &typed_view,
+                assigned: &[0, 1],
+            },
+            &alice
+        )
+        .await
+        .expect("the composition answered")
+        .allowed(),
         "alice inserting a row she owns, keyed by a UUID, must be allowed"
     );
 
@@ -888,7 +1052,13 @@ async fn a_uuid_primary_key_is_named_so_an_owned_write_is_authorized() {
     ];
     let untyped_view = ValuesRow::new(orders, &untyped);
     let refused = auth
-        .may_write(RowWrite::Insert { new: &untyped_view }, &alice)
+        .may_write(
+            RowWrite::Insert {
+                new: &untyped_view,
+                assigned: &[0, 1],
+            },
+            &alice,
+        )
         .await;
     assert!(
         !matches!(&refused, Ok(verdict) if verdict.allowed()),
@@ -952,10 +1122,14 @@ async fn replay_executor(
 ) {
     let (channel, store) = fixture.fga_store().await;
     let schema = REPLAY_SCHEMA_STATEMENTS.join(";\n") + ";";
-    let translated = Translated::of::<String, connetto_core::bots::TextIds>(
-        &schema,
-        REPLAY_POLICY,
-        "app.user_id",
+    let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
+        connetto_schema::Documents::new(
+            &schema,
+            REPLAY_POLICY,
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
+        true,
     )
     .expect("a share whose replay declares its slice boots since R86");
     let mut setup = OpenFgaServiceClient::new(channel.clone());
@@ -967,9 +1141,9 @@ async fn replay_executor(
         translated.shapes_arc(),
         setup,
         store.clone(),
+        model.model(),
     )
-    .expect("the index carries what the questions need")
-    .authorization_model_id(model.id().to_owned());
+    .expect("the index carries what the questions need");
     translated
         .load_into(&FactSource::owner(pool.clone()), &loader)
         .await
@@ -982,9 +1156,9 @@ async fn replay_executor(
         Arc::clone(&shapes),
         OpenFgaServiceClient::new(Counted::new(channel)),
         store,
+        model.model(),
     )
-    .expect("the index carries what the questions need")
-    .authorization_model_id(model.id().to_owned());
+    .expect("the index carries what the questions need");
     let auth: FgaAuth<String, String, _> = FgaAuth::new(Arc::clone(&shapes), delegate, naming);
     let upkeep = auth.upkeep(reach, translator, FactSource::owner(pool.clone()));
     (auth, upkeep, shapes)
@@ -1075,7 +1249,9 @@ async fn a_replayed_share_is_withdrawn_when_its_row_goes() {
             .may_write(
                 RowWrite::Update {
                     old: &view,
-                    new: &view
+                    new: &view,
+                    assigned: &[1],
+                    read: &[0],
                 },
                 &alice[0]
             )
@@ -1382,10 +1558,14 @@ async fn a_composite_key_share_is_withdrawn_through_the_re_run() {
     // and on Unwithdrawable shapes, so expect() covers both the grading and
     // the startup guard. Before rls2fga 98bda106 this returned Err.
     let schema = composite_schema();
-    let translated = Translated::of::<String, connetto_core::bots::TextIds>(
-        &schema,
-        COMPOSITE_POLICY,
-        "app.user_id",
+    let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
+        connetto_schema::Documents::new(
+            &schema,
+            COMPOSITE_POLICY,
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
+        true,
     )
     .expect("composite shape: no ClauseBelowThreshold, no uncovered refusal");
 
@@ -1404,9 +1584,9 @@ async fn a_composite_key_share_is_withdrawn_through_the_re_run() {
         translated.shapes_arc(),
         setup,
         store.clone(),
+        model.model(),
     )
-    .expect("the index carries what the questions need")
-    .authorization_model_id(model.id().to_owned());
+    .expect("the index carries what the questions need");
     translated
         .load_into(&FactSource::owner(pool.clone()), &loader)
         .await
@@ -1419,9 +1599,9 @@ async fn a_composite_key_share_is_withdrawn_through_the_re_run() {
         Arc::clone(&shapes),
         OpenFgaServiceClient::new(Counted::new(channel)),
         store,
+        model.model(),
     )
-    .expect("the index carries what the questions need")
-    .authorization_model_id(model.id().to_owned());
+    .expect("the index carries what the questions need");
     let auth: FgaAuth<String, String, _> = FgaAuth::new(Arc::clone(&shapes), delegate, naming);
     let upkeep = auth.upkeep(reach, translator, FactSource::owner(pool.clone()));
 
@@ -1573,10 +1753,14 @@ async fn keyed_replay_executor(
 ) -> Arc<dyn connetto_server::openfga::StoreUpkeep> {
     let (channel, store) = fixture.fga_store().await;
     let schema = KEYED_REPLAY_SCHEMA_STATEMENTS.join(";\n") + ";";
-    let translated = Translated::of::<String, connetto_core::bots::TextIds>(
-        &schema,
-        KEYED_REPLAY_POLICY,
-        "app.user_id",
+    let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
+        connetto_schema::Documents::new(
+            &schema,
+            KEYED_REPLAY_POLICY,
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
+        true,
     )
     .expect("a keyed share whose replay declares its slice boots since R86");
     let mut setup = OpenFgaServiceClient::new(channel.clone());
@@ -1588,9 +1772,9 @@ async fn keyed_replay_executor(
         translated.shapes_arc(),
         setup,
         store.clone(),
+        model.model(),
     )
-    .expect("the index carries what the questions need")
-    .authorization_model_id(model.id().to_owned());
+    .expect("the index carries what the questions need");
     translated
         .load_into(&FactSource::owner(pool.clone()), &loader)
         .await
@@ -1602,9 +1786,9 @@ async fn keyed_replay_executor(
         Arc::clone(&shapes),
         OpenFgaServiceClient::new(Counted::new(channel)),
         store,
+        model.model(),
     )
-    .expect("the index carries what the questions need")
-    .authorization_model_id(model.id().to_owned());
+    .expect("the index carries what the questions need");
     let auth: FgaAuth<String, String, _> = FgaAuth::new(Arc::clone(&shapes), delegate, naming);
     auth.upkeep(reach, translator, FactSource::owner(pool.clone()))
 }

@@ -184,21 +184,44 @@ impl Oplog for FlakyAppend {
             .await
             .map_err(|never| match never {})
     }
+
+    async fn record_refusal(&self, table: &str) -> Result<(), AppendRefused> {
+        self.inner
+            .record_refusal(table)
+            .await
+            .map_err(|never| match never {})
+    }
+
+    async fn refusals(&self) -> Result<Vec<String>, AppendRefused> {
+        self.inner.refusals().await.map_err(|never| match never {})
+    }
+
+    async fn readmit(&self, tables: &[String]) -> Result<(), AppendRefused> {
+        self.inner
+            .readmit(tables)
+            .await
+            .map_err(|never| match never {})
+    }
 }
 
 /// A change source that replays exactly the items it was handed, then ends
 /// cleanly, as a slot replaying what it was never acknowledged past would.
-struct Replay(VecDeque<SourceItem<PgChangeEvent, PgCommit>>);
+struct Replay(VecDeque<SourceItem<PgChangeEvent, PgCommit, core::convert::Infallible>>);
 
 impl CdcSource for Replay {
     type Commit = PgCommit;
     type Event = PgChangeEvent;
+    type Relation = core::convert::Infallible;
     type Error = io::Error;
 
     fn next_item(
         &mut self,
-    ) -> impl Future<Output = Result<Option<SourceItem<PgChangeEvent, PgCommit>>, io::Error>> + Send
-    {
+    ) -> impl Future<
+        Output = Result<
+            Option<SourceItem<PgChangeEvent, PgCommit, core::convert::Infallible>>,
+            io::Error,
+        >,
+    > + Send {
         let next = self.0.pop_front();
         async move { Ok(next) }
     }
@@ -285,10 +308,11 @@ async fn a_refused_append_is_retried_with_the_held_record() {
             computed
                 .subscribe("total", "SELECT COUNT(*) FROM counts")
                 .await;
+            computed.expect_aggregate_columns("total").await;
             let ControlMessage::AggregateUpdate(seed) = computed.next_control().await else {
                 panic!("expected the count seed");
             };
-            assert_eq!(seed.result_json.as_deref(), Some("0"));
+            assert_eq!(super::reexec::integer(&seed), 0);
 
             let mut rows = connect_to(&manager);
             rows.handshake_with("rows", "user:watcher").await;
@@ -345,7 +369,7 @@ async fn a_refused_append_is_retried_with_the_held_record() {
                     logs.lines()
                 );
             };
-            assert_eq!(moved.result_json.as_deref(), Some("1"));
+            assert_eq!(super::reexec::integer(&moved), 1);
             assert_quiet(&mut computed).await;
 
             // The row itself landed once.
@@ -385,10 +409,11 @@ async fn a_stream_that_resumes_past_a_held_event_drops_what_it_owed() {
     computed
         .subscribe("total", "SELECT COUNT(*) FROM counts")
         .await;
+    computed.expect_aggregate_columns("total").await;
     let ControlMessage::AggregateUpdate(seed) = computed.next_control().await else {
         panic!("expected the count seed");
     };
-    assert_eq!(seed.result_json.as_deref(), Some("0"));
+    assert_eq!(super::reexec::integer(&seed), 0);
 
     let mut rows = connect_to(&manager);
     rows.handshake_with("rows", "user:watcher").await;
@@ -466,7 +491,7 @@ async fn a_stream_that_resumes_past_a_held_event_drops_what_it_owed() {
     let ControlMessage::AggregateUpdate(moved) = computed.next_control().await else {
         panic!("expected the count movement");
     };
-    assert_eq!(moved.result_json.as_deref(), Some("2"));
+    assert_eq!(super::reexec::integer(&moved), 2);
     assert_quiet(&mut computed).await;
 
     // The log holds the second event at its position, and nothing for the first.

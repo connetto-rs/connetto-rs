@@ -37,13 +37,23 @@ CREATE TABLE order_lines (order_id UUID NOT NULL REFERENCES orders(id), line_no 
 -- repeats from the parent order as it does on order_lines, so the visibility
 -- policy settles from the row itself. thumb_id names the photo's thumbnail,
 -- an ordinary file of its own that a device in camp fetches from the author
--- unasked, and stays null for a photo staged without one.
-CREATE TABLE photos (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), order_id UUID NOT NULL REFERENCES orders(id), owner_id TEXT NOT NULL, content_id BYTEA NOT NULL, content_state TEXT, thumb_id BYTEA);
+-- unasked, and stays null for a photo staged without one. thumb_state is the
+-- thumbnail's own availability, which the commit of the thumbnail's upload
+-- writes as content_state is written for the photo, so a holder of either
+-- file reads its own acknowledgement. team_id names the team a photo is
+-- posted to, whose members read it, and stays null for a photo only its
+-- owner sees.
+CREATE TABLE photos (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), order_id UUID NOT NULL REFERENCES orders(id), owner_id TEXT NOT NULL, content_id BYTEA NOT NULL, content_state TEXT, thumb_id BYTEA, team_id TEXT, thumb_state TEXT);
 
 -- The catalogue the demo sells from. It has no policy of its own, so every
 -- account reads every row, and it is read-only, since no grant on it admits a
 -- write and no writer lists it.
 CREATE TABLE products (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name TEXT NOT NULL, price_cents BIGINT NOT NULL CHECK (price_cents >= 0));
+
+-- The demo's teams, one row per team, which the server seeds and no client
+-- writes. The row is what a membership names, so the authorization model
+-- reads a team as a type of its own, whose members are the rows below.
+CREATE TABLE teams (id TEXT PRIMARY KEY CHECK (id <> '' AND length(id) <= 64));
 
 -- The team's membership rows, one per account in a team. The rows are what
 -- the team_notes policy reads, the membership that gates the note rows, and
@@ -51,10 +61,27 @@ CREATE TABLE products (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name TEXT 
 -- write from the rows alone. member_id repeats the demo's account ids, the
 -- identity a replica settles an author against when the author carries no
 -- subjects (R77).
-CREATE TABLE team_members (team_id TEXT NOT NULL, member_id TEXT NOT NULL, PRIMARY KEY (team_id, member_id));
+CREATE TABLE team_members (team_id TEXT NOT NULL REFERENCES teams(id), member_id TEXT NOT NULL, PRIMARY KEY (team_id, member_id));
+-- The policies on team_notes, photos and users look up the caller's teams by
+-- member_id, which the key does not lead with.
+CREATE INDEX team_members_member_id ON team_members (member_id);
 
 -- A note any member of its team reads and writes, the row the team's
 -- membership rows settle in policies.sql. author_id repeats who wrote the row
 -- the way owner_id repeats who an order belongs to, so the replica that
 -- settles the row against its author knows the author from the row itself.
 CREATE TABLE team_notes (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), team_id TEXT NOT NULL, author_id TEXT NOT NULL, body TEXT NOT NULL);
+
+-- One row per account that ever signed in, written by the demo server's
+-- sign-in hooks in the login's own transaction (CONNETTO_USERS=database), so
+-- a failed write fails the sign-in and a failed sign-in leaves no row.
+-- id is the account id every other table names, the textual v5 UUID of 36
+-- characters, and login_name the subject the account signed in as, which
+-- OpenID Connect bounds at 255 ASCII characters. No client writes it, since
+-- no grant admits a write and no writer lists it. Row-level security is not
+-- forced because the sign-in writes as the owner and every client reads as
+-- connetto_reader.
+CREATE TABLE users (
+  id TEXT PRIMARY KEY CHECK (id <> '' AND length(id) <= 36),
+  login_name TEXT NOT NULL CHECK (login_name <> '' AND length(login_name) <= 255)
+);

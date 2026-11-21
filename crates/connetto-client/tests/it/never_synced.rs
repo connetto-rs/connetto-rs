@@ -219,7 +219,6 @@ async fn an_empty_first_sync_still_counts_as_having_synced() {
     script.say(IncomingFrame::Control(ControlMessage::SnapshotBegin(
         SnapshotBegin {
             sub_id: query.sub_id().to_owned(),
-            priority: connetto_core::messages::SubscriptionPriority::default(),
         },
     )));
     script.say(IncomingFrame::Control(ControlMessage::SnapshotEnd(
@@ -583,6 +582,153 @@ async fn a_dropped_watch_keeps_its_subscription_for_the_grace() {
     );
     drop(again);
     drop(probe);
+}
+
+/// The last handle of a watch dropping raises `WatchReleased` naming the watch,
+/// once its grace starts, and a handle dropped while another still shares the
+/// watch raises nothing.
+#[tokio::test]
+async fn the_last_handle_dropping_raises_watch_released_for_its_watch() {
+    let dir = tempdir().expect("temp dir");
+    let credential = super::support::held("tester");
+    let store = super::support::key_store(&credential).await;
+
+    let conn = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::NeverDial::<Script>::default(),
+    )
+    .signed_in(credential)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
+    .open_driven()
+    .await
+    .expect("open with no server");
+    let (client, pump) = ConnettoClient::with_pump(conn);
+    tokio::spawn(pump);
+    let mut events = client.events();
+
+    let shared_first = client
+        .watch::<_, Item>(items::table.order(items::id))
+        .await
+        .expect("watch");
+    let shared_second = client
+        .watch::<_, Item>(items::table.order(items::id))
+        .await
+        .expect("watch the same query");
+    let shared = declared_ids(&client).await;
+    let other = client
+        .watch::<_, Item>(items::table.filter(items::id.gt(0)))
+        .await
+        .expect("watch another query");
+    let mut both = declared_ids(&client).await;
+    assert_eq!(shared.len(), 1, "two identical watches share one watch");
+    both.retain(|id| !shared.contains(id));
+    let [other_id] = both.as_slice() else {
+        panic!("the second query declares its own watch: {both:?}");
+    };
+
+    // The first sharer goes before the other query's only handle, so its drop
+    // has been drained by the time the other's release is raised.
+    drop(shared_first);
+    drop(other);
+    assert_eq!(
+        &next_release(&mut events).await,
+        other_id,
+        "a watch another handle still shares is not released"
+    );
+
+    drop(shared_second);
+    assert_eq!(
+        next_release(&mut events).await,
+        shared[0],
+        "the last sharer dropping releases the shared watch"
+    );
+}
+
+/// A release the replica refuses fails the call that drains it, and the watch
+/// is not reported released, since its grace never started.
+#[tokio::test]
+async fn a_release_the_replica_refuses_fails_the_drain_and_raises_nothing() {
+    use diesel::connection::SimpleConnection;
+
+    let dir = tempdir().expect("temp dir");
+    let credential = super::support::held("tester");
+    let store = super::support::key_store(&credential).await;
+
+    let conn = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::NeverDial::<Script>::default(),
+    )
+    .signed_in(credential)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
+    .open_driven()
+    .await
+    .expect("open with no server");
+    // The pump is never run, so the ping below is the only drain and the
+    // refusal surfaces there.
+    let (client, _pump) = ConnettoClient::with_pump(conn);
+    let mut events = client.events();
+
+    let watch = client
+        .watch::<_, Item>(items::table.order(items::id))
+        .await
+        .expect("watch");
+    client
+        .with_conn(|conn| {
+            conn.conn()
+                .batch_execute(
+                    "CREATE TEMP TRIGGER refuse_release BEFORE UPDATE ON main._connetto_subscription \
+                     BEGIN SELECT RAISE(ABORT, 'the replica refuses'); END",
+                )
+                .expect("install the refusal");
+        })
+        .await
+        .expect("gate not locked");
+    drop(watch);
+
+    let refused = client.ping(1).await.expect_err("the release is refused");
+    assert!(
+        refused.to_string().contains("the replica refuses"),
+        "the drain fails on the refused release, not on the missing server: {refused:?}"
+    );
+    assert!(
+        !core::iter::from_fn(|| events.try_recv().ok())
+            .any(|event| matches!(event, ClientEvent::WatchReleased { .. })),
+        "a release that did not happen is not reported"
+    );
+}
+
+/// The ids of every declared subscription, sorted.
+async fn declared_ids(client: &ConnettoClient<Script>) -> Vec<String> {
+    let mut ids: Vec<String> = client
+        .with_conn(|conn| conn.declared_subscriptions().expect("declared"))
+        .await
+        .expect("gate not locked")
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// The watch named by the next `WatchReleased`, waited on for at most 5 s.
+async fn next_release(events: &mut tokio::sync::broadcast::Receiver<ClientEvent>) -> String {
+    tokio::time::timeout(core::time::Duration::from_secs(5), async {
+        loop {
+            if let ClientEvent::WatchReleased { sub_id } = events.recv().await.expect("events") {
+                return sub_id;
+            }
+        }
+    })
+    .await
+    .expect("a watch was released within 5 s")
 }
 
 /// A pin survives closing and reopening the application, with no server ever

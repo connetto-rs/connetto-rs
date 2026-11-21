@@ -8,9 +8,16 @@
 
 use core::time::Duration;
 
-use connetto_client::{ClientBuilder, CoreClient, LiveQuery, ReconnectPolicy};
+use connetto_client::{
+    ClientBuilder, ConnettoClient, CoreClient, CorePump, LiveQuery, NativeClientBuilder,
+    ReconnectPolicy, UnsyncedWrite,
+};
+use connetto_core::Major;
+use connetto_core::messages::WriterRef;
 use connetto_server::LoopbackTransport;
 use diesel::prelude::*;
+
+use super::support::{Once, Script, handshake_ack};
 
 const DDL: &str =
     "CREATE TABLE orders (id INTEGER PRIMARY KEY, price REAL, quantity INTEGER, status TEXT);";
@@ -157,6 +164,97 @@ async fn unsynced_counts_a_write_the_pump_has_not_queued_yet() {
         .expect("gate not locked");
     let unsynced = client.client().unsynced().await.expect("gate not locked");
     assert_eq!(unsynced.len(), 1, "the write counts at once");
+}
+
+/// A native build over the scripted wire, connected and its pump kept parked,
+/// so the test owns the next send the connection makes.
+async fn parked_build(script: &Script) -> (ConnettoClient<Script>, CorePump) {
+    script.say(handshake_ack());
+    let (native, pump) = NativeClientBuilder::new("ws://127.0.0.1:1", super::support::bundle(DDL))
+        .with_dialer(Once::new(script.clone()))
+        .connect_with_pump()
+        .await
+        .expect("the build connects");
+    (native.client().clone(), pump)
+}
+
+/// The queue read a guard owes the app survives the wire dying in the read's
+/// own flush, since the entry the send was carrying is already durable and
+/// the pump's reconnect replays it.
+#[tokio::test]
+async fn unsynced_reports_the_write_when_the_wire_dies_in_its_flush() {
+    let script = Script::default();
+    let (client, pump) = parked_build(&script).await;
+    client
+        .with_conn(|conn| {
+            diesel::insert_into(orders::table)
+                .values((
+                    orders::id.eq(13_i64),
+                    orders::price.eq(1.0),
+                    orders::quantity.eq(1_i64),
+                    orders::status.eq("dying"),
+                ))
+                .execute(conn.conn())
+                .expect("insert");
+        })
+        .await
+        .expect("gate not locked");
+    // The pump stays parked, so the read's own flush is the next send and
+    // meets the loss the test just cut.
+    script.hang_up();
+    let unsynced = client
+        .unsynced()
+        .await
+        .expect("the queue read survives the loss");
+    assert_eq!(
+        unsynced,
+        vec![UnsyncedWrite {
+            writer: WriterRef::Number(1),
+            seq: 1,
+            major: Major::new(1),
+        }],
+        "the write is reported, not lost"
+    );
+    drop(pump);
+}
+
+/// The pending-work read a deletion guard owes the app survives the wire
+/// dying in the read's own flush, the entry staying durable through it.
+#[tokio::test]
+async fn pending_work_reports_the_write_when_the_wire_dies_in_its_flush() {
+    let script = Script::default();
+    let (client, pump) = parked_build(&script).await;
+    client
+        .with_conn(|conn| {
+            diesel::insert_into(orders::table)
+                .values((
+                    orders::id.eq(14_i64),
+                    orders::price.eq(1.0),
+                    orders::quantity.eq(1_i64),
+                    orders::status.eq("dying"),
+                ))
+                .execute(conn.conn())
+                .expect("insert");
+        })
+        .await
+        .expect("gate not locked");
+    // The pump stays parked, so the read's own flush is the next send and
+    // meets the loss the test just cut.
+    script.hang_up();
+    let work = client
+        .pending_work()
+        .await
+        .expect("the read survives the loss");
+    assert_eq!(
+        work.unsynced,
+        vec![UnsyncedWrite {
+            writer: WriterRef::Number(1),
+            seq: 1,
+            major: Major::new(1),
+        }],
+        "the write is reported, not lost"
+    );
+    drop(pump);
 }
 
 /// Closing a client that is waiting out a reconnect backoff ends its pump at

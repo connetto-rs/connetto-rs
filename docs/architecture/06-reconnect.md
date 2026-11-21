@@ -23,7 +23,7 @@ A caller with no identity has an in-memory local copy ([`connetto_client::Replic
 
 ## Server-Side Oplog
 
-The server maintains an **oplog**, an ordered log of [`connetto_server::oplog::ChangeRecord`] entries, one per committed change, that it replays to reconnecting clients. [`connetto_server::oplog::Oplog`] has two implementations, the in-memory log and the Postgres table, and the production target is the Postgres table, which a promoted standby carries with every other table (see Failover). The table is created by `PgOplog::ensure_schema` in [oplog.rs](../../crates/connetto-server/src/oplog.rs).
+The server maintains an **oplog**, an ordered log of [`connetto_server::oplog::ChangeRecord`] entries, one per committed change, that it replays to reconnecting clients. [`connetto_server::oplog::Oplog`] has two implementations, the in-memory log and the Postgres table, and the production target is the Postgres table, which a promoted standby carries with every other table (see Failover). The table is created by `PgOplog::ensure_schema` in [oplog.rs](../../crates/connetto-server/src/oplog.rs), together with the refused registry, named as the log with `_refused` appended, which keeps every table a drift refusal left refused across a restart. The log also holds one `refused` record per table served again after a refusal, which Case 2 describes.
 
 ### Keyed by commit position
 
@@ -36,6 +36,8 @@ A snapshot cursor's fence names the transactions its read could not see, the one
 ### Where the slot resumes
 
 The source yields each transaction's rows and then its commit, which carries the commit's position and where its record ends. The ingest writes that commit into the one-row `oplog_commit` table and only then acknowledges it, and acknowledging a commit is the only thing that moves the replication slot, to exactly that end. So before every connect, a slot whose confirmed position is past the recorded end names changes the log never received, and one at or behind it does not. A reconnect in the same process starts right after the last row or commit the ingest handled (`ResumePoint`), so no engine cursor sees a position twice, and a changed timeline or a declared gap clears it, so the slot's own position decides.
+
+`ServerHandle::ingested_commits` and `SessionManager::ingested_commits` observe commits after recording, upstream acknowledgement and resume advancement. Subscribe before issuing a write and match its transaction identity. The bounded stream retains 64 notifications and reports `RecvError::Lagged` when a subscriber falls behind. Replayed commits may repeat. A receiver does not keep the server alive and drains queued notifications before reporting closure when the manager is dropped.
 
 ### The event and the patch
 
@@ -142,6 +144,8 @@ A cursor past where its timeline ended, or one the server cannot read, takes thi
 The notice waits for the read. `FullResyncRequired` is sent only once the fresh snapshot has been read, immediately ahead of its frames, because it is also the instruction to discard local rows. A read that fails instead draws the same single bare refusal as any other cause, so the caller learns nothing about the name it guessed and keeps its rows for a snapshot that never arrived.
 
 [`connetto_core::messages::FullResyncReason::AuthorizationChange`] covers a permission row appearing or disappearing on the Postgres change log. It triggers a per-subscription resync, produced by the owning session's own task so the notice and its replacement stay one ordered pair ([08-authorization.md](08-authorization.md) for the mechanism). Adding that variant was itself a wire change, because [`connetto_core::messages::FullResyncReason`] has no fallback for an unknown value.
+
+[`connetto_core::messages::FullResyncReason::TableRefused`] covers a table refused because its live schema stopped matching the catalog. The server drops the table's changes while it is refused, so the first connect that serves the table again appends a `refused` record at the position its change stream resumes from. Catchup ends every subscription reading the table at that record with this reason, and the client empties the table and takes a fresh snapshot, as for `TableTruncated`. A client whose snapshot of the table was read after the last published commit before that connect resumes past the record and keeps its rows. It is a wire change for the same reason as `AuthorizationChange`.
 
 ### Case 3. The schema changed while offline
 

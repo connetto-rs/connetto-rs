@@ -15,7 +15,7 @@ use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection};
 use connetto_core::Cursor;
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired, HandshakeAck,
-    MembershipOpened, SnapshotBegin, SnapshotEnd, SnapshotPatch, SubscriptionPriority,
+    MembershipOpened, SnapshotBegin, SnapshotEnd, SnapshotPatch,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{LoopbackTransport, loopback};
@@ -77,7 +77,6 @@ async fn send_snapshot_of(
     server
         .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
             sub_id: sub_id.to_owned(),
-            priority: SubscriptionPriority::default(),
         }))
         .await
         .expect("begin");
@@ -123,6 +122,7 @@ fn server_scripted(reason: FullResyncReason, seeds: Rows, replacements: Rows) ->
                 resume_token: "truncate".to_owned(),
                 schema_version: None,
                 sunset_at_secs: None,
+                courier: false,
                 initial_credits: 64,
                 writer: Some(connetto_core::messages::WriterGrant {
                     number: 1,
@@ -227,6 +227,24 @@ async fn a_truncate_empties_the_replica_even_under_an_overlapping_subscription()
         replica_ids(&mut conn),
         Vec::<i64>::new(),
         "the table is empty upstream, so no filter entitles a row to stay",
+    );
+}
+
+/// A refused table's changes stopped reaching the client, so every row it holds
+/// of the table may be stale and goes as soon as the first empty replacement
+/// ends, though the other subscription still claims them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_table_empties_the_replica_even_under_an_overlapping_subscription() {
+    let mut conn = seeded(FullResyncReason::TableRefused {
+        table: "orders".to_owned(),
+    })
+    .await;
+
+    pump_to_snapshot_end(&mut conn).await;
+    assert_eq!(
+        replica_ids(&mut conn),
+        Vec::<i64>::new(),
+        "the server dropped the table's changes, so no filter entitles a row to stay",
     );
 }
 
@@ -411,6 +429,7 @@ fn membership_server(declared: usize, steps: &'static [Step]) -> LoopbackTranspo
                 resume_token: "membership".to_owned(),
                 schema_version: None,
                 sunset_at_secs: None,
+                courier: false,
                 initial_credits: 64,
                 writer: Some(connetto_core::messages::WriterGrant {
                     number: 1,

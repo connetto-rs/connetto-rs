@@ -20,7 +20,9 @@ use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 
-use crate::{_connetto_pending, ClientError, PolicyTables, rename_diffset, sqlite_catalog};
+use crate::{
+    _connetto_pending, ClientError, ContentHooks, PolicyTables, rename_diffset, sqlite_catalog,
+};
 
 /// The record of the build a replica was made under: its bundle hash, and the
 /// wire name of each split table.
@@ -33,30 +35,6 @@ pub(crate) const BUILD_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_build \
 /// hash its drain presents.
 pub(crate) const HELD_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_held_batch \
     (major INTEGER PRIMARY KEY, version BLOB NOT NULL)";
-
-/// What the content layer does with an old major's unsent files across a
-/// rebuild and its drain (R31). The content layer owns its tables, so it
-/// supplies these, and a build that attaches no content uses
-/// [`HeldContent::NONE`].
-#[derive(Clone, Copy, Debug)]
-pub struct HeldContent {
-    /// Moves the unsent files of a major aside inside the rebuild
-    /// transaction, and says whether it held any.
-    pub hold: fn(&mut SqliteConnection, Major) -> Result<bool, ClientError>,
-    /// How many files are still held for a major.
-    pub count: fn(&mut SqliteConnection, Major) -> Result<u64, ClientError>,
-    /// Forgets a major's held files and says how many there were.
-    pub forget: fn(&mut SqliteConnection, Major) -> Result<u64, ClientError>,
-}
-
-impl HeldContent {
-    /// A build that attaches no content, which holds no file.
-    pub const NONE: Self = Self {
-        hold: |_, _| Ok(false),
-        count: |_, _| Ok(0),
-        forget: |_, _| Ok(0),
-    };
-}
 
 diesel::table! {
     /// The bundle hash a replica was built from.
@@ -94,14 +72,15 @@ diesel::table! {
 /// Connetto's own tables a rebuild keeps beside the held batches: the build
 /// record, the device's enrolment, the writer queues with their retirement
 /// bookkeeping and the entries kept for a restore, whose frontiers the server
-/// keeps across majors, and the peer cursors and retraction log, whose owners
-/// settle across majors (R77, R78).
-const KEPT: [&str; 11] = [
+/// keeps across majors, and the peer cursors, held peer entries and
+/// retraction log, whose owners settle across majors (R77, R78 decision 7).
+const KEPT: [&str; 12] = [
     "_connetto_build",
     "_connetto_build_renames",
     "_connetto_device_certificate",
     "_connetto_revocation_list",
     "_connetto_peer_cursor",
+    "_connetto_peer_entry",
     "_connetto_retraction",
     "_connetto_writers",
     "_connetto_pending",
@@ -237,7 +216,7 @@ pub(crate) fn stamp(
 pub(crate) fn prepare_rebuild(
     db: &mut SqliteConnection,
     from: &Recorded,
-    content: HeldContent,
+    content: ContentHooks,
 ) -> Result<(), ClientError> {
     db.batch_execute(HELD_DDL)?;
     let old_major = i64::from(from.major.get());
@@ -284,6 +263,8 @@ pub(crate) fn prepare_rebuild(
     if has_table(db, "_connetto_acked")? {
         crate::acked::fill_version(db, old_major, &from.version)?;
     }
+    #[cfg(feature = "peer")]
+    crate::peer::hold_for_rebuild(db)?;
     let held_content = (content.hold)(db, from.major)?;
     if held_writes || held_content {
         diesel::insert_into(held_batch::table)
@@ -344,7 +325,7 @@ pub(crate) fn held_builds(
 pub(crate) fn forget_batch(
     db: &mut SqliteConnection,
     major: Major,
-    content: HeldContent,
+    content: ContentHooks,
 ) -> Result<u64, ClientError> {
     db.immediate_transaction(|db| {
         let stored = i64::from(major.get());
@@ -536,7 +517,8 @@ pub(crate) fn remember_shared_generation(
     if saved.is_some_and(|saved| saved.generation == attached.generation) {
         return Ok(false);
     }
-    db.batch_execute("DELETE FROM _connetto_meta; DELETE FROM _connetto_aggregates")?;
+    db.batch_execute("DELETE FROM _connetto_meta")?;
+    crate::aggregates::drop_all(db)?;
     crate::holdings::release_account(db)?;
     diesel::sql_query(
         "INSERT INTO _connetto_shared_generation (id, generation) VALUES (1, ?) \

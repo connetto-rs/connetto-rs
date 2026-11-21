@@ -13,7 +13,7 @@ use connetto_client::{
 };
 use connetto_core::Cursor;
 use connetto_core::messages::{
-    BulkMessage, ControlMessage, SnapshotBegin, SnapshotEnd, SnapshotPatch, SubscriptionPriority,
+    BulkMessage, ControlMessage, SnapshotBegin, SnapshotEnd, SnapshotPatch,
 };
 use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::FakeTransport;
@@ -229,7 +229,6 @@ pub async fn an_orphan_from_the_server_lands_and_a_local_one_queues() {
     conn.attach(FakeTransport::accepting_then_delivering([
         IncomingFrame::Control(ControlMessage::SnapshotBegin(SnapshotBegin {
             sub_id: "notes".to_owned(),
-            priority: SubscriptionPriority::default(),
         })),
         IncomingFrame::Bulk(BulkMessage::SnapshotPatch(SnapshotPatch::new(
             "notes",

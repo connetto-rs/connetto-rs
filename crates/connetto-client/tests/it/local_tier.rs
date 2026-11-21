@@ -70,36 +70,42 @@ struct Note {
 }
 
 /// A downstream-style application SQL type: the comma-joined result of a
-/// `group_concat`. Only this test crate owns it, so the orphan rule lets it
-/// carry its own [`AggregateWire`](connetto_client::dsl::AggregateWire) impl,
-/// which is the whole point of the extension seam.
+/// `group_concat`. Only this test crate owns it, so it loads through its own
+/// diesel [`FromSql`](diesel::deserialize::FromSql) impl, with no code in
+/// connetto, which is the whole point of the extension seam.
 #[derive(diesel::sql_types::SqlType, diesel::query_builder::QueryId)]
 #[diesel(sqlite_type(name = "Text"))]
 pub struct CsvList;
 
 diesel::define_sql_function! {
     /// The SQLite built-in `group_concat` aggregate, returning the custom
-    /// [`CsvList`] type. Its name is absent from connetto's built-in
-    /// `AGGREGATE_FUNCTIONS`, so only the typed `live()` path (which reads
-    /// diesel's `IsAggregate` marker) classifies it as an aggregate. The
-    /// `#[aggregate]` attribute is what sets that marker.
+    /// [`CsvList`] type, `NULL` over no row. Its name is absent from
+    /// connetto's built-in `AGGREGATE_FUNCTIONS`, so only the typed `live()`
+    /// path (which reads diesel's `IsAggregate` marker) classifies it as an
+    /// aggregate. The `#[aggregate]` attribute is what sets that marker.
     #[aggregate]
-    fn group_concat(body: diesel::sql_types::Text) -> CsvList;
+    fn group_concat(body: diesel::sql_types::Text) -> diesel::sql_types::Nullable<CsvList>;
 }
 
-impl connetto_client::dsl::AggregateWire for CsvList {
-    type Value = Option<String>;
+/// The application value a [`CsvList`] loads as, its items in order.
+#[derive(Debug, Clone, PartialEq, Eq, diesel::deserialize::FromSqlRow)]
+pub struct Csv(Vec<String>);
 
-    fn decode(json: &str) -> Result<Option<String>, connetto_client::ClientError> {
-        use connetto_client::dsl::wire;
-        match wire::json_value(json)? {
-            serde_json::Value::Null => Ok(None),
-            serde_json::Value::String(s) => Ok(Some(s)),
-            other => Err(connetto_client::ClientError::Session(format!(
-                "expected a csv string, got {other}"
-            ))),
-        }
+impl diesel::deserialize::FromSql<CsvList, diesel::sqlite::Sqlite> for Csv {
+    fn from_sql(
+        value: diesel::sqlite::SqliteValue<'_, '_, '_>,
+    ) -> diesel::deserialize::Result<Self> {
+        let joined = <String as diesel::deserialize::FromSql<
+            diesel::sql_types::Text,
+            diesel::sqlite::Sqlite,
+        >>::from_sql(value)?;
+        Ok(Self(joined.split(',').map(str::to_owned).collect()))
     }
+}
+
+/// The [`Csv`] of `items`.
+fn csv(items: &[&str]) -> Csv {
+    Csv(items.iter().map(|item| (*item).to_owned()).collect())
 }
 
 /// A snapshot source that records every subscription's `select_sql`, so the
@@ -120,7 +126,7 @@ impl SnapshotSource for RecordingSnapshot {
     async fn estimate(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &connetto_core::Principal,
     ) -> Result<SnapshotEstimate, Self::Error> {
         Ok(SnapshotEstimate {
@@ -136,7 +142,7 @@ impl SnapshotSource for RecordingSnapshot {
     async fn snapshot_page(
         &self,
         select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &connetto_core::Principal,
         _page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {
@@ -209,10 +215,6 @@ async fn spawn_server(
 async fn connect_with_tier(
     addr: std::net::SocketAddr,
 ) -> ConnettoConnection<WebSocketTransport<TcpStream>> {
-    let stream = TcpStream::connect(addr).await.expect("connect");
-    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
-        .await
-        .expect("ws connect");
     let bundle = SyncSchema::new(
         SchemaBundle::new(
             SOURCE,
@@ -224,11 +226,19 @@ async fn connect_with_tier(
         )
         .expect("the source declares major 1"),
     );
-    ClientBuilder::new(bundle, super::support::Once::new(transport))
-        .signed_in(super::support::held("token"))
-        .connect_driven()
+    let mut conn = ClientBuilder::new(
+        bundle,
+        super::support::NeverDial::<WebSocketTransport<TcpStream>>::default(),
+    )
+    .signed_in(super::support::held("token"))
+    .open_driven()
+    .expect("open replica");
+    let stream = TcpStream::connect(addr).await.expect("connect");
+    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
         .await
-        .expect("client connect")
+        .expect("ws connect");
+    conn.attach(transport).await.expect("client connect");
+    conn
 }
 
 /// Pump the broadcast stream until an event matches `pred`, failing fast on
@@ -397,10 +407,10 @@ async fn local_custom_aggregate_decodes_via_extension_seam() {
     // (CsvList). It proves two facets at once: the typed live() path
     // classifies it as an aggregate from diesel's IsAggregate marker rather
     // than the SQL-text name list (a text classifier would misread it as a
-    // row query and reject it), and a downstream AggregateWire impl over the
-    // app's own SQL type drives live() end to end through the public wire
-    // primitives. It runs on the local tier, so the client recomputes it with
-    // json_quote and no subscription reaches the server.
+    // row query and reject it), and the app's own diesel FromSql impl over
+    // its SQL type drives live() end to end. It runs on the local tier, so
+    // the client recomputes it through diesel and no subscription reaches
+    // the server.
     let fixture = Fixture::acquire().await;
     let (_manager, seen, addr, server) = spawn_server(&fixture, 1).await;
     let conn = connect_with_tier(addr).await;
@@ -408,13 +418,12 @@ async fn local_custom_aggregate_decodes_via_extension_seam() {
     tokio::spawn(pump);
     let mut events = client.events();
 
-    let mut joined = notes::table
+    let mut joined: connetto_client::LiveValue<Option<Csv>> = notes::table
         .select(group_concat(notes::body))
         .live(&client)
         .await
         .expect("local live custom aggregate");
-    // The empty set: group_concat is NULL, json_quote renders "null", the
-    // app's decoder maps it to None.
+    // The empty set: group_concat is NULL, which loads as None.
     assert_eq!(
         joined.value(),
         Some(None),
@@ -438,7 +447,7 @@ async fn local_custom_aggregate_decodes_via_extension_seam() {
     joined.changed().await.expect("local recompute");
     assert_eq!(
         joined.value(),
-        Some(Some("a,b".to_owned())),
+        Some(Some(csv(&["a", "b"]))),
         "the custom aggregate recomputed locally and decoded through the seam",
     );
 
@@ -456,13 +465,13 @@ async fn local_custom_aggregate_decodes_via_extension_seam() {
     joined.changed().await.expect("second local recompute");
     assert_eq!(
         joined.value(),
-        Some(Some("a,b,c".to_owned())),
+        Some(Some(csv(&["a", "b", "c"]))),
         "a further change updates the custom aggregate",
     );
 
     // The nullable round-trip: deleting every row empties the set, group_concat
-    // is NULL again, and the seam decoder maps it back to None. This is the
-    // corner a nullable custom decoder most often gets wrong.
+    // is NULL again, and it loads back as None. This is the corner a nullable
+    // custom decoder most often gets wrong.
     client
         .with_conn(|conn| diesel::delete(notes::table).execute(conn.conn()))
         .await
@@ -489,6 +498,100 @@ async fn local_custom_aggregate_decodes_via_extension_seam() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_grouped_aggregate_recomputes_locally() {
+    let fixture = Fixture::acquire().await;
+    let (_manager, seen, addr, server) = spawn_server(&fixture, 1).await;
+    let conn = connect_with_tier(addr).await;
+    let (client, pump) = ConnettoClient::with_pump(conn);
+    tokio::spawn(pump);
+    let mut events = client.events();
+
+    // Filtered, so the rendered query carries a bind the local run inlines.
+    let mut counts: connetto_client::LiveGroups<String, i64> = notes::table
+        .filter(notes::id.gt(0_i64))
+        .group_by(notes::body)
+        .select((notes::body, diesel::dsl::count(notes::id)))
+        .live(&client)
+        .await
+        .expect("local live grouped aggregate");
+    assert!(counts.map().is_empty(), "bootstrap is answered locally");
+    assert!(
+        counts.as_of_secs().is_some(),
+        "a local answer is current when it is computed"
+    );
+
+    client
+        .with_conn(|conn| {
+            diesel::insert_into(notes::table)
+                .values(&vec![
+                    (notes::id.eq(1_i64), notes::body.eq("a")),
+                    (notes::id.eq(2_i64), notes::body.eq("a")),
+                    (notes::id.eq(3_i64), notes::body.eq("b")),
+                ])
+                .execute(conn.conn())
+        })
+        .await
+        .expect("gate not locked")
+        .expect("insert notes");
+    counts.changed().await.expect("local recompute");
+    assert_eq!(
+        counts.map(),
+        std::collections::HashMap::from([("a".to_owned(), 2_i64), ("b".to_owned(), 1_i64)]),
+        "each group re-executed locally"
+    );
+
+    // Moving the last row of a group out of it removes that group.
+    client
+        .with_conn(|conn| {
+            diesel::update(notes::table.find(3_i64))
+                .set(notes::body.eq("a"))
+                .execute(conn.conn())
+        })
+        .await
+        .expect("gate not locked")
+        .expect("move note");
+    counts.changed().await.expect("second local recompute");
+    assert_eq!(
+        counts.map(),
+        std::collections::HashMap::from([("a".to_owned(), 3_i64)]),
+        "the emptied group leaves the map"
+    );
+
+    // A key of two columns, through the SQL-classified entry point, splits
+    // each answer row into a tuple key and the aggregate after it.
+    let pairs: connetto_client::LiveGroups<(i64, String), i64> = client
+        .watch_groups(notes::table.group_by((notes::id, notes::body)).select((
+            notes::id,
+            notes::body,
+            diesel::dsl::count(notes::id),
+        )))
+        .await
+        .expect("local grouped aggregate keyed by two columns");
+    assert_eq!(
+        pairs.map(),
+        std::collections::HashMap::from([
+            ((1_i64, "a".to_owned()), 1_i64),
+            ((2_i64, "a".to_owned()), 1_i64),
+            ((3_i64, "a".to_owned()), 1_i64),
+        ]),
+        "each row is one group under its two-column key"
+    );
+
+    // Wire silence, fenced like the scalar case.
+    client.ping(7).await.expect("ping");
+    wait_broadcast_strict(&mut events, |e| matches!(e, ClientEvent::Pong { nonce: 7 })).await;
+    assert!(
+        seen.lock().expect("recorder lock").is_empty(),
+        "no subscription may reach the server for a local grouped aggregate"
+    );
+
+    drop(counts);
+    drop(pairs);
+    drop(client);
+    server.await.expect("join server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mixed_tier_aggregate_is_refused_at_registration() {
     let fixture = Fixture::acquire().await;
     let (_manager, _seen, addr, server) = spawn_server(&fixture, 1).await;
@@ -496,12 +599,12 @@ async fn mixed_tier_aggregate_is_refused_at_registration() {
     let (client, pump) = ConnettoClient::with_pump(conn);
     tokio::spawn(pump);
 
-    let Err(err) = orders::table
+    let refused: Result<connetto_client::LiveValue<i64>, _> = orders::table
         .inner_join(notes::table.on(notes::id.eq(orders::id)))
         .count()
         .live(&client)
-        .await
-    else {
+        .await;
+    let Err(err) = refused else {
         panic!("a mixed-tier aggregate must be refused");
     };
     assert!(

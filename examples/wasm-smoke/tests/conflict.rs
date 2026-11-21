@@ -17,24 +17,24 @@
 
 #![cfg(target_arch = "wasm32")]
 
+mod uuid_orders;
+
 use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection};
 use connetto_core::messages::{
     BulkMessage, ConflictRow, ControlMessage, HandshakeAck, MutationConflict, SnapshotBegin,
-    SnapshotEnd, SnapshotPatch, SubscriptionPriority, WriterGrant,
+    SnapshotEnd, SnapshotPatch, WriterGrant,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, loopback};
 use connetto_wasm_smoke::RelayHub;
 use connetto_wasm_smoke::build::{Once, raw_schema};
 use diesel::prelude::*;
-use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
+use uuid_orders::{DDL, QUERY, orders_payload};
 use wasm_bindgen_futures::spawn_local;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
-const DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv4()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER) STRICT;";
-const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 /// The worker's upstream subscription id.
 const UPSTREAM_SUB: &str = "db-upstream";
 
@@ -63,36 +63,18 @@ fn unique_base() -> i64 {
     (millis as i64)
 }
 
-/// Build the compressed insert-patchset the wire carries for one snapshot.
-fn snapshot_payload(rows: &[(rosetta_uuid::Uuid, i64)]) -> Vec<u8> {
-    let mut patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new();
-    for (id, quantity) in rows {
-        let table = SimpleTable::new("orders", &[("id", ""), ("quantity", "")], &[0]);
-        // Encode the 16-byte UUID as a SQLite BLOB: <[u8; 16]>::from extracts
-        // the raw bytes, matching what the server and changeset apply expect.
-        let insert = Insert::<_, String, Vec<u8>>::from(table)
-            .set(0, Value::Blob(<[u8; 16]>::from(*id).to_vec()))
-            .expect("set id")
-            .set(1, Value::Integer(*quantity))
-            .expect("set quantity");
-        patchset = patchset.insert(insert);
-    }
-    zstd::encode_all(patchset.build().as_slice(), 3).expect("compress snapshot")
-}
-
 /// Send one begin, patch, end triple for `UPSTREAM_SUB`.
 async fn send_snapshot(server: &mut LoopbackTransport, rows: &[(rosetta_uuid::Uuid, i64)]) {
     server
         .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
             sub_id: UPSTREAM_SUB.to_owned(),
-            priority: SubscriptionPriority::default(),
         }))
         .await
         .expect("snapshot begin");
     server
         .send_bulk(BulkMessage::SnapshotPatch(SnapshotPatch::new(
             UPSTREAM_SUB.to_owned(),
-            snapshot_payload(rows),
+            orders_payload(rows),
         )))
         .await
         .expect("snapshot patch");
@@ -120,6 +102,7 @@ async fn fake_upstream(mut server: LoopbackTransport, seeded_id: rosetta_uuid::U
             current_cursor: Cursor::new(Vec::new()),
             schema_version: None,
             sunset_at_secs: None,
+            courier: false,
             initial_credits: 64,
             writer: Some(WriterGrant {
                 number: 1,

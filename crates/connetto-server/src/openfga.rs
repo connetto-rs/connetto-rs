@@ -26,8 +26,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use crate::schema::ConnettoSchema;
 use connetto_core::auth::Principal;
-use connetto_core::bots::BotRegistryIdSql;
 use diesel::QueryableByName;
 use diesel::pg::Pg;
 use diesel::query_builder::{BoxedSqlQuery, SqlQuery};
@@ -41,7 +41,6 @@ use openfga_client::client::{
 use openfga_client::tonic::body::Body;
 use openfga_client::tonic::client::GrpcService;
 use openfga_client::tonic::codegen::{Body as ResponseBody, Bytes, StdError, http};
-use rls2fga::classifier::function_registry::{SessionAttribute, SessionAttributeKind};
 use rls2fga::generator::tuple_generator::{TupleCondition, TupleRow};
 use rls2fga::translator::Translator;
 use rls2fga::types::{
@@ -144,6 +143,9 @@ pub struct SubjectNaming {
     /// parameter spelled like a grantee column. Reading that as a grantee would
     /// announce a move to one bearer and leave the row on every other device.
     gated_keys: BTreeMap<String, String>,
+    /// The PostgreSQL role every request acts as, the deployment's reader
+    /// role, which every check states as the caller's acting role.
+    acting_role: String,
 }
 
 impl SubjectNaming {
@@ -165,6 +167,7 @@ impl SubjectNaming {
     fn resolve<Key: CapabilityKey>(
         shapes: &Shapes<ParserDB>,
         relations: &[RelationShapes],
+        acting_role: &str,
     ) -> Self {
         let subjects_parameter = shapes
             .required_parameters()
@@ -191,6 +194,7 @@ impl SubjectNaming {
             subjects_parameter,
             bot_list_parameter,
             gated_keys,
+            acting_role: acting_role.to_owned(),
         }
     }
 
@@ -339,6 +343,12 @@ where
             .identity()
             .into_iter()
             .map(|identity| Cow::Owned(format!("{}:{}", self.naming.user_type, identity.user_id)))
+    }
+
+    /// rls2fga gates every relation on the acting role, PUBLIC policies
+    /// included, so a check that left it out would be denied.
+    fn acting_role(&self) -> Option<&str> {
+        Some(&self.naming.acting_role)
     }
 
     fn request_value(&self, parameter: &str, out: &mut RequestValues) -> bool {
@@ -561,21 +571,6 @@ pub enum SetupError {
          will narrow this refusal: {0}"
     )]
     Unwithdrawable(String),
-    /// A policy applies to named roles, and connetto runs every caller as its
-    /// reader role, so neither translation can settle who the policy serves.
-    #[error(
-        "policy {policy} on table {table} applies only to {roles}, and connetto runs every \
-         caller as its reader role, so it cannot tell which callers the policy serves. Write \
-         the policy without a TO clause, or TO PUBLIC"
-    )]
-    RoleScopedPolicy {
-        /// The policy's name.
-        policy: String,
-        /// The table it is defined on, as written.
-        table: String,
-        /// The roles its `TO` clause names, as written.
-        roles: String,
-    },
 }
 
 /// The pool the authorization store's facts are read from, whose role sees
@@ -616,86 +611,56 @@ pub struct Translated {
     tuples: Vec<rls2fga::generator::tuple_generator::TupleQuery>,
     policy_tables: Vec<String>,
     reach: GrantReach,
+    /// The tables each policy reads, which a weakened replica identity
+    /// refuses together with the table it weakened on (R107 decision 10).
+    policy_reads: Vec<rls2fga::types::PolicyReads>,
 }
 
 impl Translated {
-    /// Translate a schema and its policies, refusing anything this cannot keep
+    /// Translate a deployment's documents, refusing anything this cannot keep
     /// current or the translator cannot express.
     ///
-    /// The two documents are parsed as one catalog, because a policy is a
-    /// catalog object and `DatabaseLike::policies()` is what reports it. The
-    /// schema alone is what clients sync, so the split is by purpose rather
-    /// than by content.
+    /// The schema, the policies, the cap they generate and the roles are
+    /// parsed as one catalog, translated under the same
+    /// [`connetto_schema::deployment`] the client build reads, so the model
+    /// and the replica are told one thing about each session setting.
     ///
-    /// **Declaring the three settings is what makes the local path fire.** A
-    /// connetto policy compares a column against `current_setting`, and a
-    /// translator told nothing about those keys refuses the whole arm: the
-    /// model then grants the owner alone and every share holder is denied
-    /// locally, silently, with the shared rows simply not arriving. `Key` names
-    /// the share-key setting, `user_setting` names the identity one and the
-    /// bot-list setting is connetto's own, all the values
-    /// [`CallerBinding`](crate::capability) binds for Postgres, so the two
-    /// executors are told one thing.
+    /// `devices` carries the deployment's device identity, so the model's
+    /// catalog holds the enrolment table exactly when the engine's does, and
+    /// the two number their tables alike, as `require_one_numbering` checks.
     ///
     /// # Errors
     ///
-    /// [`SetupError::Catalog`] when the two documents do not parse, and
-    /// [`SetupError::Untranslated`] naming every expression left unhandled.
-    pub fn of<Key: CapabilityKey, Id: BotRegistryIdSql>(
-        schema_sql: &str,
-        policy_sql: &str,
-        user_setting: &str,
+    /// [`SetupError::Catalog`] when the documents do not parse,
+    /// [`SetupError::Unplannable`] when the roles document never creates the
+    /// reader role, and [`SetupError::Untranslated`] naming every expression
+    /// left unhandled.
+    pub fn of<Key: CapabilityKey, D: ConnettoSchema>(
+        documents: connetto_schema::Documents<'_>,
+        devices: bool,
     ) -> Result<Self, SetupError> {
-        // The cap travels with the policies it caps. The model must hold a
-        // bot to its list exactly as Postgres does, so it is translated as
-        // one more document the two share.
-        let cap = connetto_schema::cap_policies::<Id>(schema_sql, policy_sql)
+        // The model holds a bot to its list exactly as Postgres does, over the
+        // same text the engine classifies.
+        let sql = crate::schema::catalog::<D>(documents, devices)
             .map_err(|err| SetupError::Catalog(err.to_string()))?;
-        // The cap names the registry tables connetto appends, so the catalog
-        // the model is built over must carry them, the way the cap's own
-        // generation does.
-        let schema_sql = connetto_schema::with_registry::<Id>(schema_sql);
-        let mut sql = String::with_capacity(schema_sql.len() + policy_sql.len() + cap.len() + 1);
-        sql.push_str(&schema_sql);
-        sql.push('\n');
-        sql.push_str(policy_sql);
-        if !cap.is_empty() {
-            // The cap is its own document of `;`-separated statements, so the
-            // document before it must end in a terminator before it begins.
-            if !sql.trim_end().ends_with(';') {
-                sql.push(';');
-            }
-            sql.push('\n');
-            sql.push_str(&cap);
-        }
         let catalog = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(&sql)
             .map_err(|err| SetupError::Catalog(err.to_string()))?;
-        refuse_role_scoped(&catalog)?;
-        let translator = rls2fga::translator::TranslatorBuilder::new()
+        let deployment = connetto_schema::deployment::<Key>(documents.reader_role())
+            .map_err(|err| SetupError::Catalog(err.to_string()))?;
+        let translator = rls2fga::translator::TranslatorBuilder::new(deployment)
             .with_min_confidence(rls2fga::types::ConfidenceLevel::B)
-            .with_session_attributes([
-                SessionAttribute::setting(user_setting, SessionAttributeKind::CallerId),
-                SessionAttribute::setting(Key::SETTING, SessionAttributeKind::SetAttribute),
-                SessionAttribute::setting(
-                    connetto_core::BOT_LIST_SETTING,
-                    SessionAttributeKind::SetAttribute,
-                ),
-            ])
             .build();
 
         let translation = translator
             .translate(&catalog)
             .map_err(|err| SetupError::Unplannable(err.to_string()))?;
+        warn_outside_policies(&catalog, documents.reader_role());
         let relations = translation.relations().to_vec();
         let naming = translation.row_naming().to_vec();
+        let resulting = translation.resulting_rows().to_vec();
         let notes = translation.notes().to_vec();
         let answers = translation.action_relations();
-        // Read beside the action report, never instead of it. A table the
-        // database filters nothing on is answered nowhere else when the model
-        // gives it no type, which is every table no policy reaches, and
-        // delegating a question the model defines no type for cannot succeed.
-        let open = translation.unrestricted_tables();
-
+        let policy_reads = translation.policy_reads().to_vec();
         // **`outputs()` alone is not step 6's refusal, and believing it was is
         // the defect this guard exists for.** It blocks only the `Unhandled`
         // severity. A policy the classifier read but graded below the caller's
@@ -731,16 +696,7 @@ impl Translated {
         let enumerations: Vec<Enumeration<'_>> = outputs
             .tuple_queries()
             .iter()
-            .filter_map(|q| {
-                q.description.as_ref().map(|d| Enumeration {
-                    description: d,
-                    sql: &q.sql,
-                    condition: q
-                        .condition
-                        .as_ref()
-                        .map(rls2fga::types::ConditionName::as_str),
-                })
-            })
+            .filter_map(Enumeration::of)
             .collect();
         // Walked here rather than where it is first read, so a model this
         // cannot follow refuses the boot beside every other startup refusal.
@@ -750,9 +706,9 @@ impl Translated {
         let shapes = Arc::new(
             Shapes::new::<Postgres>(catalog, &relations, &enumerations)
                 .with_row_naming(&naming)
+                .with_resulting_rows(&resulting)
                 .with_action_relations(answers)
-                .with_required_parameters(&notes)
-                .with_unrestricted_tables(open),
+                .with_required_parameters(&notes),
         );
         // Ask subql which shapes it cannot keep current, rather than guessing
         // from a derivation (R86). The guess was wrong in both directions: it
@@ -764,7 +720,11 @@ impl Translated {
             return Err(SetupError::Unwithdrawable(uncovered.join("; ")));
         }
 
-        let subjects = Arc::new(SubjectNaming::resolve::<Key>(&shapes, &relations));
+        let subjects = Arc::new(SubjectNaming::resolve::<Key>(
+            &shapes,
+            &relations,
+            documents.reader_role(),
+        ));
 
         Ok(Self {
             shapes,
@@ -774,7 +734,14 @@ impl Translated {
             tuples,
             policy_tables,
             reach,
+            policy_reads,
         })
+    }
+
+    /// The tables each policy reads, by the translation's own account.
+    #[must_use]
+    pub fn policy_reads(&self) -> &[rls2fga::types::PolicyReads] {
+        &self.policy_reads
     }
 
     /// The tables the policies read, for the publication check.
@@ -856,9 +823,7 @@ impl Translated {
         T::ResponseBody: ResponseBody<Data = Bytes> + Send + 'static,
         <T::ResponseBody as ResponseBody>::Error: Into<StdError> + Send,
     {
-        let wanted = serde_json::to_value(&self.model)
-            .and_then(serde_json::from_value::<ProtoModel>)
-            .map_err(|err| SetupError::Model(err.to_string()))?;
+        let wanted = self.described()?;
         let latest = client
             .read_authorization_models(ReadAuthorizationModelsRequest {
                 store_id: store_id.to_owned(),
@@ -868,16 +833,24 @@ impl Translated {
             .await
             .map_err(|status| SetupError::Model(status.message().to_owned()))?
             .into_inner();
-        if let Some(held) = latest.authorization_models.first()
+        if let Some(held) = latest.authorization_models.into_iter().next()
             && held.type_definitions == wanted.type_definitions
             && held.conditions == wanted.conditions
             && held.schema_version == wanted.schema_version
         {
-            return Ok(ModelState::Adopted(held.id.clone()));
+            return Ok(ModelState::Adopted(held));
         }
-        rls2fga::client::write_authorization_model(client, store_id, &self.model)
+        let id = rls2fga::client::write_authorization_model(client, store_id, &self.model)
             .await
-            .map(ModelState::Written)
+            .map_err(|err| SetupError::Model(err.to_string()))?;
+        Ok(ModelState::Written(ProtoModel { id, ..wanted }))
+    }
+
+    /// The rule description in the service's own form, before the service
+    /// has given it an id.
+    fn described(&self) -> Result<ProtoModel, SetupError> {
+        serde_json::to_value(&self.model)
+            .and_then(serde_json::from_value::<ProtoModel>)
             .map_err(|err| SetupError::Model(err.to_string()))
     }
 
@@ -1142,21 +1115,27 @@ impl TupleRows {
 /// the facts behind it are already loaded, so a restart costs one lookup
 /// whatever the data volume, and a new one means the store has nothing for it
 /// yet.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ModelState {
-    /// The service already held this exact description, under this id.
-    Adopted(String),
+    /// The service already held this exact description, as this model.
+    Adopted(ProtoModel),
     /// The description was written now, so the facts have to follow.
-    Written(String),
+    Written(ProtoModel),
 }
 
 impl ModelState {
+    /// The installed model, its id the one every question is asked against.
+    #[must_use]
+    pub const fn model(&self) -> &ProtoModel {
+        match self {
+            Self::Adopted(model) | Self::Written(model) => model,
+        }
+    }
+
     /// The id every question is asked against.
     #[must_use]
     pub fn id(&self) -> &str {
-        match self {
-            Self::Adopted(id) | Self::Written(id) => id,
-        }
+        &self.model().id
     }
 }
 
@@ -1219,43 +1198,33 @@ fn warn_operator_notes(notes: &[TranslationNote]) {
     }
 }
 
-/// Refuse the first policy whose `TO` clause names a role other than
-/// `PUBLIC`, naming the policy, its table and the roles as written.
+/// Warn of every policy the reader role is not subject to, naming the policy
+/// and its table.
 ///
-/// Every caller runs as the reader role, so neither the model nor the
-/// replica can tell which callers such a policy serves. `CURRENT_USER`,
-/// `CURRENT_ROLE` and `SESSION_USER` count as named, since each resolves to
-/// a role at run time.
-///
-/// # Errors
-///
-/// [`SetupError::RoleScopedPolicy`] for the first such policy in document
-/// order.
-fn refuse_role_scoped(catalog: &ParserDB) -> Result<(), SetupError> {
-    use sql_traits::prelude::DatabaseLike as _;
-    use sqlparser::ast::Owner;
+/// Every caller acts as the reader role, so such a policy, one for an
+/// administration tool that logs in outside connetto for instance, serves
+/// none of connetto's callers, and both the model and the replica leave it
+/// out. Whether the role is subject to it is sql-traits' answer, the one
+/// both translations settle the `TO` clause with.
+fn warn_outside_policies(catalog: &ParserDB, reader_role: &str) {
+    use sql_traits::prelude::{DatabaseLike as _, PolicyLike as _};
 
-    let is_public = |owner: &Owner| {
-        matches!(owner, Owner::Ident(ident)
-            if ident.quote_style.is_none() && ident.value.eq_ignore_ascii_case("public"))
+    let Some(reader) = catalog.role(reader_role) else {
+        return;
     };
-    for policy in catalog.policies() {
-        let Some(roles) = &policy.to else { continue };
-        if roles.iter().all(is_public) {
-            continue;
-        }
-        return Err(SetupError::RoleScopedPolicy {
-            policy: policy.name.value.clone(),
-            table: policy.table_name.to_string(),
-            roles: roles
-                .iter()
-                .filter(|owner| !is_public(owner))
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", "),
-        });
+    for policy in catalog
+        .policies()
+        .filter(|policy| !policy.applies_to_role(reader, catalog))
+    {
+        tracing::warn!(
+            subject = %policy.name(),
+            table = %policy.table_name,
+            "policy {} on table {} applies to no role connetto acts as, so it serves none of \
+             connetto's callers and the model and the replica leave it out",
+            policy.name(),
+            policy.table_name,
+        );
     }
-    Ok(())
 }
 
 /// Every table a policy expression reads, deduplicated and sorted.
@@ -1950,8 +1919,9 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
         use subql::backend::CdcEvent as _;
 
         let catalog = self.shapes.catalog();
-        let arrived_on = subql::catalog_helpers::table_name(catalog, event.table_id(catalog))
-            .unwrap_or_default();
+        let arrived_on =
+            subql::catalog_helpers::table_name::<Postgres, _>(catalog, event.table_id(catalog))
+                .unwrap_or_default();
         let records = || diff.added.iter().chain(diff.removed.iter());
         let mut granted: BTreeMap<String, String> = replayed.clone();
         note_named_keys(&self.naming, records(), &mut granted);
@@ -1994,10 +1964,9 @@ mod tests {
 
     use super::{
         BTreeMap, Body, FactSource, FgaAuth, GrantHolder, GrantMove, GrpcService, ModelSubject,
-        OpenFgaError, OpenFgaPolicy, OpenFgaServiceClient, ParserDB, Principal, Reconciled,
-        SubjectNaming, Translated, UpkeepError, VisibilityPolicy, WithdrawnFact,
+        OpenFgaError, OpenFgaPolicy, OpenFgaServiceClient, ParserDB, Principal, ProtoModel,
+        Reconciled, SubjectNaming, Translated, UpkeepError, VisibilityPolicy, WithdrawnFact,
     };
-    use connetto_core::auth::DEFAULT_USER_SETTING;
 
     /// The shape every connetto table carries: one permissive policy whose
     /// `USING` is the caller's identity or the keys the caller holds.
@@ -2031,10 +2000,14 @@ mod tests {
     ";
 
     fn translated(policies: &str) -> Translated {
-        Translated::of::<String, connetto_core::bots::TextIds>(
-            SCHEMA,
-            policies,
-            DEFAULT_USER_SETTING,
+        Translated::of::<String, crate::defaults::ConnettoDefaults>(
+            connetto_schema::Documents::new(
+                SCHEMA,
+                policies,
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
+            ),
+            true,
         )
         .expect("every policy here is one rls2fga classifies")
     }
@@ -2184,9 +2157,20 @@ mod tests {
         ModelSubject<String, String>,
         Postgres,
     > {
-        let (shapes, _translator, _reach) = translated(OWN_SHAPE).into_parts();
-        OpenFgaPolicy::new(shapes, OpenFgaServiceClient::new(Never), "store")
+        let translated = translated(OWN_SHAPE);
+        let model = installed(&translated);
+        let (shapes, _translator, _reach) = translated.into_parts();
+        OpenFgaPolicy::new(shapes, OpenFgaServiceClient::new(Never), "store", &model)
             .expect("the index is usable")
+    }
+
+    /// The translation's description as the service would hold it, under a
+    /// made-up id.
+    fn installed(translated: &Translated) -> ProtoModel {
+        ProtoModel {
+            id: "model".to_owned(),
+            ..translated.described().expect("the description converts")
+        }
     }
 
     /// A row named by the engine's table order, the registry tables included, must be
@@ -2200,7 +2184,10 @@ mod tests {
         let naming = translated.naming();
         let (shapes, _translator, _reach) = translated.into_parts();
         let auth: FgaAuth<String, String, Never> = FgaAuth::new(shapes, delegate_never(), naming);
-        let engine = connetto_schema::with_registry::<connetto_core::bots::TextIds>(SCHEMA);
+        // The naming the row is judged against was built through `of`, which
+        // appends the bookkeeping tables, so the engine catalog must carry
+        // them too or its table numbering will not line up with the naming.
+        let engine = crate::schema::engine_ddl::<crate::defaults::ConnettoDefaults>(SCHEMA, true);
         let session = subql::ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(&engine)
             .expect("the engine catalog parses");
         let notes = catalog_helpers::table_id::<Postgres, _>(&session, "notes")
@@ -2261,10 +2248,14 @@ mod tests {
     /// or name is what keeps this asserting about the tuples a deployment
     /// really writes.
     fn share_records(viewer: &'static str) -> (Arc<SubjectNaming>, Vec<Record>) {
-        let translated = Translated::of::<String, connetto_core::bots::TextIds>(
-            SHARE_SCHEMA,
-            SHARE_POLICY,
-            DEFAULT_USER_SETTING,
+        let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
+            connetto_schema::Documents::new(
+                SHARE_SCHEMA,
+                SHARE_POLICY,
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
+            ),
+            true,
         )
         .expect("the share shape settles from one row");
         let naming = translated.naming();
@@ -2523,10 +2514,14 @@ mod tests {
     /// none.
     #[test]
     fn a_table_with_no_policy_at_all_grants_everybody_without_a_round_trip() {
-        let shapes = Translated::of::<String, connetto_core::bots::TextIds>(
-            "CREATE TABLE orders (id INT PRIMARY KEY, quantity BIGINT NOT NULL);",
-            "",
-            DEFAULT_USER_SETTING,
+        let shapes = Translated::of::<String, crate::defaults::ConnettoDefaults>(
+            connetto_schema::Documents::new(
+                "CREATE TABLE orders (id INT PRIMARY KEY, quantity BIGINT NOT NULL);",
+                "",
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
+            ),
+            true,
         )
         .expect("a schema with no policy has nothing to refuse")
         .shapes();
@@ -2540,18 +2535,76 @@ mod tests {
     }
 
     /// Step 6's refusal, which is absolute rather than degrading per table.
+    /// The function exists, so PostgreSQL accepts the policy, but its
+    /// PL/pgSQL body is opaque to rls2fga.
     #[test]
     fn a_policy_with_no_translation_refuses_startup() {
-        let refused = Translated::of::<String, connetto_core::bots::TextIds>(
-            SCHEMA,
-            "CREATE POLICY notes_p ON notes FOR ALL USING (mystery_function(owner))",
-            DEFAULT_USER_SETTING,
+        let refused = Translated::of::<String, crate::defaults::ConnettoDefaults>(
+            connetto_schema::Documents::new(
+                SCHEMA,
+                "CREATE FUNCTION mystery_function(who TEXT) RETURNS BOOLEAN LANGUAGE plpgsql \
+                 AS $$ BEGIN RETURN who IS NOT NULL; END $$; \
+                 CREATE POLICY notes_p ON notes FOR ALL USING (mystery_function(owner))",
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
+            ),
+            true,
         );
         assert!(
             matches!(refused, Err(super::SetupError::Untranslated(_))),
             "an expression rls2fga cannot read must stop the server rather than \
              quietly narrow what the change path delivers"
         );
+    }
+
+    /// A roles document that never creates the reader role the deployment
+    /// names refuses startup, naming the role, since the model would
+    /// otherwise describe requests no declared role runs.
+    #[test]
+    fn a_reader_role_the_roles_document_never_creates_refuses_startup() {
+        let refused = Translated::of::<String, crate::defaults::ConnettoDefaults>(
+            connetto_schema::Documents::new(
+                "CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT);",
+                "",
+                "CREATE ROLE someone_else LOGIN;",
+                "app_reader",
+            ),
+            true,
+        )
+        .err()
+        .expect("an undeclared reader role refuses");
+        assert!(
+            refused.to_string().contains("app_reader"),
+            "the refusal names the role: {refused}"
+        );
+    }
+
+    /// A share key bound to the identity's own setting refuses startup, in the
+    /// model's translation and in the reverse translation of client queries.
+    #[test]
+    fn a_share_key_on_the_identity_setting_refuses_startup() {
+        #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+        struct OnIdentity(String);
+        impl core::fmt::Display for OnIdentity {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+        impl connetto_core::auth::CapabilityKey for OnIdentity {
+            const SETTING: &'static str = connetto_core::auth::DEFAULT_USER_SETTING;
+        }
+
+        let refused = Translated::of::<OnIdentity, crate::defaults::ConnettoDefaults>(
+            connetto_schema::Documents::new(
+                "CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT);",
+                "",
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
+            ),
+            true,
+        );
+        assert!(matches!(refused, Err(super::SetupError::Catalog(_))));
+        assert!(crate::CallerMappings::of::<OnIdentity>("app_reader").is_err());
     }
 
     /// A share written as a row of a join table, whose facts travel as a query
@@ -2591,10 +2644,14 @@ mod tests {
     /// phase along with the replay coverage its D4 deleted.
     #[test]
     fn a_share_written_as_a_join_table_row_boots_since_the_upstream_repair() {
-        let translated = Translated::of::<String, connetto_core::bots::TextIds>(
-            SHARE_SCHEMA,
-            SHARE_POLICY,
-            DEFAULT_USER_SETTING,
+        let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
+            connetto_schema::Documents::new(
+                SHARE_SCHEMA,
+                SHARE_POLICY,
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
+            ),
+            true,
         );
         assert!(
             translated.is_ok(),
@@ -2624,12 +2681,17 @@ mod tests {
         const POLICY: &str = "CREATE POLICY papers_p ON papers FOR SELECT USING (\
             current_setting('app.user_id', true) = ANY(viewers))";
 
-        let Err(super::SetupError::Unwithdrawable(named)) = Translated::of::<
-            String,
-            connetto_core::bots::TextIds,
-        >(
-            SCHEMA, POLICY, DEFAULT_USER_SETTING
-        ) else {
+        let Err(super::SetupError::Unwithdrawable(named)) =
+            Translated::of::<String, crate::defaults::ConnettoDefaults>(
+                connetto_schema::Documents::new(
+                    SCHEMA,
+                    POLICY,
+                    connetto_test_harness::FIXTURE_ROLES,
+                    connetto_test_harness::FIXTURE_READER,
+                ),
+                true,
+            )
+        else {
             panic!(
                 "nothing can withdraw this grant, so it must stop the server rather than \
                  serve access the database has taken away"
@@ -2666,10 +2728,14 @@ mod tests {
               AND s.viewer = current_setting('app.user_id', true) \
               AND s.weight > (SELECT avg(weight) FROM paper_shares)))";
 
-        let translated = Translated::of::<String, connetto_core::bots::TextIds>(
-            SCHEMA,
-            POLICY,
-            DEFAULT_USER_SETTING,
+        let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
+            connetto_schema::Documents::new(
+                SCHEMA,
+                POLICY,
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
+            ),
+            true,
         );
         assert!(
             translated.is_ok(),
@@ -2695,10 +2761,14 @@ mod tests {
             EXISTS (SELECT 1 FROM item_share s WHERE s.item_id = item.id \
               AND s.viewer = current_setting('app.user_id', true) \
               AND s.weight > (SELECT avg(weight) FROM item_share)))";
-        let translated = Translated::of::<String, connetto_core::bots::TextIds>(
-            SCHEMA,
-            POLICY,
-            DEFAULT_USER_SETTING,
+        let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
+            connetto_schema::Documents::new(
+                SCHEMA,
+                POLICY,
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
+            ),
+            true,
         )
         .expect("translates");
         let mats = translated.shapes.materialisations();
@@ -2741,12 +2811,17 @@ mod tests {
         const POLICY: &str = "CREATE POLICY p ON \"user\" FOR SELECT USING (\
             owner = current_setting('app.user_id', true))";
 
-        let Err(super::SetupError::Unplannable(detail)) = Translated::of::<
-            String,
-            connetto_core::bots::TextIds,
-        >(
-            SCHEMA, POLICY, DEFAULT_USER_SETTING
-        ) else {
+        let Err(super::SetupError::Unplannable(detail)) =
+            Translated::of::<String, crate::defaults::ConnettoDefaults>(
+                connetto_schema::Documents::new(
+                    SCHEMA,
+                    POLICY,
+                    connetto_test_harness::FIXTURE_ROLES,
+                    connetto_test_harness::FIXTURE_READER,
+                ),
+                true,
+            )
+        else {
             panic!("two things under one type name must stop the boot");
         };
         assert!(
@@ -2779,19 +2854,25 @@ mod tests {
             CREATE POLICY journal_p ON journal FOR SELECT USING (\
             author = current_setting('app.user_id', true))";
 
-        let translated = Translated::of::<String, connetto_core::bots::TextIds>(
-            SCHEMA,
-            POLICIES,
-            DEFAULT_USER_SETTING,
+        let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
+            connetto_schema::Documents::new(
+                SCHEMA,
+                POLICIES,
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
+            ),
+            true,
         )
         .expect("both policies are one rls2fga classifies");
         let naming = translated.naming();
+        let model = installed(&translated);
         let (shapes, translator, reach) = translated.into_parts();
         let delegate: OpenFgaPolicy<ParserDB, Never, ModelSubject<String, String>, Postgres> =
             OpenFgaPolicy::new(
                 Arc::clone(&shapes),
                 OpenFgaServiceClient::new(Never),
                 "store",
+                &model,
             )
             .expect("the index is usable");
         let auth: FgaAuth<String, String, Never> = FgaAuth::new(shapes, delegate, naming);

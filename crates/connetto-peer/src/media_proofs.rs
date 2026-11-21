@@ -1,10 +1,11 @@
-//! The media frames on the link, at peer protocol version 3 (R79 slice 2).
+//! The media frames on the link, at peer protocol version 3 (R79 slices 2
+//! and 9).
 
 use std::time::Duration;
 
 use connetto_core::device_cert::{AttestationLevel, DeviceIdentity};
 use connetto_exchange::MAX_MANIFEST_ROWS;
-use connetto_exchange::media::{MAX_PIECE_BYTES, Media};
+use connetto_exchange::media::{MAX_OWNER_BYTES, MAX_PIECE_BYTES, MAX_REPORT_ENTRIES, Media};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
@@ -13,8 +14,8 @@ use crate::test_support::{DAY, Deployment, events, node, serve, whole_second};
 use crate::tests::{await_event, linked_event, next_events, raw_linked};
 use crate::{CloseReason, Node, PeerEvent, PeerSendError};
 
-/// One message of each kind, every reply quoting `request_id`.
-fn media_messages(request_id: u64) -> [Media; 6] {
+/// One message of each kind, every request and reply quoting `request_id`.
+fn media_messages(request_id: u64) -> [Media; 9] {
     [
         Media::Want {
             request_id,
@@ -24,6 +25,7 @@ fn media_messages(request_id: u64) -> [Media; 6] {
             request_id,
             chunks: vec![([2; 32], 6_291_456), ([3; 32], 17)],
             last: true,
+            owner: Some("anna".to_owned()),
         },
         Media::Fetch {
             request_id,
@@ -38,6 +40,29 @@ fn media_messages(request_id: u64) -> [Media; 6] {
         },
         Media::Refused { request_id },
         Media::Busy { request_id },
+        Media::Holdings {
+            room: 1 << 30,
+            rates: vec![([4; 32], 2_000_000)],
+            held: vec![[5; 32], [6; 32]],
+            leaving: vec![[6; 32]],
+            number: 0,
+            seen: None,
+            last: true,
+        },
+        Media::Held {
+            added: vec![[7; 32]],
+            removed: vec![[5; 32]],
+            staying: vec![[6; 32]],
+            leaving: vec![],
+            number: 1,
+            seen: Some(0),
+        },
+        Media::Room {
+            room: 0,
+            rates: vec![([4; 32], 1_500_000)],
+            number: 2,
+            seen: Some(1),
+        },
     ]
 }
 
@@ -60,17 +85,36 @@ async fn every_media_message_round_trips_its_encoding() {
 }
 
 #[tokio::test]
-async fn a_manifest_at_the_row_bound_and_a_whole_piece_encode_under_the_ceiling() {
+async fn every_media_message_at_its_bounds_encodes_under_the_ceiling() {
+    let entries = vec![[0xff; 32]; MAX_REPORT_ENTRIES];
     let frames = [
         PeerFrame::Media(Media::Manifest {
             request_id: 1,
             chunks: vec![([0xff; 32], u64::MAX); MAX_MANIFEST_ROWS],
             last: true,
+            owner: Some("\u{10ffff}".repeat(MAX_OWNER_BYTES / 4)),
         }),
         PeerFrame::Media(Media::Piece {
             request_id: 2,
             encoded: vec![0xff; MAX_PIECE_BYTES],
             last: true,
+        }),
+        PeerFrame::Media(Media::Holdings {
+            room: u64::MAX,
+            rates: vec![([0xff; 32], u64::MAX); MAX_REPORT_ENTRIES],
+            held: entries.clone(),
+            leaving: entries.clone(),
+            number: u64::MAX,
+            seen: Some(u64::MAX),
+            last: true,
+        }),
+        PeerFrame::Media(Media::Held {
+            added: entries.clone(),
+            removed: entries.clone(),
+            staying: vec![[0xfe; 32]; MAX_REPORT_ENTRIES],
+            leaving: entries,
+            number: u64::MAX,
+            seen: Some(u64::MAX),
         }),
     ];
     for frame in frames {
@@ -86,6 +130,15 @@ async fn a_manifest_at_the_row_bound_and_a_whole_piece_encode_under_the_ceiling(
     }
 }
 
+/// The number of `node`'s live link to `peer`.
+fn link_to(node: &Node, peer: &DeviceIdentity) -> u64 {
+    node.linked()
+        .into_iter()
+        .find(|link| &link.peer == peer)
+        .and_then(|link| link.link)
+        .expect("the peer is linked")
+}
+
 /// Send `messages` from `sender` to `to` and see each reach `rx` in send
 /// order, naming `from`.
 async fn media_reaches_in_order(
@@ -93,11 +146,12 @@ async fn media_reaches_in_order(
     from: &DeviceIdentity,
     to: &DeviceIdentity,
     rx: &mut mpsc::UnboundedReceiver<PeerEvent>,
-    messages: [Media; 6],
+    messages: [Media; 9],
 ) {
+    let link = link_to(sender, to);
     for message in &messages {
         sender
-            .send_media(to, message.clone())
+            .send_media(to, link, message.clone())
             .await
             .expect("the queue takes it");
     }
@@ -110,6 +164,7 @@ async fn media_reaches_in_order(
             event,
             PeerEvent::Media {
                 peer: from.clone(),
+                link: 0,
                 message
             }
         );
@@ -157,6 +212,12 @@ async fn linked_nodes_deliver_each_media_message_in_order_naming_the_sender() {
         media_messages(7),
     )
     .await;
+    let stale = link_to(&a, &bob.identity) + 1;
+    let err = a
+        .send_media(&bob.identity, stale, media_messages(9)[0].clone())
+        .await
+        .expect_err("a send naming another link is refused");
+    assert!(matches!(err, PeerSendError::Unlinked { .. }));
     media_reaches_in_order(
         &b,
         &bob.identity,
@@ -187,7 +248,7 @@ async fn a_media_send_to_an_unlinked_peer_hands_the_message_back() {
     let a = node(deployment.root_der(), a_tx);
     let message = media_messages(1)[0].clone();
     let err = a
-        .send_media(&bob.identity, message.clone())
+        .send_media(&bob.identity, 1, message.clone())
         .await
         .expect_err("no link stands");
     assert!(
@@ -228,7 +289,7 @@ async fn a_media_message_over_the_bounds_is_refused_both_ways() {
     };
 
     let err = host_node
-        .send_media(&over.identity, piece.clone())
+        .send_media(&over.identity, 1, piece.clone())
         .await
         .expect_err("the bound holds");
     assert!(matches!(err, PeerSendError::FrameAboveBounds { .. }));

@@ -14,6 +14,7 @@ fn payload_for(verb: Verb, ceiling: u64, expiry_offset_secs: i64) -> TicketPaylo
         ceiling,
         expiry: chrono::Utc::now().timestamp() + expiry_offset_secs,
         caller: crate::fixture::identified("alice"),
+        carry: None,
     }
 }
 
@@ -179,6 +180,7 @@ async fn content_signer_read_ticket_verifies() {
         &crate::fixture::identified("bob"),
         file_id,
         ContentVerb::Read,
+        None,
     )
     .await
     .expect("mint must succeed");
@@ -221,6 +223,7 @@ async fn content_signer_read_ceiling_is_configured_value() {
         &crate::fixture::identified("eve"),
         [2u8; 32],
         ContentVerb::Read,
+        None,
     )
     .await
     .expect("mint must succeed");
@@ -249,6 +252,7 @@ async fn content_signer_write_ticket_verifies() {
         &crate::fixture::identified("carol"),
         file_id,
         ContentVerb::Write { declared_len },
+        None,
     )
     .await
     .expect("mint must succeed");
@@ -276,6 +280,7 @@ async fn content_signer_read_token_refused_as_write() {
         &crate::fixture::identified("dave"),
         file_id,
         ContentVerb::Read,
+        None,
     )
     .await
     .expect("mint must succeed");
@@ -356,6 +361,7 @@ async fn a_trailing_slash_in_the_base_mints_a_single_slashed_url() {
         &crate::fixture::identified("alice"),
         [7u8; 32],
         ContentVerb::Read,
+        None,
     )
     .await
     .expect("minting against the trimmed base must work");
@@ -440,6 +446,7 @@ async fn https_base_accepted_and_preserved_in_grant() {
         &crate::fixture::identified("alice"),
         [1u8; 32],
         connetto_core::messages::ContentVerb::Read,
+        None,
     )
     .await
     .expect("mint must succeed");

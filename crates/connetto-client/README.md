@@ -11,6 +11,6 @@ The server produces patches with `sqlite-diff-rs`, whose output is the native SQ
 
 `NativeClientBuilder` connects a server URL and its `SyncSchema` anonymously or using a held credential. It is provided by the default `native-transport` feature. `ConnettoClient` provides a shared handle and typed live Diesel queries through `watch` while a background pump drives synchronization.
 
-Optional features add `native-auth` for OAuth sign-in and OS keyring custody, `device-identity` for a device key, `peer` for a server-independent device link, `bot` for a registration signature, and `postgres-types` for aggregate decode of `Uuid` and `Timestamptz`.
+Optional features add `native-auth` for OAuth sign-in and OS keyring custody, `device-identity` for a device key, `peer` for a server-independent device link, and `bot` for a registration signature.
 
 The crate is version `0.0.0` and unpublished, so the hosted API documentation and package badges resolve after the first release.

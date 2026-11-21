@@ -9,6 +9,7 @@ pub mod aggregate;
 pub mod bulk;
 pub mod content;
 pub mod control;
+pub mod courier;
 pub mod enrolment;
 pub mod error;
 pub mod flow;
@@ -20,13 +21,18 @@ pub mod registration;
 pub mod share_keys;
 pub mod storage;
 pub mod subscription;
+pub mod unsynced;
 pub mod writer;
 
 pub use crate::exchange::Verdict;
-pub use aggregate::AggregateUpdate;
-pub use bulk::{BulkMessage, LivePatch, MutationPatch, SnapshotPatch};
+pub use aggregate::{AggregateChange, AggregateColumns, AggregateUpdate, ColumnType};
+pub use bulk::{BulkMessage, CourierBody, LivePatch, MutationPatch, SnapshotPatch};
 pub use content::{ContentTicketGrant, ContentTicketRequest, ContentVerb};
 pub use control::{ControlMessage, GateState, PauseCause, SyncStatus, TabIdentity};
+pub use courier::{
+    CourierAnswer, CourierAuditAnswer, CourierAuditCancel, CourierAuditOutcome,
+    CourierAuditRequest, CourierNotice, CourierNoticeAck, CourierNoticeRow, CourierRange,
+};
 pub use enrolment::{
     DeviceAttestation, DeviceRevokedAck, DeviceSummary, DevicesList, DevicesRequest,
     EnrolChallenge, EnrolChallengeRequest, EnrolGrant, EnrolRefusal, EnrolRefused, EnrolRequest,
@@ -34,7 +40,7 @@ pub use enrolment::{
 };
 pub use error::{
     CONTENT_TICKET_REFUSED, CONTENT_TICKET_SIGNER_ERROR, FatalError, FatalErrorReason,
-    NonFatalError, RateLimited, SUBSCRIPTION_REFUSED,
+    NonFatalError, RateLimited, SUBSCRIPTION_REFUSED, SUBSCRIPTION_REFUSED_SCHEMA,
 };
 pub use flow::{AckCredits, Ping, Pong};
 pub use handshake::{Grant, Handshake, HandshakeAck};
@@ -56,8 +62,12 @@ pub use storage::{
     SharedStoreUse, StorageUse, StoreBytes, TabStorageAnswer, TabStorageOutcome, TabStorageUse,
 };
 pub use subscription::{
-    BindValue, MembershipOpened, SnapshotBegin, SnapshotEnd, Subscribe, SubscriptionPriority,
-    SubscriptionSpec, Unsubscribe,
+    MembershipOpened, SnapshotBegin, SnapshotEnd, SqliteValue, Subscribe, SubscriptionSpec,
+    Unsubscribe,
+};
+pub use unsynced::{
+    FileState, KeyValue, RowOp, TabDismissAnswer, TabDismissOutcome, TabDismissRefusal,
+    TrackedWrite, UnsyncedFile, UnsyncedWork, UnsyncedWrite, WriteState, WrittenRow,
 };
 pub use writer::{
     BindDevice, Provenance, RetireWriter, WRITER_BIND_DOMAIN, WriterAnswer, WriterGrant,

@@ -23,8 +23,13 @@ const DEPLOYMENT_SQL: &str = include_str!("../../connetto-file-server/sql/schema
 pub struct Deployment {
     /// The Postgres schema, also served as `CONNETTO_PG_DDL`.
     pub schema: &'static str,
-    /// The non-owner reader role and its grants.
+    /// The roles document, creating the reader role and granting it the
+    /// synced tables, also served as `CONNETTO_PG_ROLES`.
     pub roles: &'static str,
+    /// The role `roles` creates, served as `CONNETTO_READER_ROLE`.
+    pub reader_role: &'static str,
+    /// The reader role's grants on connetto's bookkeeping tables.
+    pub bookkeeping: &'static str,
     /// The content columns and triggers the file server reads.
     pub content: &'static str,
     /// The row policies, also served as `CONNETTO_PG_POLICIES`.
@@ -35,6 +40,9 @@ pub struct Deployment {
     pub published: &'static [&'static str],
     /// The tables clients may write, as `CONNETTO_WRITABLE` lists them.
     pub writable: &'static str,
+    /// Whether the schema holds the `users` table the demo server registers
+    /// each account in at sign-in, served as `CONNETTO_USERS=database`.
+    pub users: bool,
 }
 
 /// The demo deployment in `examples/deployment`, which the demo stacks serve
@@ -42,6 +50,8 @@ pub struct Deployment {
 pub const DEMO_DEPLOYMENT: Deployment = Deployment {
     schema: include_str!("../../../examples/deployment/schema.sql"),
     roles: include_str!("../../../examples/deployment/roles.sql"),
+    reader_role: "connetto_reader",
+    bookkeeping: include_str!("../../../examples/deployment/bookkeeping.sql"),
     content: include_str!("../../../examples/deployment/content.sql"),
     policies: include_str!("../../../examples/deployment/policies.sql"),
     seed: include_str!("../../../examples/deployment/seed.sql"),
@@ -50,10 +60,13 @@ pub const DEMO_DEPLOYMENT: Deployment = Deployment {
         "order_lines",
         "photos",
         "products",
+        "teams",
         "team_members",
         "team_notes",
+        "users",
     ],
     writable: "orders,photos,team_notes",
+    users: true,
 };
 
 /// A temporary directory removed on drop.
@@ -136,7 +149,8 @@ pub async fn provision(
     fixture.setup(&[DEPLOYMENT_SQL]).await;
     fixture.setup(&[connetto_server::epoch::EPOCH_DDL]).await;
     provision_auth_tables(&fixture).await;
-    fixture.setup(&[deployment.roles]).await;
+    fixture.setup_roles(deployment.roles).await;
+    fixture.setup(&[deployment.bookkeeping]).await;
     fixture.setup(&[deployment.content]).await;
     fixture.setup(&[deployment.policies]).await;
     // The server's startup check requires the cap on every synced table.
@@ -157,7 +171,7 @@ pub async fn provision(
 }
 
 impl Provisioned {
-    /// The environment `connetto-server` runs this deployment with, serving
+    /// The environment `demo-server` runs this deployment with, serving
     /// sync, login and file routes on `bind`.
     pub fn server_env(
         &self,
@@ -170,7 +184,7 @@ impl Provisioned {
             ("DATABASE_URL", admin.to_owned()),
             (
                 "CONNETTO_READER_URL",
-                with_user(admin, "connetto_reader", "connetto_reader"),
+                with_user(admin, deployment.reader_role, deployment.reader_role),
             ),
             ("CONNETTO_BIND", bind.to_owned()),
             ("CONNETTO_AUTH", "database".to_owned()),
@@ -186,6 +200,8 @@ impl Provisioned {
             ),
             ("CONNETTO_PG_DDL", deployment.schema.to_owned()),
             ("CONNETTO_PG_POLICIES", deployment.policies.to_owned()),
+            ("CONNETTO_PG_ROLES", deployment.roles.to_owned()),
+            ("CONNETTO_READER_ROLE", deployment.reader_role.to_owned()),
             ("CONNETTO_SLOT", SLOT.to_owned()),
             ("CONNETTO_PUBLICATION", PUBLICATION.to_owned()),
             ("CONNETTO_FGA_URL", self.fga_url.clone()),
@@ -199,8 +215,12 @@ impl Provisioned {
                 self.keys.public.display().to_string(),
             ),
         ];
+        let users = deployment
+            .users
+            .then(|| ("CONNETTO_USERS", "database".to_owned()));
         pairs
             .into_iter()
+            .chain(users)
             .map(|(key, value)| (key.to_owned(), value))
             .collect()
     }
@@ -230,12 +250,15 @@ pub async fn provision_auth_tables(fixture: &Fixture) {
 }
 
 /// The default deployment's enrolment tables, whose descriptor is `()` and so
-/// has no columns of its own (R74).
+/// has no columns of its own (R74). The statements are idempotent, since
+/// `start_replication_on` already creates the base table before the demo
+/// stack provisions the rest.
 pub const ENROLMENT_DDL: [&str; 3] = [
-    "CREATE TABLE connetto_device_enrolments (\
+    "CREATE TABLE IF NOT EXISTS connetto_device_enrolments (\
      key_id BYTEA PRIMARY KEY, user_id TEXT NOT NULL, session_id UUID NOT NULL, \
      enrolled_at TIMESTAMPTZ NOT NULL, last_seen TIMESTAMPTZ NOT NULL, \
-     revoked_at TIMESTAMPTZ, public_key BYTEA NOT NULL, attestation TEXT NOT NULL)",
+     revoked_at TIMESTAMPTZ, public_key BYTEA NOT NULL, attestation TEXT NOT NULL, \
+     bot_list TEXT)",
     "CREATE TABLE connetto_device_certificates (\
      serial BYTEA PRIMARY KEY, \
      key_id BYTEA NOT NULL REFERENCES connetto_device_enrolments (key_id), \
@@ -264,15 +287,27 @@ pub struct DemoDeviceCa {
 /// stack sets.
 pub const DEMO_DEVICE_ROOT_VAR: &str = "CONNETTO_DEMO_BUILD_DEVICE_ROOT";
 
-/// The demo's build features for a mobile target, with its device identity
-/// and the peer link and hotspot it carries when the stack named a
+/// The dioxus demo's build features for a mobile target, with its device
+/// identity and the peer link and hotspot it carries when the stack named a
 /// deployment root.
 #[must_use]
-pub fn demo_mobile_features() -> &'static str {
+pub fn dioxus_mobile_features() -> &'static str {
     if std::env::var_os(DEMO_DEVICE_ROOT_VAR).is_some() {
         "mobile,device-identity,peer"
     } else {
         "mobile"
+    }
+}
+
+/// The Tauri demo's build features for a mobile target, its device identity
+/// and the peer link and hotspot it carries when the stack named a
+/// deployment root, and nothing when it did not.
+#[must_use]
+pub fn tauri_mobile_features() -> &'static str {
+    if std::env::var_os(DEMO_DEVICE_ROOT_VAR).is_some() {
+        "device-identity,peer"
+    } else {
+        ""
     }
 }
 
@@ -396,7 +431,7 @@ impl Drop for TaskGuard {
     }
 }
 
-/// Spawn `connetto-server` with `envs` and wait until its listener accepts.
+/// Spawn `demo-server` with `envs` and wait until its listener accepts.
 /// Dropping the returned child, or any error on the way, kills the server.
 ///
 /// # Errors
@@ -414,12 +449,12 @@ pub async fn spawn_server(
         .stderr(Stdio::inherit())
         .kill_on_drop(true)
         .spawn()
-        .context("spawning connetto-server")?;
-    wait_for_child_port(&mut child, bind, "connetto-server").await?;
+        .context("spawning demo-server")?;
+    wait_for_child_port(&mut child, bind, "demo-server").await?;
     Ok(child)
 }
 
-/// Build `connetto-server` in the [`test_profile`] unless `CONNETTO_SERVER_BIN`
+/// Build `demo-server` in the [`test_profile`] unless `CONNETTO_SERVER_BIN`
 /// names one, and return its path.
 ///
 /// # Errors
@@ -436,7 +471,7 @@ pub async fn ensure_server_bin() -> Result<PathBuf> {
     let profile = test_profile();
     // Cargo writes the dev profile to target/debug and every other profile under its own name.
     let output = if profile == "dev" { "debug" } else { &profile };
-    let candidate = target_dir()?.join(output).join(exe_name("connetto-server"));
+    let candidate = target_dir()?.join(output).join(exe_name("demo-server"));
     // The build runs even when the binary exists. A cached tree can hold a
     // server from another commit, and cargo's fingerprinting makes the warm
     // case a no-op while a stale exists() shortcut cannot.
@@ -445,17 +480,16 @@ pub async fn ensure_server_bin() -> Result<PathBuf> {
         "build",
         "--profile",
         &profile,
-        "--all-features",
         "-p",
-        "connetto-server",
+        "connetto-demo-tools",
         "--bin",
-        "connetto-server",
+        "demo-server",
     ]);
     run_process(OsStr::new("cargo"), &args, &[]).await?;
     if candidate.exists() {
         Ok(candidate)
     } else {
-        Err(anyhow!("connetto-server was not found after the build"))
+        Err(anyhow!("demo-server was not found after the build"))
     }
 }
 

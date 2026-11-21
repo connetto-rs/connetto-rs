@@ -1,68 +1,13 @@
 //! The non-Apple platform: every framework call answers its own refusal.
 
-/// The device side, absent off Apple.
-pub(super) mod device {
-    use super::super::Idiom;
-
-    /// The device's user-set name, absent off Apple.
-    pub(crate) fn device_name() -> Option<String> {
-        None
-    }
-
-    /// The device's idiom, `Other` off Apple.
-    pub(crate) fn device_idiom() -> Idiom {
-        Idiom::Other
-    }
-}
-
 /// The Bluetooth side, absent off Apple.
-pub(super) mod peripheral {
-    use super::super::{
-        Error,
-        bluetooth::{Event, PromptOutcome, State},
-    };
+pub(super) mod bluetooth {
+    use super::super::bluetooth::Authorization;
 
-    /// The radio's standing, unsupported off Apple.
-    pub(crate) fn state() -> State {
-        State::Unsupported
+    /// The app's authorization, refused off Apple.
+    pub(crate) fn authorization() -> Authorization {
+        Authorization::Denied
     }
-
-    /// The strongest action, which has nothing to do off Apple.
-    pub(crate) fn prompt() -> Result<(), Error> {
-        Err(Error::Unsupported)
-    }
-
-    /// The last prompt's outcome, never settled off Apple.
-    pub(crate) fn prompt_outcome() -> Option<PromptOutcome> {
-        None
-    }
-
-    /// The GATT service, which stands nowhere off Apple.
-    pub(crate) fn start() -> Result<(), Error> {
-        Err(Error::Unsupported)
-    }
-
-    /// The GATT service's close, which stands ready off Apple.
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "one signature on every target, and only iOS can fail"
-    )]
-    pub(crate) fn stop() -> Result<(), Error> {
-        Ok(())
-    }
-
-    /// The service's events, never any off Apple.
-    pub(crate) fn poll() -> Vec<Event> {
-        Vec::new()
-    }
-
-    /// The service's send, which reaches no central off Apple.
-    pub(crate) fn notify(_device: u64, _bytes: &[u8]) -> Result<(), Error> {
-        Err(Error::Unsupported)
-    }
-
-    /// The central's close, which stands ready off Apple.
-    pub(crate) fn disconnect(_device: u64) {}
 }
 
 /// The hotspot side, absent off Apple.

@@ -30,10 +30,12 @@ use diesel::{Connection, SqliteConnection, sql_query};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
-use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, ParsedDiffSet, PatchsetOp, SimpleTable, Value};
+use sqlite_diff_rs::{ParsedDiffSet, PatchsetOp, Value};
 use subql::{
     CdcSource, PgCommit, PgCommitPosition, PgLsn, PgSqliteEmuSource, PgXid, Seen, SourceItem,
 };
+
+use super::writer_shared::{PG_DDL, insert_changeset};
 
 diesel::table! {
     /// Row from the notes test fixture.
@@ -76,26 +78,6 @@ diesel::table! {
         /// Integer value.
         n -> diesel::sql_types::BigInt,
     }
-}
-
-const PG_DDL: &str = "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT);";
-
-fn insert_changeset(id: i64, body: &str, edited_at: &str) -> Vec<u8> {
-    let table = SimpleTable::new(
-        "notes",
-        &[("id", ""), ("body", ""), ("edited_at", "")],
-        &[0],
-    );
-    let insert = Insert::<_, String, Vec<u8>>::from(table)
-        .set(0, Value::Integer(id))
-        .expect("set id")
-        .set(1, Value::Text(body.to_owned()))
-        .expect("set body")
-        .set(2, Value::Text(edited_at.to_owned()))
-        .expect("set edited_at");
-    ChangeSet::<SimpleTable, String, Vec<u8>>::new()
-        .insert(insert)
-        .build()
 }
 
 #[tokio::test]
@@ -334,7 +316,7 @@ impl SnapshotSource for NoSnapshot {
     async fn estimate(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _auth: &connetto_core::Principal,
     ) -> Result<SnapshotEstimate, Self::Error> {
         Ok(SnapshotEstimate {
@@ -350,7 +332,7 @@ impl SnapshotSource for NoSnapshot {
     async fn snapshot_page(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _auth: &connetto_core::Principal,
         _page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {
@@ -435,14 +417,18 @@ async fn async_pg_reexec_bootstraps_min() {
         }))
         .await
         .expect("send subscribe");
+    assert!(matches!(
+        next_control(&mut client).await,
+        ControlMessage::AggregateColumns(_)
+    ));
     let update = match next_control(&mut client).await {
         ControlMessage::AggregateUpdate(update) => update,
         other => panic!("expected aggregate update, got {other:?}"),
     };
     assert_eq!(update.sub_id, "cheapest");
     assert_eq!(
-        update.result_json.as_deref(),
-        Some("5"),
+        super::reexec::integer(&update),
+        5,
         "bootstrap reflects the real MIN in PG"
     );
 
@@ -817,6 +803,7 @@ fn two_transactions() -> (Vec<ChangeRecord>, Vec<PgCommit>) {
                             .expect("build oplog record"),
                     );
                 }
+                SourceItem::Relation(_) => {}
                 SourceItem::Commit(commit) => commits.push(commit),
             }
         }
@@ -1099,7 +1086,11 @@ async fn pg_oplog_tells_a_pruned_missed_transaction_from_a_retained_one() {
 
 /// Subscribe to an aggregate and return the bootstrap value the server seeds
 /// through the connector, asserting it is a full result for `sub_id`.
-async fn bootstrap_agg<T: Transport>(client: &mut T, sub_id: &str, query: &str) -> String {
+async fn bootstrap_agg<T: Transport>(
+    client: &mut T,
+    sub_id: &str,
+    query: &str,
+) -> connetto_core::messages::SqliteValue {
     client
         .send_control(ControlMessage::Subscribe(Subscribe {
             sub_id: sub_id.to_owned(),
@@ -1107,11 +1098,21 @@ async fn bootstrap_agg<T: Transport>(client: &mut T, sub_id: &str, query: &str) 
         }))
         .await
         .expect("send subscribe");
+    assert!(matches!(
+        next_control(client).await,
+        ControlMessage::AggregateColumns(_)
+    ));
     match next_control(client).await {
         ControlMessage::AggregateUpdate(update) => {
             assert_eq!(update.sub_id, sub_id);
-            assert!(update.is_full_result);
-            update.result_json.expect("non-null aggregate bootstrap")
+            let connetto_core::messages::AggregateChange::Replace { mut rows } = update.change
+            else {
+                panic!("expected whole answer");
+            };
+            assert_eq!(rows.len(), 1);
+            let mut row = rows.pop().expect("one row");
+            assert_eq!(row.len(), 1);
+            row.pop().expect("one cell")
         }
         other => panic!("expected aggregate update, got {other:?}"),
     }
@@ -1188,28 +1189,26 @@ async fn async_pg_delta_aggregate_bootstraps_family() {
     // COUNT(*) is an exact integer.
     assert_eq!(
         bootstrap_agg(&mut client, "count", "SELECT COUNT(*) FROM agg_family").await,
-        "3",
+        connetto_core::messages::SqliteValue::Integer(3),
     );
-    // SUM(amount) over BIGINT arrives from PG as NUMERIC; the fold path now
-    // renders it as a JSON string to preserve exactness, matching value_to_json.
+    // A decimal keeps its exact text.
     assert_eq!(
         bootstrap_agg(&mut client, "sum", "SELECT SUM(amount) FROM agg_family").await,
-        "\"60\"",
+        connetto_core::messages::SqliteValue::Text("60".to_owned()),
     );
-    // AVG exercises the two-column (SUM, COUNT) seed; renders as a decimal string.
+    // The average keeps its decimal scale.
     assert_eq!(
         bootstrap_agg(&mut client, "avg", "SELECT AVG(amount) FROM agg_family").await,
-        "\"20.0000000000000000\"",
+        connetto_core::messages::SqliteValue::Text("20.0000000000000000".to_owned()),
     );
     // VAR_POP exercises the three-column (SUM, SUM(x*x), COUNT) seed. Assert with
     // a tolerance since the value is not exactly representable.
-    let var_json =
+    let variance =
         bootstrap_agg(&mut client, "var", "SELECT VAR_POP(amount) FROM agg_family").await;
-    let var: f64 = var_json.parse().expect("parse var_pop");
-    assert!(
-        (var - 200.0_f64 / 3.0).abs() < 1e-9,
-        "VAR_POP over [10, 20, 30] should be 200/3, got {var_json}",
-    );
+    let connetto_core::messages::SqliteValue::Real(variance) = variance else {
+        panic!("expected real variance");
+    };
+    assert!((variance - 200.0_f64 / 3.0).abs() < 1e-9);
 
     client.close().await.expect("close client");
     server.await.expect("join server").expect("session ok");
@@ -1269,7 +1268,7 @@ async fn snapshot_runs_the_translated_diesel_shape_with_binds() {
     let mut materializer = Materializer::builder(TRANSLATED_PG_DDL)
         .build()
         .expect("build materializer");
-    let binds = vec![connetto_core::messages::BindValue::Integer(0)];
+    let binds = vec![connetto_core::messages::SqliteValue::Integer(0)];
     let reg = materializer
         .register_sqlite(
             1,
@@ -1416,5 +1415,76 @@ async fn a_page_cursor_fences_the_snapshot_it_was_read_under() {
     assert!(
         fence.unseen().contains(running),
         "{running:?} is among the transactions {fence:?} did not see"
+    );
+}
+
+/// A page's cursor becomes the client's resume point, so it sits at or past every commit made before the read, and a later read after another commit sits strictly later. A cursor behind a delivered change would move the resume point backwards, widening the catchup or forcing a resync.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_page_cursor_never_falls_behind_a_commit_made_before_the_read() {
+    const DDL: &str = "CREATE TABLE watermarked (id INT PRIMARY KEY);";
+    #[derive(diesel::QueryableByName)]
+    struct Wal {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        lsn: String,
+    }
+    async fn commit_one(conn: &mut AsyncPgConnection, id: i32) -> PgLsn {
+        sql_query(format!("INSERT INTO watermarked VALUES ({id})"))
+            .execute(conn)
+            .await
+            .expect("insert");
+        let wal: Wal = sql_query("SELECT pg_current_wal_lsn()::text AS lsn")
+            .get_result(conn)
+            .await
+            .expect("read the flushed WAL position");
+        PgLsn::parse(&wal.lsn).expect("Postgres prints a position")
+    }
+
+    let fixture = Fixture::acquire().await;
+    fixture
+        .setup(&[
+            "DROP TABLE IF EXISTS watermarked",
+            DDL.trim_end_matches(';'),
+        ])
+        .await;
+    let pool = fixture.admin().clone();
+    let source = PgSnapshotSource::from_ddl(pool.clone(), DDL).expect("build source");
+    let read = || async {
+        let page = source
+            .snapshot_page(
+                "SELECT * FROM watermarked",
+                &[],
+                &connetto_core::Principal::<String, String>::unidentified(
+                    connetto_core::SessionId::from_token_hash("test-user"),
+                ),
+                &PageSpec {
+                    after: None,
+                    max_rows: 1024,
+                    timeout: std::time::Duration::from_secs(30),
+                },
+            )
+            .await
+            .expect("read a page");
+        split_snapshot_cursor(page.cursor.as_bytes())
+            .expect("a page cursor")
+            .0
+    };
+    let mut conn = pool.get().await.expect("connection");
+
+    let first_commit = commit_one(&mut conn, 1).await;
+    let first = read().await;
+    assert!(
+        first.commit_lsn() >= first_commit,
+        "the cursor {first:?} sits behind the commit ending at {first_commit:?}"
+    );
+
+    let second_commit = commit_one(&mut conn, 2).await;
+    let second = read().await;
+    assert!(
+        second.commit_lsn() >= second_commit,
+        "the cursor {second:?} sits behind the commit ending at {second_commit:?}"
+    );
+    assert!(
+        second > first,
+        "a later read after a commit moves the cursor forward"
     );
 }

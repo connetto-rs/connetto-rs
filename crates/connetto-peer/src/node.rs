@@ -64,6 +64,8 @@ pub(crate) const DIAL_NAME: &str = "connetto-peer";
 
 /// The two bounded queues of one live link, the exchange's and the media's.
 pub(crate) struct LinkSenders {
+    /// The link's number, the slot's `seq`.
+    pub(crate) link: u64,
     pub(crate) exchange: mpsc::Sender<Message>,
     pub(crate) media: mpsc::Sender<Media>,
 }
@@ -117,6 +119,9 @@ pub(crate) struct NodeState {
     listener: RwLock<Option<ListenerSlot>>,
     /// Whether the node still serves, checked under the links lock.
     pub(crate) serving: AtomicBool,
+    /// Whether the node's peer links stand, checked before a dial's socket
+    /// and under the links lock before a registration (R77 slice 8).
+    pub(crate) links_on: AtomicBool,
     /// The monotonic dial counter a `Hello` carries.
     pub(crate) dial_count: Mutex<u64>,
     /// The registration order, to tell a replaced slot apart.
@@ -163,6 +168,9 @@ pub struct PeerLink {
     pub bot_list: Option<String>,
     /// The kept link's remote address, `None` while a duplicate close waits for its keeper.
     pub remote: Option<SocketAddr>,
+    /// The kept link's number, which a media send names, `None` while a
+    /// duplicate close waits for its keeper.
+    pub link: Option<u64>,
 }
 
 impl fmt::Debug for NodeState {
@@ -314,6 +322,7 @@ impl Node {
             senders: RwLock::new(HashMap::new()),
             listener: RwLock::new(None),
             serving: AtomicBool::new(false),
+            links_on: AtomicBool::new(true),
             dial_count: Mutex::new(0),
             next_seq: Mutex::new(0),
             events,
@@ -396,6 +405,27 @@ impl Node {
         stop_state(&self.state, reason);
     }
 
+    /// The node's peer links standing, off refusing a dial before its
+    /// socket and an incoming link before it registers (R77 slice 8). A
+    /// fresh node stands the links on.
+    pub fn set_peer_links(&self, on: bool) {
+        self.state.links_on.store(on, Ordering::Release);
+    }
+
+    /// Whether the node's peer links stand (R77 slice 8).
+    #[must_use]
+    pub fn peer_links_on(&self) -> bool {
+        self.state.links_on.load(Ordering::Acquire)
+    }
+
+    /// Close every live link with `reason`, which reports
+    /// [`PeerEvent::Unlinked`] as each link ends, keeping the listener and
+    /// the standing (R77 slice 8).
+    pub fn close_links(&self, reason: CloseReason) {
+        let mut links = self.state.links.lock();
+        close_links_unlocked(&self.state, &mut links, reason);
+    }
+
     /// Close the live link to `peer` with `reason`, which reports
     /// [`PeerEvent::Unlinked`] as the link ends. A peer with no live link is
     /// left alone.
@@ -413,6 +443,15 @@ impl Node {
     /// stop preparing them with `None`.
     pub fn set_socket_prep(&self, prep: Option<Arc<dyn SocketPrep>>) {
         *self.state.socket_prep.write() = prep;
+    }
+
+    /// What the certificate the node presents names, `None` before it
+    /// serves.
+    #[must_use]
+    pub fn identity(&self) -> Option<DeviceIdentity> {
+        let identity = self.state.identity.read();
+        let certificate = DeviceCertificate::parse(&identity.as_ref()?.certificate).ok()?;
+        Some(certificate.identity().clone())
     }
 
     /// The bound address, while the node serves.
@@ -437,6 +476,7 @@ impl Node {
                     public_key: slot.public_key.clone(),
                     bot_list: slot.bot_list.clone(),
                     remote: Some(slot.remote),
+                    link: Some(slot.seq),
                 },
                 SlotState::AwaitingKeeper {
                     peer,
@@ -447,6 +487,7 @@ impl Node {
                     public_key: public_key.clone(),
                     bot_list: bot_list.clone(),
                     remote: None,
+                    link: None,
                 },
             })
             .collect()
@@ -483,32 +524,37 @@ impl Node {
         message: Message,
     ) -> Result<(), PeerSendError> {
         let bounds = message.within_bounds();
-        self.queue(peer, message, bounds, |senders| &senders.exchange)
+        self.queue(peer, None, message, bounds, |senders| &senders.exchange)
             .await
     }
 
-    /// Queue a media message on the link to `peer`, on the link's own media
-    /// queue, awaiting it as [`Node::send_exchange`] awaits the exchange's
-    /// (R79).
+    /// Queue a media message on the media queue of `peer`'s link numbered
+    /// `link`, awaiting it as [`Node::send_exchange`] awaits the exchange's
+    /// (R79). Naming the link keeps a message meant for one link off the
+    /// link that replaced it.
     ///
     /// # Errors
     ///
-    /// As [`Node::send_exchange`].
+    /// As [`Node::send_exchange`], [`PeerSendError::Unlinked`] also when the
+    /// peer's live link is another one.
     pub async fn send_media(
         &self,
         peer: &DeviceIdentity,
+        link: u64,
         message: Media,
     ) -> Result<(), PeerSendError<Media>> {
         let bounds = message.within_bounds();
-        self.queue(peer, message, bounds, |senders| &senders.media)
+        self.queue(peer, Some(link), message, bounds, |senders| &senders.media)
             .await
     }
 
     /// Queue `message` on the queue `pick` names of `peer`'s link, refused
-    /// before queueing when `bounds` failed.
+    /// before queueing when `bounds` failed or when the live link is not the
+    /// one `link` names.
     async fn queue<M>(
         &self,
         peer: &DeviceIdentity,
+        link: Option<u64>,
         message: M,
         bounds: Result<(), BoundsError>,
         pick: impl FnOnce(&LinkSenders) -> &mpsc::Sender<M>,
@@ -519,8 +565,8 @@ impl Node {
         let sender = {
             let senders = self.state.senders.read();
             match senders.get(&peer.key()) {
-                Some(link) => pick(link).clone(),
-                None => return Err(PeerSendError::Unlinked { message }),
+                Some(live) if link.is_none_or(|link| link == live.link) => pick(live).clone(),
+                _ => return Err(PeerSendError::Unlinked { message }),
             }
         };
         match sender.send(message).await {
@@ -540,6 +586,9 @@ impl Node {
     /// When the peer's presented chain cannot be parsed as device
     /// certificates.
     pub async fn link(&self, addr: SocketAddr) -> Result<DeviceIdentity, LinkError> {
+        if !self.state.links_on.load(Ordering::Acquire) {
+            return Err(LinkError::LinksOff);
+        }
         let identity = self
             .state
             .identity
@@ -745,12 +794,19 @@ fn stop_state(state: &NodeState, reason: CloseReason) {
     if let Some(slot) = state.listener.write().take() {
         let _ = slot.stop.send(true);
     }
-    let drained = {
-        let mut links = state.links.lock();
-        state.serving.store(false, Ordering::Release);
-        std::mem::take(&mut *links)
-    };
-    for (_, slot_state) in drained {
+    let mut links = state.links.lock();
+    state.serving.store(false, Ordering::Release);
+    close_links_unlocked(state, &mut links, reason);
+}
+
+/// Close every live link with `reason` and report the falls, under the
+/// links lock the caller holds.
+fn close_links_unlocked(
+    state: &NodeState,
+    links: &mut HashMap<KeyId, SlotState>,
+    reason: CloseReason,
+) {
+    for (_, slot_state) in std::mem::take(links) {
         match slot_state {
             SlotState::Live(slot) => {
                 let _ = slot.command.send(LinkCommand::Close(reason));
@@ -1186,8 +1242,9 @@ fn catch_up_renewal(state: &NodeState, slot: &LinkSlot, presented: &[u8]) {
 /// # Errors
 ///
 /// [`LinkError::NotServing`] when the node stopped before the link could
-/// register, and [`LinkError::Refused`] when a list kept since the handshake
-/// revokes the peer's chain.
+/// register, [`LinkError::LinksOff`] when the node's peer links went off in
+/// the same gap, and [`LinkError::Refused`] when a list kept since the
+/// handshake revokes the peer's chain.
 #[expect(
     clippy::too_many_lines,
     reason = "the keep decision, the serving check and the insert are atomic under the one links lock"
@@ -1228,6 +1285,11 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         if !state.serving.load(Ordering::Acquire) {
             return Err(LinkError::NotServing);
         }
+        // The off standing may have crossed the same gap, refusing before
+        // the link registers.
+        if !state.links_on.load(Ordering::Acquire) {
+            return Err(LinkError::LinksOff);
+        }
         // A list kept between the handshake and this registration revokes
         // the chain here, under the same lock `keep_list` sweeps the links in.
         if chain_revoked(state, &leaf, &issuer) {
@@ -1249,6 +1311,12 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             // leaf, which the slot records.
             #[cfg(feature = "discovery")]
             let fingerprint = Fingerprint::of(&leaf);
+            // The duplicate close is silent, so note the replaced slot now: a
+            // live link, or the awaiting slot the close left this keeper.
+            let replaced = matches!(
+                links.get(&peer_key),
+                Some(SlotState::Live(_) | SlotState::AwaitingKeeper { .. })
+            );
             // Close the losing link, if the new one keeps the slot. Its frame
             // task sends the `Close` frame and exits on the command.
             if let Some(SlotState::Live(existing)) = links.get(&peer_key) {
@@ -1275,21 +1343,42 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             state.senders.write().insert(
                 peer_key,
                 LinkSenders {
+                    link: seq,
                     exchange: exchange_tx,
                     media: media_tx,
                 },
             );
             #[cfg(feature = "discovery")]
             state.peer_fingerprints.lock().insert(peer_key, fingerprint);
-            if fresh && let Some(SlotState::Live(slot)) = links.get(&peer_key) {
-                state
-                    .events
-                    .send(PeerEvent::Linked {
+            let reestablished = fresh || replaced;
+            let event = if let Some(SlotState::Live(slot)) = links.get(&peer_key)
+                && reestablished
+            {
+                let expires_at = DeviceCertificate::parse(&slot.leaf)
+                    .expect("the peer's leaf was verified at the handshake")
+                    .not_after();
+                Some(if fresh {
+                    PeerEvent::Linked {
                         peer: slot.peer.clone(),
+                        link: slot.seq,
                         public_key: slot.public_key.clone(),
                         bot_list: slot.bot_list.clone(),
-                    })
-                    .ok();
+                        expires_at,
+                    }
+                } else {
+                    PeerEvent::LinkReplaced {
+                        peer: slot.peer.clone(),
+                        link: slot.seq,
+                        public_key: slot.public_key.clone(),
+                        bot_list: slot.bot_list.clone(),
+                        expires_at,
+                    }
+                })
+            } else {
+                None
+            };
+            if let Some(event) = event {
+                state.events.send(event).ok();
             }
         }
         keep_new

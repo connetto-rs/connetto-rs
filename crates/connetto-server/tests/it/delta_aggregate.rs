@@ -5,11 +5,12 @@
 //! the session, routing, or transport layers, so a regression in the register
 //! split or the dispatch fold surfaces here before the full end-to-end loop.
 
+use connetto_core::messages::{AggregateChange, SqliteValue};
 use connetto_server::{Materializer, Registration, SeedPlan};
 use subql::backend::{ScalarFamily, Value as PgValue};
 use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
 
-const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, quantity INT);";
+const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, quantity INT, ts TIMESTAMPTZ);";
 
 #[test]
 fn register_classifies_fold_aggregate_and_row() {
@@ -63,7 +64,7 @@ async fn install_fold_seed_delivers_initial_computed_value() {
         panic!("expected a fold seed plan");
     };
 
-    // Seed with COUNT = 0: the initial change carries "0" as JSON.
+    // The seed delivers the initial count.
     let seeded = mat
         .install_fold_seed(cap.subscription_id, vec![vec![PgValue::Int(0)]], None)
         .expect("seed fold");
@@ -71,15 +72,11 @@ async fn install_fold_seed_delivers_initial_computed_value() {
         !seeded.needs_snapshot,
         "COUNT(*) fold should not demote to snapshot"
     );
-    let initial_values: Vec<Option<String>> = seeded
-        .changes
-        .iter()
-        .map(|c| c.result_json.clone())
-        .collect();
     assert_eq!(
-        initial_values,
-        vec![Some("0".to_owned())],
-        "seed delivers the initial COUNT as a computed change"
+        seeded.changes[0].change,
+        AggregateChange::Replace {
+            rows: vec![vec![SqliteValue::Integer(0)]]
+        },
     );
 
     // Seeding with a non-zero count delivers the actual count.
@@ -96,10 +93,12 @@ async fn install_fold_seed_delivers_initial_computed_value() {
         seeded2
             .changes
             .iter()
-            .map(|c| c.result_json.clone())
+            .map(|change| change.change.clone())
             .collect::<Vec<_>>(),
-        vec![Some("42".to_owned())],
-        "seed with 42 delivers 42 as JSON"
+        vec![AggregateChange::Replace {
+            rows: vec![vec![SqliteValue::Integer(42)]]
+        }],
+        "seed with 42 delivers 42"
     );
 }
 
@@ -159,14 +158,15 @@ async fn dispatch_folds_an_installed_ungrouped_count() {
     }
     assert_eq!(folded.len(), 1, "one insert moves the count exactly once");
     assert_eq!(folded[0].subscription_id, cap.subscription_id);
-    assert_eq!(folded[0].group_key, None, "ungrouped: no key");
-    assert_eq!(folded[0].result_json.as_deref(), Some("1"));
+    assert_eq!(
+        folded[0].change,
+        AggregateChange::Replace {
+            rows: vec![vec![SqliteValue::Integer(1)]],
+        }
+    );
 }
 
-/// R82's grouped loopback assertion: a grouped fold seeds one value per
-/// group, an insert moves exactly its own group's value with the key on the
-/// change, the sibling group stays silent, and a group whose last source row
-/// goes is removed (`result_json: None`).
+/// Grouped folds emit keyed rows and remove empty groups.
 #[tokio::test]
 async fn dispatch_folds_a_grouped_count_per_group() {
     const GROUPED_DDL: &str =
@@ -209,16 +209,18 @@ async fn dispatch_folds_a_grouped_count_per_group() {
         "two groups sit far under the budget"
     );
     assert_eq!(seeded.changes.len(), 2, "one initial value per group");
-    let key_a = seeded.changes[0]
-        .group_key
-        .clone()
-        .expect("grouped changes carry keys");
-    assert!(
-        seeded.changes.iter().all(|c| c.group_key.is_some()
-            && c.result_json.as_deref() == Some("1")
-            && !c.is_full_result),
-        "each group seeds its own value as a keyed upsert",
+    let AggregateChange::Upsert { key: key_a, row } = &seeded.changes[0].change else {
+        panic!("expected a keyed seed");
+    };
+    let key_a = key_a.clone();
+    assert_eq!(
+        row,
+        &vec![SqliteValue::Text("a".to_owned()), SqliteValue::Integer(1)]
     );
+    assert!(seeded.changes.iter().all(|change| matches!(
+        &change.change, AggregateChange::Upsert { row, .. }
+            if row.last() == Some(&SqliteValue::Integer(1))
+    )));
 
     // One source holds the baseline the seed already counts (the 'a' and 'b'
     // rows). Their events are drained without dispatching: the canned seed
@@ -242,14 +244,11 @@ async fn dispatch_folds_a_grouped_count_per_group() {
     }
     assert_eq!(moved.len(), 1, "only the touched group moves");
     assert_eq!(
-        moved[0].group_key.as_deref(),
-        Some(key_a.as_slice()),
-        "the change addresses group a by the same key its seed used",
-    );
-    assert_eq!(moved[0].result_json.as_deref(), Some("2"));
-    assert!(
-        !moved[0].is_full_result,
-        "a grouped fold delta is an upsert"
+        moved[0].change,
+        AggregateChange::Upsert {
+            key: key_a.clone(),
+            row: vec![SqliteValue::Text("a".to_owned()), SqliteValue::Integer(2)],
+        }
     );
 
     source
@@ -263,14 +262,7 @@ async fn dispatch_folds_a_grouped_count_per_group() {
         removed.extend(mat.dispatch(&event).await.expect("dispatch").computed);
     }
     assert_eq!(removed.len(), 1, "the emptied group produces one removal");
-    assert!(
-        removed[0].group_key.as_deref() != Some(key_a.as_slice()) && removed[0].group_key.is_some(),
-        "the removal addresses group b",
-    );
-    assert_eq!(
-        removed[0].result_json, None,
-        "a group with no source rows left is removed, not zeroed",
-    );
+    assert!(matches!(&removed[0].change, AggregateChange::Remove { key } if key != &key_a));
 }
 
 /// R82's demotion assertion: a seed whose groups already exceed the budget
@@ -346,8 +338,9 @@ async fn an_event_that_cannot_be_encoded_is_applied_without_a_patch() {
     mat.install_fold_seed(cap.subscription_id, vec![vec![PgValue::Int(0)]], None)
         .expect("seed fold");
 
-    // A column the catalog does not know, as a schema change ahead of the deployment delivers.
-    let drifted = orders_insert(&[("id", "1"), ("quantity", "10"), ("note", "x")], 1);
+    // A `timestamptz` infinity, a value Postgres can hold but the wire
+    // cannot carry, so the fold cannot encode the event.
+    let drifted = orders_insert(&[("id", "1"), ("quantity", "10"), ("ts", "infinity")], 1);
     let dispatched = mat
         .dispatch(&drifted)
         .await
@@ -363,23 +356,80 @@ async fn an_event_that_cannot_be_encoded_is_applied_without_a_patch() {
             .is_some_and(|record| record.payload().is_none()),
         "the oplog keeps the unencodable event as a marker without a payload"
     );
-    let values: Vec<Option<&str>> = dispatched
-        .computed
-        .iter()
-        .map(|change| change.result_json.as_deref())
-        .collect();
     assert_eq!(
-        values,
-        [Some("1")],
-        "the fold still counted the unencodable insert"
+        dispatched.computed[0].change,
+        AggregateChange::Replace {
+            rows: vec![vec![SqliteValue::Integer(1)]],
+        }
     );
 
-    let valid = orders_insert(&[("id", "2"), ("quantity", "20")], 2);
+    let valid = orders_insert(
+        &[
+            ("id", "2"),
+            ("quantity", "20"),
+            ("ts", "2026-01-01 00:00:00+00"),
+        ],
+        2,
+    );
     let dispatched = mat.dispatch(&valid).await.expect("dispatch");
-    let values: Vec<Option<&str>> = dispatched
-        .computed
-        .iter()
-        .map(|change| change.result_json.as_deref())
-        .collect();
-    assert_eq!(values, [Some("2")], "both inserts reached the count");
+    assert_eq!(
+        dispatched.computed[0].change,
+        AggregateChange::Replace {
+            rows: vec![vec![SqliteValue::Integer(2)]],
+        }
+    );
+}
+
+#[test]
+fn grouped_seeds_preserve_uuid_and_invalid_utf8_bytes() {
+    let uuid = "00010203-0405-0607-0809-0a0b0c0d0e0f"
+        .parse()
+        .expect("uuid");
+    for (column_type, groups, expected) in [
+        (
+            "UUID",
+            vec![PgValue::Uuid(uuid)],
+            vec![(0_u8..16).collect::<Vec<_>>()],
+        ),
+        (
+            "BYTEA",
+            vec![PgValue::Bytes(vec![0x80]), PgValue::Bytes(vec![0x81])],
+            vec![vec![0x80], vec![0x81]],
+        ),
+    ] {
+        let ddl = format!("CREATE TABLE orders (id INT PRIMARY KEY, category {column_type});");
+        let mut materializer = Materializer::builder(&ddl).build().expect("materializer");
+        let Registration::Computed(registration) = materializer
+            .register(1, "SELECT category, COUNT(*) FROM orders GROUP BY category")
+            .expect("register")
+        else {
+            panic!("expected computed")
+        };
+        let rows = groups
+            .into_iter()
+            .map(|group| vec![group, PgValue::Int(1), PgValue::Int(1)])
+            .collect();
+        let seeded = materializer
+            .install_fold_seed(registration.subscription_id, rows, None)
+            .expect("seed");
+        assert_eq!(seeded.changes.len(), expected.len());
+        let mut keys = Vec::new();
+        for (change, bytes) in seeded.changes.iter().zip(expected) {
+            let AggregateChange::Upsert { key, row } = &change.change else {
+                panic!("expected keyed row");
+            };
+            assert_eq!(
+                row,
+                &vec![SqliteValue::Blob(bytes), SqliteValue::Integer(1)]
+            );
+            assert!(!keys.contains(&key));
+            keys.push(key);
+        }
+        assert_eq!(
+            materializer
+                .computed_columns(registration.subscription_id)
+                .expect("columns")[0],
+            connetto_core::messages::ColumnType::Blob
+        );
+    }
 }

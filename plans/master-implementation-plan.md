@@ -10,20 +10,21 @@ The `Status` table is the one status record of the programme, and every statemen
 
 ## The gate
 
-The gate is what a session runs in full before any push, and CI runs the same gate on every pull request, except that its clippy legs run `+stable` where the gate prescribes `+nightly`. `.github/workflows/ci.yml` checks each of the eight workspaces in eleven legs, fmt, `cargo +stable clippy --all-targets` and the doc build with `-D warnings`, runs the test shards `server`, `client`, `files` and `rest` under `cargo nextest` with `--test-threads 4` inside a `keyctl session`, and runs the browser suites as four shards of `connetto-browser-stack --shard`. `.github/workflows/coverage.yml` re-runs the three native test shards `server`, `client` and `rest` under `cargo llvm-cov` and uploads them to Codecov. There is no task runner reconciling this prose, the workflows and `.config/nextest.toml`, so the workflows and the config are the executable record of what CI proves.
+The gate is what a session runs in full before any push, and CI runs the same gate on every pull request. `.github/workflows/ci.yml` checks each of the eight workspaces in eleven legs, fmt, `cargo +stable clippy --all-targets` and the doc build with `-D warnings`, runs the root's clippy once more on the dated nightly that `ci/clippy-nightly` names, runs the test shards `server`, `client`, `files` and `rest` under `cargo nextest` with `--test-threads 4` inside a `keyctl session`, and runs the browser suites as four shards of `connetto-browser-stack --shard`. `.github/workflows/coverage.yml` re-runs the three native test shards `server`, `client` and `rest` under `cargo llvm-cov` and uploads them to Codecov. There is no task runner reconciling this prose, the workflows and `.config/nextest.toml`, so the workflows and the config are the executable record of what CI proves.
 
 Eight workspaces, each with its own lockfile, the root, `crates/connetto-web`, the four demos, `examples/wasm-smoke` and `examples/webauthn-unlock`.
 
-The root workspace runs the four proof legs.
+The root workspace runs the five proof legs.
 
 ```sh
 cargo +stable fmt --all -- --check
-cargo +nightly clippy --all-targets --all-features -- -D warnings
+cargo +stable clippy --all-targets --all-features -- -D warnings
+cargo +"$(cat ci/clippy-nightly)" clippy --all-targets --all-features -- -D warnings
 cargo +stable test --release --all-features
 RUSTDOCFLAGS="-D warnings" cargo +stable doc --no-deps --all-features
 ```
 
-**`cargo +stable` for every build and test, `cargo +nightly` only for clippy.** The rule is load-bearing, because nightly has been observed to ICE on tokio in release, and there is no `rust-toolchain.toml`, so the plus-selector is the only thing enforcing it. The clippy mismatch between the gate and CI is [G14](#g14), and it means a lint that fires only on nightly reaches `main` with CI green.
+**`cargo +stable` for every build and test, nightly only for clippy.** The rule is load-bearing, because nightly has been observed to ICE on tokio in release, and there is no `rust-toolchain.toml`, so the plus-selector is the only thing enforcing it. The nightly is pinned to a date so a lint that lands upstream fails no pull request that did not ask for it. Moving the date is a pull request of its own, carrying the fixes the newer nightly asks for.
 
 Tests run `--release`. Debug builds of these workloads are one to two orders of magnitude slower, and a full debug run is a session-eating trap. Use debug only when targeting overflow checks, `debug_assert!` bodies, or a bug that only appears unoptimized, and say so when you do.
 
@@ -35,13 +36,13 @@ cargo nextest run --cargo-profile testfast --all-features -E 'test(retention::)'
 cargo +stable test --profile testfast --all-features -p connetto-server --test it openfga_live
 ```
 
-`.config/nextest.toml` bounds the `docker` group to four threads and serializes the `keyring` and `discovery` groups, and a wedged test is killed at five slow periods instead of hanging the invocation. The `keyctl session` wrapper is optional locally, since every OS-keyring test joins its own fresh session keyring in-process through `connetto_test_harness::isolated_session_keyring`, called first in each such test, and CI still wraps its runs in one out of caution. The gate commands above still run `--release`, unchanged, so the proof profile is untouched.
+`connetto_test_harness::container_slot` lets at most four of one user's harness fixtures run a Postgres container at once, across test processes. `.config/nextest.toml` bounds the file server's tests, whose fixtures always start a container, to four at a time, serializes the `keyring` and `discovery` groups, and kills a wedged test at five slow periods instead of hanging the invocation. The `keyctl session` wrapper is optional locally, since every OS-keyring test joins its own fresh session keyring in-process through `connetto_test_harness::isolated_session_keyring`, called first in each such test, and CI still wraps its runs in one out of caution. The gate commands above still run `--release`, unchanged, so the proof profile is untouched.
 
-Fixtures can start a native PostgreSQL 16 cluster copied from a stopped template in place of a container, keeping one cluster per test without Docker. On the `connetto-server` suite that took 100 s against 854 s with containers. `scripts/native-postgres.sh` makes the template once and prints the two variables that select it, and the `native` nextest profile lifts the `docker` group's bound. The Linux test and coverage jobs run this way through the `native-postgres` action. OpenFGA and MySQL stay containers.
+Fixtures can start a native PostgreSQL 16 cluster copied from a stopped template in place of a container, keeping one cluster per test without Docker. On the `connetto-server` suite that took 100 s against 854 s with containers. `scripts/native-postgres.sh` makes the template once and prints the two variables that select it. The Linux test and coverage jobs run this way through the `native-postgres` action. OpenFGA and MySQL stay containers.
 
 ```sh
 eval "$(scripts/native-postgres.sh /mnt/nvme/scratch/$USER/connetto-pg16)"
-cargo nextest run --profile native --cargo-profile testfast --all-features
+cargo nextest run --cargo-profile testfast --all-features
 ```
 
 The browser suites run per suite through `connetto-browser-stack`, a binary of `connetto-test-harness`. It starts the stack and drives one `wasm-pack test --headless --chrome` invocation per suite, and the suite list covers the `tests` targets of `crates/connetto-web`, `examples/wasm-smoke`, `examples/yew-web-demo` and `examples/leptos-demo`, the lib suites of `connetto-web` and `connetto-file-client`, and the dioxus demo's `web` feature. Bare, the binary runs the verified-topology step and then the default suites in series, and `--shard I/N` runs the suites whose position lands on `I`, which is how CI quarters them.
@@ -57,24 +58,25 @@ Docker-gated Postgres tests and headless Chrome may both be run freely.
 | [R101](#r101-live-query-lifetimes-and-waking-a-closed-client) | in progress |  | The client API for the three lifetimes, the server's durable engine, the wire declarations, the notification keys and the provider sending |  | [#151](https://github.com/connetto-rs/connetto-rs/pull/151), [#201](https://github.com/connetto-rs/connetto-rs/pull/201) |
 | [R99](#r99-bot-login-and-lifetime) | not started |  | Key login at connect, the installation as the connection's identity, the closures on removal and ban, the awaiting-acceptance refusal, the metering and the audit ops |  |  |
 | [R103](#r103-the-bot-runtime-and-template) | not started | R99, R101 | The `connetto-bot` crate with the bot trait, the installation loop, the reactors and the wake receiver, and `examples/bot-template` |  |  |
-| [R100](#r100-the-standard-ownership-schema) | blocked | sql-rules row-level security checks on `connetto-rs/sql-rules`, then rls2fga translating a declared definer helper into `from parent` relations | A ready-to-use Postgres document with one table per level, the grants per level, the definer helpers and the registry policies written against it |  |  |
+| [R100](#r100-the-standard-ownership-schema) | blocked | R108 slices 2 and 3 | A ready-to-use Postgres document with one table per level, a grant table per level, the definer helpers, the founding and last-admin triggers, and the registry policies written against them |  |  |
 | [R104](#r104-the-demos-for-apps-and-bots) | not started | R100, R103 | `examples/deployment` on the standard schema, the screens in both web demos and the two template bots |  |  |
 | [R74](#r74-device-identity-enrolment-and-certificates) | in progress | R76 (slice 9d) | The last open proof, the Windows `unproven` enrolment record the slice 9d run produces on hardware |  | [#130](https://github.com/connetto-rs/connetto-rs/pull/130), [#132](https://github.com/connetto-rs/connetto-rs/pull/132), [#138](https://github.com/connetto-rs/connetto-rs/pull/138), [#139](https://github.com/connetto-rs/connetto-rs/pull/139), [#146](https://github.com/connetto-rs/connetto-rs/pull/146), [#161](https://github.com/connetto-rs/connetto-rs/pull/161) |
 | [R76](#r76-the-peer-link) | in progress |  | Slices 9d (Windows hosting, joining, beacon and proof) and 9e (the recorded home run) remain, parked while the work goes mobile first |  | [#134](https://github.com/connetto-rs/connetto-rs/pull/134), [#135](https://github.com/connetto-rs/connetto-rs/pull/135), [#136](https://github.com/connetto-rs/connetto-rs/pull/136), [#137](https://github.com/connetto-rs/connetto-rs/pull/137), [#140](https://github.com/connetto-rs/connetto-rs/pull/140), [#141](https://github.com/connetto-rs/connetto-rs/pull/141), [#142](https://github.com/connetto-rs/connetto-rs/pull/142), [#143](https://github.com/connetto-rs/connetto-rs/pull/143), [#148](https://github.com/connetto-rs/connetto-rs/pull/148), [#158](https://github.com/connetto-rs/connetto-rs/pull/158), [#162](https://github.com/connetto-rs/connetto-rs/pull/162), [#163](https://github.com/connetto-rs/connetto-rs/pull/163), [#204](https://github.com/connetto-rs/connetto-rs/pull/204) |
 | [R57](#r57-the-demo-feature-gaps-the-export-audit-found) | in progress |  | The application-visible features the export audit found missing from the demos, steps 1 to 5 and 7 found built in the demos on `examples/demo-support` (2026-10-26), step 6 found already fixed (2026-09-12), step 8 merged (2026-10-20), and the human proof pass remaining |  | [#205](https://github.com/connetto-rs/connetto-rs/pull/205), [#216](https://github.com/connetto-rs/connetto-rs/pull/216) |
-| [R77](#r77-the-exchange-and-the-provisional-tier) | in progress |  | Slices 7 (online adjudication), 12 (Apple devices only join) and 8 (the handheld proof) remain, the rest of the exchange and the provisional tier is merged |  | [#296](https://github.com/connetto-rs/connetto-rs/pull/296), [#297](https://github.com/connetto-rs/connetto-rs/pull/297), [#300](https://github.com/connetto-rs/connetto-rs/pull/300), [#304](https://github.com/connetto-rs/connetto-rs/pull/304), [#310](https://github.com/connetto-rs/connetto-rs/pull/310), [#342](https://github.com/connetto-rs/connetto-rs/pull/342), [#344](https://github.com/connetto-rs/connetto-rs/pull/344), [#348](https://github.com/connetto-rs/connetto-rs/pull/348), [#351](https://github.com/connetto-rs/connetto-rs/pull/351), [#354](https://github.com/connetto-rs/connetto-rs/pull/354), [#357](https://github.com/connetto-rs/connetto-rs/pull/357), [#365](https://github.com/connetto-rs/connetto-rs/pull/365) |
-| [R78](#r78-courier-recovery) | not started | R77 | The server courier path under the five constraints, deployment-opt-in and default off, and the client's explicit offer of another author's held changesets |  |  |
-| [R79](#r79-media-over-the-peer-link) | in progress | R78 (step 4) | Slice 8, the harness proof, and step 4's opt-in replication |  | [#371](https://github.com/connetto-rs/connetto-rs/pull/371), [#373](https://github.com/connetto-rs/connetto-rs/pull/373), [#376](https://github.com/connetto-rs/connetto-rs/pull/376), [#379](https://github.com/connetto-rs/connetto-rs/pull/379), [#383](https://github.com/connetto-rs/connetto-rs/pull/383), [#385](https://github.com/connetto-rs/connetto-rs/pull/385), [#388](https://github.com/connetto-rs/connetto-rs/pull/388) |
-| [R80](#r80-peer-sync-in-every-demo) | not started | R76 (slice 9d), R77, R78, R79 | The camp flow in every native-capable demo on every native platform, and the grown phone and home runs |  |  |
+| R78 | done |  | The server's courier rules and wire, audit, meter and notices, the receiver's courier hold, rebuild and archive, the explicit offer on the main wire, retained rows offered again after a restore, older-major rows on a drain wire the call opens, and the author's re-send after a restore on the main and drain wires | The Docker-gated [courier_offer.rs](../crates/connetto-test-harness/tests/it/courier_offer.rs), a courier through another account's session, and [courier_restore.rs](../crates/connetto-test-harness/tests/it/courier_restore.rs), the restored server getting its writes back from a courier and a retired author's held copies leaving nothing to courier | [#384](https://github.com/connetto-rs/connetto-rs/pull/384), [#387](https://github.com/connetto-rs/connetto-rs/pull/387), [#391](https://github.com/connetto-rs/connetto-rs/pull/391), [#396](https://github.com/connetto-rs/connetto-rs/pull/396), [#400](https://github.com/connetto-rs/connetto-rs/pull/400), [#403](https://github.com/connetto-rs/connetto-rs/pull/403), [#412](https://github.com/connetto-rs/connetto-rs/pull/412), [#418](https://github.com/connetto-rs/connetto-rs/pull/418), [#453](https://github.com/connetto-rs/connetto-rs/pull/453), [#465](https://github.com/connetto-rs/connetto-rs/pull/465), [#466](https://github.com/connetto-rs/connetto-rs/pull/466), [#467](https://github.com/connetto-rs/connetto-rs/pull/467), [#468](https://github.com/connetto-rs/connetto-rs/pull/468), [#469](https://github.com/connetto-rs/connetto-rs/pull/469), [#470](https://github.com/connetto-rs/connetto-rs/pull/470), [#471](https://github.com/connetto-rs/connetto-rs/pull/471), [#475](https://github.com/connetto-rs/connetto-rs/pull/475) |
+| R79 | done |  | A device's files over the peer link, each range verified against the file id through BLAKE3 outboards, the media frames and the port, the holder and the receiver judged through the policy views, a file kept while a provisional row names it and swept on retraction, thumbnails fetched unasked, and opt-in replication, with holder reports and link rates, copies placed across linked devices within their budgets, holders asked fastest first, a held copy uploaded credited to its file's owner, and custody copies carried in the device archive | The Docker-gated [peer_media.rs](../crates/connetto-test-harness/tests/it/peer_media.rs), a photo crossing the camp and its retraction sweeping it, and [peer_loss.rs](../crates/connetto-test-harness/tests/it/peer_loss.rs), a lost author's photo reaching the server through its teammates | [#371](https://github.com/connetto-rs/connetto-rs/pull/371), [#373](https://github.com/connetto-rs/connetto-rs/pull/373), [#376](https://github.com/connetto-rs/connetto-rs/pull/376), [#379](https://github.com/connetto-rs/connetto-rs/pull/379), [#383](https://github.com/connetto-rs/connetto-rs/pull/383), [#385](https://github.com/connetto-rs/connetto-rs/pull/385), [#388](https://github.com/connetto-rs/connetto-rs/pull/388), [#394](https://github.com/connetto-rs/connetto-rs/pull/394), [#415](https://github.com/connetto-rs/connetto-rs/pull/415), [#490](https://github.com/connetto-rs/connetto-rs/pull/490), [#491](https://github.com/connetto-rs/connetto-rs/pull/491), [#503](https://github.com/connetto-rs/connetto-rs/pull/503), [#530](https://github.com/connetto-rs/connetto-rs/pull/530), [#531](https://github.com/connetto-rs/connetto-rs/pull/531), [#532](https://github.com/connetto-rs/connetto-rs/pull/532), [#533](https://github.com/connetto-rs/connetto-rs/pull/533), [#538](https://github.com/connetto-rs/connetto-rs/pull/538), [#540](https://github.com/connetto-rs/connetto-rs/pull/540), [#543](https://github.com/connetto-rs/connetto-rs/pull/543), [#544](https://github.com/connetto-rs/connetto-rs/pull/544), [#546](https://github.com/connetto-rs/connetto-rs/pull/546), [#547](https://github.com/connetto-rs/connetto-rs/pull/547) |
+| [R80](#r80-peer-sync-in-every-demo) | not started |  | The camp flow in every native-capable demo on Android, iOS, iPadOS, macOS and Linux, and the grown phone and home runs. Windows is outside it |  |  |
 | [R107](#r107-schema-changes-under-running-servers) | in progress | subql passing pgoutput `Relation` messages to consumers (slice 2) | The expand and contract procedure with the sunset, the table refusal when a running server notices a change, and the two-model boot check |  |  |
-| [R108](#r108-caller-kinds-as-database-roles) | in progress | sql-traits answering the caller contract, privileges and effective policies for both translators, for slices 2 to 5. R99, for the bot kinds | Caller kinds as database roles, every startup refusal before OpenFGA, four flat kind roles switched per transaction, grants per kind, and a client copy per kind |  |  |
-| [R109](#r109-content-tickets-bound-to-their-session) | not started |  | Content tickets carry their session, and every fetch confirms the session is live, so a ticket dies with the session that minted it |  |  |
+| [R107-MySQL](#r107-mysql-refused-tables-on-mysql-and-mariadb) | not started |  | subql's drift guard on MySQL and MariaDB, through a Maxwell change source and a live read over `my_diesel` |  |  |
+| [R108](#r108-caller-kinds-as-database-roles) | in progress | sql-traits answering the caller contract, privileges and effective policies for both translators, and rls2fga translating R107's live model, for slices 2 to 5. R99, for the bot kinds | Caller kinds as database roles, every startup refusal before OpenFGA, four flat kind roles switched per transaction, grants per kind read from the live database, and a client copy per kind |  |  |
 | [R110](#r110-a-session-bound-by-provider-staleness) | not started |  | Session lifetime bounded by the time since the identity provider last confirmed the user, replacing the fixed idle window and ceiling |  |  |
 | [R111](#r111-a-durable-replica-where-opfs-is-refused) | blocked | the JSPI IndexedDB VFS upstream in `sqlite-wasm-rs` | A durable browser replica on IndexedDB through JSPI where OPFS is refused, memory kept only where JSPI is missing |  |  |
 | [R112](#r112-an-apple-peer-to-peer-link) | in progress |  | A link between Apple devices over Apple's peer-to-peer Wi-Fi, for an all-Apple group with no hotspot host and no shared network, on Network framework through `objc2-network`, with the link generic over its byte stream |  |  |
+| [R113](#r113-tests-that-wait-on-events) | blocked | Refreshed dependency graph | CI-backed sequential test and event-hook fixes, ranked by downstream impact and observed flakiness, with targeted repetition only | | |
 | [R21](#r21-one-page-codec-on-both-backends) | in progress |  | Slices 2 to 5, the browser on `sqlite-wasm-rs` 0.6 and then on SQLCipher, one open contract, the capability and hardening proof, and SQLCipher 4.20.0 |  | [#402](https://github.com/connetto-rs/connetto-rs/pull/402) |
+| [R117](#r117-typed-aggregate-wire) | in progress |  | Aggregate values, group keys and computed rows carried and rested in the replica's storage encoding, one `STRICT` table per statistic, decoded through diesel's `FromSql` into any type a generated model loads |  |  |
 | R0 | done | | The always-on change-path counters in `counters.rs` and the `fanout_load` harness that priced the dispatch loop, with the ceiling measured as one sequential visibility round trip per subscriber per event and the lock wait at zero | [fanout_counters.rs](../crates/connetto-test-harness/tests/it/fanout_counters.rs), [fanout_load.rs](../crates/connetto-test-harness/tests/it/fanout_load.rs) | |
-| R1 | done | | The three permissive stand-ins reachable from configuration alone are gone, and the reference binary refuses to start without a reader role and a recognised `CONNETTO_OIDC_PROVIDER` | [e2e.rs](../crates/connetto-server/tests/it/e2e.rs) | |
+| R1 | done | | The three permissive stand-ins reachable from configuration alone are gone, and the reference binary refuses to start without a reader role and a recognised `CONNETTO_OIDC_PROVIDER` | [e2e.rs](../examples/demo-tools/tests/it/e2e.rs) | |
 | R2 | done | | The durable session handle is the operational key. Cursors and the `_connetto_mutations` watermark key on `session_id`, the connection registry serves revocation and supersession, and `TrustingSessionVerifier` is deleted with the verifier a required constructor argument | [session_handle.rs](../crates/connetto-test-harness/tests/it/session_handle.rs), [authn_flow.rs](../crates/connetto-server/tests/it/authn_flow.rs) | |
 | R3 | done | | The handshake carries a grant list instead of a single credential, `HandshakeAuthority` checks each grant into a `Principal` with a non-optional handle, a refused grant is logged and silent on the wire, and the type guard keeps an ephemeral replica paired only with an ephemeral tier | [grants.rs](../crates/connetto-server/tests/it/grants.rs), [verified_topology.rs](../crates/connetto-client/tests/it/verified_topology.rs) | |
 | R4 | done | | Capabilities as connetto-signed tokens naming subjects that are not people, the `CapabilityIssuer` mint that asks the read question through the same seam, the `app.subjects` binding every transaction applies, the expiry bounds, and the permission as a relation in the model | [capabilities.rs](../crates/connetto-server/tests/it/capabilities.rs), [capability_live.rs](../crates/connetto-test-harness/tests/it/capability_live.rs) | |
@@ -123,8 +125,8 @@ Docker-gated Postgres tests and headless Chrome may both be run freely.
 | R48 | done | | A `TRUNCATE` empties the client's copy. The `TableTruncated` resync reason clears the table unconditionally, catchup abandons the replay on a truncate it meets, and the pending local writes reapply after every resync | [truncate_resync.rs](../crates/connetto-client/tests/it/truncate_resync.rs), [truncate.rs](../crates/connetto-test-harness/tests/it/truncate.rs) | |
 | R49 | done | | The startup refusal for a policy shape whose withdrawal cannot reach the authorization store, the upstream finding, and the deletion of the re-run machinery the refusal made unreachable, with the shape booting again after R86 adopted the upstream repair | [openfga.rs](../crates/connetto-server/src/openfga.rs) | |
 | R50 | done | | The row-level-security policy answers the write question from the database. `RlsAuth::may_write` asks the two verbs a share can certify through a locking read, refuses the delete verb where the schema writes a separate rule, and maps a failed question to `ShareError::WriteUndecidable` | [rls_write_question.rs](../crates/connetto-server/tests/it/rls_write_question.rs) | |
-| R51 | done | | The native Apple gate on the two keychain items, gated through `AccessPolicy::RequireUserPresence` behind one shared `LAContext` unlock per launch, macOS joins the protected store under the provisioned app, and custody reports `Verified` | [gate_recheck.rs](../crates/connetto-client/tests/it/gate_recheck.rs), [connetto-ios-proof.rs](../crates/connetto-test-harness/src/bin/connetto-ios-proof.rs) | [#112](https://github.com/connetto-rs/connetto-rs/pull/112) |
-| R52 | done | | The native Android gate through the unlock-once store option. One approval opens the store until connetto locks it, the `BiometricPrompt` waits for the app's window focus, and a lost store key wipes and resyncs | [gate_recheck.rs](../crates/connetto-client/tests/it/gate_recheck.rs), [connetto-android-proof.rs](../crates/connetto-test-harness/src/bin/connetto-android-proof.rs) | [#112](https://github.com/connetto-rs/connetto-rs/pull/112) |
+| R51 | done | | The native Apple gate on the two keychain items, gated through `AccessPolicy::RequireUserPresence` behind one shared `LAContext` unlock per launch, macOS joins the protected store under the provisioned app, and custody reports `Verified` | [gate_recheck.rs](../crates/connetto-client/tests/it/gate_recheck.rs), [connetto-ios-proof.rs](../examples/demo-stack/src/bin/connetto-ios-proof.rs) | [#112](https://github.com/connetto-rs/connetto-rs/pull/112) |
+| R52 | done | | The native Android gate through the unlock-once store option. One approval opens the store until connetto locks it, the `BiometricPrompt` waits for the app's window focus, and a lost store key wipes and resyncs | [gate_recheck.rs](../crates/connetto-client/tests/it/gate_recheck.rs), [connetto-android-proof.rs](../examples/demo-stack/src/bin/connetto-android-proof.rs) | [#112](https://github.com/connetto-rs/connetto-rs/pull/112) |
 | R53 | done | | The Windows gate through the `HelloStore`, sealing each secret under a key derived from a Windows Hello passkey PRF. One approval unlocks each launch, and whether the credential survives a fingerprint re-enrolment is measured in R76 slice 9d | [gate.rs](../crates/connetto-client/src/keyring/gate.rs) | [#112](https://github.com/connetto-rs/connetto-rs/pull/112) |
 | R54 | done | | Every demo carries every application-visible feature. The multi-account picker and switch, the passkey gate with its custody display, the session expiry warning, the over-limit signal, the several-provider `CONNETTO_OIDC_PROVIDERS` environment, and the parity fills | [browser_auth.rs](../examples/wasm-smoke/tests/browser_auth.rs) | |
 | R55 | done | | Containerised test services and the CI that runs them. `testcontainers` behind the service-backed suites, `connetto-browser-stack` driving the browser gates, the `ci.yml` workflow as the gate, and `docs/devstack-local.md` deleted | [ci.yml](../.github/workflows/ci.yml) | |
@@ -141,11 +143,12 @@ Docker-gated Postgres tests and headless Chrome may both be run freely.
 | R67 | done |  | The native file client, the encrypted chunk store, the manifests and outbox committed with the entry row, the boot integrity pass, the resolver and `tidy_content` |  |  |
 | R68 | done |  | The browser file client, worker-owned encrypted OPFS with memory fallback, reference-counted object URLs and the version 3 archive that restores unsent content |  |  |
 | R69 | done |  | Files in every demo, the offline and online photo flows on the browser stack and the native photos surface in the desktop demo | [photo_flow.rs](../examples/wasm-smoke/tests/photo_flow.rs), [photo_offline.rs](../examples/wasm-smoke/tests/photo_offline.rs), [photo_visibility.rs](../examples/wasm-smoke/tests/photo_visibility.rs), [demo_photos_flow.rs](../examples/dioxus-demo/tests/demo_photos_flow.rs) | [#28](https://github.com/connetto-rs/connetto-rs/pull/28), [#29](https://github.com/connetto-rs/connetto-rs/pull/29), [#30](https://github.com/connetto-rs/connetto-rs/pull/30), [#31](https://github.com/connetto-rs/connetto-rs/pull/31), [#34](https://github.com/connetto-rs/connetto-rs/pull/34), [#35](https://github.com/connetto-rs/connetto-rs/pull/35) |
-| R70 | done |  | The backup and restore story, the `connetto-local-data` archive at version 6 with each queued write carrying its number's secret, the restore procedure in chapter 20 | [restore.rs](../crates/connetto-server/tests/it/restore.rs) | [#59](https://github.com/connetto-rs/connetto-rs/pull/59), [#131](https://github.com/connetto-rs/connetto-rs/pull/131), [#302](https://github.com/connetto-rs/connetto-rs/pull/302), [#306](https://github.com/connetto-rs/connetto-rs/pull/306), [#317](https://github.com/connetto-rs/connetto-rs/pull/317) |
+| R70 | done |  | The backup and restore story, the `connetto-local-data` archive at version 6 with each queued write carrying its number's secret, the restore procedure in chapter 20 | [restore.rs](../examples/demo-tools/tests/it/restore.rs) | [#59](https://github.com/connetto-rs/connetto-rs/pull/59), [#131](https://github.com/connetto-rs/connetto-rs/pull/131), [#302](https://github.com/connetto-rs/connetto-rs/pull/302), [#306](https://github.com/connetto-rs/connetto-rs/pull/306), [#317](https://github.com/connetto-rs/connetto-rs/pull/317) |
 | R71 | done |  | Linux key custody across a reboot, the sealed records, the sandbox keyring, the systemd credential, the wrap key and the desktop proofs | [linux_custody.rs](../crates/connetto-client/tests/it/linux_custody.rs), [desktop-proofs](../scripts/desktop-proofs/) |  |
 | R72 | done |  | Clock discipline, the wall-clock rule per timer class, chapter 21 states it and X6 is closed |  | [#211](https://github.com/connetto-rs/connetto-rs/pull/211), [#212](https://github.com/connetto-rs/connetto-rs/pull/212), [#214](https://github.com/connetto-rs/connetto-rs/pull/214), [#215](https://github.com/connetto-rs/connetto-rs/pull/215) |
 | R73 | done |  | Failover verification, every cursor carries its timeline and one past where that timeline ended resyncs, X7 closed | [failover.rs](../crates/connetto-server/tests/it/failover.rs) | [#55](https://github.com/connetto-rs/connetto-rs/pull/55) |
 | R75 | done |  | The per-device applied frontier, the writer frontiers, the courier dedup on the same frontier and the audit records | [writer_frontier.rs](../crates/connetto-server/tests/it/writer_frontier.rs), [courier_frontier.rs](../crates/connetto-server/tests/it/courier_frontier.rs), [mutation_replay.rs](../crates/connetto-client/tests/it/mutation_replay.rs) | [#196](https://github.com/connetto-rs/connetto-rs/pull/196), [#197](https://github.com/connetto-rs/connetto-rs/pull/197), [#199](https://github.com/connetto-rs/connetto-rs/pull/199), [#200](https://github.com/connetto-rs/connetto-rs/pull/200), [#206](https://github.com/connetto-rs/connetto-rs/pull/206) |
+| R77 | done |  | The offline exchange of device writer entries between certified peers under one signed offer, the provisional tier that applies a policy-passing peer write and spares it from eviction, online adjudication that confirms or rolls back with the reason, pushed when the author's write settles, and Apple devices that only join | [peer_exchange.rs](../crates/connetto-test-harness/tests/it/peer_exchange.rs), [provisional_adjudication.rs](../crates/connetto-test-harness/tests/it/provisional_adjudication.rs), the handheld run in [chapter 19](../docs/architecture/19-device-to-device.md) | [#296](https://github.com/connetto-rs/connetto-rs/pull/296), [#297](https://github.com/connetto-rs/connetto-rs/pull/297), [#300](https://github.com/connetto-rs/connetto-rs/pull/300), [#304](https://github.com/connetto-rs/connetto-rs/pull/304), [#310](https://github.com/connetto-rs/connetto-rs/pull/310), [#342](https://github.com/connetto-rs/connetto-rs/pull/342), [#344](https://github.com/connetto-rs/connetto-rs/pull/344), [#348](https://github.com/connetto-rs/connetto-rs/pull/348), [#351](https://github.com/connetto-rs/connetto-rs/pull/351), [#354](https://github.com/connetto-rs/connetto-rs/pull/354), [#357](https://github.com/connetto-rs/connetto-rs/pull/357), [#365](https://github.com/connetto-rs/connetto-rs/pull/365), [#377](https://github.com/connetto-rs/connetto-rs/pull/377), [#404](https://github.com/connetto-rs/connetto-rs/pull/404), [#405](https://github.com/connetto-rs/connetto-rs/pull/405), [#406](https://github.com/connetto-rs/connetto-rs/pull/406), [#419](https://github.com/connetto-rs/connetto-rs/pull/419), [#420](https://github.com/connetto-rs/connetto-rs/pull/420), [#422](https://github.com/connetto-rs/connetto-rs/pull/422) |
 | R81 | done |  | The aggregate read time bound, the seed plans, the re-execution bound and the caller-assigned read ceilings | [read_ceiling.rs](../crates/connetto-server/tests/it/read_ceiling.rs) |  |
 | R82 | done |  | Grouped and re-executed delivery, the grouped seed, the keyed deltas and the demotion at the wire | [grouped_wire.rs](../crates/connetto-server/tests/it/grouped_wire.rs) |  |
 | R83 | done |  | The client resting table, the aggregate resting state keyed on the query identity | [loop_emu.rs](../crates/connetto-client/tests/it/loop_emu.rs) |  |
@@ -153,7 +156,7 @@ Docker-gated Postgres tests and headless Chrome may both be run freely.
 | R85 | done |  | Per-viewer RLS re-execution, the computed subscription's per-viewer identity on the reader pool | [rls_computed.rs](../crates/connetto-server/tests/it/rls_computed.rs) |  |
 | R86 | done |  | The re-run path, the boot refusal asks the real question and the composite-join grading is adopted | [openfga_live.rs](../crates/connetto-server/tests/it/openfga_live.rs), [grant_withdrawal.rs](../crates/connetto-test-harness/tests/it/grant_withdrawal.rs) |  |
 | R87 | done |  | The per-identity commit quota answered `507` under a per-uploader advisory lock, the cached deployment storage and bandwidth ceilings answered `503` with `Retry-After`, the per-day `_cfs_traffic` ledger, one warning and one error per crossing and the client treating `507` as permanent and `503` as transient | [quotas.rs](../crates/connetto-file-server/tests/it/quotas.rs) | [#46](https://github.com/connetto-rs/connetto-rs/pull/46), [#47](https://github.com/connetto-rs/connetto-rs/pull/47), [#49](https://github.com/connetto-rs/connetto-rs/pull/49) |
-| R88 | done |  | The mobile build of a demo, the dioxus demo on Android and iOS through the proof drivers, the emulator and simulator legs on the Tauri demo | [connetto-android-proof.rs](../crates/connetto-test-harness/src/bin/connetto-android-proof.rs), [connetto-ios-proof.rs](../crates/connetto-test-harness/src/bin/connetto-ios-proof.rs) | [#58](https://github.com/connetto-rs/connetto-rs/pull/58), [#60](https://github.com/connetto-rs/connetto-rs/pull/60), [#66](https://github.com/connetto-rs/connetto-rs/pull/66), [#73](https://github.com/connetto-rs/connetto-rs/pull/73), [#165](https://github.com/connetto-rs/connetto-rs/pull/165) |
+| R88 | done |  | The mobile build of a demo, the dioxus demo on Android and iOS through the proof drivers, the emulator and simulator legs on the Tauri demo | [connetto-android-proof.rs](../examples/demo-stack/src/bin/connetto-android-proof.rs), [connetto-ios-proof.rs](../examples/demo-stack/src/bin/connetto-ios-proof.rs) | [#58](https://github.com/connetto-rs/connetto-rs/pull/58), [#60](https://github.com/connetto-rs/connetto-rs/pull/60), [#66](https://github.com/connetto-rs/connetto-rs/pull/66), [#73](https://github.com/connetto-rs/connetto-rs/pull/73), [#165](https://github.com/connetto-rs/connetto-rs/pull/165) |
 | R89 | done |  | A failing re-execution read ends its subscription, the `ReadFailure` three classes with the one retry for the codeless error | [reexec_failure.rs](../crates/connetto-server/tests/it/reexec_failure.rs) | [#51](https://github.com/connetto-rs/connetto-rs/pull/51) |
 | R90 | done |  | The browser's refresh token in an `HttpOnly` cookie, the websocket keeps its bearer, the cross-site refusal proven |  | [#53](https://github.com/connetto-rs/connetto-rs/pull/53) |
 | R91 | done |  | The bot registry and the list cap, the five registry tables, the four `AS RESTRICTIVE` cap policies per synced and registry table and the registration over the connection's challenge | [bot_cap.rs](../crates/connetto-server/tests/it/bot_cap.rs), [bot_registration.rs](../crates/connetto-server/tests/it/bot_registration.rs) | [#152](https://github.com/connetto-rs/connetto-rs/pull/152), [#153](https://github.com/connetto-rs/connetto-rs/pull/153), [#154](https://github.com/connetto-rs/connetto-rs/pull/154) |
@@ -166,40 +169,20 @@ Docker-gated Postgres tests and headless Chrome may both be run freely.
 | R98 | done |  | One schema contract, `ConnettoSchema` with its members and the startup preflight that refuses a missing member | [builder_coverage.rs](../crates/connetto-server/tests/it/builder_coverage.rs) | [#126](https://github.com/connetto-rs/connetto-rs/pull/126) |
 | R105 | done |  | Answering a stolen account, the session record, the session surfaces, the revocation of a second session and the `auth_events` rows |  | [#262](https://github.com/connetto-rs/connetto-rs/pull/262), [#268](https://github.com/connetto-rs/connetto-rs/pull/268), [#274](https://github.com/connetto-rs/connetto-rs/pull/274), [#283](https://github.com/connetto-rs/connetto-rs/pull/283), [#287](https://github.com/connetto-rs/connetto-rs/pull/287), [#289](https://github.com/connetto-rs/connetto-rs/pull/289) |
 | R106 | done |  | Database failures classified by their SQLSTATE, the named transient list for reads, writes and the oplog, the `Deterministic` class and the `42501` refusal as `Unauthorized` | [reexec_failure.rs](../crates/connetto-server/tests/it/reexec_failure.rs) | [#343](https://github.com/connetto-rs/connetto-rs/pull/343), [#356](https://github.com/connetto-rs/connetto-rs/pull/356) |
+| R109 | done |  | A login's content ticket names its session, and the mint and every read and upload request confirm the session is live, so a ticket dies with the session that minted it, and reads are cached privately | [ticket_logout.rs](../crates/connetto-server/tests/it/ticket_logout.rs), [ticket_session.rs](../crates/connetto-server/tests/it/ticket_session.rs), [session_bound.rs](../crates/connetto-file-server/tests/it/session_bound.rs) | [#583](https://github.com/connetto-rs/connetto-rs/pull/583) |
+| R114 | done |  | Every session asks the server about its retained rows, so a `Pending` candidacy outlives a restart, and an `Abandoned` verdict deletes the retained rows it names | [courier_tests.rs](../crates/connetto-client/src/courier_tests.rs), [courier_restore.rs](../crates/connetto-test-harness/tests/it/courier_restore.rs) | [#492](https://github.com/connetto-rs/connetto-rs/pull/492), [#493](https://github.com/connetto-rs/connetto-rs/pull/493) |
+| R115 | done |  | Every session asks about provisional records and stored entries up to each author's signed offer frontier, including provisional entries with no records | [provisional_adjudication.rs](../crates/connetto-client/tests/it/provisional_adjudication.rs), [courier_tests.rs](../crates/connetto-client/src/courier_tests.rs), [courier_restore.rs](../crates/connetto-test-harness/tests/it/courier_restore.rs) | [#495](https://github.com/connetto-rs/connetto-rs/pull/495), [#496](https://github.com/connetto-rs/connetto-rs/pull/496) |
+| R116 | done |  | One live-query hook, `use_live(&source, spec)`, in `connetto-yew`, `connetto-dioxus` and `connetto-leptos` over one loop in `connetto-client`, the Tauri plugin and page source that serve it in a webview, and every demo on it with no hand-written subscription loop | [live_source.rs](../crates/connetto-client/tests/it/live_source.rs), [hook.rs](../crates/connetto-leptos/tests/hook.rs), [tests.rs](../crates/tauri-plugin-connetto/src/tests.rs), [tests.rs](../crates/connetto-tauri-page/src/tests.rs), [live.rs](../crates/connetto-test-harness/src/android_phone/live.rs) | [#563](https://github.com/connetto-rs/connetto-rs/pull/563), [#564](https://github.com/connetto-rs/connetto-rs/pull/564), [#568](https://github.com/connetto-rs/connetto-rs/pull/568), [#569](https://github.com/connetto-rs/connetto-rs/pull/569), [#570](https://github.com/connetto-rs/connetto-rs/pull/570), [#572](https://github.com/connetto-rs/connetto-rs/pull/572) |
 
 ## Gaps
 
 Defects and unowned risks with no phase yet. Each states what the code does and why it matters. A phase that takes one links it and the entry goes when the phase lands.
-
-### G1
-
-**Handshake liveness ignores the idle deadline.** `session_is_live` checks only `revoked` and the absolute deadline, in [`InMemoryAuthStore`](../crates/connetto-server/src/authn/store.rs) and in `live_session` in [schema.rs](../crates/connetto-server/src/authn/schema.rs), while the refresh path checks both. A session past its idle window passes the handshake until its access token expires.
-
-Fixed in one pull request with [G2](#g2), by checking the idle deadline in both stores, proven by a session past its idle window refused at the handshake.
-
-### G2
-
-**The refresh lock map is never pruned.** `AuthService::refresh_locks` in [service.rs](../crates/connetto-server/src/authn/service.rs) gains an entry per session that ever refreshed and keeps it for the life of the process.
-
-Fixed with [G1](#g1), by holding the locks weakly and pruning dead entries on insert.
 
 ### G3
 
 **Browser tabs do not receive membership rows.** The relay in [relay.rs](../crates/connetto-web/src/relay.rs) neither forwards `MembershipOpened` nor opens tab-level membership subscriptions, so a tab reading through a membership-shaped policy sees empty results.
 
 Fixed in one pull request in `relay.rs`. The hub forwards `MembershipOpened`, mirrors membership tables into tab snapshots, live routing and resync, proven by a tab reading the demo's membership-shaped `team_notes_p` policy.
-
-### G4
-
-**Without OPFS the web client runs on an in-memory replica.** `ReplicaStorage::install` in [storage.rs](../crates/connetto-web/src/storage.rs) falls back to a memory VFS, so queued writes and the replica are lost on reload and nothing tells the user.
-
-Decided. The client keeps the in-memory replica where OPFS is refused and reports the replica's persistence in its boot report, so the application can warn that a reload loses unsent writes, in one pull request. A durable fallback is [R111](#r111-a-durable-replica-where-opfs-is-refused).
-
-### G5
-
-**A content ticket outlives the session that minted it.** Every fetch rechecks the file's visibility to the ticket's caller (`file_visible_to_caller` in [serve.rs](../crates/connetto-file-server/src/serve.rs)), so a revoked share, a revoked grant or an erased row denies at once. What outlives the session is the caller's identity. After a logout or a revoked session, a cached ticket keeps reading the files that identity can still see until its expiry, `CONNETTO_CONTENT_TICKET_TTL_SECS` (default 3600 s) plus the server skew.
-
-Taken by [R109](#r109-content-tickets-bound-to-their-session).
 
 ### G6
 
@@ -209,7 +192,7 @@ Taken by [R110](#r110-a-session-bound-by-provider-staleness).
 
 ### G7
 
-**Role-scoped policies cannot be served.** Every caller runs as the reader role, so connetto refuses at startup any policy whose `TO` clause names a role other than `PUBLIC` (`SetupError::RoleScopedPolicy`), naming the policy, its table and the roles, before anything reaches OpenFGA. Served as they stand, the two translators would disagree on such a policy. `rls2fga` turns every `TO` clause into `pg_role` facts nothing in connetto loads or watches, and a probe at `rls2fga` 3004d6b86, ahead of the pinned 40437eb and not yet reproduced at the pin, found that without those facts a permissive scope narrows and a restrictive one binds nobody, while `pg2sqlite` refuses any role-scoped policy because connetto names no session role.
+**Policies cannot tell kinds of caller apart.** Every caller acts as the reader role, so both translators settle a policy's `TO` clause against that one role. A policy the reader is subject to serves every caller, and one only other roles are subject to is logged at startup and left out of the model and the client copy. A deployment cannot scope a policy to anonymous callers, signed-in users or bots, and every caller holds the reader's table grants.
 
 Taken by [R108](#r108-caller-kinds-as-database-roles), whose decision 4 settles each `TO` clause against connetto's caller roles.
 
@@ -225,45 +208,19 @@ Taken by [R108](#r108-caller-kinds-as-database-roles), which has both translator
 
 A diverging note from `rls2fga` for a policy translated to no access is an upstream request.
 
-### G12
-
-**Snapshot priority is not scheduled.** `SubscriptionPriority` travels on the wire and the server delivers snapshots in arrival order.
-
-Decided. `SubscriptionPriority` leaves the wire with a `PROTOCOL_VERSION` bump, in one pull request.
-
-### G14
-
-**The local gate and CI run different clippy.** The gate prescribes `+nightly`, the CI Check job runs `+stable`, so a nightly-only lint can land on `main` with CI green.
-
-Fixed in one pull request, by a CI leg running the gate's clippy on a pinned dated nightly.
-
-### G17
-
-**A snapshot source's cursor contract is unverified.** The resume cursor is opaque to the client, so the client cannot compare two of them, and a stale but non-empty snapshot cursor would regress the resume point. The Postgres source returns the watermark of the commit its read sat at, which is `page_cursor` in [snapshot.rs](../crates/connetto-server/src/snapshot.rs), so production is safe, but no test pins that contract across sources. A regressed cursor widens the catchup or forces a resync.
-
-Fixed in one pull request, by stating the rule on `SnapshotSource::snapshot_page` and a non-regression test of the watermark in `pg_async.rs`.
-
-### G18
-
-**The browser hub's upstream reconnect is never tested against a real server.** The fake-transport browser suites drive `hub_recover` in [relay.rs](../crates/connetto-web/src/relay.rs) through attach refusal, terminal close, rate limiting, resubscription and resync fan-out. No suite drives it across a real server restart, because the shared demo stack cannot be killed mid-run.
-
-Fixed in one pull request, by a browser CI shard with its own restartable stack and a suite that restarts the server mid-run.
-
 ## Upstream dependencies
 
 **No phase waits on an upstream merge.** A phase that needs a change in a dependency requests it upstream, then builds against the fork through a `[patch.crates-io]` entry pinned to a revision, and drops the entry once a release carries the change. A review that takes months therefore holds nothing, and an upstream finding lists no phase in its blockers. What follows holds only the requests still open, each checked against its upstream.
 
 1. **R21, the page codec on both backends.** Slice 2 needs safe `memvfs` access in `sqlite-wasm-rs`, [#210](https://github.com/Spxg/sqlite-wasm-rs/pull/210) and [#211](https://github.com/Spxg/sqlite-wasm-rs/pull/211), open and stacked on the multithreading pair [#205](https://github.com/Spxg/sqlite-wasm-rs/pull/205) and [#204](https://github.com/Spxg/sqlite-wasm-rs/pull/204), and builds against a revision carrying them. Slice 5 waits on releases of merged changes, `sqlite-wasm-rs` [#212](https://github.com/Spxg/sqlite-wasm-rs/pull/212) moving its pin to `sqlcipher-src` 420.0.0 and awaiting 0.6.3, then [rusqlite #1932](https://github.com/rusqlite/rusqlite/pull/1932), a draft until 0.6.3 exists, moving `libsqlite3-sys` the same way.
 
-2. **R100, the standard ownership schema.** The row-level security checks the maintainer ordered first are open in `connetto-rs/sql-rules` as [#18](https://github.com/connetto-rs/sql-rules/pull/18), [#20](https://github.com/connetto-rs/sql-rules/pull/20), [#21](https://github.com/connetto-rs/sql-rules/pull/21), [#24](https://github.com/connetto-rs/sql-rules/pull/24), [#26](https://github.com/connetto-rs/sql-rules/pull/26) and [#29](https://github.com/connetto-rs/sql-rules/pull/29). The `rls2fga` request for translating a declared definer helper into `from parent` relations is not written yet, and R100's `Blocked on` names it.
+2. **R107 slice 2.** The slice needs subql to pass pgoutput `Relation` messages on to consumers, and no request is filed yet. R107's `Blocked on` names the change.
 
-3. **R107 slice 2.** The slice needs subql to pass pgoutput `Relation` messages on to consumers, and no request is filed yet. R107's `Blocked on` names the change.
+3. **R108 slices 2 to 5.** sql-traits answering the deployment's caller contract, merged as [sql-traits #213](https://github.com/connetto-rs/sql-traits/pull/213), the privileges per command and column, and the policies that apply to an acting role, with `pg2sqlite` and `rls2fga` adopting those answers. `rls2fga` #93, #94 and #95 are held and rebuilt on them. The server's live model also needs `pg_diesel` to read function `EXECUTE` (open as `pg_diesel` #21) and schema `USAGE`, which no branch reads yet.
 
-4. **R108 slices 2 to 5.** sql-traits answering the deployment's caller contract, merged as [sql-traits #213](https://github.com/connetto-rs/sql-traits/pull/213), the privileges per command and column, and the policies that apply to an acting role, with `pg2sqlite` and `rls2fga` adopting those answers. `rls2fga` #93, #94 and #95 are held and rebuilt on them.
+4. **The keyring store pins, R51, R52 and R53, done phases whose patches retire when a release carries the change.** The R51 pin waits on the shared-authentication change, [`apple-native-keyring-store` #26](https://github.com/open-source-cooperative/apple-native-keyring-store/pull/26), which stands on `rust-security-framework`'s typed authentication context, [#263](https://github.com/kornelski/rust-security-framework/pull/263) and [#264](https://github.com/kornelski/rust-security-framework/pull/264), all open, and the keychain crate cannot release while it depends on the unreviewed `security-framework` pull requests, so those decide when the patch goes. The R52 pin carries the unlock-once store option, requested as [`android-native-keyring-store` issue #16](https://github.com/open-source-cooperative/android-native-keyring-store/issues/16), open, and the release behind it waits on [`rust-mobile/ndk-context` #6](https://github.com/rust-mobile/ndk-context/pull/6) and [#7](https://github.com/rust-mobile/ndk-context/pull/7), open. The R53 pin, shared with R74's TPM signing key, waits on [`windows-native-keyring-store` #19](https://github.com/open-source-cooperative/windows-native-keyring-store/pull/19), open.
 
-5. **The keyring store pins, R51, R52 and R53, done phases whose patches retire when a release carries the change.** The R51 pin waits on the shared-authentication change, [`apple-native-keyring-store` #26](https://github.com/open-source-cooperative/apple-native-keyring-store/pull/26), which stands on `rust-security-framework`'s typed authentication context, [#263](https://github.com/kornelski/rust-security-framework/pull/263) and [#264](https://github.com/kornelski/rust-security-framework/pull/264), all open, and the keychain crate cannot release while it depends on the unreviewed `security-framework` pull requests, so those decide when the patch goes. The R52 pin carries the unlock-once store option, requested as [`android-native-keyring-store` issue #16](https://github.com/open-source-cooperative/android-native-keyring-store/issues/16), open, and the release behind it waits on [`rust-mobile/ndk-context` #6](https://github.com/rust-mobile/ndk-context/pull/6) and [#7](https://github.com/rust-mobile/ndk-context/pull/7), open. The R53 pin, shared with R74's TPM signing key, waits on [`windows-native-keyring-store` #19](https://github.com/open-source-cooperative/windows-native-keyring-store/pull/19), open.
-
-6. **Merged and pinned, holding no build.** `diesel`'s SQLSTATE stack, #5332 to #5336, and `diesel_async`'s half, [#306](https://github.com/diesel-rs/diesel_async/pull/306) and [#307](https://github.com/diesel-rs/diesel_async/pull/307), are merged on their `main` branches and unreleased, and the root workspace follows both through its `[patch.crates-io]` entries for R106. `diesel_async` `main` also carries #214, the async DSL bound to diesel's marked types, and `sqlite-diff-rs` 0.18.1 carries the adjustment that bound needed. `pg_walstream` #141 and #142, the startup metadata API and `AlignedSnapshot::capture`, are merged on `isdaniel/pg-walstream` `main` and unreleased, and the subql durable engine and replication reader, `LucaCappelletti94/subql` #207 and #208 and `connetto-rs/subql` #223 and #224, are merged on `connetto-rs/subql` `main` and unreleased. None of these gates a build step, and each pin retires when a release carries the change.
+5. **Merged and pinned, holding no build.** `diesel`'s SQLSTATE stack, #5332 to #5336, and `diesel_async`'s half, [#306](https://github.com/diesel-rs/diesel_async/pull/306) and [#307](https://github.com/diesel-rs/diesel_async/pull/307), are merged on their `main` branches and unreleased, and the root workspace follows both through its `[patch.crates-io]` entries for R106. `diesel_async` `main` also carries #214, the async DSL bound to diesel's marked types, and `sqlite-diff-rs` 0.18.1 carries the adjustment that bound needed. `pg_walstream` #141 and #142, the startup metadata API and `AlignedSnapshot::capture`, are merged on `isdaniel/pg-walstream` `main` and unreleased, and the subql durable engine and replication reader, `LucaCappelletti94/subql` #207 and #208 and `connetto-rs/subql` #223 and #224, are merged on `connetto-rs/subql` `main` and unreleased. None of these gates a build step, and each pin retires when a release carries the change.
 
 # Designs without a phase
 
@@ -349,7 +306,7 @@ It does not foreclose the zero-copy send. `bytes::Bytes::from_owner` accepts any
 | One frame built per handle per event, cloned per socket | `session.rs` |
 | `tokio-tungstenite` from 0.24, and the frame handed over as `Bytes` | `connetto-core/Cargo.toml`, `transport.rs` |
 
-Nothing goes upstream. The frame split is a breaking framing change, and `PROTOCOL_VERSION` (currently 2, `crates/connetto-core/src/version.rs`) bumps on breaking changes to `ControlMessage`, `BulkMessage`, framing or compression, so the new wire takes a version bump rather than riding on a frozen one.
+Breaking changes to `ControlMessage`, `BulkMessage`, framing or compression require a `PROTOCOL_VERSION` bump.
 
 # Phases
 
@@ -456,6 +413,7 @@ A registered bot connects, for one installation or as itself, proves its key, an
 4. **Removal, a ban on the bot or on one installation, a deleted bot and a key rotation close the affected connections at once.** Deleting an installation closes its connection with `SessionRevoked`, a ban of the bot or of one installation id refuses the logins it names and closes the connections, and deleting the bot refuses everything and closes its connections. A key rotation registers the new key through a fresh one-time code and stops the old one at once, so the connections the old key held close and re-login under the new key. A woken bot costs one signature per wake and catches up from its cursor, kept per installation. R19's throttle counts failed logins per bot id after the signature verifies and per connection before it.
 5. **Metering.** An installation connection bills the owner it serves (`owner:<id>`), a bot-level connection the bot's owner. The bot identity holds no bucket.
 6. **Audit.** `BotRegistered`, `BotListRegistered`, `BotKeyRotated`, `BotRemoved` and `BotLoginRefused`. Successful logins are not audited, since a woken bot logs in on every wake. Adding and accepting are the installation row's own changes.
+7. **A key login's principal says so.** The principal a key login yields is marked as holding no stored session, so the content ticket mint names no session for it and the file server never asks the auth store about a session it never held, as [18-file-handling.md](../docs/architecture/18-file-handling.md#the-wire-tickets-and-the-mint) states for every ticket minted with no login.
 
 ### Lifetime, every event against every situation
 
@@ -527,11 +485,11 @@ A second bot written from the template by someone other than the author needs no
 
 ## R100: the standard ownership schema
 
-**Status.** NOT STARTED. The first design, ownership chained through `ownables` and read through a closure table, is superseded by the layered layout the maintainer chose. Its rules are held, since a review against the Postgres and OpenFGA sources found the layered draft only partly best practice, the maintainer wants best practice alone, and the rules are to be rewritten around definer helpers (below the decisions).
+**Status.** IN PROGRESS. Steps 1 and 2, the helper design and its grading, are done, and every upstream change they needed is merged. Step 3 waits on R108.
 
-**Blocked on** sql-rules' row-level security checks, which the maintainer ordered first, since rls2fga may later lean on them for its own diagnostics. They are in work as `connetto-rs/sql-rules` #14, #16 and #17 (merged) and #18, #20, #21, #24, #26 and #29 (open). Then on rls2fga translating a declared definer helper into `from parent` relations, a request not yet written, rls2fga refusing to expand a `SECURITY DEFINER` body on purpose, since it sees rows the caller cannot. Then on pg2sqlite translating the definer helper's body to the client side, which refuses a function call in a policy there today, the fix standing on the `upstream/inline-sql-functions` branch with no pull request open. The layered draft's own rules diverge with `MembershipTableGuarded` on every rule reading a grant table, and without row-level security on the grant tables only the `connetto_installations` rules diverge.
+**Blocked on** R108 slices 2 and 3, the deployment description pg2sqlite reads at build time and rls2fga reads over R107's live model, and the `authenticated` kind role the registry's read policies name.
 
-**Changes state.** Client tables, none of connetto's, the standard document's tables syncing as a deployment's own. Server tables, none of connetto's, the document offering `organizations`, `teams`, `projects`, a grant table per level and the definer helpers for a deployment to adopt, with the policies of R91's registry tables written against them. Wire messages, none. Archive format, none.
+**Changes state.** Client tables, none of connetto's, the standard document's tables syncing as a deployment's own. Server tables, none of connetto's, the document offering `organizations`, `teams`, `projects`, a grant table per level, the definer helpers and their triggers for a deployment to adopt, with the policies of R91's registry tables written against them. Wire messages, none. Archive format, none.
 
 ### Purpose
 
@@ -540,27 +498,27 @@ A ready-to-use Postgres document holding ownership, membership and their policie
 ### Decisions
 
 1. **Roles are read, write and admin.** Admin implies write implies read. Adding a member or a bot needs admin.
-2. **Registry policies.** Any signed-in user may create a registration code and see registered bots with their lists, installations are visible to the admins of the owner they serve and to their own bot.
-3. **One table per level**, `organizations`, `teams (organization_id)`, `projects (team_id, organization_id)`, and assets carrying `project_id, team_id, organization_id`. A composite foreign key to the level above, declared `ON UPDATE CASCADE`, holds the ancestor ids, so moving a project to another team rewrites the team on everything under it in the same statement. Explicit types per level are OpenFGA's recommended model, which keeps recursion for depths that are genuinely unbounded.
-4. **Grants per level, carrying their ancestor ids.** An installation is a principal like a user, its id the grant's principal.
-5. **One policy per command on every grant table.** A policy on a table may read that table only while the table's own `SELECT` policies hold no subquery, or Postgres raises `42P17` (measured on Postgres 17).
-6. **Grant tables carry an own-rows rule**, or every client reads every grant.
-7. **The principal column of every grant table is indexed**, since every rule compares it to the caller.
-8. **The reader role runs with `jit = off`.** The layered draft cost 1.8 to 2.6 s per read with JIT and 17 to 21 ms without over 20,000 orders, the compilation triggered by the policy-heavy plan's cost estimate.
-
-**Held for a rewrite around definer helpers, not yet designed.** The sources agree on one pair. In Postgres, a `STABLE SECURITY DEFINER` helper with a pinned `search_path`, owned by a role that bypasses row-level security and called as `(SELECT fn())`, resolves the owners the caller holds a role on once per statement, and each rule compares an indexed column to it. In OpenFGA, one type per level, a `parent` link and roles that imply each other (`define admin: [user] or admin from parent`). The rewrite must hold on the client's replica too, where pg2sqlite refuses a function call in a policy, so the helper's body must translate as an inlined body, a `SECURITY DEFINER` body reading the backing table and an invoker body the filtered view, the shape settled for the pg2sqlite fix. The layered draft's separate admin tables, its admin rule reading its own table and its per-row subquery per level are workarounds no source recommends, and the maintainer asked that sql-rules enforce against them.
-
-**Open in the layered draft, to be settled in the helper design.** Whether organization admins appoint co-admins or only the creator does. Whether admins above a level manage its installations, which `connetto_installations`' single `owner` column cannot express without ancestor ids or a hop. Whether co-admins at one level see each other. Who creates teams and projects. The fixed depth, which cannot express an organization inside an organization or a sub-team.
+2. **One table per level, each row naming only its parent.** `organizations`, `teams (organization_id)`, `projects (team_id)`, and assets carrying `project_id`, each parent column indexed, so moving a project rewrites one row. The depth stays three, since OpenFGA keeps self-recursion for genuinely unbounded depth and rls2fga emits none.
+3. **One grant table per level**, `(<level>_id, principal_id, role)` with `role IN ('read', 'write', 'admin')` and `principal_id` indexed. An installation is a principal like a user.
+4. **Definer helpers resolve what the caller holds.** `authz.organizations_with(min_role)`, `authz.teams_with(min_role)` and `authz.projects_with(min_role)` return the caller's own grants at that level unioned with the children of every parent it holds the role on, the OpenFGA rule `define reader: [user] or writer or reader from parent`. `authz.installations_administered()` and `authz.installations_of_bot()` serve the registry. Each is `LANGUAGE sql STABLE SECURITY DEFINER SET search_path = ''`, owned by `authz_owner` (`NOLOGIN BYPASSRLS`), with `EXECUTE` revoked from `PUBLIC`.
+5. **Every policy arm is one comparison,** `<indexed column> = ANY (ARRAY(SELECT authz.<helper>('<role>')))`, plus `principal_id` equal to the caller on grant tables, the credential read wrapped as `(SELECT current_setting(...))`. The `ARRAY` form plans one `InitPlan` and an index condition, where `IN (SELECT ...)` plans a hashed `SubPlan` over a sequential scan. A team reader reads its 1,000 of 20,000 orders in 0.7 ms on Postgres 17, and JIT never triggers.
+6. **Admins manage their own level and below.** An admin appoints co-admins at its level, at every level, and co-admins see each other. An organization admin creates teams, a team or organization admin creates projects, and a project moves only between teams its mover administers.
+7. **Founding and the last admin are kept by `SECURITY DEFINER` triggers,** since OpenFGA cannot express "no admin yet" or "not the last admin" and a trigger can lock. Creating an organization grants its creator admin in the same statement, and removing or demoting an admin locks the organization row before counting the others, so an organization keeps at least one admin. One function per event, as pg2sqlite folds `TG_OP` only that way.
+8. **An installation's single `owner` column is a parent of any level.** The installation policies compare `owner` to each level helper in its own arm, and rls2fga loads one parent relation per level type from it. Keys stay distinct across levels, as UUIDs, since a key shared by two levels would admit through either.
+9. **Registry policies.** A signed-in caller creates registration codes and reads its own, and reads registered bots and their lists `TO authenticated` (R108 decision 7). An installation is read and managed by an admin of the owner it serves or of any level above, and read by itself, as an installation and as its bot.
+10. **Ids follow the deployment's `Id`**, TEXT or UUID, so the document is generated per id type, as R91's registry is.
+11. **R100 ships its share of R108's third document.** `authz_owner`, its `SELECT` on the tables the helpers read and the triggers' `INSERT` and `UPDATE`, `USAGE` on `authz`, and `USAGE` on `authz` plus `EXECUTE` on each helper for every kind role whose policies call it. The deployment's migration applies it and the build reads it for each kind's client copy. The server follows the live grants and never compares them with the document (R108 decision 5), so a missing grant is followed, not refused, and the migration applying them is the only guarantee. Neither a kind role nor the reader role is a member of `authz_owner`, since a `SET ROLE` would then reach `BYPASSRLS`.
+12. **A changed helper is adopted.** The server translates the live helpers with the live policies (R107), so a changed helper takes effect at the next marker row, or at the next boot without one. An old client keeps its copy's helper translation until it updates, and R107's proof covers it.
 
 ### Steps
 
-1. The helper design, measured on Postgres 17 against the layered draft's behaviour matrix and cost.
-2. Graded under sql-rules and rls2fga, and the rls2fga request for declared helpers written and launched upstream.
-3. The document and its grading guard. pg2sqlite translated the layered draft without refusal.
+1. The helper design, measured on Postgres 17 for behaviour and cost. Done.
+2. Graded under sql-rules, rls2fga and pg2sqlite, every refusal and false finding fixed upstream: pg2sqlite #219, #231, #232, #233, #235 and #236, sql-traits #258, #263, #267 and #309, rls2fga #99 and #101, sqlparser-plpgsql #27 and sql-rules #39, all merged. Done.
+3. The document, its share of the third document, and its grading guard, booting a server.
 
 ### Proof
 
-A reader of an organization sees orders two levels down, a writer of a team edits its orders and cannot add a member or a bot, its admin can, a principal outside the chain sees nothing, an installation added as read cannot insert, and moving a project between teams moves its orders' visibility at once.
+A reader of an organization sees orders two levels down, a writer of a team edits its orders and cannot add a member or a bot, its admin can, a principal outside the chain sees nothing, an installation added as read cannot insert, an organization's last admin cannot leave, and moving a project between teams moves its orders' visibility at once.
 
 ### Done when
 
@@ -834,12 +792,23 @@ The joiner's central against its state, on a system that runs one (decision 22).
 
 | Event | Absent | Starting | Running |
 | --- | --- | --- | --- |
-| Bluetooth reads `Ready` | start btleplug's thread, become Starting | nothing | nothing |
+| The readiness lets the central start, Bluetooth reading `Ready`, or on Apple the app's Bluetooth permission allowing it (the Apple readiness table below) | start btleplug's thread, become Starting | nothing | nothing |
 | The start answers the central | not applicable | become Running, then the joiner table's "Bluetooth becomes `Ready`" row applies | not applicable |
-| The start fails or passes its 10-second bound | not applicable | log the failure, become Absent, and start again 30 seconds later while Bluetooth still reads `Ready` | not applicable |
+| The start fails or passes its 10-second bound | not applicable | log the failure, become Absent, and start again 30 seconds later while the readiness still lets it start | not applicable |
 | Bluetooth leaves `Ready` | nothing | let the start finish | the joiner table's rows apply, the central stays |
+| The readiness asks for the central's restart (Apple, a prompt while the radio is off) | nothing, the ask waits | nothing, the ask waits | stop the central, become Absent, and start it again on the same look |
 | `join_nearby(host)` or `fetch_offer(host)` while Bluetooth reads `Ready` | start btleplug's thread, become Starting, answer `CentralStarting` | answer `CentralStarting` | the joiner table's rows apply |
 | Client closed | nothing | drop the start's answer, which stops its thread | stop the central |
+
+An Apple device's readiness, which runs no peripheral manager (R77 decision 23). The permission is `CBManager.authorization`, a class property read with no manager. The power is btleplug's, its `adapter_state` once the central starts and its `StateUpdate` events after, unknown again when a start fails. btleplug creates its `CBCentralManager` when the central starts, so that start asks for the permission and shows the platform's power alert where the radio is off.
+
+| Situation | `state()` | The central may start | `prompt()` | Prompt outcome |
+| --- | --- | --- | --- | --- |
+| Permission not asked yet | `NotPermitted` | only after a prompt | mark the prompt asked, so the central's start asks for the permission | none until the user answers |
+| Permission denied or restricted | `NotPermitted` | no | nothing to show | `Declined` |
+| Permission allowed, power unknown | `Off` | yes | nothing, the start under way settles the power | none |
+| Permission allowed, power on | `Ready` | yes | nothing | `NotAsked` |
+| Permission allowed, power off | `Off` | yes | ask for the central's restart, whose new manager shows the power alert | none, the caller's bound ends it |
 
 - **Hotspot.** The application calls `NativeClient::host_hotspot()`, answered by a `HotspotOffer { ssid, passphrase, security, port }` or a `HotspotError` (`Unsupported`, `MissingPermission(name)`, `Incompatible`, `NoChannel`, `Disallowed`, `TimedOut`, `Failed`), and `stop_hotspot()`. A joiner calls `join_hotspot(offer)`, answered by the joined network's gateway or a `JoinError` (`Unsupported`, `MissingPermission(name)`, `Declined`, `TimedOut`, `Failed`), and `leave_hotspot()`. `ClientEvent::HotspotStopped` and `HotspotLeft` report what the system ended. Android needs `CHANGE_WIFI_STATE`, `NEARBY_WIFI_DEVICES` (with `neverForLocation`), `ACCESS_WIFI_STATE`, `CHANGE_NETWORK_STATE` and `ACCESS_NETWORK_STATE`, which `connetto-peer-android`'s manifest declares, and the application asks the user for `NEARBY_WIFI_DEVICES` at run time, which the plugin offers to do. A system whose backend has not arrived answers `Unsupported` to every call, Linux, Windows and the Apple systems until slice 8. Every wait is bounded, 30 seconds for a hotspot to start and 60 seconds for a join including the user's approval.
 
@@ -997,371 +966,78 @@ Making the demos runnable in CI, which `R55` settled, since they need a browser,
 
 ---
 
-## R77: the exchange and the provisional tier
+## R80: peer sync in every demo
 
-**Status.** IN PROGRESS. Slices 1 to 5, 9 and 10 are merged, the chain at version 2 with the signed offer, the provisional bookkeeping, the bot list in the certificate, the peer link frames, the peer apply, a replacement snapshot read as no verdict, and the provisional holding with shared tables. Slices 6, 7 and 8 remain, the exchange driver, online adjudication and the handheld proof. Aimed first at offline data between the iPhone, the iPad and an Android phone over R76 slice 9f's star.
+**Status.** IN PROGRESS. Designed with the maintainer on 2026-11-14, decisions 1 to 6 below, in six slices, and placed on the tabbed demo UI of `plans/demo-account-badges.md` on 2026-11-15. Slice 1, the builder's media driver (decision 2), is in review. Slice 2 is built on it. A retraction undoes a peer entry in the views' backing tables, since the receiver may be unable to read a row the author wrote, which slice 2's proof met when a teammate's order was retracted.
 
-**Blocked on** R75 and R76, both merged for everything this phase uses. R31 is merged, and slices 1, 4 and 5 carry its capture major. The retraction's reason rides on R57 step 8, which surfaces the `MutationRejectReason` the client used to drop.
+**Blocked on** the demo UI's slices 5 to 7 (navigator, Connectivity tab, Log tab) for R80 slices 3 and 4, which put the photos and the courier offer into those tabs. Slices 1 and 2 are blocked on nothing.
 
-**Changes state.** Client tables, `_connetto_peer_cursor`, `_connetto_peer_entry`, `_connetto_provisional` and `_connetto_retraction` in `main`, and `settled_seq` and `settled_head` on `_connetto_writers` (decisions 2 and 9). Server tables, none. Wire messages, the chain hash at version 2 covering each entry's capture major and provenance (decision 1), the exchange frames at peer protocol version 2, `ProvisionalStatus` and `ProvisionalVerdicts` on the server wire (decision 11), and the certificate's bot-list extension (decision 12). Archive format, the peer entries and cursors (decision 16).
+**Out of scope.** Windows. The camp flow serves handhelds where the network is poor or absent, and a Windows desktop rarely if ever needs it, so R76's slice 9d blocks nothing here.
 
-### Purpose
-
-The peer exchange itself, with every rule the review fixed, per-author-device cursors, the acked frontier against the uncovered-row leak, signed retractions, and the provisional tier with its explicit conflict rule and its own eviction spare clause.
-
-### Decisions
-
-1. **The chain hash covers the capture major and the provenance.** `entry_hash` becomes `connetto-chain-v2` over `previous || seq || major || provenance || SHA-256(changeset)`, and one `range_message` serves the peer and the courier, with no second courier message listing each entry's provenance. A signature over a head then vouches for every entry's major and original writer below it, as a [Scuttlebutt message](https://ssbc.github.io/scuttlebutt-protocol-guide/#message-format) signs its `previous`, `author`, `sequence` and content together. The server hashes the major its connection declared, which is the entry's capture major on the main wire and on R31's drain wire alike, and the provenance from `MutationHeader.provenance`.
-2. **Every R77 table lives in `main`, beside `_connetto_pending`.** The provenance, the applied rows and the per-author cursor commit in one transaction, and [SQLite documents](https://www.sqlite.org/lang_attach.html) that under `journal_mode` WAL a transaction spanning attached database files is atomic only within each file. The replica runs WAL. `main` also exists on every build, while the tier exists only when the application declares one. No outbox trigger watches a `_connetto*` table, which keeps these tables device-private as it keeps `_connetto_pending`. This corrects chapter 19, which put the provenance in the device-private tier.
-3. **The author's write is judged by replaying it through the policy views as the author.** [`sqlite3changeset_apply`](https://www.sqlite.org/session/sqlite3changeset_apply.html) modifies a row whose old values match without consulting any handler, and it applies to the backing tables, so neither can enforce a policy. The peer apply runs each op as SQL against the logical view, as `replay` already does for the shared tier, with recording off, write exemption off and the author bound. The `INSTEAD OF` guard refuses a `WITH CHECK` violation, and an update or delete that the view's `USING` hides touches no row, which counts as a refusal. Recording is switched off by `UnrecordedWrites`, which raises the second flag the outbox triggers read beside the write exemption, so the policy guards still judge the write and the outbox records none of it.
-4. **Identity is rebound on the same connection under a guard.** An `AuthorBinding` guard re-registers `current_app_user()` with the author's certificate `account`, `current_app_subjects()` with `NULL` and `current_bot_list()` with the certificate's bot list (decision 12), and restores the receiver's own values on drop, the `adopt_relay_identity` mechanism with RAII restore. `NULL` subjects make every share-key arm deny, chapter 19's fail-closed rule for rights the receiver cannot answer.
-5. **An author's write is applied whole or not at all.** A changeset is one transaction of the author's, so one refused op refuses the entry and none of its rows land. The cursor still advances past it, and the receiver raises `PeerWriteRefused`.
-6. **Keys the receiver's own unsent writes hold are filtered before the apply.** The key set is what `pending_spare` already computes. An op on such a key is dropped, the provenance records the author as displaced by the receiver's own write, and the rest of the entry applies. A conflict handler cannot do this, since a matching row applies without invoking it. Any other collision applies, last writer locally in arrival order, with the displaced provisional author recorded. `server_wins` stays with server patches.
-7. **One signature per hand-off covers the whole offer.** The device key signs one `offer_message(key_id, settled, newest, builds, retractions)`, so the acked frontier, the retraction log and the queue head cost one chip operation per link, within R74 decision 12's reason for signing per hand-off.
-8. **An entry another build captured crosses as a digest.** The offer names the author's builds, its own `(major, version)` and each held major's row from R31's `_connetto_held_batch`. An entry whose `(major, version)` differs from the receiver's build crosses as its manifest row only, so the receiver verifies the chain and advances its cursor and never applies or holds it. A same-major entry under another version is refused the same way, the case R31 refuses at the server.
-9. **The settled head is kept.** An acked entry is deleted from `_connetto_pending` today and the hash at the frontier with it. `_connetto_writers` gains `settled_seq` and `settled_head`, written as each acked entry is deleted, so the author can name the hash its offered range chains from. Settlement runs in sequence order, since the server answers a writer's mutations in order.
-10. **Every request carries an id and every wait has a bound.** Each exchange request carries a `request_id` every reply quotes, a receiver waits at most 30 s for the next frame of a range on a monotonic clock, and a lapse ends the exchange, never the link, and retries at the next offer.
-11. **The server settles the provisional rows of an author the receiver never meets again, with the author's signature as the right to ask.** The frontier and the retraction log reach a receiver only over a link with the author, so without a server path a row the server applied but the receiver's subscriptions do not cover stays spared for ever, and a refused write stays visible as provisional. On every server connection the receiver sends `ProvisionalStatus { request_id, author, offer, seqs }` per author it holds provisional rows from, `offer` being the author's last verified signed offer. The server verifies the signature against the author's key in its writer row, refuses any sequence above the offer's signed `newest`, and answers `ProvisionalVerdicts` per sequence from R75's settled records, `Applied` and `Settled` (at or below the frontier, record pruned) adjudicate, `Refused(cause)` retracts with the cause, `Abandoned` (above the frontier of a retired writer or a revoked enrolment) retracts with cause `Abandoned`, and `Pending` waits for the next connection. A receiver can ask only about entries the author handed it. [Bayou](https://www.cs.cornell.edu/courses/cs6464/2009sp/papers/bayou.pdf) has every replica learn from the primary which tentative writes committed in the same way. Five points were settled with the maintainer on 2026-11-02. The server's pruning at the author's handshake and its revocation sweep delete only `Applied` records, and a rejected or conflicted record stays while its writer row stays, because a refusal at or below the frontier would otherwise answer `Settled` once pruned and the receiver would keep a refused write for ever. An author whose certificate is past its expiry plus the tolerance, with no live enrolment, counts as abandoned like a revoked one, so its entries above the frontier answer `Abandoned`. An author the receiver holds no signed offer from, which only a direct call to `apply_peer_entry` leaves, is not asked, and its rows wait for the author's frontier over a link. One ask carries at most 8192 sequences, the manifest frame's bound, so an author with more is asked about in ascending chunks, and the receiver sends its asks one at a time, the next once the last is answered, lapsed or refused. The server answers an ask before it reads the next message on the session, so it keeps no latch of its own, and a `RateLimited` naming an ask, from the server's general deferral, counts as the 30 s timeout. A key the enrolment store has no record of counts as revoked, as the revocation sweep already treats it, so its sequences above the writer's frontier answer `Abandoned`, and a signature that does not verify, or a sequence above the offer's signed `newest`, answers `NonFatal { related_to: request_id }`, after which the receiver asks again at its next connection.
-
-The server's answer per asked sequence `s` of a verified ask, the writer row's `frontier` being `f`.
-
-| Situation | Verdict |
-|---|---|
-| a record of `s` with outcome `Applied` | `Applied` |
-| a record of `s` with outcome `Rejected(reason)` | `Refused(Rejected(reason))` |
-| a record of `s` with outcome `Conflict` | `Refused(Conflict)` |
-| no record, `s <= f` | `Settled` |
-| no record, `s > f`, writer retired, enrolment revoked, absent, or past expiry plus tolerance | `Abandoned` |
-| no record, `s > f`, author still live | `Pending` |
-
-12. **A bot session may enrol a device key, and every certificate carries its bot list.** The maintainer judged that refusing bots hardware could be shortsighted, since small language models may run as bots on field devices. Every certificate carries a non-critical extension under `1.3.6.1.4.1.67105.2`, beside the attestation extension's `.1`, holding the bot list text `bot_list_for` renders for the enrolling session, the wildcard `*` for a person and the list for a bot, the same value the server binds as `app.bot_list`. `AuthorBinding` binds that text, and `NULL` when the extension is absent, so a certificate that does not say fails closed. A changed list reaches peers when the certificate renews, a bounded false allow of the class chapter 19 already accepts for an offline-stale replica.
-13. **A resync keeps provisional rows until their verdict, and re-applies the stored entries when the replacement snapshot ends, ahead of the receiver's own unsent writes.** A provisional row is a write the server has not adjudicated, the same kind of write as the receiver's own unsent one, which R15's un-acked rule never lets vanish from its own device and R48 decision 3 puts back with `reapply_pending` once a replacement snapshot ends. A truncate empties its table at once, peer-applied rows and their records with every other row, keeping only the receiver's unsent writes (R11 Part B, O5). Every other resync, an authorization change, a cursor outside retention, an interrupted snapshot or a cursor beyond history, keeps a provisional row and its record in place, as R11 Part B keeps an unsent write (O7, O10). A replacement snapshot that writes a provisional key is no verdict, so during a resync the record stays and no `ProvisionalConfirmed` is raised, while a live server patch on the key still clears the record with `ProvisionalConfirmed`. At the `SnapshotEnd` that ends the resync, the receiver re-applies every entry still in `_connetto_peer_entry`, in the order of its `position`, through the peer apply of decisions 3 to 6, which judges the author's rights again on the resynced replica and rewrites each record, so after a truncate the entries come back and after any other resync the author's values stand over the replacement's. It then re-applies its own pending writes, so its own authorship still wins locally (decision 6). `position` is a durable append position across authors, assigned when an entry is stored and kept across a re-apply, the role a pending entry's position plays for `reapply_pending`, since the wall-clock `received_at` cannot order two entries of one second. An entry the resynced replica now refuses raises `PeerWriteRefused` and stays stored until the author's frontier or the server settles it.
-14. **A provisional row is held by the reserved holder `connetto-provisional`, exactly while its provenance record is provisional** (R11 Part B, O7). R11 Part B keeps a row only while a holding names it or an unsent write of this identity keeps it, so the peer apply writes the holding in its own transaction, in `_connetto_holding` for a `main` table and in the store's `_connetto_shared_holding` under this identity for a shared one, and the record's every exit releases it in the transaction that changes the record, a server write on the key (`ProvisionalConfirmed`), the frontier or a verdict moving it to adjudicated, a retraction deleting it, and a truncate dropping the table's records. A retraction that stands a displaced author's record back keeps the holding, since the key is still provisional. A key the receiver's own unsent write holds keeps the holding as well, because its record is provisional too, so one rule covers every record. `holdings::prune`, `release_all` and `release_account` skip the holder as they skip `connetto-unsent`, so a dead subscription, a beyond-history resync and a new store generation leave a provisional row in place, and the resync's re-apply writes the holding again, which an existing one absorbs. The holding's key is the same `quote()` clause every holding uses, rendered from the record's key values, so a provisional delete's record, whose row is gone, still names its key. The pass then keeps a provisional row through its holding alone, with no keep clause of its own.
-15. **A peer entry reaches a shared table through the store, as a server patch does.** A build that shares a table keeps the table, its policy view and its holdings in the attached store alone, and `apply_peer_entry` used to address `main` only, so an entry touching a shared table failed with `no such table` and nothing of it landed. The peer apply, its undo and the provisional holding now route a shared table to the store through `shared_route`, the route server patches, rollbacks and undos already take, and the provenance record stays in this identity's own replica beside its entries. Another identity on the device then reads the row before the server rules on it, without its provenance, which is the exposure R11 slice 4 already accepted for an identity's unsent shared writes held under `connetto-unsent`. The identity's departure releases its holdings in the store, and the rows nothing else holds go with them.
-16. **An archive carries the peer entries and cursors, and an import re-applies the entries** (decided with the maintainer). Decision 2 puts every peer table in `main`, which the archive does not otherwise carry, so the archive carries the peer state of its own, the stored entries of `_connetto_peer_entry` in their position order and the cursors of `_connetto_peer_cursor` with their last verified offers. The import re-applies the entries through the peer apply of decisions 3 to 6 in its own transaction, so a device restored in camp shows its peer rows again with provenance while still offline, and the `_connetto_provisional` records are the ones that re-apply writes. The entries then stay for the re-apply at a replacement snapshot's end (decision 13), so a snapshot that later replaces a table puts the rows back as it does for every provisional row. An archived cursor merges per author by keeping the further one, which the re-applied entries back, and two cursors at one sequence with different heads name a forked chain, which keeps the replica's own cursor and raises `PeerChainInvalid`. An archived entry at or below the replica's own cursor for its author is not re-applied, since the replica already took it and may have seen it adjudicated since. Both export scopes carry the peer state, which the server does not hold. A build without the `peer` feature, the browser's among them, imports the rest of the archive and reports in the import plan how many peer entries it leaves out, and those rows arrive once the server holds them. The retraction log stays out of the archive. The import retires the archived writer, a retired writer offers nothing and the importing device cannot sign as the archived device key, so a peer holding one of the archived writer's refused entries learns the refusal through slice 7's server path. The archive format's version moves. Rejected: carrying nothing and letting peers send everything again, which loses a restored device's peer rows until the authors are met again or the server answers. Rejected: copying the records, since a copied record names a row the import does not restore and would have to be reconciled with the record the re-apply writes. Rejected: always keeping the replica's own cursor, which asks the authors again for entries the re-apply already wrote. Rejected: re-applying only at the next snapshot's end, which hides the rows until the device is online. Rejected: carrying the retraction log, which no offer could ever send. Rejected: refusing an import into a build without the `peer` feature, which would keep a user from restoring their own unsent writes there.
-
-The `connetto-provisional` holding at every event, for a key in a `main` table and in a shared one (decisions 14 and 15).
-
-| Event | `main` table | Shared table |
-|---|---|---|
-| Peer apply lands an op, or leaves a key to the receiver's own unsent write | write the holding in `_connetto_holding` | write it in `_connetto_shared_holding` under this identity |
-| Peer apply refused, or failed | the transaction rolls back, no holding | same |
-| Re-apply at the `SnapshotEnd` ending a resync | write it again, an existing one absorbs it | same |
-| Server write on the key (`ProvisionalConfirmed`) | release it with the record | same, in the store |
-| Replacement snapshot write during a resync (slice 9) | keep it with the record | same |
-| Frontier or verdict adjudicates the record | release it with the record | same |
-| Retraction deletes the record | release it | same |
-| Retraction stands a displaced author's record back | keep it | same |
-| Retraction whose undo is refused | nothing changes | same |
-| Truncate drops the table's records | release the table's holdings | release this identity's holdings of the table |
-| Subscription ends, `prune` | skip the holder | same |
-| Beyond-history resync, `release_all` | skip the holder | same |
-| New store generation, `release_account` | skip the holder | n/a, the store is new |
-| Identity departs the store | n/a, the replica goes with it | `release_identity` releases it |
-| R31 rebuild at a newer major | dropped with the tables | dropped with the store's tables |
-| Eviction pass | keeps the row | keeps the row for every identity |
-
-### Decisions for the exchange driver, taken with the maintainer
-
-17. **A request names its whole range and the receiver's build.** `Request { request_id, from, to, build }` asks for `from..=to`, `to` being the `newest.seq` of the offer the receiver verified, and the sender serves exactly that range, so an entry the author writes after signing never reaches a manifest checked against the older head. This is how a [Hypercore request](https://github.com/holepunchto/hypercore/blob/main/lib/messages.js) names the length whose signed tree it wants proven. `build` is the receiver's own `(major, version)`, and the sender sends a body only for an entry captured under it, the others crossing as their manifest row alone (decision 8), since a device with no device writer sends no offer and the sender would otherwise not know the receiver's build. Rejected: serving up to the sender's last sent offer, which bends the state table's rule that an offer arriving during a request waits for its end, and serving everything the sender holds, which sends bodies for nothing.
-18. **A range the author no longer holds is answered `NotAvailable`.** An entry the server answered meanwhile has left the author's queue, so the author cannot serve a range starting at or below its settled frontier and answers `End { outcome: NotAvailable }`, kept apart from `Busy` as Hypercore's `noData` keeps `NOT_AVAILABLE` apart from `INVALID_REQUEST`. The receiver drops the request and acts on the author's next offer, which every settlement produces. A device whose writer retired answers every request `NotAvailable`.
-19. **The signed offer is one `connetto-core` type.** `Offer { builds, settled, newest, retractions }` and `SignedOffer { offer, signature }` live in `connetto-core::exchange`, the peer message carries `SignedOffer`, the cursor row stores it as MessagePack, and the server decodes the same type in slice 7. The signed bytes are rebuilt from the fields by `offer_message`, as Hypercore rebuilds `treeSignable` from the tree fields it stores beside the signature, so no encoding has to round-trip byte for byte.
-20. **A head contradicting a verified one is caught at the cursor.** The receiver keeps one verified `(seq, head)` per author, its cursor, and raises `PeerChainInvalid` when the offer's `settled` or `newest` sits at the cursor's sequence with another head. A fork below the cursor is left to the server's chain check at settlement. Rejected: keeping every verified hash, which adds a column and catches forks the server refuses anyway.
-21. **The exchange protocol is a sans-IO crate, `connetto-exchange`.** No Rust crate fits. Hypercore, p2panda, iroh-docs, willow25 and bamboo all sign with ed25519, which the [Secure Enclave](https://developer.apple.com/documentation/security/protecting-keys-with-the-secure-enclave) ("works only with NIST P-256 elliptic curve keys") and [StrongBox](https://android.googlesource.com/platform/hardware/interfaces/+/refs/heads/master/security/keymint/aidl/android/hardware/security/keymint/IKeyMintDevice.aidl) ("StrongBox implementations do not support CURVE_25519") cannot hold. Each would also replace a merged piece of connetto, the chain the server recomputes, the SQLite queue or the mTLS link, and an upstream signature PR would fix none of those. The crate holds the exchange messages and the R0 to R3 and S0 to S2 state machine, fed events and returning actions with no SQLite, runtime or socket, as `quinn-proto` holds QUIC's. `connetto-peer` carries its messages, and the client's enrolment task feeds it and carries out its actions.
-22. **A stalled request is retried by both sides.** An author that answered `Busy` sends its current offer again to that peer once its stream ends, and a receiver whose request timed out requests again from its kept offer after a backoff of 5 s doubling to 5 min while the link lives, reset by a completed range or a fresh offer. Either alone leaves a case stalled until the author writes again.
-
-### Decision for the handheld proof, taken with the maintainer
-
-23. **Apple devices only join.** An iPhone hosts only through Personal Hotspot, which shares the phone's mobile data and greys out with mobile data off, so a group able to start it reaches the server, and iOS lets an application neither start nor read it (R76 decisions 26 and 27). iOS auto-join also took an application-joined iPad off the iPhone's hotspot back to a known network twice in one three-device run. So the iPhone host leaves connetto, with `host_personal_hotspot`, the landing read on `bridge100` and `HotspotUnreached`, the Apple beacon and GATT service over `CBPeripheralManager`, the device-name read, the demos' host controls on Apple devices, the star's iPhone-hosted round, the tapper's Personal Hotspot actions, and R80's zero-coverage field test. A joiner stops reading a beacon without a prefix until slice 9d's Windows host brings it back (R76 decision 25). An Apple joiner reads its Bluetooth permission from `CBManager.authorization`, a class property that needs no manager, and its power from btleplug's adapter state, since btleplug 0.13 reports CoreBluetooth's `Unauthorized` as `CentralState::Unknown`. iPhones, iPads and Macs keep joining Android and Linux hosts, and an all-Apple group with no shared network waits for [R112](#r112-an-apple-peer-to-peer-link). `host_personal_hotspot` leaves the client with no deprecation step, since nothing outside the repository calls it.
-
-### Design
-
-**The wire.** `PROTOCOL_VERSION` is 2, which the hello, the TXT record and the beacon carry together, so a version 1 and a version 2 device refuse each other at hello. The writer is never sent, since each device offers only its own device writer's chain and the link has proven its key. A device with no device writer offers nothing and still receives. The messages are built in `crates/connetto-exchange/src/message.rs`, carried as `PeerFrame::Exchange` in `crates/connetto-peer/src/frame.rs`, with their shared types in `crates/connetto-core/src/exchange.rs`. The server's `ProvisionalStatus` and `ProvisionalVerdicts` of decision 11 are built with slice 7.
-
-```text
-connetto-exchange Message, carried as PeerFrame::Exchange
-  Offer(SignedOffer)
-  Transfer::Request  { request_id, from, to, build: (Major, SchemaVersion) }
-  Transfer::Manifest { request_id, previous: [u8; 32], rows: Vec<ManifestRow>, last }
-  Transfer::Body     { request_id, seq, changeset }
-  Transfer::End      { request_id, outcome: EndOutcome }
-
-connetto-core exchange
-  Offer       { builds, settled: Option<Frontier>, newest: Option<Frontier>, retractions }
-  SignedOffer { offer, signature }
-  Frontier    { seq, head: [u8; 32] }
-  ManifestRow { seq, major, origin: Option<Origin>, digest: [u8; 32] }
-  Origin      { writer, seq }
-  Retraction  { seq, cause: RetractCause }
-  RetractCause = Rejected(MutationRejectReason) | Conflict | Abandoned
-  EndOutcome   = Complete | Busy | NotAvailable
-
-the server wire, remaining with slice 7
-  ProvisionalStatus   { request_id, author, offer, seqs }
-  ProvisionalVerdicts { request_id, verdicts }
-  Verdict = Applied | Settled | Refused(RetractCause) | Abandoned | Pending
-```
-
-The manifest always runs to the request's `to`, the `newest` of the offer the receiver verified, at most 8192 rows per frame, so the receiver verifies the chain from `previous` to the signed head before any body arrives. Bodies follow in sequence order for the entries captured under the request's build, each checked against its digest. `RetractCause::Conflict` exists because R75's `SettledOutcome::Conflict` applied nothing and carries no `MutationRejectReason`. A row names an entry's original writer as an `Origin`, the writer and sequence of a `Provenance` without the number writer's secret, which names that writer to the server (R70 decision 22) and so must never reach a peer. The type has no place for it, and the chain hash covers the same two fields.
-
-**One exchange, as the receiver sees it.** The link comes up and each side sends its offer, whose signature the receiver checks against the key the link proved. The receiver applies the offer's frontier and retractions and moves its cursor up to `settled` when that is higher, then requests `cursor.seq + 1 ..= newest.seq` under its own build when `newest.seq` is above the cursor (decision 17). It recomputes the chain over the manifest from the cursor's head and compares the last hash with `newest.head`, and a mismatch, or a `settled` or `newest` head contradicting the cursor's head at its sequence (decision 20), raises `PeerChainInvalid` and ends the exchange. Each row then commits in its own transaction. A row at another build advances the cursor alone. Otherwise the body is checked against its digest, keys held by the receiver's own unsent writes are filtered, the remaining ops run through the views under `AuthorBinding`, and the provenance, the stored entry and the cursor are written, or on refusal the cursor alone.
-
-**Client tables, in `main`.**
-
-```sql
-CREATE TABLE _connetto_peer_cursor (author BLOB PRIMARY KEY, account TEXT NOT NULL, seq INTEGER NOT NULL, head BLOB NOT NULL, offer BLOB NOT NULL);
-CREATE TABLE _connetto_peer_entry (author BLOB, seq INTEGER, major INTEGER NOT NULL, changeset BLOB NOT NULL, account TEXT NOT NULL, bot_list TEXT, received_at INTEGER NOT NULL, position INTEGER NOT NULL, PRIMARY KEY (author, seq));
-CREATE TABLE _connetto_provisional (tbl TEXT, pk BLOB, author BLOB NOT NULL, seq INTEGER NOT NULL, account TEXT NOT NULL, received_at INTEGER NOT NULL, state INTEGER NOT NULL, displaced_author BLOB, displaced_seq INTEGER, PRIMARY KEY (tbl, pk));
-CREATE TABLE _connetto_retraction (writer TEXT, seq INTEGER, cause BLOB NOT NULL, PRIMARY KEY (writer, seq));
--- _connetto_writers gains settled_seq INTEGER and settled_head BLOB
-```
-
-`_connetto_peer_entry` keeps an applied entry until it is adjudicated, because a retraction restores the rows by inverting the author's changeset, as R57's rollback inverts the device's own. A provisional delete keeps its provenance row, so a retraction can restore the row from the changeset's old values. The author's account, its certificate's bot list and `received_at` live once per entry, so decision 13's re-apply binds the bot list the entry was judged under, and a retraction restores a displaced author's record from that author's stored entry, or leaves the key to ordinary coverage when that entry was already adjudicated or retracted. A certificate that carries no bot list stores `NULL`, which fails closed again at the re-apply. `received_at` is the wall clock and serves display only. `offer` is the author's last verified signed offer, which decision 11 presents to the server. `_connetto_retraction` is the author's own log, written when the server rejects or conflicts one of its device writer's entries and kept until the writer retires. R31's rebuild drops `_connetto_provisional` and `_connetto_peer_entry` with the synced tables and keeps the other two.
-
-**The client surface.** Events `ProvisionalApplied`, `ProvisionalConfirmed`, `ProvisionalRetracted { cause }`, `PeerWriteRefused` and `PeerChainInvalid`, each naming the author and the affected rows. Reads `NativeClient::provenance(table, key)` and `provisional_rows()`, from the table, since the broadcast event stream can drop events. There is no builder setting, and a build with the `peer` feature and a device identity exchanges with every linked peer.
-
-**Adjudication.** A server write on a provisional key deletes its provenance in the same transaction and raises `ProvisionalConfirmed`, whether or not it is the author's write. Rows at or below the author's `settled.seq` and absent from the retraction log become adjudicated, their stored entries are deleted, and the spare clause stops covering them. A retraction inverts the stored entry for the rows whose provenance still names it, restores a displaced author's provenance, deletes the entry and raises `ProvisionalRetracted`. Decision 11 settles the rest online.
-
-**Limits stated in chapter 19.** A receiver applies an author's update or delete only to rows it holds, since an `UPDATE` change carries the changed columns and the primary key alone. A peer's change to a row the receiver never held is refused.
-
-### Every event in every situation
-
-Both roles run on every link at once. For one author as the receiver sees it, **R0** not linked, **R1** linked with no offer verified, **R2** offer verified and nothing to request, **R3** a request outstanding. For the sender, **S0** not linked, **S1** linked and serving no request, **S2** serving a request.
-
-| Event | R0 | R1 | R2 | R3 | S0 | S1 | S2 |
-|---|---|---|---|---|---|---|---|
-| Link up | send own offer, enter R1 | n/a | n/a | n/a | enter S1 | n/a | n/a |
-| Link lost | nothing | enter R0 | enter R0 | abort request, the current row's transaction rolls back, enter R0 | nothing | enter S0 | stop streaming, enter S0 |
-| Offer received, signature valid | n/a | apply frontier and retractions, move the cursor up to `settled`, request the rest under the own build (R3) or enter R2 | same as R1 | keep it, act on it at `End` | n/a | n/a | n/a |
-| Offer received, signature invalid | n/a | `PeerChainInvalid`, stay R1 | same | abort request, same | n/a | n/a | n/a |
-| Offer received, `settled` or `newest` contradicts the cursor's head (decision 20) | n/a | `PeerChainInvalid`, stay R1 | same | keep it, checked when acted on at `End` | n/a | n/a | n/a |
-| Manifest chain mismatch or fork | n/a | n/a | n/a | `PeerChainInvalid`, abort, enter R1 until a new offer | n/a | n/a | n/a |
-| Body digest mismatch | n/a | n/a | n/a | same as a chain mismatch | n/a | n/a | n/a |
-| A frame out of order within a request, or `End { Complete }` before every row | n/a | n/a | n/a | same as a chain mismatch | n/a | n/a | n/a |
-| A reply quoting another request id, or arriving with no request outstanding | n/a | ignore it | ignore it | ignore it | n/a | n/a | n/a |
-| Row at another build | n/a | n/a | n/a | advance the cursor alone | n/a | n/a | n/a |
-| Row refused by policy | n/a | n/a | n/a | advance the cursor, `PeerWriteRefused` | n/a | n/a | n/a |
-| Row applied | n/a | n/a | n/a | provenance, entry and cursor in one transaction, `ProvisionalApplied` | n/a | n/a | n/a |
-| `End { Complete }` | n/a | n/a | n/a | act on a kept offer or enter R2, reset the backoff | n/a | n/a | n/a |
-| `End { Busy }` | n/a | n/a | n/a | act on a kept offer or enter R2, the author re-offers when its stream ends (decision 22) | n/a | n/a | n/a |
-| `End { NotAvailable }` | n/a | n/a | n/a | drop the request, act on a kept offer or enter R2 until the next offer (decision 18) | n/a | n/a | n/a |
-| 30 s without the next frame | n/a | n/a | n/a | abort request, enter R1, request again from the kept offer after the backoff (decision 22) | n/a | n/a | n/a |
-| Adopting an offer or applying a row fails to commit | n/a | the cursor returns to the one the replica holds | same | the row's transaction rolls back, the commits queued after it are dropped, the cursor returns to the one the replica holds, abort request, enter R1, request again from it after the backoff | n/a | n/a | n/a |
-| Retry backoff elapses | n/a | request again from the kept offer, enter R3 | n/a | n/a | n/a | n/a | n/a |
-| Request received | n/a | n/a | n/a | n/a | n/a | stream the range with bodies for the request's build alone, enter S2, or answer `End { NotAvailable }` when the range starts at or below the settled frontier (decisions 17 and 18) | refuse with `End { Busy }`, send the current offer when the stream ends (decision 22) |
-| Own stream ends | n/a | n/a | n/a | n/a | n/a | n/a | send the offer that waited, or the current one to a peer answered `Busy`, enter S1 |
-| Own new local write | nothing | nothing | nothing | nothing | nothing | sign and send a fresh offer | send it after the stream ends |
-| Own entry settled, applied | nothing | nothing | nothing | nothing | nothing | update `settled_*`, fresh offer | after the stream |
-| Own entry rejected or conflicted | nothing | nothing | nothing | nothing | write `_connetto_retraction` | same, fresh offer | after the stream |
-| Peer certificate renewed | n/a | nothing | nothing | nothing | n/a | nothing | nothing |
-| Peer revoked or expired, link closes | as link lost | as link lost | as link lost | as link lost | as link lost | as link lost | as link lost |
-| Server patch on a provisional key | delete provenance, `ProvisionalConfirmed` | same | same | same, after the current row's transaction | n/a | n/a | n/a |
-| Eviction pass | keeps a row `connetto-provisional` holds | same | same | same | n/a | n/a | n/a |
-| Replacement snapshot writes a provisional key during a resync | keep the record, raise nothing | same | same | same, after the current row's transaction | n/a | n/a | n/a |
-| Truncate notice for a table | delete its rows and records at once, keep unsent writes and stored entries | same | same | same, after the current row's transaction | n/a | n/a | n/a |
-| Replacement snapshot ends (`SnapshotEnd` ending a resync) | re-apply every stored entry through the peer apply, then own pending writes | same | same | same, after the current row's transaction | n/a | n/a | n/a |
-| R31 rebuild at a newer major | provisional rows and entries dropped, cursors kept | links close first, as R0 | same | same | n/a | n/a | n/a |
-| Archive import | peer tables restored, as R0 | n/a, import runs closed | n/a | n/a | own writer retired, its retraction log kept | n/a | n/a |
-| Own device writer retired | nothing | nothing | nothing | nothing | offers stop until the fresh key enrols | offers stop, every request answered `End { NotAvailable }` | stop streaming with `End { NotAvailable }`, enter S1 |
-| Server session established | send `ProvisionalStatus` per author with provisional rows | same | same | same | n/a | n/a | n/a |
-| `ProvisionalVerdicts` received | adjudicate, retract or keep per verdict | same | same | same, after the current row's transaction | n/a | n/a | n/a |
-| 30 s without `ProvisionalVerdicts`, or `RateLimited` or `NonFatal` naming the ask | drop the wait, ask at the next server session | same | same | same | n/a | n/a | n/a |
-
-### Steps
-
-1. The exchange, mTLS session, mutual signed offer of queue bounds plus acked frontier plus retraction log (decision 7), request from cursor plus one, a verified manifest then bodies streamed in order, cursor advanced in the same transaction as the apply.
-2. A peer apply suspends capture as `apply_patch` does, or a peer's write re-uploads as the receiver's own, and keeps the policy guards on (decision 3).
-3. The conflict rule, the receiver's own unsent write is never displaced (decision 6), any other collision applies last-writer-locally with the displaced author recorded, `server_wins` stays reserved for server patches.
-4. Offline authorization, the translated policy evaluated as the author through `AuthorBinding` (decisions 3, 4 and 12), failing closed on share-key and locally unanswerable rights, with the partial-replica false-deny and bounded false-allow limits stated in chapter 19.
-5. `_connetto_provisional` in `main` (decision 2), provenance per (table, pk), a `connetto-provisional` holding per provisional record (decision 14), server-sourced writes clearing provenance, typed provenance reads and applied, confirmed and retracted-with-cause events.
-6. The acked frontier marks at-or-below provisional rows adjudicated, handing them to ordinary coverage, a signed retraction removes the copy and surfaces its cause, and the server settles the rest online (decision 11).
-
-### Slices
-
-Slices 1 to 5, 9 and 10 are merged, each one pull request, and slices 6 to 8 and 12 remain, slice 12 landing before slice 8.
-
-1. **The chain at version 2 and the signed offer** (decisions 1 and 7), `connetto-core` with the server's chain recomputation and `courier_deliver` moved to version 2, and a public `verify_range` a peer and the server call. Needs R31's per-entry major. Merged.
-2. **The provisional bookkeeping** (decision 2, step 5), `connetto-client` with no wire, `_connetto_provisional`, the eviction keep for provisional rows, the server-write clearing with `ProvisionalConfirmed`, and the reads, proven by tests that write provenance directly and then evict and patch. The other three tables arrive with the slices that write them. Needs nothing from R31. Merged.
-3. **The bot list in the certificate** (decision 12), `connetto-core`'s certificate profile, the server's enrolment and renewal filling the extension from `bot_list_for`, and its reading on the client and on a linked peer. Needs nothing from R31. Merged.
-4. **The peer link frames** (the wire above), `connetto-peer` at protocol version 2, the frames, a bounded request path through `LinkCommand` and a `PeerEvent` for exchange traffic, proven between two nodes on loopback. Needs R31's `Major`. Merged.
-5. **The peer apply** (decisions 3 to 6, 8 and 13), `connetto-client`, from a verified manifest and bodies to applied rows, refusal and retraction, under `UnrecordedWrites`, `_connetto_peer_entry` and `AuthorBinding`, and the re-apply of stored entries when a resync's replacement snapshot ends, proven in process with two replicas and no link. Needs R31. Merged.
-6. **The exchange driver**, in four pull requests (decided with the maintainer), each green on its own. The driver runs in the enrolment task, which already receives the link's events and holds the device key, and reaches the replica through the client's lock. An offer names no peer, so one signature serves every linked peer, and writes arriving while a signature is in flight fold into the next offer.
-   - **6a, the author's state** (decisions 7 and 9). `settled_seq` and `settled_head` on `_connetto_writers` written as each acknowledged entry leaves the queue, `_connetto_retraction` written when the server rejects or conflicts one of the device writer's entries and kept until the writer retires, and the offer built from them with the build's majors, signed by the device key and sent to every linked peer on link up and on every change the state table names. Proven in process against a bare peer node. Merged.
-   - **6b, the exchange both ways** (decisions 8, 10 and 17 to 22, the receiver flow above). The `connetto-exchange` crate with the messages, `SignedOffer` in `connetto-core`, and the state machine of the table above tested row by row without SQLite or sockets. In the client, `_connetto_peer_cursor`, the offer's signature checked against the key the link proved, a request naming its range and build with an id every reply quotes, the manifest's chain checked against the signed head with `PeerChainInvalid` on a mismatch, each row applied with its cursor in one transaction, the 30 s bound per frame with the backoff retry, and the sender serving a range, answering `Busy` or `NotAvailable`, and re-offering after a stream. Proven between two clients on loopback. Merged.
-   - **6c, the archive and the rebuild** (decision 16). The peer entries and cursors in the archive, the import's re-apply and its per-author cursor merge, and R31's rebuild keeping the cursors and the retraction log while it drops the entries and the records. Merged.
-   - **6d, the harness proof.** Two clients of different accounts against the real server, exchanging offline and reconciling online, as a Docker-gated test in `connetto-test-harness` with both native clients in one process on the loopback peer link, against Postgres, OpenFGA and the mock identity provider. The demo deployment gains a team table both accounts read and write through membership rows of a synced members table its policy reads, so slice 8's handheld run exercises the same shapes. Membership is rows rather than subjects because the receiver judges an author with no subjects bound (decision 3). The proof applies alice's offline row on bob's replica, removes alice from the team while both are offline, and reconnects them. The server refuses alice's row with `Unauthorized`, alice's next offer carries the retraction, and bob rolls the row back with that reason, beside a row the server sends bob, which confirms, a row it never sends him, which the frontier adjudicates, and an eviction that spares every provisional row throughout. The refusal of an author never met again stays slice 7's. Merged.
-7. **Online adjudication** (decision 11). Both server messages, proven Docker-gated by a receiver that never meets the author again and still confirms an applied write, retracts a refused one with its reason, and retracts an abandoned one after the author's enrolment is revoked.
-8. **The handheld proof.** The demo controls the runner drives and a run on R76 slice 9f's star, the Android phone hosting while the iPhone and the iPad join, per R76 decision 4, which runs before each peer phase closes, and chapter 19's R77 statements marked built. It lands after slice 12.
-9. **A replacement snapshot is no verdict** (decision 13, after R11 Part B lands). During a resync a snapshot write on a provisional key keeps its record and raises no `ProvisionalConfirmed`, and the re-apply at `SnapshotEnd` puts the author's values back over the replacement's, proven in process for an authorization change, a cursor beyond history and a truncate. It needs nothing from slices 6 to 8 and may land before them. Merged.
-10. **The provisional holding and shared tables** (decisions 14 and 15). The `connetto-provisional` holding written and released with each record, the reserved-holder skip in `prune`, `release_all` and `release_account`, the pass keeping provisional rows through their holdings alone, and the peer apply, its undo and the holding routed to the store for a shared table, proven in process for every release and for a shared table's apply, retraction and adjudication. Merged.
-12. **Apple devices only join** (decision 23), one pull request merged before slice 8. The removal decision 23 lists across `connetto-client`, `connetto-peer-apple`, the demos and the test harness, the joiner's prefixless beacon reading with it, and the Apple readiness on `CBManager.authorization` and btleplug's adapter state, proven by unit tests of the readiness and the scan table and by the star's one round, the Android phone hosting while the iPhone and the iPad join.
-
-### Done when
-
-Two devices of different accounts exchange offline and reconcile online with nothing lost and nothing double-applied, an offline exchange applies policy-passing writes provisionally, a reconnect confirms covered rows, adjudicates uncovered ones by the frontier, rolls back a refused write on both devices with its reason surfaced, also when the two devices never meet again, and eviction spares provisional rows throughout, proven end to end in the harness and on the handheld star.
-
----
-
-## R78: courier recovery
-
-**Status.** NOT STARTED.
-
-**Blocked on** R75 and R77. The capture major a couriered entry carries on the wire is R31's, merged.
-
-**Changes state.** Client tables, none, the courier's entry reading the record R75 settles into. Server tables, the settled record the courier replay answers from, with its audit rows. Wire messages, the couriered entry with its capture major. Archive format, none.
+**Changes state.** None. Client tables, server tables, wire messages and the archive format stay as R78 and R79 left them (decision 1).
 
 ### Purpose
 
-Field survivability, a lost device's work is recoverable from the camp. The server accepts author-signed changesets from any certified bearer, deduplicated by the same frontier every path consults. The boundary is cryptographic, not trusted. The courier authenticates as itself and can only relay verbatim what the author's device key signed, its range attestation covering the chain, whose hashes bind each entry's capture major and provenance original, so a courier cannot strip or substitute either, and its own document rights are never consulted. What a malicious courier can do is withhold, no worse than not couriering, with sequence-gap refusal preventing reordering, and delay, no worse than the author's own delayed reconnect, policy evaluated at apply time. The maintainer's impersonation concern is met by this confinement and rides as five constraints, none optional.
-
-### Steps
-
-1. The server courier path, **deployment-opt-in, default off**, verify the author's signature against its enrolment, apply under the author's identity, refuse sequence gaps, dedup by the frontier.
-2. The five constraints, which ride with the path because it is the first place session identity and write author differ, a distinct R13 `auth_events` record per couriered application naming courier and author, per-courier metering under R19's machinery, refusal of revoked enrolments, author notification on next login, and acceptance governed by the account's and enrolment's standing at apply time, since signatures carry no trusted timestamp, with the author's certificate live at delivery, a same-key renewal keeping the author's records and standing.
-3. The client side, offering another author's held changesets for courier upload, explicit, never automatic.
-4. A courier re-delivering the author's changesets to a server restored to an earlier point, whose rewound frontier accepts them again byte for byte, demonstrated and written into chapter 20 beside R70's legs (R70 decision 20).
-
-### Done when
-
-A device's writes reach the server through a different account's session with exactly-once held against the author's own later replay, a malicious courier can neither forge nor reorder (gap refusal proven), a revoked enrolment is refused, every couriered application is audited, and a courier's re-delivery restores the author's writes a restored server lost, all Docker-gated.
-
----
-
-## R79: media over the peer link
-
-**Status.** IN PROGRESS. Steps 1 to 3 are sliced into eight pull requests below, of which slices 1 to 7 are merged, and step 4 waits for R78. Decisions 1 to 10 were taken with the maintainer, and decision 11 was settled on evidence.
-
-**Blocked on** R77, and on R64 to R67 for the chunk machinery, all merged for steps 1 to 3. R77's open slices 7 and 8 block none of them. Step 4 is blocked on R78.
-
-**Changes state.** Client tables, `_connetto_content_outboard` in `main` beside the manifests (decision 4). Server tables, none. Wire messages, the media frames at peer protocol version 3 (decision 1). Archive format, none, since an outboard is derived and peer-fetched content is cache. Demo deployment, `photos.thumb_id` (decision 9).
-
-### Purpose
-
-Sample photos in camp. This is the join point with chapter 18's identity, chunking and manifest, metadata rows travel in the exchange like any rows, so this phase adds content, pull-on-demand by chunk over the established link, a holding device answering after evaluating the requester against its translated policy fail-closed, the receiver verifying against the file id the signed row carries, re-encrypting under its own key, and storing in the never-exported cache class. The application can additionally mark content for replication to present peers, the survivability half of couriering.
-
-### Steps
-
-1. The chunk-request frames on the peer link and the holder-side policy gate.
-2. Receiver verification against the file id the signed row carries, re-encryption, cache-class storage, orphan sweep after retraction. **Peer-fetched content has its own spare clause**, `tidy_content` keeps a manifest only while unsent or pinned and R60 made the residual pass automatic, so without this a photo pulled in camp would be deleted at the next crossing, offline and unrefetchable. Peer-fetched chunks are spared while their row is provisional, mirroring the spare clause provisional rows themselves have, and become ordinary cache when the row is adjudicated, at which point the server can serve them again.
-3. Thumbnail prefetch (ordinary derived files behind a thumbnail column, instant at their size), and the peer fetch as a stage of the resolver (decision 10).
-4. Opt-in replication, the application marks content for push to present peers, the survivability half of R78. Not designed, waiting for R78.
+R76 to R79 built the camp in the library and proved it in the harness and on phones through the demos' peer panel. The native demos already host and join a hotspot, discover and list linked peers, exchange peer writes, show a provisional row with its author and print retractions, on every target they build for. No demo offers a courier call or moves a photo over the link, so R78's courier and R79's media are capabilities no demo drives, which R54's rule forbids. The builder's content piece drives the outbox but takes no peer declaration and runs no media driver, so an application built through the builder cannot reach R79's media without wiring the driver itself.
 
 ### Decisions, taken with the maintainer
 
-1. **Chunks cross as per-chunk pulls on a media queue of their own, at peer protocol version 3.** `PeerFrame::Media` carries the messages below on a second bounded queue per link, eight frames deep like the exchange's, so a 16 MiB chunk never waits ahead of an offer or a range and an offer never stalls a photo. `PROTOCOL_VERSION` becomes 3 in the hello, the TXT record and the beacon together, because a version 2 end decodes an unknown variant as malformed and closes the link with `CloseReason::Protocol`. A receiver asks for a file's manifest with `Want` and then for each chunk it lacks with `Fetch`, which names the chunk by its byte range of the file, since two holders can chunk one file differently (the author under its mime class, a server-fetched copy under the generic class) while a byte range of `F` is the same on every holder. A holder answers `Manifest` frames of at most 8192 rows, then the range as `Piece` frames of at most 1 MiB of file bytes with their proof hashes (decision 4), and answers `Refused` alike for a file it lacks and a requester its gate refuses, the rule the file server keeps by answering 404 for both (R38). Each side keeps at most one request outstanding per peer, a holder serves at most two peers at once and answers `Busy` beyond that, since each serve holds one decrypted chunk of up to 16 MiB, every reply quotes the request id, and a receiver waits at most 30 s for the next frame on a monotonic clock (R77 decision 10). A lost link resumes at the next chunk the receiver lacks, since every verified chunk is already in its store. Rejected: one request per file, which restarts the whole file on a lost link. Rejected: sharing the exchange queue, which puts a 16 MiB chunk ahead of the next offer.
-2. **The serving device judges the requester through declared content columns, failing closed.** The application declares each column holding a file id on its content client, `with_peer_content("photos", "content_id")`, the same declaration in every build of the application. A holder asked for `F` binds the requester's certificate `account`, `NULL` subjects and the certificate's bot list on its own connection for one statement, the `AuthorBinding` mechanism R77 decision 4 built for an author, and runs `SELECT 1 FROM photos WHERE content_id = ? LIMIT 1` through the policy view for each declared column, serving when any answers a row. It refuses when the application declared no column, when the build has no caller mapping and so no view, and on any error, and a certificate with no bot list binds `NULL`, which the views refuse. The gate runs again at every `Fetch`, so a right the holder's replica withdraws ends the transfer at the next chunk. The answer comes from the holder's partial replica, with chapter 19's false-deny and bounded false-allow limits. The same declaration names the rows a receiver routes by (decision 3), the rows the spare clause reads (decision 6) and the thumbnail columns (decision 8). Rejected: query-shaped declarations like pins, which cannot name a row for the routing and the spare clause.
-3. **Any linked device holding the file answers, the row's provisional author first.** A receiver resolving `F` asks, in order, the linked authors of the provisional rows whose declared columns name `F`, then every other linked peer in the order its link came up, moving to the next on `Refused`, `Busy`, a lapse or a failed verification. Each holder runs the gate on its own replica, so a teammate who synced the row and its bytes before camp serves them while the author is out of range. Rejected: the author alone, under which a row synced from the server has nobody to ask in camp.
-4. **Every piece is verified against the file id by BLAKE3 verified streaming.** `FileId` is the plain BLAKE3 of the file, the root of BLAKE3's own hash tree, so [`bao-tree`](https://github.com/n0-computer/bao-tree) streams any byte range of `F` with the sibling hashes that prove it, with no format change, the upgrade chapter 18 names. [BitTorrent v2](https://www.bittorrent.org/beps/bep_0052.html) checks each 16 KiB block against a file's Merkle root the same way, and [iroh-blobs](https://www.iroh.computer/blog/blake3-hazmat-api) streams BLAKE3 content with this crate. Chunk groups are 16 KiB, so the outboard, the tree's parent hashes, costs 64 bytes per 16 KiB, about 0.4% of the file. A device keeps each file's outboard as an encrypted object in its chunk store, named by `_connetto_content_outboard (file_id BLOB PRIMARY KEY, hash BLOB NOT NULL)`, computed in the native staging and fetching pass that already hashes the file for its identity, and on first serve for a file staged in a browser or before this phase. An outboard leaves with its manifest in the same transaction, and the orphan sweep keeps every outboard the table names. A receiver checks every piece against `F` as it arrives and each completed chunk against the hash its manifest row names, so a forged piece fails within 16 KiB and a lying manifest at its first chunk, and it keeps the outboard its decoding builds, so it can serve the file in turn. Rejected: chunk hashes with the identity checked at commit, under which a lying holder costs up to the whole file's transfer and ranged reads stay unverifiable.
-5. **The receiver keeps the holder's chunk boundaries and re-encrypts each chunk under its own key.** A verified chunk is written under its own hash through the receiver's `EncryptingStore` of the generic class, with the receiver's root key, a fresh nonce and the chunk hash as associated data, holding one chunk in memory, and a resumed fetch skips every chunk the store already holds. The manifest rows and the outboard row commit in one transaction once every chunk is in, with no outbox row, which is what makes content cache, never exported and evictable (chapter 18). Rejected: re-chunking the whole file as `fetch_one` does, which holds the file in memory and cannot resume.
-6. **Peer-fetched content is spared while a provisional row names it** (the rule in step 2). `tidy_content` keeps a manifest while it is unsent, pinned, or named by a declared column of a row whose `_connetto_provisional` record is still provisional. Adjudication or a server write on the row makes the file ordinary cache, which the next pass removes and the server serves once its author has uploaded it, so a receiver online before that upload shows `Unavailable` until it lands. A file fetched for a row that was never provisional, from a teammate's synced copy, is ordinary cache from the moment it lands. A provisional delete names no file, since its row is gone. Rejected: sparing an adjudicated row's file until a read ticket succeeds, which needs the `content_state` column declared and a ticket round trip per kept file.
-7. **A retraction runs the content retention pass.** The content client runs its retention pass on every `ClientEvent::ProvisionalRetracted` and once when its driver starts, since the event broadcast can drop events, so the bytes of a write the server or its author refused leave the receiver at once. The pass is the whole retention pass, so it also removes ordinary cache, which a linked holder can serve again. Rejected: waiting for the next upload or a manual tidy, which keeps a refused write's bytes readable on disk until then.
-8. **Thumbnails are prefetched through a flag on the declaration.** `with_peer_content("photos", "thumb_id").prefetch()` marks a thumbnail column. A receiver fetches each prefetch-column file of an author's provisional rows that it lacks from that author, when a peer apply raises `ProvisionalApplied` and when the author's link comes up, the second reading the records since the broadcast can drop events. A prefetch is dropped when its manifest totals more than 1 MiB, so a misdeclared column never pulls a video unasked, and the file stays fetchable on demand. An on-demand fetch to a peer goes before every prefetch queued for it. The application generates a thumbnail and stages it as an ordinary file (chapter 18). Rejected: pins fetching from peers, which keeps every thumbnail until unpinned and gives pins a second source. Rejected: no prefetch, under which the first view of every photo waits a round trip.
-9. **The demo deployment's `photos` gains `thumb_id`.** `schema.sql` adds `thumb_id BYTEA`, `content.sql`'s `connetto_visible_files` admits a file either column names, and R80's demos inherit the column. The Done when's proof is a Docker-gated test in `connetto-test-harness` with two native clients in one process on the loopback peer link, as R77 slice 6d's is. Rejected: a fixture table in the test alone, which leaves R80 to add the column.
-10. **The peer fetch is a stage of `resolve` after the local answer** (amending R67 decision 8). `resolve` answers locally for any manifest whose chunks are all held, whether unsent, pinned or cached. Online it then asks the server for a signed URL and turns to a linked holder when the server refuses the ticket, which is the case of a provisional row whose author has not uploaded yet. Offline it turns to a linked holder directly. The fetched chunks land in the store and `ChunkStoreSource` answers from them, so the `LocalContentSource` list keeps local sources alone. R67 decision 8 expected the peer to register in that list, but the list is asked only for a held manifest, and its `bytes` takes a `Manifest` a receiver does not have. Rejected: a `LocalContentSource` taking a `FileId`, whose bytes would come back uncached and need a second store write path for the spare clause.
-
-### Decision, settled on evidence
-
-11. **The pull lives in `connetto-file-client` behind a `peer` feature, over a media port `connetto-client` opens.** `connetto-peer` cannot host it, since `connetto-file-client` depends on `connetto-client`, which depends on `connetto-peer` under its own `peer` feature. The messages and a sans-IO machine per peer, with the request ids, the one outstanding request each way, the 30 s bound and the candidate order, live in `connetto-exchange::media` beside the exchange's machine (R77 decision 21). The outboard and the verified range codec live in `connetto-file-core`, which every platform tests under wasm, and the frame and its queue in `connetto-peer`. `connetto-client` gives the file client a port that lists the linked peers with their certificates' accounts and bot lists, sends and receives media messages, runs the gate statement under the requester's binding, and reads the values of a declared column on provisional rows with their authors. The enrolment task, which already receives the link's events, forwards `PeerEvent::Media` to that port.
-
-### Design
-
-```rust
-// connetto-exchange::media::Media, carried as PeerFrame::Media on its own queue
-Want { request_id: u64, file_id: [u8; 32] }
-Manifest { request_id: u64, chunks: Vec<([u8; 32], u64)>, last: bool }
-Fetch { request_id: u64, file_id: [u8; 32], start: u64, len: u64 }
-Piece { request_id: u64, encoded: Vec<u8>, last: bool }
-Refused { request_id: u64 }
-Busy { request_id: u64 }
-```
-
-```sql
-CREATE TABLE _connetto_content_outboard (file_id BLOB PRIMARY KEY, hash BLOB NOT NULL);
-```
-
-`Fetch` asks for at most 16 MiB, the largest chunk. `Piece.encoded` is the bao encoding of the next part of the range, at most 1 MiB of file bytes with the parent hashes that prove it, whole 16 KiB groups, so a chunk boundary inside a group costs the edge bytes of that group, verified and discarded.
+1. **R80 adds no stored or wire format.** A fetched file is R79's manifest and outboard rows, announced by `ContentEvent::Fetched`, and who holds what is R79's holder reports and `_connetto_content_custody`, so a table of completed media or a completed-media entry on the link would record what already stands.
+2. **The content piece carries the peer declarations, and the native client runs the media driver.** `Content::with_peer_content(table, column)` takes R79's declaration with its `prefetch` and `replicate`, applied to the content client before it is shared, and a native client built with the `peer` feature takes its device's media port at connect and runs `drive_media` on it beside the outbox driver the piece already runs, so an application declares its columns and writes no driver code. A build that declares no peer content takes no port, and a port some other caller took first leaves the driver unstarted, which `NativeClient::media_port` already reports by answering `None`. Rejected: each application taking the port and spawning the driver, the same wiring copied into every application.
+3. **The demos declare both photo columns, each replicated to three devices.** `photos.content_id` with `content_state`, and `photos.thumb_id` with `thumb_state` and `prefetch`, both `replicate(3, ...)`, declared once in `examples/demo-support`. A peer shows a teammate's thumbnail at once and fetches the full photo on tap through `resolve`, and a lost author's photo and thumbnail both reach the server, the thumbnail costing little budget. Every demo, native and browser, makes the thumbnail at stage with the `image` crate in `examples/demo-support`, JPEG and PNG decoding only, scaled to 256 px on the longest side and encoded as JPEG, staged before the full photo whose row names it. A photo is posted to the team picked in the Photos tab, so the account's teammates read it and an account with no team keeps it private (decided with the maintainer on 2026-11-14). The Photos tab shows each photo with its author's account badge and the sync mark of the demo UI's C1.
+4. **The courier offer sits in the Connectivity tab, and its outcome in the Log tab.** The Connectivity tab lists `ClientEvent::CourierCandidates` as one row per author, the author's account badge with the sequences held, the bytes and the last verdict heard, each row with a Courier button calling `courier` for that author. The report and every `CourierNotices` entry become Log tab entries naming the settled, refused and kept counts and any retry wait, so the phone runners read the outcome from the Log tab.
+5. **Each platform keeps the role the demos already enforce.** Linux and Android host and join, and the iPhone, the iPad and the Mac only join (R77 decision 23, R76 decision 1).
+6. **The Tauri demo with the Leptos front end carries R80's demo work.** The Dioxus and Yew demos keep building and follow where the shared `View` lets them, with no work of their own (demo UI decision B11).
 
 ### Every event in every situation
 
-For one peer as the receiver sees it: **Q0** not linked, **Q1** linked with no media request outstanding, **Q2** a `Want` outstanding, **Q3** a `Fetch` outstanding. As the holder sees it: **H0** not linked, **H1** linked and serving this peer nothing, **H2** serving this peer. A fetch moves to the next candidate (decision 3) wherever a row says so, and when no candidate is left, an on-demand fetch answers `Unavailable` and a prefetch is dropped until the next trigger.
+The media driver of one native client is **D0** not wanted, no peer content declared or no `peer` feature, **D1** wanted but not running, **D2** running.
 
-| Event | Q0 | Q1 | Q2 | Q3 | H0 | H1 | H2 |
-|---|---|---|---|---|---|---|---|
-| Link up | enter Q1, queue the prefetches of this author's provisional rows, resume fetches waiting for a candidate | n/a | n/a | n/a | enter H1 | n/a | n/a |
-| Link lost | nothing | enter Q0 | abort, next candidate, enter Q0 | abort, the chunk's verified pieces dropped, earlier chunks kept, next candidate, enter Q0 | nothing | enter H0 | stop serving, enter H0 |
-| `resolve` with every chunk of a manifest held | answer locally, no frame | same | same | same | n/a | n/a | n/a |
-| `resolve` with no local bytes, offline or with the ticket refused | next candidate | send `Want`, enter Q2 | queue it ahead of every prefetch | same | n/a | n/a | n/a |
-| Prefetch due, `ProvisionalApplied` naming a prefetch-column file this device lacks | nothing, link up queues it | send `Want`, enter Q2 | queue it behind every on-demand fetch | same | n/a | n/a | n/a |
-| `Manifest`, not last | n/a | ignore it | keep the rows, wait for the next frame | ignore it | n/a | n/a | n/a |
-| `Manifest`, last | n/a | ignore it | a prefetch above 1 MiB is dropped, else `Fetch` the first chunk not held (Q3), or commit when every chunk is held (Q1) | ignore it | n/a | n/a | n/a |
-| `Manifest` above 8192 rows, or rows after the last | n/a | n/a | abort, next candidate | n/a | n/a | n/a | n/a |
-| `Piece` verifies against `F` | n/a | ignore it | ignore it | keep it, and at the last piece check the chunk against its manifest hash, write it, then `Fetch` the next chunk not held, or commit the manifest and outboard rows in one transaction, raise `ContentEvent::Fetched` and enter Q1 | n/a | n/a | n/a |
-| `Piece` fails verification, or a chunk disagrees with its manifest hash | n/a | n/a | n/a | abort, drop the chunk's pieces and this holder's manifest, next candidate from `Want` | n/a | n/a | n/a |
-| `Refused` | n/a | ignore it | next candidate | next candidate | n/a | n/a | n/a |
-| `Busy` | n/a | ignore it | next candidate, and once every candidate answered `Busy`, the first again after 5 s doubling to 5 min (R77 decision 22), an on-demand fetch answering `Unavailable` 30 s after it began or after its last verified piece | same | n/a | n/a | n/a |
-| A reply quoting another request id | n/a | ignore it | ignore it | ignore it | n/a | n/a | n/a |
-| 30 s without the next frame | n/a | n/a | abort, next candidate, enter Q1 | same | n/a | n/a | n/a |
-| A chunk write or the commit fails | n/a | n/a | n/a | abort, the fetch fails with the store's or the replica's error, written chunks left to the orphan sweep, enter Q1 | n/a | n/a | n/a |
-| `Want` received | n/a | n/a | n/a | n/a | n/a | gate and manifest held, stream `Manifest` frames and enter H2, else `Refused` | `Busy` |
-| `Fetch` received | n/a | n/a | n/a | n/a | n/a | gate again, range within the file and its chunks held, outboard computed when absent, stream `Piece` frames and enter H2, else `Refused`, and `Busy` while two other peers are served | `Busy` |
-| Own stream ends | n/a | n/a | n/a | n/a | n/a | n/a | enter H1 |
-| Own file evicted or a chunk unreadable mid-stream | n/a | n/a | n/a | n/a | n/a | n/a | stop, `Refused`, enter H1 |
-| Peer certificate renewed | nothing | nothing | nothing | nothing | n/a | the next gate binds the renewed bot list | same |
-| Peer revoked or expired, link closes | as link lost | as link lost | as link lost | as link lost | as link lost | as link lost | as link lost |
-| R31 rebuild at a newer major | n/a | links close first, as link lost | same | same | n/a | same | same |
-| Data wipe or destructive logout | n/a | links close first, the store goes with the replica | same | same | n/a | same | same |
-
-A held peer-fetched manifest is **K1** spared, a declared column of a provisional row naming it, **K2** ordinary cache, or **K3** kept by another clause, unsent or pinned.
-
-| Event | K1 | K2 | K3 |
+| Event | D0 | D1 | D2 |
 |---|---|---|---|
-| Peer fetch commits | enters K1 when a provisional row names it | else enters K2 | n/a |
-| Retention pass, after an upload, on `tidy_content`, on `ProvisionalRetracted` or at driver start | kept | manifest and outboard rows deleted, then their unreferenced chunks swept | kept |
-| `ProvisionalRetracted` for the naming row | the pass runs, the file moves to K2 and goes unless another row names it | the pass runs | the pass runs |
-| Frontier, verdict or server write adjudicates the row | moves to K2, the next pass removes it | nothing | nothing |
-| A pin covers it | moves to K3 | moves to K3 | nothing |
-| Its pin goes | n/a | n/a | back to K1 or K2 |
-| Export | not carried | not carried | unsent carried with its chunks, pinned not |
-| Truncate of the naming table or R31's rebuild dropping the records | moves to K2 | nothing | nothing |
+| Connect with a device and peer content declared, the port free | n/a | take the port, spawn `drive_media`, enter D2 | n/a |
+| Connect with no device, or the port already taken by another caller | n/a | stay, the port reads `None` | n/a |
+| The client closes, logs out destructively or wipes its data | nothing | nothing | the port's client ends, `drive_media` returns, enter D1 |
+| A link comes up, falls or is replaced | nothing | nothing | `drive_media` handles it (R79's Q, H and C tables) |
+| A later connect after the client closed | n/a | as the first two rows | n/a |
 
-### Slices
+The Photos tab holds rows and display sources while subscribed. Thumbnail resolution runs serially with row refreshes. Opening a full photo runs independently.
 
-One pull request each, in this order, each green and useful on its own.
+| Event or job | Subscribed | Ended |
+|---|---|---|
+| Initial snapshot or changed photo rows | Publish rows, then resolve each row's thumbnail | Nothing |
+| `ContentEvent::Fetched` | Refresh thumbnail sources | Nothing |
+| Other content event | Preserve sources and process status or refusal information | Nothing |
+| Tauri content receiver lag | Refresh sources from the current snapshot | Nothing |
+| Photo subscription closes | End subscription | Nothing |
+| Content receiver closes | End content subscription | Nothing |
+| Thumbnail resolution completes | Publish sources while the session still stands | Nothing |
+| Full photo tap | Resolve `content_id` in an independent job | Nothing |
+| Full photo resolution completes | Publish full preview | Nothing |
+| Tab or session drops | Cancel owned jobs and subscriptions | Nothing |
 
-1. **Outboards** (decision 4). `connetto-file-core` gains the outboard and the verified range codec over a `ChunkStore` and a manifest, and `connetto-file-client` the `_connetto_content_outboard` table, the outboard written in the native staging and fetching pass and computed on demand, and its eviction and sweep with its manifest. Proven in process, every range of a held file decoding against its id and a forged byte refused.
-2. **The media frames** (decisions 1 and 11). `connetto-exchange::media` with the messages, their bounds and the per-peer machine tested row by row without sockets, and `connetto-peer` at protocol version 3 with `PeerFrame::Media`, its own queue, `Node::send_media` and `PeerEvent::Media`, proven between two nodes on loopback.
-3. **The media port and the gate** (decisions 2 and 11). `connetto-client`'s port, the enrolment task forwarding media events to it, the gate statement under the requester's binding, and the provisional values of a declared column with their authors, proven in process for a permitted requester, a refused one, a certificate with no bot list and a build with no caller mapping.
-4. **The holder** (decisions 1, 2 and 4). `connetto-file-client`'s `peer` feature, the declarations, and the serving of `Want` and `Fetch` with `Refused` and `Busy`, proven between a client and a bare peer node on loopback.
-5. **The receiver** (decisions 3, 5 and 10). The fetch stage of `resolve`, the candidate order, verification, storage and the commit, proven between two clients on loopback, a forged piece and a lying manifest refused and a fetch resumed after a lost link.
-6. **The retention** (decisions 6 and 7). The spare clause in `tidy_content` and the retention pass on `ProvisionalRetracted` and at driver start, proven in process for a provisional, an adjudicated and a retracted row's file.
-7. **Thumbnails** (decisions 8 and 9). The prefetch flag, its 1 MiB bound and its order behind on-demand fetches, and the demo deployment's `thumb_id`, proven between two clients on loopback.
-8. **The harness proof** (decision 9). The Docker-gated test of the Done when's first three clauses, and chapters 18 and 19 brought to what is built.
-
-### Done when
-
-A photo authored offline on one device displays on a peer in camp (thumbnail immediately, full image on tap), a policy-refused requester gets nothing, a retraction sweeps the cached chunks, proven in the harness. With step 4, replicated content survives the author device's loss end to end with R78.
-
----
-
----
-
-## R80: peer sync in every demo
-
-**Status.** NOT STARTED.
-
-**Blocked on** R77, R78 and R79, plus R76's slice 9d, which R76 parked until decision 40's machine is at hand.
-
-**Changes state.** Client tables, none, the receiver's file table recording the completed media by its content hash. Server tables, none. Wire messages, the completed media entry on the peer link (step 3). Archive format, none.
+Browser object URLs remain owned by the displayed sources.
 
 ### Steps
 
-1. Every native-capable demo carries the camp flow per R54's rule, on every native platform in the set (Android, iOS, iPadOS, macOS, Windows, Linux), meaning hosting or joining a hotspot, discovery, exchange, provisional display with provenance, retraction display and the courier offer.
-2. The on-demand phone run grows to the full camp flow, and the recorded home run across every local machine (R76 decision 4) exercises it before the phase closes.
+1. The Tauri demo carries the camp flow per R54's rule, on Android, iOS, iPadOS, macOS and Linux, meaning hosting or joining a hotspot, discovery, exchange, provisional display with provenance, retraction display, the courier offer, and photos over the link with their thumbnails prefetched and both replicated, each in its tab of the demo UI.
+2. The on-demand phone run grows to the full camp flow, and a recorded home run exercises it before the phase closes, R76 decision 4's mesh over pippo on Linux, the Mac, the iPhone, the iPad and the Galaxy M52.
 3. The gate section and CI gain whatever new legs the peer crates added.
+
+### Slices
+
+One pull request each, in this order, each green and useful on its own. Slices 3 and 4 follow the demo UI's slices 5 to 7.
+
+1. **The builder's media driver** (decision 2). `Content::with_peer_content` with its `prefetch` and `replicate`, and the native client taking the media port at connect and running `drive_media`, with the event table above, proven Docker-gated in the harness by two builder-built clients on loopback, one fetching the other's photo through `resolve` with no driver code of its own.
+2. **The demos' photo declarations and thumbnails** (decision 3, no screen). The two declarations and the thumbnail made at stage in `examples/demo-support`, proven Docker-gated in the harness by two clients built with the demo's declarations on loopback, a photo staged offline on one reaching the other's thumbnail through `ContentEvent::Fetched` with no server.
+3. **The Photos tab over the link** (decisions 3 and 6). The tab with its badges, sync marks and the event table above, proven by the on-demand run's two phones, a photo taken offline on one showing its thumbnail on the other at once and its full image on tap.
+4. **The courier offer** (decision 4). The candidate rows in the Connectivity tab and the Log tab entries, proven by the on-demand run, one phone's offline note reaching the server through the other.
+5. **The grown runs** (step 2). `connetto-android-proof`'s on-demand run and `connetto-ios-proof`'s star walk the Photos, Connectivity and Log tabs for the photo and courier legs, and the recorded home run over the five machines closes the phase.
+6. **The CI legs** (step 3). The emulator leg runs the grown camp walk on the Tauri demo, and the gate section names every new leg.
 
 ### Done when
 
-The camp flow runs through a demo on every local machine in the recorded home run and in the on-demand run on two attached phones.
+The camp flow runs through the Tauri demo on pippo, the Mac, the iPhone, the iPad and the M52 in the recorded home run, and in the on-demand run on two attached phones, a photo authored offline showing on a teammate's device in camp and reaching the server through a teammate's courier.
 
 ---
 
@@ -1414,6 +1090,39 @@ Docker-gated, against two servers of consecutive majors on one database. The exp
 ### Done when
 
 A deployment can move between majors by the documented procedure with old clients working through the window, an old client learns its sunset before its server goes away, and a change the procedure does not allow refuses only the tables it touched, whether it arrives while the server runs or before it boots.
+
+---
+
+## R107-MySQL: refused tables on MySQL and MariaDB
+
+**Status.** NOT STARTED. Parked by the maintainer until resumed, since other work is more pressing. Which Maxwell producer the source reads is open.
+
+**Changes state.** None. The phase builds in subql, and connetto's server reads PostgreSQL only.
+
+### Purpose
+
+R107 slice 2 rests on subql's drift guard, which refuses only the tables whose live shape no longer matches the catalog. The guard covers subql's PostgreSQL and SQLite sources. subql folds Maxwell's JSON for MySQL and MariaDB, but no `CdcSource` reads it and no `LiveCatalog` loads a MySQL table, so a subql consumer on MySQL or MariaDB has no guard.
+
+### Decisions, taken with the maintainer
+
+1. **A Maxwell source in subql.** MySQL and MariaDB get a `CdcSource` reading Maxwell's JSON from a producer, so the drift guard covers them unchanged. Maxwell's `table-alter`, `table-create` and `table-drop` messages are its schema signals.
+2. **The live read over `my_diesel`.** A MySQL table's live shape loads through subql's diesel-based `LiveCatalog` implemented over `my_diesel`, as PostgreSQL's loads over `pg_diesel`, never through a hand-typed `information_schema` query.
+3. **The row image is checked at connect.** MySQL's `binlog_row_image` is a server and session setting with no per-table counterpart, so the Maxwell source checks it once when it connects.
+4. **Collations compare under MySQL's rule.** A column's catalog and live collations compare through sql-traits' MySQL rule, [sql-traits #514](https://github.com/connetto-rs/sql-traits/pull/514).
+
+### Steps
+
+1. The Maxwell `CdcSource` in subql.
+2. The `LiveCatalog` over `my_diesel` in subql, once `my_diesel` exists.
+3. The MySQL collation verdict, over step 2's live read.
+
+### Proof
+
+Against MySQL and MariaDB servers streamed through Maxwell, a column dropped under a running subql consumer refuses that table while another table keeps flowing, on the `table-alter` message, at reconciliation and again at the next start.
+
+### Done when
+
+A subql consumer on MySQL or MariaDB refuses only the tables a schema change touched, as it does on PostgreSQL and SQLite.
 
 ---
 
@@ -1495,21 +1204,21 @@ Completion requires native and headless-browser proof of encrypted replica opens
 ## R108: caller kinds as database roles
 
 
-**Blocked on shared semantics in sql-traits, for slices 2 to 5.** pg2sqlite and rls2fga each work out on their own which policies apply to a role, which privileges gate a command, what `current_user` means and how a session setting is typed and split, and an alignment review measured against PostgreSQL 18 found them disagreeing on each. The fix computes those answers once in sql-traits, as a deployment description (the login role, the acting role of each kind, each session setting's type, separator and whether it may be unset, merged as sql-traits #213), privileges per command and per column, and the policies PostgreSQL applies to an acting role per statement shape, and has both translators adopt them. rls2fga #93, #94 (`TO` settled against caller roles) and #95 (table privileges per role) are held and rebuilt on those answers, so each rule exists once. The two bot kinds take effect once R99 gives bots their logins. Slice 1 is blocked on nothing.
+**Blocked on shared semantics in sql-traits and on R107's live catalog, for slices 2 to 5.** pg2sqlite and rls2fga each work out on their own which policies apply to a role, which privileges gate a command, what `current_user` means and how a session setting is typed and split, and an alignment review measured against PostgreSQL 18 found them disagreeing on each. The fix computes those answers once in sql-traits, as a deployment description (the login role, the acting role of each kind, each session setting's type, separator and whether it may be unset, merged as sql-traits #213), privileges per command and per column, and the policies PostgreSQL applies to an acting role per statement shape, and has both translators adopt them. rls2fga #93, #94 (`TO` settled against caller roles) and #95 (table privileges per role) are held and rebuilt on those answers, so each rule exists once. The server reads the roles, memberships, grants and helper functions its translation needs from the live database, through the `PgDieselDatabase` R107 loads at boot and reloads at each marker row, so slices 2 to 5 also wait on rls2fga translating that live model. The two bot kinds take effect once R99 gives bots their logins. Slice 1 is blocked on nothing.
 
-**Changes state.** Client tables: none, but the build's schema bundle becomes one bundle per kind, and a client opens its replica with the bundle of its kind. Server tables: none of connetto's. The deployment adds a third document, its kind roles and their grants, beside the schema and the policies. Wire messages: a refusal reason naming a table and a kind, for a subscription and for a write. Archive format: none.
+**Changes state.** Client tables: none, but the build's schema bundle becomes one bundle per kind, and a client opens its replica with the bundle of its kind. Server tables: none of connetto's. The deployment adds a third document, its kind roles and their grants, which its migration applies and the build reads for each kind's client copy. Wire messages: a refusal reason naming a table and a kind, for a subscription and for a write. Archive format: none.
 
 ### Purpose
 
-Every caller reaches Postgres through connetto's one reader role, and a policy tells callers apart only through the settings connetto binds (`app.user_id`, `app.subjects`, `app.bot_list`). A policy written `TO app_admin` therefore means one thing to Postgres, which judges it by the reader role, and another to OpenFGA, which rls2fga gates on `pg_role` memberships nobody loads or watches. Such a deployment is refused at startup with `SetupError::RoleScopedPolicy`, naming the policy, its table and the roles, before anything reaches OpenFGA. This phase gives each kind of caller its own database role, so policies can name kinds and table grants can differ per kind.
+Every caller reaches Postgres through connetto's one reader role, and a policy tells callers apart only through the settings connetto binds (`app.user_id`, `app.subjects`, `app.bot_list`). Both translators settle a policy's `TO` clause against the reader role, so a policy written `TO app_admin` serves no connetto caller and is logged at startup and left out, while one the reader is subject to serves every caller alike. This phase gives each kind of caller its own database role, so policies can name kinds and table grants can differ per kind.
 
 ### Decisions, taken with the maintainer
 
 1. **Four kind roles, flat.** Anonymous callers, signed-in users, a bot acting for the owner that added it, and a bot as itself, by default named `anon`, `authenticated`, `bot_installation` and `bot`, each renameable in the server builder. No kind implies another, as in Hasura's flat model ("Roles in Hasura are defined in a flat, non-hierarchical model"), so a rule for every caller has no `TO` clause. A role per user is rejected, and so is a role bypassing row-level security in the manner of Supabase's `service_role`, whose own guide warns that "A leaked secret key exposes all of your project's data". connetto's callers are devices, and a machine acting through connetto comes as a bot, held to its list.
 2. **Finer states stay settings.** Share keys, the bot list, and any later assurance level or attestation stay in the settings connetto binds, as Supabase keeps anonymous sign-ins and MFA as claims under one role.
 3. **The switch is per transaction.** The reader role holds every kind role `WITH INHERIT FALSE, SET TRUE`, since Postgres applies a `TO` clause by `has_privs_of_role` and an inherited membership would apply every kind's rules before any switch. `CallerBinding` runs `SET LOCAL ROLE` beside the settings it binds today, so no path runs a caller's statements as the bare reader role.
-4. **A `TO` clause is settled against connetto's caller roles**. A policy every caller role reaches applies to every caller, one some reach is scoped to those kinds, and one no caller role reaches, such as a policy for an admin tool that logs in outside connetto, is left out of connetto's model and its client copies and reported, never refused. A role whose membership the schema does not settle refuses startup. Every refusal runs before anything is written to OpenFGA. Until the kind roles exist, the reader role is the only caller role.
-5. **The kind roles and their grants are a third document.** connetto translates it beside the schema and the policies, and grants may differ per kind. At startup connetto compares each kind's privileges in the database (`has_table_privilege` per role and command) with the document and refuses to start on any difference. It refuses a kind role that can log in, is `SUPERUSER` or `BYPASSRLS`, belongs to `pg_read_all_data` or `pg_write_all_data`, or is held by the reader role with inheritance. It also refuses a kind role that owns a table the schema declares or inherits the privileges of its owner (`pg_has_role(kind, owner, 'USAGE')`), since PostgreSQL skips an owner's policies unless the table forces row-level security, and sql-traits answers every table as owned by a role other than each acting role. A deployment that shares a role name with another API on the same database, such as Supabase's own `anon`, renames connetto's kinds, since that API's grants would otherwise differ from the document.
+4. **A `TO` clause is settled against connetto's caller roles**. A policy every caller role reaches applies to every caller, one some reach is scoped to those kinds, and one no caller role reaches, such as a policy for an admin tool that logs in outside connetto, is left out of connetto's model and its client copies and reported, never refused. Every refusal runs before anything is written to OpenFGA. Until the kind roles exist, the reader role is the only caller role.
+5. **The kind roles and their grants follow the live database.** The deployment's migration creates the kind roles and applies their grants from a third document, which the build reads for each kind's client copy. The server reads the live roles, memberships, grants and helper functions from the `PgDieselDatabase` R107 loads for the policies, sql-traits computes each kind's privileges from them, and a marker row reloads them with the policies (R107). A live grant that differs from the document is followed, never refused, and leaves the client copies stale until the next app update, as a live policy change does. At startup the server refuses a kind role that can log in, is `SUPERUSER` or `BYPASSRLS`, belongs to `pg_read_all_data` or `pg_write_all_data`, or is held by the reader role with inheritance. It also refuses a kind role that owns a table the schema declares or inherits the privileges of its owner (`pg_has_role(kind, owner, 'USAGE')`), since PostgreSQL skips an owner's policies unless the table forces row-level security, and sql-traits answers every table as owned by a role other than each acting role. A deployment that shares a role name with another API on the same database, such as Supabase's own `anon`, renames connetto's kinds, since that API's grants would otherwise reach connetto's callers.
 6. **connetto's own bookkeeping is never granted to a kind.** The write path writes `_connetto_writers`, `_connetto_settled` and `_connetto_session_writers` after `RESET ROLE`, back under the reader role, in the same transaction as the caller's change.
 7. **The registry tables are granted per kind.**
 
@@ -1522,65 +1231,33 @@ Every caller reaches Postgres through connetto's one reader role, and a policy t
 8. **A command a kind lacks is refused up front.** A subscription to a table the kind cannot read is refused at subscribe with the new reason, a write it cannot make is refused before it is applied and settles as refused, and its client copy omits the table. A `permission denied` that still arrives is classified through R106 as a permanent refusal and never retried.
 9. **The client copy is translated once per kind.** pg2sqlite builds each kind's copy from sql-traits' answers for that kind, so the copy keeps the policies that apply to the kind, memberships included, and each table takes the kind's privileges, omitting a table it cannot read and making read-only one it cannot write. Each replica file holds one kind only, since an anonymous caller runs in memory and signing in opens the file named from the identity, so the build emits a bundle per kind and the client picks its own. `current_user` evaluates to the kind role's name, as PostgreSQL defines it after `SET ROLE`.
 10. **Each check tells OpenFGA the caller's kind**. The kind belongs to the connection, not to the person, since one share key may be held by an anonymous and by a signed-in caller. So no kind is stored as a fact. Each check carries the caller's kind as a contextual tuple, the pattern of OpenFGA's token-claims guide, which `BatchCheck` accepts per item, and connetto's local answers take the kind as an input in the same way.
-11. **connetto checks the kind roles by default, and creating them is opt-in.** By default the deployment creates the roles and applies the grants from the roles-and-grants document, as it already creates the reader role, and startup refuses on any difference, as it already refuses a missing publication or replication slot. A builder setting lets connetto create the roles at startup instead, where its owner role has `CREATEROLE`, which managed Postgres often withholds. A deployment that asks for creation without `CREATEROLE` is refused at startup.
+11. **The deployment's migration creates the kind roles.** connetto applies no server DDL (R107 decision 9), so a missing kind role refuses startup.
 
 ### Slices
 
 1. **Refusals before OpenFGA.** Step 1. Merged.
-2. **One deployment description.** Step 2. Blocked on sql-traits' deployment description and both translators adopting it.
-3. **The kind roles.** Steps 3 to 5. Blocked on sql-traits' privileges and effective policies and both translators adopting them.
+2. **One deployment description.** Step 2, in two pull requests. The first builds the description from the roles document and hands it to both translators, and waits on subql's follow-up to rls2fga's acting roles, which every check now states. The second is the preflight refusals of the reader role.
+3. **The kind roles.** Steps 3 to 5. Blocked on sql-traits' privileges and effective policies, both translators adopting them, and R107's live load and marker row.
 4. **The client copy per kind.** Step 6. Needs slice 3.
 5. **Refusing what a kind lacks.** Step 7. Needs slices 3 and 4.
 
 ### Steps
 
 1. Every startup refusal runs before connetto first writes to OpenFGA, so a refused deployment leaves the store untouched, the replica translation's included. A refusal names the policy and the role it could not settle, never a translator's builder call. Every `rls2fga` note that leaves the boot running and asks something of the operator or names whom the rules do not reach is logged as a warning, apart from the check parameter connetto supplies itself.
-2. connetto builds sql-traits' deployment description once, with the reader role as the only acting role and its three settings declared always bound, and hands the same description to pg2sqlite and rls2fga. A policy for a role outside connetto is then reported and left out on both sides instead of refusing startup through pg2sqlite. Preflight refuses a reader role that owns a table the schema declares or inherits its owner, as decision 5 refuses it for a kind role.
-3. The server builder takes the four kind role names and the setting of decision 11, off by default. Preflight checks decision 5's attributes and the grants against the roles-and-grants document, after creating the roles first when the setting is on, and the four kinds become the description's acting roles.
+2. connetto builds sql-traits' deployment description once, with the reader role as the only acting role and its three settings declared always bound, and hands it to pg2sqlite at build time and to rls2fga at boot. The reader role comes from the roles document, which the build and the server both parse and which must create it, while connetto's bookkeeping grants stay in a document neither translator reads. Every OpenFGA check states the reader role as the acting role, since rls2fga gates every relation on it. A policy for a role outside connetto is then reported and left out on both sides instead of refusing startup through pg2sqlite. In a second pull request, preflight refuses a reader URL that logs in as another role than the one the description names, and a reader role that owns a table the schema declares or inherits its owner, as decision 5 refuses it for a kind role.
+3. The server builder takes the four kind role names. Preflight reads the kind roles from the live model and refuses a missing one and the attributes of decision 5, and the four kinds become the description's acting roles.
 4. `CallerBinding` switches to the caller's kind role, and the write path resets to the reader role for connetto's bookkeeping.
-5. connetto translates the roles-and-grants document with the other two, and every check, remote and local, carries the caller's kind per decision 10.
+5. The server translates with each kind's live privileges, every check, remote and local, carries the caller's kind per decision 10, and a marker row reloads grants and memberships with the policies.
 6. `connetto_schema` translates once per kind, the generated bundle carries one entry per kind, and the client opens its replica with the bundle of its kind.
 7. The subscription and write refusals of decision 8, and the client's error for a table its copy lacks.
 
 ### Proof
 
-Docker-gated. A deployment refused at startup leaves the OpenFGA store untouched. A policy `TO support_staff` for a role outside connetto is reported and serves no connetto caller, in OpenFGA and in the client copy alike, and a `TO` role the schema never creates refuses startup. With the four kind roles and grants that differ per kind, an anonymous caller's write to a table it may only read is refused before the database, its subscription to a table it may not read is refused at subscribe, and its client copy lacks that table, while a signed-in caller reads and writes both. A share key used by an anonymous and by a signed-in caller is answered by each one's kind. A grant applied by hand and missing from the document refuses startup, and so does a kind role or the reader role that owns a synced table or inherits its owner, with and without `FORCE ROW LEVEL SECURITY`. By default a missing kind role refuses startup, and with creation on connetto creates it where its owner role has `CREATEROLE` and refuses where it lacks it. The differential harness that compares PostgreSQL, OpenFGA and the SQLite copy for one policy set, built on the same deployment description, agrees for each kind on connetto's example deployment. The harness is seeded with the alignment review's probes, including a dropped `::uuid` cast over an untyped `pg2sqlite` mapping and `->>` on a non-string `jsonb` value, the two replica-side defects that go to `pg2sqlite` as upstream requests.
+Docker-gated. A deployment refused at startup leaves the OpenFGA store untouched. A policy `TO support_staff` for a role outside connetto is reported and serves no connetto caller, in OpenFGA and in the client copy alike. With the four kind roles and grants that differ per kind, an anonymous caller's write to a table it may only read is refused before the database, its subscription to a table it may not read is refused at subscribe, and its client copy lacks that table, while a signed-in caller reads and writes both. A share key used by an anonymous and by a signed-in caller is answered by each one's kind. A `REVOKE` from one kind applied with a marker row takes effect for that kind at the marker, and one applied without a marker at the next boot. A missing kind role, a kind role with an attribute decision 5 refuses, and a kind role or the reader role that owns a synced table or inherits its owner, with and without `FORCE ROW LEVEL SECURITY`, each refuse startup. The differential harness that compares PostgreSQL, OpenFGA and the SQLite copy for one policy set, built on the same deployment description, agrees for each kind on connetto's example deployment. The harness is seeded with the alignment review's probes, including a dropped `::uuid` cast over an untyped `pg2sqlite` mapping and `->>` on a non-string `jsonb` value, the two replica-side defects that go to `pg2sqlite` as upstream requests.
 
 ### Done when
 
 A deployment can name connetto's kinds in its policies and grant each kind its own table privileges, a policy for a role outside connetto serves none of connetto's callers, every refusal comes before anything is written, and Postgres, OpenFGA and each kind's client copy agree on what each kind may read and write.
-
-## R109: content tickets bound to their session
-
-**Blocked on** nothing.
-
-**Changes state.** Client tables, none. Server tables, none. Wire messages, the content ticket gains the minting session. Archive format, none.
-
-### Purpose
-
-Every fetch already rechecks that the ticket's caller may see the file, so a revoked share or an erased row denies at once. What a ticket outlives is its session, [G5](#g5). After a logout or a revoked session, a cached ticket keeps reading the files that identity can still see until it expires. This phase makes the session's end the ticket's end.
-
-### Decisions, taken with the maintainer
-
-1. **The ticket names its session and every fetch confirms it is live.** The signed payload gains the session that minted it, and the file server consults the session's liveness on every read through a check the server builder wires to `AuthService::session_is_live`, so a logout or a revocation cuts every cached ticket of that session at its next request.
-
-### Open points
-
-1. **A ticket minted by a share key alone**, with no session behind it. Whether it binds to the share key's own liveness or keeps the expiry as its only bound.
-2. **The cost of the check.** One store read per fetch, or a short-lived cache of live sessions, and what the cache's lifetime adds to the lag.
-
-### Steps
-
-1. The ticket payload carries the minting session, signed with the rest.
-2. The file server's configuration takes a liveness check, the builder wires it to the auth store, and every read refuses a ticket whose session is not live, answering as it answers a file the caller may not see.
-
-### Proof
-
-Docker-gated. A ticket minted in a session reads a file, the session logs out, and the same ticket is refused at once, while a ticket of another live session of the same identity keeps reading.
-
-### Done when
-
-No content read succeeds for a ticket whose session has ended.
 
 ---
 
@@ -1632,7 +1309,7 @@ A session ends when the provider has not confirmed the user within the bound, an
 
 ### Purpose
 
-A browser that refuses OPFS, Firefox private windows among them, runs the replica in memory, [G4](#g4), so a reload loses every unsent write. Firefox private windows keep IndexedDB for the life of the private session. A synchronous VFS over IndexedDB loses commits, which for connetto means a reused writer sequence the server refuses as forked, and `sqlite-wasm-vfs` removed the one it had for that reason. JSPI, in Chrome 137 and Firefox 153, lets a VFS wait for IndexedDB before SQLite's commit returns.
+A browser that refuses OPFS, Firefox private windows among them, runs the replica in memory and reports it in the boot result, so a reload loses every unsent write. Firefox private windows keep IndexedDB for the life of the private session. A synchronous VFS over IndexedDB loses commits, which for connetto means a reused writer sequence the server refuses as forked, and `sqlite-wasm-vfs` removed the one it had for that reason. JSPI, in Chrome 137 and Firefox 153, lets a VFS wait for IndexedDB before SQLite's commit returns.
 
 ### Decisions, taken with the maintainer
 
@@ -1666,7 +1343,7 @@ A browser that refuses OPFS but runs JSPI keeps the replica and its queued write
 
 ### Purpose
 
-Apple devices only join ([R77 decision 23](#r77-the-exchange-and-the-provisional-tier)), so a group of iPhones, iPads and Macs with no Android phone, no Linux machine and no shared Wi-Fi has no link. Apple's peer-to-peer Wi-Fi (AWDL), reached through Network framework's [`includePeerToPeer`](https://developer.apple.com/documentation/network/nwparameters/includepeertopeer), links iOS 12, iPadOS and macOS 10.14 devices and later with no access point, no managed entitlement and no pairing screen, needing only the local-network permission and `NSBonjourServices`.
+Apple devices only join ([R77 decision 23](https://github.com/connetto-rs/connetto-rs/blob/729d2f2321d0e8866472f8dcab8455715243d1a2/plans/master-implementation-plan.md#r77-the-exchange-and-the-provisional-tier)), so a group of iPhones, iPads and Macs with no Android phone, no Linux machine and no shared Wi-Fi has no link. Apple's peer-to-peer Wi-Fi (AWDL), reached through Network framework's [`includePeerToPeer`](https://developer.apple.com/documentation/network/nwparameters/includepeertopeer), links iOS 12, iPadOS and macOS 10.14 devices and later with no access point, no managed entitlement and no pairing screen, needing only the local-network permission and `NSBonjourServices`.
 
 ### Findings
 
@@ -1704,6 +1381,92 @@ An iPhone, an iPad and a Mac with mobile data off and no shared network discover
 ### Done when
 
 An all-Apple group with no hotspot host and no shared Wi-Fi links and syncs offline.
+
+---
+
+## R113: tests that wait on events
+
+**Status.** CI evidence collected. Implementation blocked by the refreshed dependency graph.
+
+**Dependencies.** R78 owns the courier restore and retired-writer proofs. R113 proceeds independently outside those files.
+
+**Changes state.** Client tables, none. Server tables, none. Wire messages, none planned, and a missing hook that needs one names it in its own slice. Archive format, none.
+
+### Purpose
+
+A wait that synchronises on time assumes the machine is fast enough. It passes on an idle machine and fails under load, so it merges green and returns as a flake, as the R78 courier proofs did once the CI runners and the local machine were busy. An event says the state was reached at the moment it was reached. This phase moves every wait onto an event hook wherever one exists or can be built, so timing flakes cannot happen by construction.
+
+A first heuristic pass over `main` at 7cffaf2d5 found about 270 sleeps in code following a `#[cfg(test)]` line or under `tests`, across about 90 files, sorted by the code around each into fixed sleeps, polls until a deadline, polls with no deadline and fixed windows asserting that nothing happened. Those counts are candidates. Some sites are product timers sitting below a test module, and slice 1 establishes the verified baseline. The shared harness helpers `wait_roster`, `wait_unsynced_empty` and `assert_bodies` poll, and every end-to-end proof since R77 copies them.
+
+### Rules
+
+1. **A wait listens to the event that signals its state**, subscribed before the action that causes it, through the client's event stream, a live query, the awaited action or a process exit.
+2. **A state with no event is a finding.** The slice names the state, the code that changes it and the hook that would expose it, and the hook is one a consumer of the API can use, never a test-only seam. Server-side changes reach clients through subql.
+3. **A bound stays on every event wait as failure detection only**, so a broken run fails instead of hanging.
+4. **A timer wait stays only where time is the subject**, a product backoff, keepalive or throttle, a test of one on a paused clock where the test runs in process, a silence assertion bounded by the change it is about, or an external system with no notification, each with its reason at the site.
+
+### Slices
+
+Each candidate below is a separate pull request, investigated and completed before starting the next. A candidate already corrected on `main` leaves the queue. Each pull request contains only its consumer-usable hook, affected callers, one test migration and required API documentation. Open it after its checks pass. Dependent fixes stack on the preceding branch, independent fixes start from `main`.
+
+1. **Live column updates.** `column_subset::a_left_out_column_matches_the_server` protects replica freshness. Two failures in the sampled CI runs, [41912933385](https://github.com/connetto-rs/connetto-rs/actions/runs/41912933385) and [41912925956](https://github.com/connetto-rs/connetto-rs/actions/runs/41912925956). The test drives the pump in 500 ms windows. First establish whether the historical missing update remains possible.
+2. **Writes with invisible parents.** `synced_references::a_child_whose_parent_is_invisible_lands_and_uploads` protects writes through row-level security. Two failures in the same sampled runs. It already waits on events, so identify the missing producer or ordering contract before changing its wait.
+3. **Revocation across reconnect.** `enrolment::tests::a_revoked_device_stays_spectator_when_its_pump_says_connected_again` protects device-key revocation. One failure in [42350971834](https://github.com/connetto-rs/connetto-rs/actions/runs/42350971834). Initial enrolment polls internal state and the reconnect assertion uses a one-second silence window.
+4. **Startup sunset notification.** `sunset::the_ack_carries_the_configured_sunset_and_raises_the_event` protects upgrade notifications. One failure in [42291879651](https://github.com/connetto-rs/connetto-rs/actions/runs/42291879651). On `main`, it starts the pump before subscribing to its event stream.
+5. **Keepalive through a locked gate.** `keepalive::the_probe_runs_while_the_gate_is_locked` protects connection continuity while authentication is pending. One failure in [42184627708](https://github.com/connetto-rs/connetto-rs/actions/runs/42184627708), at the launch approval wait. The later ping assertion also uses a fixed sleep. Diagnose the launch failure before attributing it to that sleep.
+6. **Browser photo readiness.** `a_photo_round_trips_through_stage_commit_resolve_and_http_fetch` protects browser media startup. One failure in [42395628048](https://github.com/connetto-rs/connetto-rs/actions/runs/42395628048), reporting readiness stuck at `signed-in`. Establish the missing boot transition before selecting its hook.
+7. **Remaining classified waits.** Extend the CI-backed queue after the named candidates, retaining one test per pull request and ordering by downstream impact followed by observed flakiness.
+8. **The guard.** A separate `disallowed-methods` pull request for `tokio::time::sleep` and `std::thread::sleep`, with each legitimate timer carrying an `expect` and a reason.
+
+These are observed failure counts in a selected historical sample, not estimated failure probabilities. Every named test also passed in sampled logs. The failing branches are `feat/r77-s11c-pushed-verdicts`, `feat/r77-s11b-bookkeeping-catalog`, `test/harness-container-slots`, `refactor/fold-harness-and-android-duplicates`, `ci/apt-lock-timeout` and `main`, respectively. Current source was inspected for candidates 1 to 5. Their current runtime behaviour and other branches are unchecked. PR #457 changes different tests and does not discharge candidates 1 or 2.
+
+### Verification
+
+Use CI history as the source of flakiness evidence. After an edit, hammer only the affected test. No companion suite or unrelated tests as stress load. Keep deadlines solely for failure detection. Record the exact repetition count and outcomes with each fix.
+
+### Open points
+
+1. **Dependency graph.** The scoped client test build fails before tests in `pg2sqlite` and `rls2fga-types` after following Git dependency tips. The R108 owner is implementing the deployment API migration and owns upstream request `follow-sql-traits-341` (`57786543-9503-4f1b-b4c5-10bdaeab42de`). R113 waits for those prerequisites without duplicating their work.
+2. **Silence assertions.** Determine the processing boundary for the specific test when its slice is reached.
+
+### Done when
+
+No wait in the workspace synchronises on a timer except sites carrying an `expect` and a reason, the clippy guard refuses a new one, and each converted test passes its targeted repetition run.
+
+---
+
+## R117: typed aggregate wire
+
+**Status.** IN PROGRESS. Every design point is decided with the maintainer. Slice 1, protocol 7 end to end, is in review.
+
+**Changes state.** Client tables, `_connetto_aggregates` is dropped and each statistic rests in its own `STRICT` table `_connetto_stat_<query_id>`. Server tables, none. Wire messages, `AggregateUpdate` carries typed SQLite values in place of `group_values_json` and `result_json`, and a new `AggregateColumns` frame carries each output's SQLite type, with `PROTOCOL_VERSION` at 7. Archive format, none.
+
+### Purpose
+
+The server renders every aggregate value and group value as JSON from its own value type, so two `BYTEA` group values can reach the client as one key, and a uuid or `timestamptz` arrives in a form that neither compares with nor decodes like the replica's own rows. The client decodes through a connetto trait implemented only for diesel's own types, so a `rosetta_uuid::Uuid`, a `TimestampUTC` or a synql enum cannot be an aggregate value or a group key without per-type code in connetto.
+
+### Decisions, taken with the maintainer
+
+1. **One encoding.** Every value an aggregate frame carries is encoded as the replica stores the column it comes from, by subql's encoder beside `pgoutput_patchset`, so rows and aggregates share one definition of every storage form.
+2. **Column types from the server.** subql answers each output's `WireType`. An output with no catalog column behind it has none, its cells are encoded in their value family's default form and its column is declared `ANY`. The server sends the types once at each registration in `AggregateColumns`, before any update and also when the result is empty.
+3. **One `STRICT` table per statistic**, keyed by `(binds, group_key)`, created at registration, written with `sql_query` and read with `sql::<ST>(..).bind(..)`, so `V: Queryable<ST, Sqlite>` and `K` likewise are the only bounds. A type mismatch at a later registration drops and recreates the table. The forget sweep drops it with its query row. `_connetto_aggregates` is dropped on first start, its values returning with the next push.
+4. **Per-group updates.** A push reads and decodes its own group only.
+5. **Local tier.** `watch_groups` over local tables re-executes the query on each change and diffs into the same `LiveGroups` map, and local `watch_value` decodes through diesel.
+6. **Webview.** The native core decodes into `K` and `V` and sends those over IPC with serde.
+
+### Steps
+
+1. Protocol 7 end to end in one slice, since the frame change compiles only with server and client together. `AggregateWire`, `GroupKeyWire`, `GroupedProjectionWire` and the `postgres-types` feature go.
+2. The local tier.
+3. The Tauri page, unless slice 1 must carry it.
+
+### Proof
+
+A group keyed on a uuid, one keyed on a `BYTEA` column holding two values that differ only in invalid UTF-8, and a `max` over a `TimestampUTC` column each decode into the application's own types on a fresh subscribe, after an offline restart and after a reconnect, with the stored values byte-identical to the replica's rows of the same columns.
+
+### Done when
+
+Any type a generated model loads from the replica works as an aggregate value, a group key and a computed-row column, with no per-type code in connetto and no Cargo feature.
 
 ---
 

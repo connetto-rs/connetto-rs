@@ -70,6 +70,7 @@ async fn stage(
             ceiling: file_size + 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: identified("alice"),
+            carry: None,
         })
         .unwrap();
     let chunks_json: Vec<serde_json::Value> = manifest
@@ -151,6 +152,7 @@ async fn recommit(
             ceiling: u64::try_from(data.len()).unwrap() + 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: identified("alice"),
+            carry: None,
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -173,6 +175,7 @@ fn read_ticket(
             ceiling,
             expiry: chrono::Utc::now().timestamp() + 3600,
             caller: identified("alice"),
+            carry: None,
         })
         .unwrap()
 }

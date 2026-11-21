@@ -1,6 +1,7 @@
 //! In-memory chunk store backed by a mutex-held hash map.
 
 use core::future::{self, Future};
+use core::sync::atomic::{AtomicU64, Ordering};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -8,7 +9,7 @@ use thiserror::Error;
 
 use crate::identity::ChunkHash;
 use crate::maybe_send::MaybeSend;
-use crate::store::{ChunkInventory, ChunkStore};
+use crate::store::{ChunkInventory, ChunkStore, FreeSpace};
 
 /// The one thing an in-memory store can fail at.
 #[derive(Debug, Error)]
@@ -30,12 +31,25 @@ pub enum MemStoreError {
 ///
 /// Thread-safe via interior `Mutex`. Suitable for tests and for short-lived
 /// in-process pipelines. All stored bytes are lost when the store is dropped.
-#[derive(Debug, Clone, Default)]
+/// The free space it answers is whatever [`set_free_bytes`](Self::set_free_bytes)
+/// last set, every byte addressable until then.
+#[derive(Debug, Clone)]
 pub struct MemStore {
     /// Held behind an `Arc` so a clone shares the same chunks, since the content
     /// client clones its store for its local read source, and an in-memory
     /// clone that copied the map would answer every read empty.
     chunks: Arc<Mutex<HashMap<ChunkHash, Vec<u8>>>>,
+    /// The free bytes [`FreeSpace::free_bytes`] answers, shared by every clone.
+    free: Arc<AtomicU64>,
+}
+
+impl Default for MemStore {
+    fn default() -> Self {
+        Self {
+            chunks: Arc::default(),
+            free: Arc::new(AtomicU64::new(u64::MAX)),
+        }
+    }
 }
 
 impl MemStore {
@@ -43,6 +57,17 @@ impl MemStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Sets the free bytes this store and every clone of it answer.
+    pub fn set_free_bytes(&self, bytes: u64) {
+        self.free.store(bytes, Ordering::Relaxed);
+    }
+}
+
+impl FreeSpace for MemStore {
+    fn free_bytes(&self) -> std::io::Result<u64> {
+        Ok(self.free.load(Ordering::Relaxed))
     }
 }
 

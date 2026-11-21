@@ -11,6 +11,13 @@ pub mod web;
 pub use native::Ops;
 #[cfg(target_arch = "wasm32")]
 pub use web::Ops;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use native::{read_badge_names, save_badge_names};
+#[cfg(target_arch = "wasm32")]
+pub(crate) use support::web::{
+    read_stored_names as read_badge_names, save_stored_names as save_badge_names,
+};
 #[cfg(target_arch = "wasm32")]
 mod inner {
     use std::rc::Rc;
@@ -297,13 +304,7 @@ pub async fn stage_picked(
     let Some(mime) = support::mime_from_extension(std::path::Path::new(name)) else {
         return "not an image: only .jpg .jpeg .png are accepted".to_owned();
     };
-    match content
-        .0
-        .stage(blob, mime, client, move |conn, file_id| {
-            support::stage_photo_row(conn, file_id, &identity)
-        })
-        .await
-    {
+    match support::web::stage_photo(&content.0, client, blob, mime, &identity, None).await {
         Ok(_) => {
             // Push the staged mutation up now, as the browser build has always done.
             client.replay_pending().await.ok();
@@ -326,13 +327,7 @@ pub async fn stage_picked(
     let Ok(bytes) = bytes else {
         return "could not read the file".to_owned();
     };
-    match content
-        .0
-        .stage(bytes.as_slice(), mime, move |conn, file_id| {
-            support::stage_photo_row(conn, file_id, &identity)
-        })
-        .await
-    {
+    match support::native::stage_photo(&content.0, bytes.as_slice(), mime, &identity, None).await {
         Ok(_) => format!("staged: {name}"),
         Err(err) => format!("stage failed: {err}"),
     }

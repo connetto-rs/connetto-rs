@@ -19,11 +19,13 @@ use core::fmt::Display;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use connetto_core::SessionId;
 use connetto_core::auth::{
     CapabilityKey, CapabilitySubject, ContentCaller, Principal, absent_marker,
 };
 use diesel::sql_types::{Bool, Text};
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use subql::ColumnId;
 use subql::backend::{Postgres, Value};
 use subql::visibility::{RowWrite, Verdict, VisibilityPolicy, WriteOp};
 
@@ -75,9 +77,9 @@ pub(crate) async fn bind_writer<W: crate::writer_schema::ConnettoWriterSchema>(
     .map(drop)
 }
 
-/// Render the caller for a transaction or a ticket: the identity, the share
-/// keys packed by the deployment's [`CapabilityKey`], and the bot list the
-/// caller's connection binds.
+/// Render the caller for a transaction or a ticket: the identity, the login's
+/// session, the share keys packed by the deployment's [`CapabilityKey`], and
+/// the bot list the caller's connection binds.
 ///
 /// The one renderer of a caller's values. A half the caller does not hold
 /// stays absent, never `""`, so an owner comparison is NULL and hides the row
@@ -89,9 +91,20 @@ pub(crate) fn rendered_caller<Id: Display, Key: CapabilityKey>(
         caller
             .identity()
             .map(|identity| identity.user_id.to_string()),
+        login_session(caller),
         Key::subjects(caller.capabilities()),
         bot_list_for(caller),
     )
+}
+
+/// The session of the login the caller's identity came from, the one the auth
+/// store keeps live, or `None` for a caller holding no login.
+///
+/// An identity resolves only from a login, whose handle the auth store minted
+/// and keeps. A share key's run has a handle minted for it and never stored,
+/// so it names none.
+pub(crate) fn login_session<Id, Key>(caller: &Principal<Id, Key>) -> Option<SessionId> {
+    caller.identity().map(|_| caller.session_id())
 }
 
 /// The bot list one caller's connections carry in `app.bot_list`, the value
@@ -292,11 +305,16 @@ impl ShareLevel {
     /// [`RowWrite::UpdateUsing`], which is subql's question for exactly this
     /// case: whether the row as it stands may be replaced at all. It is the
     /// weaker half of the full replacement question, and it is the half a
-    /// delegated permission over a row needs.
-    fn writes<R: ?Sized>(self, row: &R) -> impl Iterator<Item = RowWrite<'_, R>> {
+    /// delegated permission over a row needs. `read` is what both verbs read,
+    /// the key a shared write names the row by.
+    fn writes<'a, R: ?Sized>(
+        self,
+        row: &'a R,
+        read: &'a [ColumnId],
+    ) -> impl Iterator<Item = RowWrite<'a, R>> {
         [
-            (self.update, RowWrite::UpdateUsing { old: row }),
-            (self.delete, RowWrite::Delete { old: row }),
+            (self.update, RowWrite::UpdateUsing { old: row, read }),
+            (self.delete, RowWrite::Delete { old: row, read }),
         ]
         .into_iter()
         .filter_map(|(named, write)| named.then_some(write))
@@ -309,7 +327,7 @@ impl ShareLevel {
     /// and never the row, which keeps one ordered list rather than two that
     /// can drift.
     pub fn verbs(self) -> impl Iterator<Item = WriteOp> {
-        self.writes(&()).map(|write| write.op())
+        self.writes(&(), &[]).map(|write| write.op())
     }
 }
 
@@ -560,7 +578,7 @@ impl<P, R, Id> CapabilityIssuer<P, R, Id> {
         // words: no database write follows a mint, so this loop is the only gate
         // there is, and reporting an unanswered question as a denial would tell
         // an operator the row is unwritable when the truth is that nothing knew.
-        for write in level.writes(&view) {
+        for write in level.writes(&view, &row.key) {
             let op = write.op();
             let verdict = self
                 .policy
@@ -621,6 +639,7 @@ mod tests {
         assert!(
             ContentCaller::new(
                 None,
+                None,
                 String::subjects(&[]),
                 connetto_core::BOT_LIST_WILDCARD.to_owned()
             )
@@ -637,6 +656,7 @@ mod tests {
             CapabilitySubject::new("key:a"),
         ];
         let caller = ContentCaller::new(
+            None,
             None,
             String::subjects(&keys),
             connetto_core::BOT_LIST_WILDCARD.to_owned(),

@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use connetto_core::messages::{BindValue, ControlMessage, Grant, Handshake, Ping};
+use connetto_core::messages::{ControlMessage, Grant, Handshake, Ping, SqliteValue};
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION, Principal};
@@ -34,7 +34,7 @@ impl SnapshotSource for EmptySnapshot {
     async fn estimate(
         &self,
         _select_sql: &str,
-        _binds: &[BindValue],
+        _binds: &[SqliteValue],
         _caller: &Principal,
     ) -> Result<SnapshotEstimate, Self::Error> {
         Ok(SnapshotEstimate {
@@ -50,7 +50,7 @@ impl SnapshotSource for EmptySnapshot {
     async fn snapshot_page(
         &self,
         _select_sql: &str,
-        _binds: &[BindValue],
+        _binds: &[SqliteValue],
         _caller: &Principal,
         _page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {

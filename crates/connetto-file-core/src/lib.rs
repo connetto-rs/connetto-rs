@@ -23,7 +23,7 @@ pub use params::{ChunkParams, MEDIA_PARAMS, MimeClass, TEXT_PARAMS};
 pub use process::{
     ProcessError, process_file, process_file_from_reader, process_file_with_outboard, reassemble,
 };
-pub use store::{ChunkInventory, ChunkStore};
+pub use store::{ChunkInventory, ChunkStore, FreeSpace};
 
 #[cfg(test)]
 mod tests {

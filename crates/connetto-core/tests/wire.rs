@@ -12,18 +12,23 @@ use connetto_core::{
         decode_control_framed, encode_bulk, encode_bulk_framed, encode_control,
         encode_control_framed,
     },
-    exchange::{Frontier, Offer, RetractCause, Retraction, SignedOffer},
+    exchange::{
+        CourierEntryOutcome, CourierOutcome, CourierRefusal, Frontier, ManifestRow, Offer, Origin,
+        RetractCause, Retraction, SignedOffer,
+    },
     messages::{
-        AckCredits, AggregateUpdate, BindDevice, BotListEntry, BotRegistered, BulkMessage,
-        Challenge, ConflictRow, ControlMessage, DeviceAttestation, DeviceRevokedAck, DeviceSummary,
-        DevicesList, DevicesRequest, EnrolChallenge, EnrolChallengeRequest, EnrolGrant,
-        EnrolRefusal, EnrolRefused, EnrolRequest, FatalError, FatalErrorReason, FullResyncReason,
+        AckCredits, AggregateChange, AggregateColumns, AggregateUpdate, BindDevice, BotListEntry,
+        BotRegistered, BulkMessage, Challenge, ColumnType, ConflictRow, ControlMessage,
+        CourierAnswer, CourierBody, CourierNotice, CourierNoticeAck, CourierNoticeRow,
+        CourierRange, DeviceAttestation, DeviceRevokedAck, DeviceSummary, DevicesList,
+        DevicesRequest, EnrolChallenge, EnrolChallengeRequest, EnrolGrant, EnrolRefusal,
+        EnrolRefused, EnrolRequest, FatalError, FatalErrorReason, FullResyncReason,
         FullResyncRequired, Grant, Handshake, HandshakeAck, LivePatch, MutationConflict,
         MutationHeader, MutationPatch, MutationReject, MutationRejectReason, NonFatalError,
         PauseCause, Ping, Pong, Provenance, ProvisionalStatus, ProvisionalVerdicts, RateLimited,
         RegisterBot, ReplaceShareKeys, RetireWriter, RevocationUpdate, RevokeDeviceRequest,
-        ShareKeysReplaced, SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe,
-        SubscriptionPriority, SubscriptionSpec, Unsubscribe, Verdict, WriterAnswer, WriterGrant,
+        ShareKeysReplaced, SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch, SqliteValue,
+        Subscribe, SubscriptionSpec, Unsubscribe, Verdict, WriterAnswer, WriterGrant,
         WriterOutcome, WriterRef, WriterRequest, WriterSecret,
     },
     version::PROTOCOL_VERSION,
@@ -137,6 +142,7 @@ fn handshake_and_ack_round_trip() {
             current_cursor: Cursor::new(vec![1, 2, 3, 4]),
             schema_version: Some(SchemaVersion::from_hash(vec![0xab, 0xcd])),
             sunset_at_secs: None,
+            courier: false,
             initial_credits: 128,
             writer,
         }));
@@ -229,20 +235,17 @@ fn share_key_frames_round_trip() {
 fn subscription_lifecycle_round_trips() {
     round_trip_control(&ControlMessage::Subscribe(Subscribe {
         sub_id: "sub-orders".into(),
-        spec: SubscriptionSpec::new("SELECT * FROM orders WHERE user_id = 1")
-            .with_priority(SubscriptionPriority::HIGHEST),
+        spec: SubscriptionSpec::new("SELECT * FROM orders WHERE user_id = 1"),
     }));
     round_trip_control(&ControlMessage::Subscribe(Subscribe {
         sub_id: "sub-count".into(),
-        spec: SubscriptionSpec::new("SELECT region, COUNT(*) FROM orders GROUP BY region")
-            .with_priority(SubscriptionPriority::new(2)),
+        spec: SubscriptionSpec::new("SELECT region, COUNT(*) FROM orders GROUP BY region"),
     }));
     round_trip_control(&ControlMessage::Unsubscribe(Unsubscribe {
         sub_id: "sub-orders".into(),
     }));
     round_trip_control(&ControlMessage::SnapshotBegin(SnapshotBegin {
         sub_id: "sub-orders".into(),
-        priority: SubscriptionPriority::HIGHEST,
     }));
     round_trip_control(&ControlMessage::SnapshotEnd(SnapshotEnd {
         sub_id: "sub-orders".into(),
@@ -298,32 +301,36 @@ fn mutation_control_frames_round_trip() {
 }
 
 #[test]
-fn aggregate_update_round_trip() {
+fn aggregate_frames_round_trip() {
+    round_trip_control(&ControlMessage::AggregateColumns(AggregateColumns {
+        sub_id: "sub-count".into(),
+        columns: vec![ColumnType::Blob, ColumnType::Integer, ColumnType::Any],
+    }));
     round_trip_control(&ControlMessage::AggregateUpdate(AggregateUpdate {
         sub_id: "sub-count".into(),
-        group_key: Some(b"region=eu".to_vec()),
-        group_values_json: Some(r#"["eu"]"#.into()),
-        result_json: Some(r#"{"count":42}"#.into()),
-        is_full_result: false,
+        change: AggregateChange::Upsert {
+            key: vec![0xff, 0x00],
+            row: vec![
+                SqliteValue::Blob(vec![0xff, 0x00]),
+                SqliteValue::Integer(42),
+                SqliteValue::Null,
+            ],
+        },
+    }));
+    round_trip_control(&ControlMessage::AggregateUpdate(AggregateUpdate {
+        sub_id: "sub-count".into(),
+        change: AggregateChange::Remove {
+            key: vec![0xff, 0x00],
+        },
     }));
     round_trip_control(&ControlMessage::AggregateUpdate(AggregateUpdate {
         sub_id: "sub-total".into(),
-        group_key: None,
-        group_values_json: None,
-        result_json: Some(r#"{"total":9001}"#.into()),
-        is_full_result: true,
-    }));
-}
-
-#[test]
-fn aggregate_removal_round_trip() {
-    // A grouped key leaving the result set: result_json is absent on the wire.
-    round_trip_control(&ControlMessage::AggregateUpdate(AggregateUpdate {
-        sub_id: "sub-count".into(),
-        group_key: Some(b"region=eu".to_vec()),
-        group_values_json: Some(r#"["eu"]"#.into()),
-        result_json: None,
-        is_full_result: false,
+        change: AggregateChange::Replace {
+            rows: vec![
+                vec![SqliteValue::Real(9001.5)],
+                vec![SqliteValue::Text("t".into())],
+            ],
+        },
     }));
 }
 
@@ -351,6 +358,11 @@ fn every_resync_reason() -> Vec<FullResyncReason> {
         // SessionManager::subscribe_row, when the resume cursor lies beyond
         // where its timeline ended in the database's history (R73).
         FullResyncReason::CursorBeyondHistory,
+        // SessionManager catchup, when a missed record says the table was
+        // refused because its live schema drifted from the catalog.
+        FullResyncReason::TableRefused {
+            table: "orders".to_owned(),
+        },
     ];
     for reason in &reasons {
         match reason {
@@ -358,7 +370,8 @@ fn every_resync_reason() -> Vec<FullResyncReason> {
             | FullResyncReason::AuthorizationChange
             | FullResyncReason::SnapshotInterrupted
             | FullResyncReason::CursorBeyondHistory
-            | FullResyncReason::TableTruncated { .. } => {}
+            | FullResyncReason::TableTruncated { .. }
+            | FullResyncReason::TableRefused { .. } => {}
         }
     }
     reasons
@@ -638,6 +651,9 @@ fn every_enrol_refusal() -> Vec<EnrolRefusal> {
         },
         EnrolRefusal::Revoked,
         EnrolRefusal::AttestationRequired,
+        EnrolRefusal::Refused {
+            reason: "the account is closed".into(),
+        },
     ];
     for reason in &all {
         match reason {
@@ -647,7 +663,8 @@ fn every_enrol_refusal() -> Vec<EnrolRefusal> {
             | EnrolRefusal::InvalidRequest
             | EnrolRefusal::OverCeiling { .. }
             | EnrolRefusal::Revoked
-            | EnrolRefusal::AttestationRequired => {}
+            | EnrolRefusal::AttestationRequired
+            | EnrolRefusal::Refused { .. } => {}
         }
     }
     all
@@ -704,4 +721,166 @@ fn provisional_frames_round_trip() {
         offer: rmp_serde::to_vec_named(&signed).expect("a signed offer encodes"),
         seqs: vec![],
     }));
+}
+
+/// Every courier frame and every outcome its answer can carry round-trip.
+#[test]
+fn courier_frames_round_trip() {
+    let major = Major::new(2).expect("a major");
+    round_trip_control(&ControlMessage::CourierRange(CourierRange {
+        request_id: "c1".into(),
+        author: [4; 32],
+        offer: vec![0x81, 0xa1, 0x6f],
+        rows: vec![
+            ManifestRow {
+                seq: 5,
+                major,
+                origin: None,
+                digest: [1; 32],
+            },
+            ManifestRow {
+                seq: 6,
+                major,
+                origin: Some(Origin {
+                    writer: WriterRef::Number(9),
+                    seq: 2,
+                }),
+                digest: [2; 32],
+            },
+        ],
+        bodies: 1,
+    }));
+    round_trip_bulk(&BulkMessage::CourierBody(CourierBody {
+        request_id: "c1".into(),
+        seq: 5,
+        changeset_zstd: vec![0x28, 0xb5, 0x2f, 0xfd],
+    }));
+    for refusal in [
+        CourierRefusal::Disabled,
+        CourierRefusal::Uncertified,
+        CourierRefusal::Malformed,
+        CourierRefusal::NotEnrolled,
+        CourierRefusal::AuthorBanned,
+        CourierRefusal::WriterRetired,
+        CourierRefusal::Unverified,
+        CourierRefusal::SequenceGap {
+            expected: 3,
+            got: 5,
+        },
+    ] {
+        round_trip_control(&ControlMessage::CourierAnswer(CourierAnswer {
+            request_id: "c1".into(),
+            outcome: CourierOutcome::Refused(refusal),
+        }));
+    }
+    round_trip_control(&ControlMessage::CourierAnswer(CourierAnswer {
+        request_id: "c1".into(),
+        outcome: CourierOutcome::Entries(vec![
+            (5, CourierEntryOutcome::Ruled(Verdict::Applied)),
+            (6, CourierEntryOutcome::Ruled(Verdict::Settled)),
+            (
+                7,
+                CourierEntryOutcome::Ruled(Verdict::Refused(RetractCause::Conflict)),
+            ),
+            (
+                8,
+                CourierEntryOutcome::Retry {
+                    retry_after_ms: 250,
+                },
+            ),
+            (9, CourierEntryOutcome::NotCouriered),
+        ]),
+    }));
+}
+
+/// The author's notices and their ack round-trip.
+#[test]
+fn courier_notice_frames_round_trip() {
+    round_trip_control(&ControlMessage::CourierNotice(CourierNotice {
+        notice_id: "n1".into(),
+        notices: vec![
+            CourierNoticeRow {
+                courier: "bruno".into(),
+                writer: WriterRef::Device([3; 32]),
+                seq: 5,
+                verdict: Verdict::Applied,
+            },
+            CourierNoticeRow {
+                courier: "bruno".into(),
+                writer: WriterRef::Device([3; 32]),
+                seq: 6,
+                verdict: Verdict::Refused(RetractCause::Rejected(
+                    MutationRejectReason::Unauthorized,
+                )),
+            },
+        ],
+    }));
+    round_trip_control(&ControlMessage::CourierNoticeAck(CourierNoticeAck {
+        notice_id: "n1".into(),
+    }));
+}
+
+#[test]
+fn courier_audit_frames_round_trip() {
+    use connetto_core::messages::{
+        CourierAuditAnswer, CourierAuditCancel, CourierAuditOutcome, CourierAuditRequest,
+    };
+
+    round_trip_control(&ControlMessage::CourierAuditRequest(CourierAuditRequest {
+        request_id: "audit-1".into(),
+        author: [7; 32],
+        seqs: vec![1, i64::MAX.unsigned_abs()],
+        remaining_ms: u64::MAX,
+    }));
+    for outcome in [
+        CourierAuditOutcome::Confirmed,
+        CourierAuditOutcome::Expired,
+        CourierAuditOutcome::Refused,
+        CourierAuditOutcome::Failed,
+    ] {
+        round_trip_control(&ControlMessage::CourierAuditAnswer(CourierAuditAnswer {
+            request_id: "audit-1".into(),
+            outcome,
+        }));
+    }
+    round_trip_control(&ControlMessage::CourierAuditCancel(CourierAuditCancel {
+        request_id: "audit-1".into(),
+    }));
+}
+
+#[test]
+fn courier_audit_requests_enforce_their_wire_bounds() {
+    use connetto_core::exchange::MAX_MANIFEST_ROWS;
+    use connetto_core::messages::CourierAuditRequest;
+
+    let sequence_count = u64::try_from(MAX_MANIFEST_ROWS).expect("the manifest bound fits");
+    let mut request = CourierAuditRequest {
+        request_id: "é".repeat(64),
+        author: [7; 32],
+        seqs: (1..=sequence_count).collect(),
+        remaining_ms: u64::MAX,
+    };
+    assert!(request.is_well_formed());
+    request.request_id.push('a');
+    assert!(!request.is_well_formed());
+    request.request_id.clear();
+    assert!(!request.is_well_formed());
+    request.request_id = "audit-1".into();
+    request.seqs.push(sequence_count + 1);
+    assert!(!request.is_well_formed());
+    for seqs in [
+        vec![],
+        vec![0],
+        vec![2, 1],
+        vec![1, 1],
+        vec![i64::MAX.unsigned_abs() + 1],
+    ] {
+        request.seqs = seqs;
+        assert!(!request.is_well_formed(), "{:?}", request.seqs);
+    }
+    request.seqs = vec![i64::MAX.unsigned_abs()];
+    request.remaining_ms = 0;
+    assert!(!request.is_well_formed());
+    request.remaining_ms = 1;
+    assert!(request.is_well_formed());
 }

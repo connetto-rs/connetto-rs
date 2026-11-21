@@ -1,9 +1,6 @@
 //! Every producer emits its own event kind, and a denial emits nothing.
 //!
-//! These run against the in-memory store with a capturing sink, so they assert
-//! what connetto *emits* rather than what Postgres stores. The writing half is
-//! `audit_table.rs`, which is Docker-gated. Splitting them keeps the assertion
-//! that matters here, which `op` a producer chooses, free of database timing.
+//! A capturing sink checks the events emitted by authentication against Postgres.
 
 use std::sync::{Arc, Mutex};
 
@@ -11,9 +8,12 @@ use connetto_core::Subject;
 use connetto_core::messages::Grant;
 use connetto_server::audit::{AuditHook, AuthEvent, AuthOp};
 use connetto_server::{
-    AuthConfig, AuthService, InMemoryAuthStore, RequestGuard, ResolvedIdentity, SessionOrigin,
-    SignInNotice, TokenAuthority, TokenPair,
+    AuthConfig, AuthHooks, AuthService, CommittedNotice, DefaultAuthHooks, RequestGuard,
+    ResolvedIdentity, SessionOrigin, TokenAuthority, TokenPair,
 };
+use connetto_test_harness::{ConnettoDefaults, Fixture};
+
+use crate::auth_hooks::Told;
 
 /// Collects what connetto emitted, in order.
 #[derive(Clone, Default)]
@@ -46,14 +46,30 @@ impl Captured {
     }
 }
 
-fn service() -> (
+async fn service() -> (
     Arc<TokenAuthority>,
-    Arc<AuthService<InMemoryAuthStore>>,
+    Arc<AuthService<ConnettoDefaults>>,
     Captured,
+    Fixture,
+) {
+    service_with(Arc::new(DefaultAuthHooks)).await
+}
+
+/// [`service`] over a store running `hooks`.
+async fn service_with(
+    hooks: Arc<dyn AuthHooks<ConnettoDefaults>>,
+) -> (
+    Arc<TokenAuthority>,
+    Arc<AuthService<ConnettoDefaults>>,
+    Captured,
+    Fixture,
 ) {
     let config = AuthConfig::default();
     let authority = Arc::new(TokenAuthority::generate(&config).expect("generate keypair"));
-    let store = Arc::new(InMemoryAuthStore::new(config.refresh_lifetimes()));
+    let fixture = Fixture::acquire().await;
+    let store = fixture
+        .auth_store_with(config.refresh_lifetimes(), hooks)
+        .await;
     let svc = Arc::new(AuthService::new(
         Arc::clone(&authority),
         store,
@@ -61,7 +77,7 @@ fn service() -> (
     ));
     let captured = Captured::default();
     svc.set_audit_hook(captured.hook());
-    (authority, svc, captured)
+    (authority, svc, captured, fixture)
 }
 
 /// The session a minted access token names.
@@ -88,16 +104,17 @@ fn identity(subject: &str) -> ResolvedIdentity {
 }
 
 /// Sign `subject` in through the provider configured as `google`.
-async fn login(svc: &AuthService<InMemoryAuthStore>, subject: &str) -> TokenPair<String> {
-    svc.login(
-        &identity(subject),
-        SessionOrigin {
-            provider: "google".to_owned(),
-            description: (),
-        },
-    )
-    .await
-    .expect("login")
+async fn login(service: &AuthService<ConnettoDefaults>, subject: &str) -> TokenPair<String> {
+    service
+        .login(
+            &identity(subject),
+            SessionOrigin {
+                provider: "google".to_owned(),
+                description: (),
+            },
+        )
+        .await
+        .expect("login")
 }
 
 /// A sign-in is `logged_in`, naming the provider and issuer it came through
@@ -105,7 +122,7 @@ async fn login(svc: &AuthService<InMemoryAuthStore>, subject: &str) -> TokenPair
 /// gone.
 #[tokio::test]
 async fn a_login_records_its_provider_and_issuer() {
-    let (authority, svc, captured) = service();
+    let (authority, svc, captured, _fixture) = service().await;
     let pair = login(&svc, "erin").await;
 
     let events = captured.0.lock().expect("sink").clone();
@@ -122,28 +139,33 @@ async fn a_login_records_its_provider_and_issuer() {
     assert_eq!(event.issuer.as_deref(), Some("https://issuer.example"));
 }
 
-/// The application's sign-in callback hears of each sign-in with the
-/// session it created, so it can tell the person.
+/// The application's hooks hear of each committed sign-in with the session it
+/// created and the claims it verified, so it can tell the person.
 #[tokio::test]
 async fn a_sign_in_tells_the_application() {
-    let (authority, svc, _captured) = service();
-    let told = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&told);
-    svc.set_sign_in_hook(Arc::new(move |notice| {
-        sink.lock().expect("sink").push(notice);
-    }));
+    let (told, mut notices) = Told::<ConnettoDefaults>::channel();
+    let (authority, svc, _captured, _fixture) = service_with(told).await;
     let before = std::time::SystemTime::now();
     let pair = login(&svc, "frank").await;
 
-    let told = told.lock().expect("sink").clone();
-    let [SignInNotice::SignedIn(session)] = told.as_slice() else {
-        panic!("expected one sign-in notice, got {told:?}");
+    // The notice is told before the login returns.
+    let notice = notices.try_recv().expect("the sign-in was told");
+    let CommittedNotice::SignedIn {
+        user_id,
+        claims,
+        session,
+    } = notice
+    else {
+        panic!("expected a sign-in notice");
     };
+    assert!(notices.try_recv().is_err(), "one sign-in, one notice");
     assert_eq!(
         session.session_id,
         session_of(&authority, &pair.access_token)
     );
+    assert_eq!(user_id, pair.user_id);
     assert_eq!(session.user_id, pair.user_id);
+    assert_eq!(claims.subject, "frank");
     assert_eq!(session.provider, "google");
     assert_eq!(session.issuer, "https://issuer.example");
     assert!(
@@ -156,7 +178,7 @@ async fn a_sign_in_tells_the_application() {
 /// A caller ending their own login is `logged_out`, not the generic revocation.
 #[tokio::test]
 async fn logout_records_logged_out() {
-    let (_authority, svc, captured) = service();
+    let (_authority, svc, captured, _fixture) = service().await;
     let pair = login(&svc, "alice").await;
 
     assert!(svc.logout(&pair.refresh_token).await.expect("logout"));
@@ -170,7 +192,7 @@ async fn logout_records_logged_out() {
 /// The application revoking a login itself is `session_revoked`.
 #[tokio::test]
 async fn an_application_revoke_records_session_revoked() {
-    let (authority, svc, captured) = service();
+    let (authority, svc, captured, _fixture) = service().await;
     let pair = login(&svc, "bob").await;
     let session = session_of(&authority, &pair.access_token);
 
@@ -185,7 +207,7 @@ async fn an_application_revoke_records_session_revoked() {
 /// split: it must not look like an ordinary logout.
 #[tokio::test]
 async fn token_reuse_records_token_replayed() {
-    let (_authority, svc, captured) = service();
+    let (_authority, svc, captured, _fixture) = service().await;
     let pair = login(&svc, "mallory").await;
     svc.refresh(&pair.refresh_token).await.expect("rotate");
 
@@ -210,7 +232,7 @@ async fn token_reuse_records_token_replayed() {
 /// audit row into the oracle the endpoint refuses to be.
 #[tokio::test]
 async fn a_logout_that_revoked_nothing_records_nothing() {
-    let (_authority, svc, captured) = service();
+    let (_authority, svc, captured, _fixture) = service().await;
     let _ = login(&svc, "carol").await;
 
     assert!(
@@ -234,7 +256,7 @@ async fn a_logout_that_revoked_nothing_records_nothing() {
 /// split a future change is most likely to break.
 #[tokio::test]
 async fn denials_never_reach_the_audit_table() {
-    let (_authority, svc, captured) = service();
+    let (_authority, svc, captured, _fixture) = service().await;
     let pair = login(&svc, "dave").await;
     svc.logout(&pair.refresh_token).await.expect("logout");
     let before = captured.ops();

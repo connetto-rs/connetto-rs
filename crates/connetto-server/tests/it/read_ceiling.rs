@@ -660,13 +660,14 @@ mod aggregates {
                 client
                     .subscribe("cheapest", "SELECT MIN(n) FROM counts")
                     .await;
+                client.expect_aggregate_columns("cheapest").await;
                 let ControlMessage::AggregateUpdate(seeded) = client.next_control().await else {
                     panic!(
                         "the seed is served under the caller's own tier: {:?}",
                         logs.lines()
                     );
                 };
-                assert_eq!(seeded.result_json.as_deref(), Some("1"));
+                assert_eq!(super::super::reexec::integer(&seeded), 1);
 
                 let mut source =
                     PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
@@ -709,6 +710,7 @@ mod aggregates {
         client
             .subscribe("cheapest", "SELECT MIN(n) FROM counts")
             .await;
+        client.expect_aggregate_columns("cheapest").await;
         let ControlMessage::AggregateUpdate(_) = client.next_control().await else {
             panic!("expected the seed");
         };
@@ -721,6 +723,6 @@ mod aggregates {
         let ControlMessage::AggregateUpdate(again) = client.next_control().await else {
             panic!("a triggered read inside the bound is delivered");
         };
-        assert_eq!(again.result_json.as_deref(), Some("1"));
+        assert_eq!(super::super::reexec::integer(&again), 1);
     }
 }

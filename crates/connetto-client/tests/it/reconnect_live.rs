@@ -25,6 +25,7 @@ use connetto_server::{
     pg_write_target,
 };
 use connetto_test_harness::events::await_event;
+use connetto_test_harness::wire_tables::orders_table;
 use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -50,7 +51,7 @@ impl SnapshotSource for SeedSnapshot {
     async fn estimate(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &connetto_core::Principal,
     ) -> Result<SnapshotEstimate, Self::Error> {
         Ok(SnapshotEstimate {
@@ -66,15 +67,11 @@ impl SnapshotSource for SeedSnapshot {
     async fn snapshot_page(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &connetto_core::Principal,
         _page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {
-        let table = SimpleTable::new(
-            "orders",
-            &[("id", ""), ("price", ""), ("quantity", ""), ("status", "")],
-            &[0],
-        );
+        let table = orders_table();
         let insert = Insert::<_, String, Vec<u8>>::from(table)
             .set(0, Value::Integer(1))
             .expect("set id")
@@ -620,11 +617,10 @@ async fn persisted_replica_resumes_across_restarts_without_a_snapshot() {
 
     // First run: a file-backed replica, one live query, one synced row. The
     // applied cursor lands in the replica's meta table transactionally.
-    let transport = open_session(&manager, &slot).await;
     let store = super::support::key_store(&credential).await;
-    let conn = ClientBuilder::new(
+    let mut conn = ClientBuilder::new(
         super::support::bundle(SQLITE_DDL),
-        super::support::Once::new(transport),
+        super::support::NeverDial::<LoopbackTransport>::default(),
     )
     .signed_in(credential.clone())
     .durable(
@@ -632,9 +628,11 @@ async fn persisted_replica_resumes_across_restarts_without_a_snapshot() {
         store,
         MemoryRefreshStore::default(),
     )
-    .connect_driven()
+    .open_driven()
     .await
-    .expect("first connect");
+    .expect("open first replica");
+    let transport = open_session(&manager, &slot).await;
+    conn.attach(transport).await.expect("first connect");
     let (client, pump) = ConnettoClient::with_pump(conn);
     let pump_handle = tokio::spawn(pump);
     let mut live: LiveQuery<Order> = client
@@ -670,11 +668,10 @@ async fn persisted_replica_resumes_across_restarts_without_a_snapshot() {
     // Second run: reopen the SAME replica with no explicit cursor. The
     // persisted cursor makes the new subscription catch up from the oplog,
     // never re-snapshot.
-    let transport = open_session(&manager, &slot).await;
     let store = super::support::key_store(&credential).await;
-    let conn = ClientBuilder::new(
+    let mut conn = ClientBuilder::new(
         super::support::bundle(SQLITE_DDL),
-        super::support::Once::new(transport),
+        super::support::NeverDial::<LoopbackTransport>::default(),
     )
     .signed_in(credential)
     .durable(
@@ -682,9 +679,11 @@ async fn persisted_replica_resumes_across_restarts_without_a_snapshot() {
         store,
         MemoryRefreshStore::default(),
     )
-    .connect_driven()
+    .open_driven()
     .await
-    .expect("second connect");
+    .expect("open second replica");
+    let transport = open_session(&manager, &slot).await;
+    conn.attach(transport).await.expect("second connect");
     let (client, pump) = ConnettoClient::with_pump(conn);
     tokio::spawn(pump);
     let mut audit = client.events();

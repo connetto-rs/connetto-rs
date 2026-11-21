@@ -31,6 +31,31 @@ pub(crate) enum TicketWire {
     Drain,
 }
 
+/// What a ticket request asks for: one verb, and for a carried write the
+/// account it credits (R79 decision 17).
+pub(crate) struct TicketAsk {
+    pub(crate) verb: ContentVerb,
+    pub(crate) for_owner: Option<String>,
+}
+
+impl TicketAsk {
+    /// A read of the file.
+    pub(crate) const fn read() -> Self {
+        Self {
+            verb: ContentVerb::Read,
+            for_owner: None,
+        }
+    }
+
+    /// A write of `declared_len` bytes, credited to `for_owner` when set.
+    pub(crate) const fn write(declared_len: u64, for_owner: Option<String>) -> Self {
+        Self {
+            verb: ContentVerb::Write { declared_len },
+            for_owner,
+        }
+    }
+}
+
 /// Asks for one ticket on `wire` and returns the URL the server granted.
 ///
 /// The subscription is taken before the request goes out, so an answer the
@@ -38,7 +63,7 @@ pub(crate) enum TicketWire {
 pub(crate) async fn request<T>(
     client: &ConnettoClient<T>,
     file_id: FileId,
-    verb: ContentVerb,
+    ask: TicketAsk,
     wire: TicketWire,
 ) -> Result<String, ContentError>
 where
@@ -50,12 +75,17 @@ where
     match wire {
         TicketWire::Main => {
             client
-                .request_content_ticket(request_id.clone(), *file_id.as_bytes(), verb)
+                .request_content_ticket(
+                    request_id.clone(),
+                    *file_id.as_bytes(),
+                    ask.verb,
+                    ask.for_owner,
+                )
                 .await?;
         }
         TicketWire::Drain => {
             client
-                .request_held_ticket(request_id.clone(), *file_id.as_bytes(), verb)
+                .request_held_ticket(request_id.clone(), *file_id.as_bytes(), ask.verb)
                 .await?;
         }
     }
@@ -87,7 +117,7 @@ pub(crate) struct PendingTicket {
 pub(crate) async fn request_connection_or<T, C>(
     connection: &mut ConnettoConnection<T>,
     file_id: FileId,
-    verb: ContentVerb,
+    ask: TicketAsk,
     observed: &mut Vec<ClientEvent>,
     cancel: C,
     pending: &mut Option<PendingTicket>,
@@ -98,7 +128,7 @@ where
     T::Error: Display,
     C: core::future::Future<Output = ()>,
 {
-    ensure_pending_request(connection, file_id, verb, pending, wire).await?;
+    ensure_pending_request(connection, file_id, ask, pending, wire).await?;
     tokio::pin!(cancel);
     loop {
         let event = match connection.pump_one_or(cancel.as_mut()).await {
@@ -121,7 +151,7 @@ where
 pub(crate) async fn ensure_pending_request<T: Transport>(
     connection: &mut ConnettoConnection<T>,
     file_id: FileId,
-    verb: ContentVerb,
+    ask: TicketAsk,
     pending: &mut Option<PendingTicket>,
     wire: TicketWire,
 ) -> Result<(), ContentError>
@@ -143,12 +173,17 @@ where
     match wire {
         TicketWire::Main => {
             connection
-                .request_content_ticket(request_id.clone(), *file_id.as_bytes(), verb)
+                .request_content_ticket(
+                    request_id.clone(),
+                    *file_id.as_bytes(),
+                    ask.verb,
+                    ask.for_owner,
+                )
                 .await?;
         }
         TicketWire::Drain => {
             connection
-                .request_held_ticket(request_id.clone(), *file_id.as_bytes(), verb)
+                .request_held_ticket(request_id.clone(), *file_id.as_bytes(), ask.verb)
                 .await?;
         }
     }

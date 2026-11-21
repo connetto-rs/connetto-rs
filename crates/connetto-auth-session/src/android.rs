@@ -19,6 +19,10 @@ extern "Kotlin" {
 
 const PLUGIN_CLASS: &str = "dev.connetto.authsession.AuthSessionPlugin";
 const UNLOCK_CLASS: &str = "dev.connetto.authsession.UnlockPromptPlugin";
+/// The tracker of the screen in front, a Kotlin `object` the manifest's
+/// `CurrentActivityProvider` installs at process start.
+#[cfg(feature = "device-identity")]
+const CURRENT_ACTIVITY_CLASS: &str = "dev.connetto.authsession.CurrentActivity";
 const POLL: Duration = Duration::from_millis(250);
 
 /// The prompt's outcome codes, `UnlockPromptPlugin`'s constants.
@@ -248,5 +252,46 @@ impl connetto_client::device_key::JavaAccess for ContextJava {
                 connetto_client::device_key::ChipError::Failed("no Android context".into()),
             )
         })
+    }
+
+    fn with_activity(
+        &self,
+        body: &mut dyn FnMut(&mut JNIEnv<'_>, &JObject<'_>),
+    ) -> Result<(), connetto_client::ClientError> {
+        let shown = jni_call(|env, context| {
+            let loader = env
+                .call_method(context, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])?
+                .l()?;
+            let name = env.new_string(CURRENT_ACTIVITY_CLASS)?;
+            let class = env
+                .call_method(
+                    &loader,
+                    "loadClass",
+                    "(Ljava/lang/String;)Ljava/lang/Class;",
+                    &[JValue::Object(&name)],
+                )?
+                .l()?;
+            let tracker = env
+                .get_static_field(
+                    JClass::from(class),
+                    "INSTANCE",
+                    "Ldev/connetto/authsession/CurrentActivity;",
+                )?
+                .l()?;
+            let activity = env
+                .call_method(&tracker, "get", "()Landroid/app/Activity;", &[])?
+                .l()?;
+            if activity.is_null() {
+                return Ok(false);
+            }
+            body(env, &activity);
+            Ok(true)
+        })
+        .map_err(|err| connetto_client::ClientError::AndroidJava(err.to_string()))?;
+        if shown {
+            Ok(())
+        } else {
+            Err(connetto_client::ClientError::NoAndroidScreen)
+        }
     }
 }

@@ -44,6 +44,7 @@ android {
             }
             proguardFiles(
                 file("../../../../../../crates/connetto-auth-session/android/consumer-rules.pro"),
+                file("../../../../../../crates/connetto-peer-android/android/consumer-rules.pro"),
                 *fileTree(".") {
                   include("**/*.pro")
                   exclude("build/**")
@@ -59,10 +60,13 @@ android {
         buildConfig = true
     }
     // The sign-in tab, its redirect and the Keystore unlock prompt, the same
-    // Kotlin the dioxus demo bundles through dx.
+    // Kotlin the dioxus demo bundles through dx, and the peer link's hotspot
+    // and Bluetooth plugins, which the nearby panel asks for on the UI thread.
     sourceSets {
         getByName("main") {
             java.srcDir("../../../../../../crates/connetto-auth-session/android/src/main/kotlin")
+            java.srcDir("../../../../../../crates/connetto-peer-android/android/src/main/kotlin")
+            java.srcDir("../../../../../../crates/connetto-peer-android/android/src/main/java")
         }
     }
 }

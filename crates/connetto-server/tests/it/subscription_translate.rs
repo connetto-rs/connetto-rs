@@ -11,12 +11,11 @@
 //! translate as syntax, a missing bind fails registration cleanly, and an
 //! unparseable query fails as `Translate` rather than reaching subql.
 
-use connetto_core::messages::BindValue;
+use connetto_core::messages::SqliteValue;
 use connetto_server::{
     CallerMappings, Materializer, MaterializerError, NoConnector, ReadBudget, Registration,
     RuntimeWritableCatalog, SeedPlan, subject_set_reach,
 };
-use pg2sqlite::prelude::SessionVariableMapping;
 
 const PG_DDL: &str =
     "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, amount INT, price FLOAT, tag BYTEA);";
@@ -133,7 +132,7 @@ fn register_sqlite_classifies_translated_query() {
         .register_sqlite(
             2,
             "SELECT * FROM t WHERE amount > ?",
-            &[BindValue::Integer(0)],
+            &[SqliteValue::Integer(0)],
             ReadBudget::new(core::time::Duration::from_secs(5)),
         )
         .expect("register row");
@@ -157,7 +156,7 @@ fn register_sqlite_accepts_a_real_bind() {
         .register_sqlite(
             1,
             "SELECT * FROM t WHERE price > ?",
-            &[BindValue::Real(1.5)],
+            &[SqliteValue::Real(1.5)],
             ReadBudget::new(core::time::Duration::from_secs(5)),
         )
         .expect("a REAL bind registers");
@@ -172,7 +171,7 @@ fn register_sqlite_accepts_a_blob_bind() {
         .register_sqlite(
             1,
             "SELECT * FROM t WHERE tag = ?",
-            &[BindValue::Blob(vec![0xde, 0xad, 0xbe, 0xef])],
+            &[SqliteValue::Blob(vec![0xde, 0xad, 0xbe, 0xef])],
             ReadBudget::new(core::time::Duration::from_secs(5)),
         )
         .expect("a BLOB bind registers");
@@ -213,7 +212,7 @@ fn registers_the_exact_shape_diesel_renders() {
             1,
             "SELECT `t`.`id`, `t`.`name`, `t`.`amount`, `t`.`price`, `t`.`tag` FROM `t` \
              WHERE (`t`.`amount` > ?) ORDER BY `t`.`id`",
-            &[BindValue::Integer(0)],
+            &[SqliteValue::Integer(0)],
             ReadBudget::new(core::time::Duration::from_secs(5)),
         )
         .expect("diesel-rendered shape registers");
@@ -304,13 +303,10 @@ fn the_subject_set_reach_reverses_to_the_membership_it_came_from() {
     const DDL: &str = "CREATE TABLE members (member TEXT NOT NULL);";
     let materializer: Materializer<_, _, NoConnector> = Materializer::builder(DDL)
         .with_write_catalog(RuntimeWritableCatalog::default())
-        .with_caller(CallerMappings {
-            identity: SessionVariableMapping::current_setting("app.user_id", "current_app_user"),
-            subjects: Some(
-                SessionVariableMapping::current_setting("app.subjects", "current_app_subjects")
-                    .holding_set(','),
-            ),
-        })
+        .with_caller(
+            CallerMappings::of::<String>(connetto_test_harness::FIXTURE_READER)
+                .expect("the deployment description builds"),
+        )
         .with_read_connector(NoConnector)
         .build()
         .expect("the catalog parses");
@@ -319,7 +315,7 @@ fn the_subject_set_reach_reverses_to_the_membership_it_came_from() {
         .translate_subscription_sql(&format!("SELECT * FROM members WHERE {reach}"))
         .expect("the mirror's own spelling has to translate");
     assert!(
-        pg.contains("member = ANY(string_to_array(current_setting('app.subjects', true), ','))"),
+        pg.contains("member = ANY(string_to_array(current_setting('app.subjects'), ','))"),
         "the reach has to read back as the membership it stands for, got {pg}"
     );
 }

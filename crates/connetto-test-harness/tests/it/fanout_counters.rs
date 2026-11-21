@@ -61,18 +61,16 @@ async fn the_change_path_asks_the_service_nothing_whatever_the_audience() {
         "route clones at {LARGE} subscribers"
     );
 
-    // The dispatch take is per event regardless of the subscriber count, and
-    // any transaction-control events cost the same in both runs, so the
-    // difference between the runs isolates the per-subscriber advance_cursor
-    // takes. A lower bound rather than equality,
-    // since time-based source events would only ever add takes.
-    let extra_lock_takes =
-        large.counters.materializer_lock_takes - small.counters.materializer_lock_takes;
-    assert!(
-        extra_lock_takes >= (LARGE - SMALL) * EVENTS,
-        "per-subscriber lock takes grew by {extra_lock_takes}, expected at least {}",
-        (LARGE - SMALL) * EVENTS
-    );
+    // One dispatch take per event and one advance_cursor take per subscriber, and takes from outside the window only add.
+    for (subscribers, run) in [(SMALL, &small), (LARGE, &large)] {
+        let floor = (subscribers + 1) * EVENTS;
+        assert!(
+            run.counters.materializer_lock_takes >= floor,
+            "lock takes at {subscribers} subscribers fell below {floor}: small run {}, large run {}",
+            small.counters.materializer_lock_takes,
+            large.counters.materializer_lock_takes
+        );
+    }
 
     // Both runs write identical rows, so per-event payloads match up to
     // cursor jitter inside the compressed patchset, and the copied bytes

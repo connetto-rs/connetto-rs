@@ -201,6 +201,7 @@ mod tests {
             current_cursor: Cursor::new(vec![9, 8, 7]),
             schema_version: Some(SchemaVersion::from_hash(vec![0xab, 0xcd])),
             sunset_at_secs: None,
+            courier: false,
             initial_credits: 64,
             writer: Some(WriterGrant {
                 number: 3,

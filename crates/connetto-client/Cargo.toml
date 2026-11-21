@@ -16,12 +16,10 @@ workspace = true
 
 [features]
 default = ["native-transport"]
-# The native WebSocket transport plus the tokio conveniences built on it:
-# NativeClientBuilder and the client binary. Wasm builds leave this off,
-# inject their own transport, and drive the pump with spawn_local.
+# The native WebSocket transport plus the tokio conveniences built on it,
+# `NativeClientBuilder` among them. Wasm builds leave this off, inject their
+# own transport, and drive the pump with spawn_local.
 native-transport = [
-  "connetto-core/env",
-  "connetto-core/logging",
   "connetto-core/native-transport",
   "tokio/rt",
   "tokio/rt-multi-thread",
@@ -29,11 +27,6 @@ native-transport = [
   "tokio/io-util",
   "dep:getrandom",
 ]
-# Aggregate decode support for the Postgres-only diesel SQL types `Uuid` and
-# `Timestamptz`. Their diesel markers live behind diesel's postgres_backend
-# (no libpq), which the orphan rule forbids a downstream crate from mapping, so
-# they are opt-in here rather than forced on every SQLite-only client.
-postgres-types = ["diesel/postgres_backend"]
 # A bot registering itself over a live connection (R91): the Ed25519
 # signature over the connection's nonce. Native only, like `native-auth`,
 # because ring does not build for the browser's wasm target.
@@ -44,7 +37,7 @@ bot = ["dep:ring"]
 # Native only, never wasm (the browser worker owns token custody there).
 # A device identity key for peer sync (R74): in the security chip, or a
 # software key in the plain secret store where no chip is usable.
-device-identity = ["native-auth", "connetto-core/device-cert", "dep:ring", "dep:core-foundation", "dep:rmp-serde", "dep:serde_bytes", "dep:connetto-app-attest"]
+device-identity = ["native-auth", "connetto-core/device-cert", "dep:ring", "dep:core-foundation", "dep:connetto-app-attest"]
 # The peer link (R76): the device serves its identity to other devices over
 # a second, server-independent channel, and dials them.
 peer = [
@@ -75,21 +68,10 @@ native-auth = [
   "dep:open",
   "dep:connetto-schema",
   "dep:getrandom",
-  "tokio/signal",
 ]
 # A media port over a bare peer node, for the proofs of a media consumer
 # that runs without an enrolled client. Test builds only.
 test-support = ["peer"]
-
-[[bin]]
-name = "connetto-client"
-path = "src/bin/connetto-client.rs"
-required-features = ["native-transport", "native-auth"]
-
-# The container custody test runs this against a mounted wrap-key file (R71).
-[[example]]
-name = "secret_store_probe"
-required-features = ["native-auth"]
 
 [dependencies]
 # Wire types and framing. The native transports ride the feature above. The
@@ -100,10 +82,14 @@ connetto-core = { workspace = true, features = ["sqlite-shape"] }
 # supplies the v4 randomness on wasm32-unknown-unknown (Web Crypto); on
 # native, v4 uses the platform RNG and `js` is inert.
 uuid = { version = "1", default-features = false, features = ["v4", "v5", "js"] }
-# The device descriptor goes to the server in MessagePack (R74).
-rmp-serde = { workspace = true, optional = true }
-# The certificate chain an enrolment grant carries.
-serde_bytes = { workspace = true, optional = true }
+# The device descriptor goes to the server in MessagePack (R74), and a live
+# subscription's rows cross a process boundary in it (R116).
+rmp-serde.workspace = true
+# The array header a page rebuilds a keyed answer's rows under.
+rmp = "0.8.15"
+# The certificate chain an enrolment grant carries, and the keys and rows of a
+# keyed live subscription.
+serde_bytes.workspace = true
 # Local store plus the SQLite session extension: the capture hook for local
 # writes and the native apply for server patches. The third-party-backend
 # feature lets `ConnettoConnection` implement diesel's sealed `Connection`.
@@ -113,13 +99,13 @@ diesel = { workspace = true, features = [
 ] }
 diesel-sqlite-session = { git = "https://github.com/connetto-rs/diesel-sqlite-session" }
 # Counting ops in a captured changeset for the advisory MutationHeader op_count.
-sqlite-diff-rs = { version = "0.18", default-features = false }
+sqlite-diff-rs = { version = "0.20", default-features = false }
 # Bulk payloads ride the wire Zstd-compressed (connetto-core Q2.5).
 zstd = "0.13"
 # Extracting the table set of a live query from its rendered SQL, so the pump
 # refreshes only the handles a changed table affects. Version and rev follow
 # subql via the root [patch] blocks.
-sqlparser = { version = "0.63", default-features = false, features = [
+sqlparser = { version = "0.64", default-features = false, features = [
   "visitor",
 ] }
 # Rendering typed diesel queries to placeholder SQL plus bind values through
@@ -148,10 +134,8 @@ tokio = { version = "1", default-features = false, features = [
 thiserror.workspace = true
 # The hotspot machine's answer, waited on by the API methods (R76).
 parking_lot = "0.12"
-# Binary error handling (connetto-client bin).
-anyhow.workspace = true
 # Structured logging (R12). The facade only: a library emits and installs no
-# destination, and the binary installs `connetto_core::logging`.
+# destination, and each program installs `connetto_core::logging`.
 tracing = { version = "0.1", default-features = false, features = [
   "std",
   "attributes",
@@ -224,7 +208,7 @@ apple-native-keyring-store = { version = "1.0.2", features = [
 security-framework = { version = "3.7", features = ["OSX_10_15"], optional = true }
 # The enclave's refusals arrive as `CFError`, which is not `Send`.
 core-foundation = { version = "0.10", optional = true }
-# The peer's Apple bridge, the peripheral's readiness and the join, the
+# The peer's Apple bridge, the Bluetooth permission read and the join, the
 # Network Extension's on iOS and CoreWLAN's on macOS (R76).
 [target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies]
 connetto-peer-apple = { path = "../connetto-peer-apple", optional = true }
@@ -239,8 +223,6 @@ apple-native-keyring-store = { version = "1.0.2", features = [
 ], optional = true }
 security-framework = { version = "3.7", optional = true }
 core-foundation = { version = "0.10", optional = true }
-# The interfaces the personal hotspot's landing bound reads (R76 decision 26).
-if-addrs = "0.15"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 linux-keyutils-keyring-store = { version = "1.0.0", optional = true }
@@ -330,14 +312,14 @@ connetto-core = { workspace = true, features = ["test-support"] }
 # Postgres path now (pg-async), so the harness supplies the fixture. The CDC
 # source stays the SQLite emulator, so reads are Docker-free and only the
 # write-path assertions need Postgres.
-connetto-server = { path = "../connetto-server", features = ["test-seams"] }
+connetto-server = { path = "../connetto-server", features = ["test-seams", "rosetta-uuid"] }
 connetto-test-harness = { path = "../connetto-test-harness" }
 # The loop and handshake tests derive the schema version the server compares
 # against, through the same translated-bundle step the server itself runs.
 connetto-schema = { workspace = true }
 # The write-path loop tests read the server's Postgres target back through a
 # typed diesel-async query, so the async DSL must be nameable directly.
-diesel-async = { version = "0.9", default-features = false, features = [
+diesel-async = { version = "0.10", default-features = false, features = [
   "postgres",
   "bb8",
 ] }
@@ -362,9 +344,10 @@ pg2sqlite = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main",
 # The watch_fn boxed-row test drives a live query whose row type carries a
 # strongly typed `rosetta_uuid::Uuid` primary key (stored as a SQLite BLOB) and
 # a `bool` column, the same key strategy the demos use, rather than raw bytes.
-# The native-auth test additionally serves it as the project's typed user id
-# across the token endpoint, which needs serde both ways.
-rosetta-uuid = { version = "0.2.0", features = ["diesel", "sqlite", "serde"] }
+# The native-auth test additionally serves it as the project's typed user id,
+# stored as a Postgres `uuid` on the server and carried across the token
+# endpoint, which needs serde both ways.
+rosetta-uuid = { version = "0.2.0", features = ["diesel", "sqlite", "postgres", "serde"] }
 # The native-auth test serves connetto-server's auth router on a real port and
 # drives the browser round-trip with a redirect-following-disabled HTTP client.
 axum = { workspace = true }

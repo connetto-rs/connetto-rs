@@ -43,7 +43,7 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport as _};
 use connetto_server::audit::{AuditHook, AuthEvent, AuthOp};
 use connetto_server::defaults::{_connetto_session_writers, _connetto_settled, _connetto_writers};
-use connetto_server::device_cert::{DeviceEnrolment, Enrolment, EnrolmentStore};
+use connetto_server::device_cert::{DeviceEnrolment, Enrolment};
 use connetto_server::writer_schema::SettlePath;
 use connetto_server::{
     AbuseConfig, LoopbackTransport, ManagerBuilder, Materializer, NoConnector, PageSpec,
@@ -74,7 +74,7 @@ fn test_verifier() -> std::sync::Arc<dyn connetto_core::HandshakeAuthority> {
 
 /// No subscriptions are made in these tests, so the snapshot source is never
 /// invoked.
-struct NoSnapshot;
+pub(super) struct NoSnapshot;
 
 impl SnapshotSource for NoSnapshot {
     type Error = Infallible;
@@ -86,7 +86,7 @@ impl SnapshotSource for NoSnapshot {
     async fn estimate(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &Principal,
     ) -> Result<SnapshotEstimate, Self::Error> {
         Ok(SnapshotEstimate {
@@ -102,7 +102,7 @@ impl SnapshotSource for NoSnapshot {
     async fn snapshot_page(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _auth: &Principal,
         _page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {
@@ -271,17 +271,19 @@ impl Enrolments {
         let record = Enrolment {
             user: user.to_owned(),
             key,
-            serial: [7; 16],
+            serial: *uuid::Uuid::new_v4().as_bytes(),
             issuer: KeyId::from_bytes([9; 32]),
             issued_at: SystemTime::now(),
             expires_at,
             session: SessionId::from_uuid(uuid::Uuid::new_v4()),
             public_key,
-            descriptor: vec![0x91, 0x01],
+            descriptor: vec![0xc0],
             attestation: AttestationLevel::Unproven,
+            bot_list: connetto_core::BOT_LIST_WILDCARD.to_owned(),
         };
+        let mut connection = self.pool.get().await.expect("admin connection");
         self.store
-            .record(record)
+            .record(&mut connection, record)
             .await
             .expect("record the certificate");
         key
@@ -307,7 +309,7 @@ use super::enrolment::device_key;
 fn writing_manager(
     pool: &Pool<AsyncPgConnection>,
     guard: Arc<RequestGuard<String>>,
-    enrolment: Option<DeviceEnrolment<String>>,
+    enrolment: Option<DeviceEnrolment<ConnettoDefaults>>,
     session: SessionConfig,
 ) -> Arc<SessionManager<NoSnapshot, RosterAuth, ConnettoDefaults>> {
     let manager = ManagerBuilder::new(
@@ -859,7 +861,7 @@ async fn a_good_bind_binds_a_live_enrolment_and_rebinds_at_its_frontier() {
         AbuseConfig::default(),
     ));
     guard.set_audit_hook(hook);
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let device = store
         .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
@@ -994,7 +996,7 @@ async fn a_device_bind_records_its_session_once_and_an_anonymous_run_records_non
         ThrottleConfig::default(),
         AbuseConfig::default(),
     ));
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let device = store
         .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
@@ -1095,7 +1097,7 @@ async fn a_bind_with_a_bad_signature_is_not_enrolled() {
         AbuseConfig::default(),
     ));
     guard.set_audit_hook(hook);
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let device = store
         .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
@@ -1152,7 +1154,7 @@ async fn a_bind_without_a_live_enrolment_is_not_enrolled() {
         AbuseConfig::default(),
     ));
     guard.set_audit_hook(hook);
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let manager = writing_manager(
         fixture.admin(),
         guard,
@@ -1199,7 +1201,7 @@ async fn a_bind_of_a_retired_writer_is_retired() {
         AbuseConfig::default(),
     ));
     guard.set_audit_hook(hook);
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let device = store
         .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
@@ -1278,7 +1280,7 @@ async fn a_bind_of_a_revoked_key_closes_device_revoked() {
         AbuseConfig::default(),
     ));
     guard.set_audit_hook(hook);
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let device = store
         .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
@@ -1291,7 +1293,7 @@ async fn a_bind_of_a_revoked_key_closes_device_revoked() {
     let _ = captured;
 
     // The revocation lands while the device is away.
-    store.revoke(device.1);
+    store.revoke(device.1).await;
 
     let (server_transport, mut client) = loopback();
     let server = tokio::spawn(manager.clone().serve(server_transport));
@@ -1841,7 +1843,7 @@ async fn a_provenance_write_naming_an_enrolled_key_that_never_bound_stands_its_r
         AbuseConfig::default(),
     ));
     guard.set_audit_hook(hook);
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let key = store
         .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
@@ -1910,7 +1912,7 @@ async fn a_provenance_write_naming_a_foreign_writer_applies_plainly() {
         AbuseConfig::default(),
     ));
     guard.set_audit_hook(hook);
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let bob_key = store
         .enrol_signer("bob", SystemTime::now() + Duration::from_hours(24))
         .await;
@@ -2040,7 +2042,7 @@ async fn retiring_a_bound_writer_closes_its_live_connection() {
         AbuseConfig::default(),
     ));
     guard.set_audit_hook(hook);
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let device = store
         .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
@@ -2116,7 +2118,7 @@ async fn retiring_a_writer_the_account_does_not_hold_is_unknown() {
         AbuseConfig::default(),
     ));
     guard.set_audit_hook(hook);
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let manager = writing_manager(
         fixture.admin(),
         guard,
@@ -2192,7 +2194,7 @@ async fn retiring_an_enrolled_device_key_that_never_bound_creates_its_row_retire
         AbuseConfig::default(),
     ));
     guard.set_audit_hook(hook);
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let device = store
         .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
@@ -2261,7 +2263,7 @@ async fn a_forged_changeset_at_a_device_sequence_is_refused_forked_and_audited()
         AbuseConfig::default(),
     ));
     guard.set_audit_hook(hook);
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let device = store
         .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
@@ -2442,7 +2444,7 @@ async fn a_device_restore_then_reupload_is_answered_from_the_record_and_audited(
         AbuseConfig::default(),
     ));
     guard.set_audit_hook(hook);
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let k = store
         .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
@@ -3629,7 +3631,7 @@ async fn an_anonymous_bind_is_not_enrolled() {
         ThrottleConfig::default(),
         AbuseConfig::default(),
     ));
-    let enrolments = Enrolments::new();
+    let enrolments = Enrolments::new(&fixture).await;
     let (_, key_id) = enrolments
         .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
@@ -3668,7 +3670,7 @@ async fn a_bind_of_a_key_with_an_unreadable_public_key_is_not_enrolled() {
         ThrottleConfig::default(),
         AbuseConfig::default(),
     ));
-    let enrolments = Enrolments::new();
+    let enrolments = Enrolments::new(&fixture).await;
     let key_id = enrolments
         .enrol_with(
             "alice",
@@ -3718,7 +3720,7 @@ async fn retiring_a_device_key_another_account_holds_is_unknown() {
         ThrottleConfig::default(),
         AbuseConfig::default(),
     ));
-    let enrolments = Enrolments::new();
+    let enrolments = Enrolments::new(&fixture).await;
     let (signer, key_id) = enrolments
         .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
@@ -3772,7 +3774,7 @@ async fn an_anonymous_retire_of_a_device_key_is_unknown() {
         ThrottleConfig::default(),
         AbuseConfig::default(),
     ));
-    let enrolments = Enrolments::new();
+    let enrolments = Enrolments::new(&fixture).await;
     let (signer, key_id) = enrolments
         .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
@@ -3874,11 +3876,11 @@ async fn retiring_a_revoked_enrolled_key_that_never_bound_is_unknown() {
         ThrottleConfig::default(),
         AbuseConfig::default(),
     ));
-    let enrolments = Enrolments::new();
+    let enrolments = Enrolments::new(&fixture).await;
     let (_, key_id) = enrolments
         .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
-    enrolments.revoke(key_id);
+    enrolments.revoke(key_id).await;
     let manager = writing_manager(
         fixture.admin(),
         guard,
@@ -3915,11 +3917,11 @@ async fn a_provenance_write_of_a_device_key_that_cannot_stand_applies_plain() {
         ThrottleConfig::default(),
         AbuseConfig::default(),
     ));
-    let enrolments = Enrolments::new();
+    let enrolments = Enrolments::new(&fixture).await;
     let (_, revoked) = enrolments
         .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
-    enrolments.revoke(revoked);
+    enrolments.revoke(revoked).await;
     let (_, foreign) = enrolments
         .enrol_signer("bob", SystemTime::now() + Duration::from_hours(24))
         .await;
@@ -3983,7 +3985,7 @@ async fn an_anonymous_provenance_copy_of_a_device_key_settles_nothing() {
         ThrottleConfig::default(),
         AbuseConfig::default(),
     ));
-    let enrolments = Enrolments::new();
+    let enrolments = Enrolments::new(&fixture).await;
     let (signer, held) = enrolments
         .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
@@ -4062,7 +4064,7 @@ async fn a_refused_provenance_write_settles_its_unbound_original() {
         ThrottleConfig::default(),
         AbuseConfig::default(),
     ));
-    let store = Enrolments::new();
+    let store = Enrolments::new(&fixture).await;
     let (_, key) = store
         .enrol_signer("alice", SystemTime::now() + Duration::from_hours(24))
         .await;
@@ -4137,7 +4139,7 @@ fn accept_bundle() -> SyncSchema {
 
 /// The manager the acceptance client reaches: the suite's write manager at
 /// major 1, the bundle's version advertised the way the deployment does.
-fn accept_manager(
+pub(super) fn accept_manager(
     pool: &Pool<AsyncPgConnection>,
     guard: Arc<RequestGuard<String>>,
 ) -> Arc<SessionManager<NoSnapshot, RosterAuth, ConnettoDefaults>> {
@@ -4167,6 +4169,23 @@ fn accept_manager(
 async fn accept_client(
     manager: &Arc<SessionManager<NoSnapshot, RosterAuth, ConnettoDefaults>>,
 ) -> ConnettoConnection<LoopbackTransport> {
+    let mut client = signed_in_alice(manager).await;
+    client
+        .subscribe("notes", "SELECT * FROM notes")
+        .await
+        .expect("subscribe");
+    pump_until(&mut client, |event| {
+        matches!(event, ClientEvent::SnapshotEnd { .. })
+    })
+    .await;
+    client
+}
+
+/// The in-process acceptance client, signed in as alice over one of the
+/// manager's loopback ends, its pump not yet driven.
+pub(super) async fn signed_in_alice(
+    manager: &Arc<SessionManager<NoSnapshot, RosterAuth, ConnettoDefaults>>,
+) -> ConnettoConnection<LoopbackTransport> {
     let (server_end, client_end) = loopback();
     let serving = Arc::clone(manager);
     tokio::spawn(async move {
@@ -4181,25 +4200,16 @@ async fn accept_client(
     };
     let credential =
         HeldCredential::new(Grant::new("user:alice"), "alice").expect("the credential holds");
-    let mut client = ClientBuilder::new(accept_bundle(), dial)
+    ClientBuilder::new(accept_bundle(), dial)
         .signed_in(credential)
         .connect_driven()
         .await
-        .expect("the client connects");
-    client
-        .subscribe("notes", "SELECT * FROM notes")
-        .await
-        .expect("subscribe");
-    pump_until(&mut client, |event| {
-        matches!(event, ClientEvent::SnapshotEnd { .. })
-    })
-    .await;
-    client
+        .expect("the client connects")
 }
 
 /// Drive the client until its pump reports an event matching `pred`,
 /// applying every frame in between, bounded so a wedged pump fails.
-async fn pump_until(
+pub(super) async fn pump_until(
     client: &mut ConnettoConnection<LoopbackTransport>,
     pred: impl Fn(&ClientEvent) -> bool,
 ) -> ClientEvent {

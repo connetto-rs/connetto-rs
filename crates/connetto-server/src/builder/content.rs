@@ -246,12 +246,27 @@ impl FileHalf {
     }
 }
 
+/// What the file routes report to and ask of the rest of the server.
+#[cfg_attr(
+    not(feature = "content"),
+    expect(dead_code, reason = "only the file routes read the hooks")
+)]
+pub(crate) struct FileHooks<Id> {
+    /// The server's one audit hook, so a carried commit's row lands in
+    /// emission order beside every other access change.
+    pub(crate) audit: crate::audit::AuditHook<Id>,
+    /// The handshake's own authority, which answers whether a ticket's login
+    /// session is still live, so a logout or a revocation ends the session's
+    /// tickets at their next request.
+    pub(crate) sessions: std::sync::Arc<dyn connetto_core::SessionLiveness>,
+}
+
 /// The file-serving half of the deployment.
 ///
 /// `settings` absent answers no signer and no router, which is the
 /// no-files deployment. Present, the store opens, the keypair loads, and
 /// the file server's preflight runs before serving proceeds, so a
-/// deployment missing its `_cfs_` tables or its two contract functions
+/// deployment missing its `_cfs_` tables or its three contract functions
 /// refuses to start naming what is absent.
 ///
 /// The pools are the file router's own two, built from the same conninfos,
@@ -264,6 +279,7 @@ pub(crate) async fn build<D: crate::schema::ConnettoSchema>(
     owner_url: &str,
     reader_url: &str,
     reader_pool_size: u32,
+    hooks: FileHooks<D::Id>,
 ) -> Result<FileHalf, ContentBuildError> {
     let Some(settings) = settings else {
         return Ok(FileHalf::none());
@@ -292,6 +308,8 @@ pub(crate) async fn build<D: crate::schema::ConnettoSchema>(
             refresh: settings.ceiling_refresh,
         },
         ceilings: files::CeilingCache::default(),
+        on_carried: Some(carried_audit::<D>(hooks.audit)),
+        sessions: hooks.sessions,
         _schema: std::marker::PhantomData,
     })
     .await?;
@@ -336,18 +354,47 @@ pub(crate) async fn build<D: crate::schema::ConnettoSchema>(
     })
 }
 
+/// The observer that records each durable carried commit as one
+/// `content_carried` audit row (R79 decision 17), the owner as the row's
+/// account, the carrier as its courier and the file as its subject.
+///
+/// The accounts arrive as the text the deployment's owner function and the
+/// carrier's ticket spelled them. A spelling the typed id does not parse
+/// leaves that column empty and says so in the log.
+#[cfg(feature = "content")]
+fn carried_audit<D: crate::schema::ConnettoSchema>(
+    audit: crate::audit::AuditHook<D::Id>,
+) -> files::CarriedObserver {
+    std::sync::Arc::new(move |commit: files::CarriedCommit| {
+        let owner = commit.owner.parse::<D::Id>().ok();
+        if owner.is_none() {
+            tracing::warn!(owner = %commit.owner, "a carried file's owner is not a user id");
+        }
+        let mut event = crate::audit::AuthEvent::new(
+            commit.session,
+            owner,
+            crate::audit::AuthOp::ContentCarried,
+        )
+        .about_file(&commit.file_id);
+        match commit.carrier.parse::<D::Id>() {
+            Ok(carrier) => event = event.about_courier(carrier),
+            Err(_) => {
+                tracing::warn!(carrier = %commit.carrier, "a file's carrier is not a user id");
+            }
+        }
+        audit(event);
+    })
+}
+
 /// The no-op shape of [`build`] for a server built without the `content`
 /// feature. A configured deployment still hears about it.
 #[cfg(not(feature = "content"))]
-#[expect(
-    clippy::extra_unused_type_parameters,
-    reason = "one call site serves both builds, and the content build reads the schema's file member"
-)]
 pub(crate) async fn build<D: crate::schema::ConnettoSchema>(
     settings: Option<ContentSettings>,
     _owner_url: &str,
     _reader_url: &str,
     _reader_pool_size: u32,
+    _hooks: FileHooks<D::Id>,
 ) -> Result<FileHalf, ContentBuildError> {
     if settings.is_some() {
         tracing::warn!(
@@ -368,6 +415,7 @@ mod tests {
     fn identified(user_id: &str) -> connetto_core::auth::ContentCaller {
         connetto_core::auth::ContentCaller::new(
             Some(user_id.to_owned()),
+            Some(connetto_core::SessionId::from_token_hash(user_id)),
             None,
             connetto_core::BOT_LIST_WILDCARD.to_owned(),
         )
@@ -411,6 +459,7 @@ mod tests {
             &identified("caller-1"),
             [7u8; 32],
             ContentVerb::Read,
+            None,
         )
         .await
         .expect("a minted read url");
@@ -435,6 +484,7 @@ mod tests {
             &identified("caller-2"),
             [9u8; 32],
             ContentVerb::Write { declared_len: 128 },
+            None,
         )
         .await
         .expect("a minted write url");
@@ -447,7 +497,7 @@ mod tests {
         assert_eq!(payload.file_id, [9u8; 32]);
     }
 
-    /// The photo table and the two contract functions a configured deployment applies.
+    /// The photo table and the three contract functions a configured deployment applies.
     const DEPLOYMENT_SQL: &[&str] = &[
         "CREATE TABLE photos (content_id BYTEA PRIMARY KEY, content_state TEXT NOT NULL \
              DEFAULT 'staged')",
@@ -460,7 +510,47 @@ mod tests {
              LANGUAGE plpgsql SECURITY DEFINER SET search_path TO '' \
              AS $$ BEGIN UPDATE public.photos SET content_state = p_new_state \
              WHERE content_id = p_file_id; RETURN p_file_id; END; $$",
+        "CREATE OR REPLACE FUNCTION connetto_file_owner(p_file_id BYTEA) RETURNS TEXT \
+             LANGUAGE sql SECURITY INVOKER SET search_path TO '' AS $$ SELECT NULL::text $$",
     ];
+
+    /// Hooks that record nothing and find every session live, for builds whose
+    /// carried commits and session checks no test reads.
+    fn no_hooks() -> FileHooks<String> {
+        FileHooks {
+            audit: std::sync::Arc::new(|_| {}),
+            sessions: std::sync::Arc::new(connetto_core::test_support::TestGrantChecker),
+        }
+    }
+
+    /// A carried commit becomes one `content_carried` row naming the owner as
+    /// its account, the carrier as its courier and the file as its subject,
+    /// under the session that minted the ticket.
+    #[test]
+    fn a_carried_commit_is_audited_for_its_owner_and_carrier() {
+        let rows = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&rows);
+        let observe =
+            carried_audit::<crate::defaults::ConnettoDefaults>(std::sync::Arc::new(move |event| {
+                sink.lock().push(event);
+            }));
+        let session = connetto_core::SessionId::from_token_hash("bob's session");
+        observe(files::CarriedCommit {
+            file_id: [0xab; 32],
+            owner: "alice".to_owned(),
+            carrier: "bob".to_owned(),
+            session,
+        });
+        let rows = rows.lock();
+        let [row] = rows.as_slice() else {
+            panic!("one row per carried commit, got {}", rows.len());
+        };
+        assert_eq!(row.op, crate::audit::AuthOp::ContentCarried);
+        assert_eq!(row.session, Some(session));
+        assert_eq!(row.user_id.as_deref(), Some("alice"));
+        assert_eq!(row.courier_user_id.as_deref(), Some("bob"));
+        assert_eq!(row.subject.as_deref(), Some("ab".repeat(32).as_str()));
+    }
 
     /// The no-files deployment is the common one: no settings, no signer, no
     /// router.
@@ -472,6 +562,7 @@ mod tests {
             "postgres://unused",
             "postgres://unused",
             1,
+            no_hooks(),
         )
         .await
         .expect("no settings is a valid deployment");
@@ -500,6 +591,7 @@ mod tests {
             "DROP TABLE IF EXISTS _cfs_traffic CASCADE",
             "DROP FUNCTION IF EXISTS connetto_visible_files(BYTEA[])",
             "DROP FUNCTION IF EXISTS connetto_set_content_state(BYTEA, TEXT, TEXT)",
+            "DROP FUNCTION IF EXISTS connetto_file_owner(BYTEA)",
         ] {
             diesel::sql_query(stmt)
                 .execute(&mut *conn)
@@ -558,15 +650,21 @@ mod tests {
             key: doc.as_ref().to_vec(),
         };
         // The sweep's guard stays alive until the tick below, then stops it.
-        let half =
-            build::<crate::defaults::ConnettoDefaults>(Some(settings), &admin_url, &reader_url, 2)
-                .await
-                .expect("a configured deployment builds");
+        let half = build::<crate::defaults::ConnettoDefaults>(
+            Some(settings),
+            &admin_url,
+            &reader_url,
+            2,
+            no_hooks(),
+        )
+        .await
+        .expect("a configured deployment builds");
         let url = ContentTicketSigner::mint(
             &half.signer,
             &identified("caller-9"),
             [3u8; 32],
             ContentVerb::Read,
+            None,
         )
         .await
         .expect("the deployment signer mints");

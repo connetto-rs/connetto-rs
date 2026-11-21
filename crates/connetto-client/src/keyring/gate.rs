@@ -51,6 +51,17 @@ impl From<Refusal> for ClientError {
     }
 }
 
+/// What an ungated read does with a secret only the gated storage holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Leftover {
+    /// Move it out through the one prompt that reads it, for a key whose
+    /// loss would cost the data it opens.
+    Move,
+    /// Delete it without a prompt, for a refresh token whose loss costs one
+    /// sign-in.
+    Drop,
+}
+
 /// Where one secret goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Storage {
@@ -207,6 +218,18 @@ impl<B: Backend> SecretGate<B> {
     /// The secret under `name`, moving a copy an earlier launch stored under the
     /// other storage to the one this launch uses.
     pub(crate) fn read(&self, name: &str) -> Result<Option<String>, ClientError> {
+        self.read_with(name, Leftover::Move)
+    }
+
+    /// The refresh token under `name`, as [`Self::read`] reads a secret, except
+    /// that while the secrets are ungated a token only the gated storage holds
+    /// is deleted without a prompt and reads as `None`, so no launch with the
+    /// gate off asks for verification over a sign-in.
+    pub(crate) fn read_token(&self, name: &str) -> Result<Option<String>, ClientError> {
+        self.read_with(name, Leftover::Drop)
+    }
+
+    fn read_with(&self, name: &str, leftover: Leftover) -> Result<Option<String>, ClientError> {
         if crate::replica::is_ungated_record(name) {
             return Ok(self.backend.read(&self.service, name, PLAIN)?);
         }
@@ -214,7 +237,7 @@ impl<B: Backend> SecretGate<B> {
         let read = match self.backend.read(&self.service, name, storage) {
             Err(Refusal::Unsupported) if storage == Storage::Gated => {
                 self.fall_back(NoGate::Unsupported);
-                return self.read(name);
+                return self.read_with(name, leftover);
             }
             read => read?,
         };
@@ -231,6 +254,10 @@ impl<B: Backend> SecretGate<B> {
         // A move verifies nothing, so it leaves the mode as it found it.
         let stranded = match storage {
             Storage::Gated => self.backend.read(&self.service, name, PLAIN)?,
+            Storage::Ungated(_) if leftover == Leftover::Drop => {
+                self.backend.clear(&self.service, name, Storage::Gated)?;
+                None
+            }
             Storage::Ungated(_) => self.backend.read_stranded(&self.service, name)?,
         };
         if let Some(secret) = &stranded {
@@ -387,6 +414,8 @@ mod tests {
         /// The key behind the gated copies is gone, as after a screen lock or
         /// Windows Hello was removed.
         key_gone: bool,
+        /// Every clear fails, as a store that refuses a delete does.
+        clear_fails: bool,
     }
 
     /// Why the fake platform cannot hold a gated item.
@@ -512,6 +541,9 @@ mod tests {
         }
 
         fn clear(&self, _service: &str, name: &str, storage: Storage) -> Result<(), ClientError> {
+            if self.script.lock().expect("lock").clear_fails {
+                return Err(ClientError::Auth("delete refused".into()));
+            }
             match storage {
                 Storage::Gated => self.gated.lock().expect("lock").remove(name).map(drop),
                 Storage::Ungated(_) => self.plain.lock().expect("lock").remove(name).map(drop),
@@ -890,6 +922,7 @@ mod tests {
             explicit_open: false,
             creation_authorises: false,
             key_gone: false,
+            clear_fails: false,
         },
         Script {
             dismiss: false,
@@ -897,6 +930,7 @@ mod tests {
             explicit_open: true,
             creation_authorises: false,
             key_gone: false,
+            clear_fails: false,
         },
     ];
 
@@ -922,18 +956,57 @@ mod tests {
     }
 
     #[test]
-    fn a_gate_turned_off_moves_each_gated_secret_out_for_one_prompt() {
+    fn a_gate_turned_off_drops_a_gated_token_unasked_and_moves_a_key_out_for_one_prompt() {
         for script in STORES {
             let (gate, fake) = gate(script);
             gate.configure(false);
             fake.seed(KEY, "key", Storage::Gated);
             fake.seed(TOKEN, "refresh", Storage::Gated);
+            assert_eq!(gate.read_token(TOKEN).expect("read"), None);
+            assert_eq!(fake.storage_of(TOKEN), None, "the gated token is gone");
+            assert_eq!(fake.prompts(), 0, "dropping the token asks nothing");
             assert_eq!(gate.read(KEY).expect("read").as_deref(), Some("key"));
-            assert_eq!(gate.read(TOKEN).expect("read").as_deref(), Some("refresh"));
             assert_eq!(fake.storage_of(KEY), Some(PLAIN));
-            assert_eq!(fake.storage_of(TOKEN), Some(PLAIN));
-            assert_eq!(fake.prompts(), 1, "one prompt moves every secret");
+            assert_eq!(fake.prompts(), 1, "the key moves out through one prompt");
             assert_eq!(gate.protection(), Custody::Unverified(NoGate::Offerable));
+        }
+    }
+
+    /// A gated token the gate turned off cannot delete fails the read and
+    /// stays where it was, so no launch takes a token it could not drop for
+    /// one it has no copy of.
+    #[test]
+    fn a_gated_token_that_cannot_be_dropped_fails_the_read_and_stays() {
+        for script in STORES {
+            let (gate, fake) = gate(Script {
+                clear_fails: true,
+                ..script
+            });
+            gate.configure(false);
+            fake.seed(TOKEN, "refresh", Storage::Gated);
+            assert!(
+                matches!(gate.read_token(TOKEN), Err(ClientError::Auth(_))),
+                "the refused delete reaches the caller"
+            );
+            assert_eq!(
+                fake.storage_of(TOKEN),
+                Some(Storage::Gated),
+                "the token stays where it was"
+            );
+            assert_eq!(fake.prompts(), 0, "the failed drop asks nothing");
+        }
+    }
+
+    #[test]
+    fn a_gated_token_reads_and_moves_like_any_secret_while_the_gate_is_on() {
+        for script in STORES {
+            let (gate, fake) = gate(script);
+            fake.seed(TOKEN, "refresh", PLAIN);
+            assert_eq!(
+                gate.read_token(TOKEN).expect("read").as_deref(),
+                Some("refresh")
+            );
+            assert_eq!(fake.storage_of(TOKEN), Some(Storage::Gated));
         }
     }
 

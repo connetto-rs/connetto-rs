@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use axum::Router;
 use bytes::Bytes;
+use connetto_core::{LivenessFuture, LivenessUnknown, SessionId, SessionLiveness};
 use connetto_file_core::{ChunkHash, ChunkMeta, FileId};
 use connetto_file_server::{
     AnyStore, AppPools, Config, ContentCaller, CustomStore, DEPLOYMENT_DDL, DefaultFileSchema,
@@ -19,6 +20,20 @@ use diesel_async::{
 use testcontainers::core::WaitFor;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+
+/// The owner function every fixture installs: the account of the metadata
+/// row naming the file, as the caller's own rights read it, `NULL` when
+/// those rows name none or more than one (R79 decision 17).
+pub const OWNER_FN: &str = "CREATE OR REPLACE FUNCTION connetto_file_owner(p_file_id BYTEA)
+     RETURNS TEXT LANGUAGE sql SECURITY INVOKER
+         SET search_path TO '' AS $$
+         SELECT CASE WHEN count(DISTINCT m.uploaded_by) = 1 THEN min(m.uploaded_by) END
+         FROM public.test_file_metadata m WHERE m.file_id = p_file_id
+     $$";
+
+/// The reader's grant on [`OWNER_FN`].
+pub const OWNER_GRANT: &str =
+    "GRANT EXECUTE ON FUNCTION connetto_file_owner TO connetto_file_server";
 
 /// Individual DDL statements applied by tests (not part of the shipped DDL const).
 ///
@@ -74,6 +89,8 @@ pub const FIXTURE_STMTS: &[&str] = &[
      END;
      $$",
     "GRANT EXECUTE ON FUNCTION connetto_set_content_state TO connetto_file_server",
+    OWNER_FN,
+    OWNER_GRANT,
 ];
 
 /// DDL statements for a deployment whose `connetto_visible_files` relies on RLS
@@ -130,6 +147,8 @@ pub const FIXTURE_STMTS_RLS_ONLY: &[&str] = &[
      END;
      $$",
     "GRANT EXECUTE ON FUNCTION connetto_set_content_state TO connetto_file_server",
+    OWNER_FN,
+    OWNER_GRANT,
 ];
 
 /// DDL for a deployment whose policy and visibility function read the packed
@@ -180,6 +199,8 @@ pub const FIXTURE_STMTS_SUBJECTS: &[&str] = &[
      END;
      $$",
     "GRANT EXECUTE ON FUNCTION connetto_set_content_state TO connetto_file_server",
+    OWNER_FN,
+    OWNER_GRANT,
 ];
 
 /// DDL for a deployment that named its own identity setting, `app.who`.
@@ -226,6 +247,8 @@ pub const FIXTURE_STMTS_OWN_SETTING: &[&str] = &[
      END;
      $$",
     "GRANT EXECUTE ON FUNCTION connetto_set_content_state TO connetto_file_server",
+    OWNER_FN,
+    OWNER_GRANT,
 ];
 
 /// DDL for the deployment whose metadata table the bot cap holds (R91).
@@ -283,6 +306,8 @@ pub const FIXTURE_STMTS_BOT_LIST: &[&str] = &[
      END;
      $$",
     "GRANT EXECUTE ON FUNCTION connetto_set_content_state TO connetto_file_server",
+    OWNER_FN,
+    OWNER_GRANT,
 ];
 
 pub struct Pg {
@@ -670,6 +695,67 @@ pub async fn build_router(pg: &Pg, store: AnyStore) -> (Router, TicketSigner) {
     build_router_with_settings(pg, store, connetto_file_server::CallerSettings::default()).await
 }
 
+/// What the session store stand-in answers: every session live until a test
+/// ends it, and no answer at all while `failing` is set.
+#[derive(Default)]
+struct SessionState {
+    ended: Vec<SessionId>,
+    failing: bool,
+    asked: usize,
+}
+
+/// A session store stand-in whose answers a test sets, counting every
+/// question the file server asks it.
+#[derive(Default)]
+pub struct Sessions(parking_lot::Mutex<SessionState>);
+
+impl Sessions {
+    /// End `session`, as a logout or a revocation does in the store.
+    pub fn end(&self, session: SessionId) {
+        self.0.lock().ended.push(session);
+    }
+
+    /// Answer every later question with a store failure.
+    pub fn fail(&self) {
+        self.0.lock().failing = true;
+    }
+
+    /// How many questions the file server asked.
+    pub fn asked(&self) -> usize {
+        self.0.lock().asked
+    }
+}
+
+impl SessionLiveness for Sessions {
+    fn session_is_live(&self, session_id: SessionId) -> LivenessFuture<'_> {
+        let mut state = self.0.lock();
+        state.asked += 1;
+        let answer = if state.failing {
+            Err(LivenessUnknown("the store is down".to_owned()))
+        } else {
+            Ok(!state.ended.contains(&session_id))
+        };
+        Box::pin(core::future::ready(answer))
+    }
+}
+
+/// A router whose ticket sessions `sessions` answers for.
+pub async fn build_router_with_sessions(
+    pg: &Pg,
+    store: AnyStore,
+    sessions: Arc<Sessions>,
+) -> (Router, TicketSigner) {
+    build_router_answering(
+        pg,
+        store,
+        connetto_file_server::QuotaSettings::default(),
+        connetto_file_server::CeilingCache::default(),
+        connetto_file_server::CallerSettings::default(),
+        sessions,
+    )
+    .await
+}
+
 /// A router that binds the caller under `caller_settings`, which is how a
 /// deployment that renamed either setting is configured.
 pub async fn build_router_with_settings(
@@ -699,6 +785,27 @@ pub async fn build_router_with_quotas(
     ceilings: connetto_file_server::CeilingCache,
     caller_settings: connetto_file_server::CallerSettings,
 ) -> (Router, TicketSigner) {
+    build_router_answering(
+        pg,
+        store,
+        quotas,
+        ceilings,
+        caller_settings,
+        Arc::new(Sessions::default()),
+    )
+    .await
+}
+
+/// The router every fixture builds, its ticket sessions answered by
+/// `sessions`.
+async fn build_router_answering(
+    pg: &Pg,
+    store: AnyStore,
+    quotas: connetto_file_server::QuotaSettings,
+    ceilings: connetto_file_server::CeilingCache,
+    caller_settings: connetto_file_server::CallerSettings,
+    sessions: Arc<Sessions>,
+) -> (Router, TicketSigner) {
     let (signer, verifier) = make_signer();
     let cfg: Config<DefaultFileSchema> = Config {
         pools: AppPools {
@@ -711,6 +818,8 @@ pub async fn build_router_with_quotas(
         caller_settings,
         quotas,
         ceilings,
+        on_carried: None,
+        sessions,
         _schema: std::marker::PhantomData,
     };
     (
@@ -894,26 +1003,38 @@ pub async fn registry_row_count(
     rows.into_iter().next().map_or(0, |r| r.n)
 }
 
-/// A ticket caller carrying an identity and no share key, the person's
-/// wildcard for the bot list.
+/// The session the fixture's login of `user_id` holds.
+pub fn session_of(user_id: &str) -> SessionId {
+    SessionId::from_token_hash(user_id)
+}
+
+/// A ticket caller logged in as `user_id`, on [`session_of`] that user, with
+/// no share key and the person's wildcard for the bot list.
 pub fn identified(user_id: &str) -> ContentCaller {
     ContentCaller::new(
         Some(user_id.to_owned()),
+        Some(session_of(user_id)),
         None,
         connetto_core::BOT_LIST_WILDCARD.to_owned(),
     )
 }
 
-/// A ticket caller carrying an identity and the bot list its login resolved,
-/// the bot the deployment registered it with (R91).
+/// A ticket caller logged in as `user_id` with the bot list its login
+/// resolved, the bot the deployment registered it with (R91).
 pub fn listed(user_id: &str, bot_list: &str) -> ContentCaller {
-    ContentCaller::new(Some(user_id.to_owned()), None, bot_list.to_owned())
+    ContentCaller::new(
+        Some(user_id.to_owned()),
+        Some(session_of(user_id)),
+        None,
+        bot_list.to_owned(),
+    )
 }
 
-/// A ticket caller carrying share-key subjects and no identity, the person's
+/// A ticket caller carrying share-key subjects and no login, the person's
 /// wildcard for the bot list.
 pub fn keyed<'a>(subjects: impl IntoIterator<Item = &'a str>) -> ContentCaller {
     ContentCaller::new(
+        None,
         None,
         subjects.into_iter().map(ToOwned::to_owned),
         connetto_core::BOT_LIST_WILDCARD.to_owned(),

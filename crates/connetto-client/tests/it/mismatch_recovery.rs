@@ -111,6 +111,7 @@ impl Transport for StaleTransport {
                         current_cursor: Cursor::new(Vec::new()),
                         schema_version: self.version.clone(),
                         sunset_at_secs: None,
+                        courier: false,
                         initial_credits: 64,
                         writer: match &handshake.writer {
                             WriterRequest::Device => None,

@@ -25,9 +25,9 @@
 //! Needs Docker: the fixture starts its own Postgres.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use connetto_core::SessionId;
 use connetto_core::auth::Principal;
 use connetto_core::messages::{
     BulkMessage, ControlMessage, Grant, Handshake, SUBSCRIPTION_REFUSED, Subscribe,
@@ -39,11 +39,13 @@ use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::audit::{AUTH_OP_TYPE, AuthOp, pg_audit_hook};
 use connetto_server::ban::Instant;
 use connetto_server::{
-    AbuseConfig, AbuseLimits, ConnectionLimits, Crossing, Enforcement, EnforcementFuture,
-    EnforcementPolicy, LoopbackTransport, ManagerBuilder, Materializer, NewBan, NoConnector,
-    PageSpec, PersonLimits, RequestGuard, SessionManager, SnapshotEstimate, SnapshotPage,
-    SnapshotSource, ThrottleConfig, TierLimits, loopback, pg_ban_store, pg_write_target,
+    AbuseConfig, AbuseLimits, BanFuture, BannedSessions, ConnectionLimits, Crossing, Enforcement,
+    EnforcementFuture, EnforcementPolicy, LoopbackTransport, ManagerBuilder, Materializer, NewBan,
+    NoConnector, PageSpec, PersonLimits, RequestGuard, SessionManager, SnapshotEstimate,
+    SnapshotPage, SnapshotSource, ThrottleConfig, TierLimits, loopback, pg_ban_store,
+    pg_write_target,
 };
+use connetto_test_harness::wire_tables::orders_table;
 use connetto_test_harness::{
     ConnettoDefaults, Fixture, RosterAuth, RowValue, WITHHELD_ID, insert_changeset,
 };
@@ -55,6 +57,7 @@ use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 use subql::backend::Postgres as PgBackend;
 use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
 use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
+use tokio::sync::watch;
 
 // The default schema is over `Id = String`, which is what `TestGrantChecker`
 // resolves a `user:` grant to.
@@ -87,7 +90,7 @@ impl SnapshotSource for KeyedSnapshot {
     async fn estimate(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &Principal,
     ) -> Result<SnapshotEstimate, Self::Error> {
         Ok(SnapshotEstimate {
@@ -103,7 +106,7 @@ impl SnapshotSource for KeyedSnapshot {
     async fn snapshot_page(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         auth: &Principal,
         _page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {
@@ -122,11 +125,7 @@ impl SnapshotSource for KeyedSnapshot {
                 bytes: 0,
             });
         }
-        let table = SimpleTable::new(
-            "orders",
-            &[("id", ""), ("price", ""), ("quantity", ""), ("status", "")],
-            &[0],
-        );
+        let table = orders_table();
         let insert = Insert::<_, String, Vec<u8>>::from(table)
             .set(0, Value::Integer(1))
             .expect("set id")
@@ -193,18 +192,18 @@ impl VisibilityPolicy for DenyAll {
     }
 }
 
-/// Answers every crossing with a fixed verdict and counts how many it was asked
-/// about, so a test can assert the application was never consulted.
+/// Reports each crossing answered with its fixed verdict.
 struct Recording {
     verdict: Enforcement,
-    asked: Arc<AtomicUsize>,
+    asked: watch::Sender<usize>,
 }
 
 impl EnforcementPolicy<String> for Recording {
     fn on_threshold<'a>(&'a self, _crossing: &'a Crossing<String>) -> EnforcementFuture<'a> {
-        self.asked.fetch_add(1, Ordering::Relaxed);
-        let verdict = self.verdict;
-        Box::pin(async move { verdict })
+        Box::pin(async move {
+            self.asked.send_modify(|count| *count += 1);
+            self.verdict
+        })
     }
 }
 
@@ -268,7 +267,7 @@ fn throttled_guard(
     policy: Option<Arc<dyn EnforcementPolicy<String>>>,
 ) -> Arc<RequestGuard<String>> {
     let mut built = RequestGuard::new(*throttle, abuse)
-        .with_bans(pg_ban_store::<ConnettoDefaults>(fixture.admin().clone()));
+        .with_bans(fixture.admin().clone(), pg_ban_store::<ConnettoDefaults>());
     if let Some(policy) = policy {
         built = built.with_enforcement(policy);
     }
@@ -315,11 +314,6 @@ where
 struct Live {
     client: LoopbackTransport,
     server: tokio::task::JoinHandle<()>,
-}
-
-/// Read a counter without meeting the diesel prelude's blanket `load`.
-fn times_asked(counter: &AtomicUsize) -> usize {
-    AtomicUsize::load(counter, Ordering::Relaxed)
 }
 
 /// Open a connection presenting `grants`, expecting the handshake to succeed.
@@ -559,32 +553,47 @@ async fn a_crossed_threshold_bans_the_person_and_refuses_the_next_handshake() {
     );
 }
 
-/// The guard tells its ban hook which identity it banned, once the ban is
-/// written, which is how the server ends every session of that identity
+/// Banned sessions that end none and send each banned identity to the test
+/// once the ban commits.
+struct TellingBans(tokio::sync::mpsc::UnboundedSender<String>);
+
+impl BannedSessions<String> for TellingBans {
+    fn end<'a>(
+        &'a self,
+        _transaction: &'a mut AsyncPgConnection,
+        _user_id: &'a String,
+    ) -> BanFuture<'a, Vec<SessionId>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn ended(&self, user_id: &String, _sessions: &[SessionId]) {
+        self.0
+            .send(user_id.clone())
+            .expect("the test keeps the receiver");
+    }
+}
+
+/// The guard tells its banned sessions which identity it banned, once the
+/// ban commits, which is how the server ends every session of that identity
 /// (R105 decision 8).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_ban_tells_its_hook_the_banned_identity() {
+async fn a_ban_tells_its_banned_sessions_the_banned_identity() {
     let fixture = Fixture::acquire().await;
     reset_tables(&fixture).await;
     let guard = guard(&fixture, limits(2, 1), None);
-    let told = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let sink = Arc::clone(&told);
-    guard.set_ban_hook(Arc::new(move |user: String| sink.lock().push(user)));
+    let (sender, mut told) = tokio::sync::mpsc::unbounded_channel();
+    guard.set_banned_sessions(Arc::new(TellingBans(sender)));
     let manager = manager(&fixture, silent_policy(), &guard);
 
     let mut live = connect(&manager, "prober", &["user:alice#one"]).await;
     probe(&mut live.client, "ghost-0").await;
     probe(&mut live.client, "ghost-1").await;
-    await_ban(fixture.admin(), "alice").await;
-    let deadline = tokio::time::Instant::now() + SETTLE;
-    while told.lock().is_empty() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the hook was never told"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(*told.lock(), vec!["alice".to_owned()]);
+    let banned = tokio::time::timeout(SETTLE, told.recv())
+        .await
+        .expect("the banned sessions are told within the bound")
+        .expect("the guard keeps the sender");
+    assert_eq!(banned, "alice");
+    assert!(told.try_recv().is_err(), "one ban tells once");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -593,13 +602,13 @@ async fn the_application_decides_the_outcome_and_silence_takes_the_proposal() {
     reset_tables(&fixture).await;
 
     // Overriding with a bounded ban.
-    let asked = Arc::new(AtomicUsize::new(0));
+    let (asked, calls) = watch::channel(0);
     let bounded = guard(
         &fixture,
         limits(2, 1),
         Some(Arc::new(Recording {
             verdict: Enforcement::BanFor(Duration::from_secs(3600)),
-            asked: Arc::clone(&asked),
+            asked,
         })),
     );
     let bounded_manager = manager(&fixture, silent_policy(), &bounded);
@@ -611,31 +620,33 @@ async fn the_application_decides_the_outcome_and_silence_takes_the_proposal() {
         expires_at.is_some(),
         "the application's duration replaced the permanent proposal"
     );
-    assert_eq!(times_asked(&asked), 1, "asked once, for one crossing");
+    assert_eq!(*calls.borrow(), 1, "asked once, for one crossing");
     expect_dropped(live).await;
 
     // Declining leaves nothing behind, and the connection stays open.
-    let declined = Arc::new(AtomicUsize::new(0));
+    let (declined, mut declined_calls) = watch::channel(0);
     let lenient = guard(
         &fixture,
         limits(2, 1),
         Some(Arc::new(Recording {
             verdict: Enforcement::Ignore,
-            asked: Arc::clone(&declined),
+            asked: declined,
         })),
     );
     let lenient_manager = manager(&fixture, silent_policy(), &lenient);
     let mut tolerated = connect(&lenient_manager, "lenient", &["user:dave#one"]).await;
     probe(&mut tolerated.client, "ghost-0").await;
     probe(&mut tolerated.client, "ghost-1").await;
-    // The refusal below both proves the session survived and orders the assert
-    // after the crossing was handled.
+    tokio::time::timeout(SETTLE, declined_calls.wait_for(|count| *count >= 1))
+        .await
+        .expect("the application answers within the bound")
+        .expect("the policy keeps its observation channel open");
+    // A later refusal proves the session remains usable after the policy answers.
     probe(&mut tolerated.client, "ghost-2").await;
     assert!(
         ban_row(fixture.admin(), "dave").await.is_none(),
         "the application declined, so no ban was written"
     );
-    assert!(times_asked(&declined) >= 1, "the application was asked");
     tolerated.client.close().await.expect("close");
     tolerated.server.await.expect("join server");
 }
@@ -648,15 +659,19 @@ async fn an_expiry_lapses_silently_and_only_a_lift_is_recorded() {
     reset_tables(&fixture).await;
     let guard = guard(&fixture, limits(2, 1), None);
     let manager = manager(&fixture, silent_policy(), &guard);
-    let bans = pg_ban_store::<ConnettoDefaults>(fixture.admin().clone());
+    let bans = pg_ban_store::<ConnettoDefaults>();
     let session = connetto_core::SessionId::from_uuid(uuid::Uuid::new_v4());
+    let mut owner = fixture.admin().get().await.expect("owner connection");
 
-    bans.impose(NewBan::starting_now(
-        "erin".to_owned(),
-        session,
-        "unresolvable_subscription 2 per 300s",
-        Some(Duration::from_secs(3600)),
-    ))
+    bans.impose(
+        &mut owner,
+        NewBan::starting_now(
+            "erin".to_owned(),
+            session,
+            "unresolvable_subscription 2 per 300s",
+            Some(Duration::from_secs(3600)),
+        ),
+    )
     .await
     .expect("impose the live ban");
     // A backdated ban that already lapsed by the database clock. The clock
@@ -785,13 +800,13 @@ async fn filtered_reads_drive_no_counter() {
 async fn an_unidentified_caller_is_closed_and_the_application_is_not_asked() {
     let fixture = Fixture::acquire().await;
     reset_tables(&fixture).await;
-    let asked = Arc::new(AtomicUsize::new(0));
+    let (asked, calls) = watch::channel(0);
     let guard = guard(
         &fixture,
         limits(4, 1),
         Some(Arc::new(Recording {
             verdict: Enforcement::BanPermanently,
-            asked: Arc::clone(&asked),
+            asked,
         })),
     );
     let manager = manager(&fixture, silent_policy(), &guard);
@@ -801,7 +816,7 @@ async fn an_unidentified_caller_is_closed_and_the_application_is_not_asked() {
     expect_dropped(live).await;
 
     assert_eq!(
-        times_asked(&asked),
+        *calls.borrow(),
         0,
         "the trait only ever receives a caller that can actually be banned"
     );
@@ -834,13 +849,17 @@ async fn a_ban_applies_under_row_level_security_with_no_policy_admitting_anyone(
 
     let guard = guard(&fixture, limits(2, 1), None);
     let manager = manager(&fixture, silent_policy(), &guard);
-    let bans = pg_ban_store::<ConnettoDefaults>(fixture.admin().clone());
-    bans.impose(NewBan::starting_now(
-        "heidi".to_owned(),
-        connetto_core::SessionId::from_uuid(uuid::Uuid::new_v4()),
-        "unresolvable_subscription 2 per 300s",
-        None,
-    ))
+    let bans = pg_ban_store::<ConnettoDefaults>();
+    let mut owner = fixture.admin().get().await.expect("owner connection");
+    bans.impose(
+        &mut owner,
+        NewBan::starting_now(
+            "heidi".to_owned(),
+            connetto_core::SessionId::from_uuid(uuid::Uuid::new_v4()),
+            "unresolvable_subscription 2 per 300s",
+            None,
+        ),
+    )
     .await
     .expect("impose the ban");
 

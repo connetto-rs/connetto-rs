@@ -205,9 +205,18 @@ pub async fn run_leg() -> Result<()> {
     let policies_sql = tokio::fs::read_to_string(demo.join("policies.sql"))
         .await
         .context("reading the demo policies")?;
-    let bundle =
-        connetto_schema::translate::<String, connetto_schema::TextIds>(&schema_sql, &policies_sql)
-            .map_err(|err| anyhow!("the demo schema does not translate: {err}"))?;
+    let roles_sql = tokio::fs::read_to_string(demo.join("roles.sql"))
+        .await
+        .context("reading the demo roles")?;
+    let bundle = connetto_schema::translate::<String, connetto_schema::TextIds>(
+        connetto_schema::Documents::new(
+            &schema_sql,
+            &policies_sql,
+            &roles_sql,
+            crate::stack::DEMO_DEPLOYMENT.reader_role,
+        ),
+    )
+    .map_err(|err| anyhow!("the demo schema does not translate: {err}"))?;
 
     tokio::fs::create_dir_all(&data_dir)
         .await
@@ -680,7 +689,9 @@ fn pump_event(event: ClientEvent, fatal: &tokio::sync::mpsc::UnboundedSender<Str
 fn short_identity(identity: &connetto_core::device_cert::DeviceIdentity) -> String {
     let key = identity.key().to_string();
     let prefix = key.get(..8).unwrap_or_default();
-    format!("{}/{prefix}", identity.account())
+    let account = identity.account();
+    let short = account.split('-').next().unwrap_or(account);
+    format!("{short}/{prefix}")
 }
 
 /// The beacon's answer fields, advertising with its prefix or off with its
@@ -700,7 +711,7 @@ fn nearby_entries(hosts: &[connetto_client::NearbyHost]) -> Vec<serde_json::Valu
         .map(|host| {
             json!({
                 "host": host.host,
-                "prefix": host.prefix.map(hex_prefix),
+                "prefix": hex_prefix(host.prefix),
                 "rssi": host.rssi,
             })
         })
@@ -1162,7 +1173,10 @@ impl LegClient {
         let deadline = Instant::now() + bound;
         loop {
             let linked = self.linked().await?;
-            if linked.iter().any(|held| held == peer) {
+            if linked
+                .iter()
+                .any(|held| crate::peer_devices::same_peer(held, peer))
+            {
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -1182,7 +1196,10 @@ impl LegClient {
         let deadline = Instant::now() + LINK_END_BOUND;
         loop {
             let linked = self.linked().await?;
-            if !linked.iter().any(|held| held == peer) {
+            if !linked
+                .iter()
+                .any(|held| crate::peer_devices::same_peer(held, peer))
+            {
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -1193,14 +1210,13 @@ impl LegClient {
     }
 
     /// Hold until the leg's scan stands the host whose beacon carries
-    /// `prefix` and it alone, which the beacon join names to the walk, with
-    /// `None` for an Apple host, whose beacon carries no prefix.
+    /// `prefix` and it alone, which the beacon join names to the walk.
     ///
     /// # Errors
     ///
     /// When the leg never stands a lone host with the prefix within the
     /// bound.
-    pub async fn wait_nearby(&self, prefix: Option<&str>) -> Result<u64> {
+    pub async fn wait_nearby(&self, prefix: &str) -> Result<u64> {
         let deadline = Instant::now() + NEARBY_BOUND;
         loop {
             let hosts = self.nearby().await?;
@@ -1209,7 +1225,7 @@ impl LegClient {
             }
             if Instant::now() >= deadline {
                 bail!(
-                    "the leg never stood a lone host with the beacon prefix {prefix:?}, \
+                    "the leg never stood a lone host with the beacon prefix {prefix}, \
                      it stands: {hosts:?}"
                 );
             }
@@ -1463,13 +1479,12 @@ async fn end_leg_app() {
     }
 }
 
-/// One `codesign` call, named with its refusal on failure.
+/// One `codesign` call on `path`, named with its refusal on failure.
 ///
 /// # Errors
 ///
-/// When `codesign` refuses.
-#[cfg(target_os = "macos")]
-async fn codesign(args: &[&str], path: &Path) -> Result<()> {
+/// When `codesign` cannot start or refuses.
+pub async fn codesign(args: &[&str], path: &Path) -> Result<()> {
     let output = Command::new("codesign")
         .args(args)
         .arg(path)
@@ -1659,12 +1674,12 @@ mod tests {
         let hosts = [
             connetto_client::NearbyHost {
                 host: 7,
-                prefix: Some([9; 8]),
+                prefix: [9; 8],
                 rssi: Some(-55),
             },
             connetto_client::NearbyHost {
                 host: 8,
-                prefix: None,
+                prefix: [8; 8],
                 rssi: None,
             },
         ];
@@ -1672,7 +1687,7 @@ mod tests {
             super::nearby_entries(&hosts),
             vec![
                 serde_json::json!({ "host": 7, "prefix": "0909090909090909", "rssi": -55 }),
-                serde_json::json!({ "host": 8, "prefix": null, "rssi": null }),
+                serde_json::json!({ "host": 8, "prefix": "0808080808080808", "rssi": null }),
             ]
         );
         assert_eq!(super::nearby_entries(&[]), Vec::<serde_json::Value>::new());

@@ -2,39 +2,46 @@
 //! client over, minted devices on loopback nodes, and a media port over a
 //! bare node.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use connetto_client::SyncSchema;
 use connetto_client::live::ConnettoClient;
 use connetto_client::media::{MediaEvent, MediaPort};
 use connetto_client::peer::PeerAuthor;
-use connetto_core::Major;
-use connetto_core::device_cert::AttestationLevel;
+use connetto_core::clock::DEVICE_SKEW;
+use connetto_core::device_cert::{AttestationLevel, DeviceIdentity};
 use connetto_core::exchange::ManifestRow;
+use connetto_core::messages::{BulkMessage, LivePatch};
 use connetto_core::schema::SchemaBundle;
+use connetto_core::traits::IncomingFrame;
+use connetto_core::{Cursor, Major};
 use connetto_exchange::media::{MAX_PIECE_BYTES, Media};
 use connetto_file_client::{ContentClient, FsStore, MimeClass};
-use connetto_file_core::{FileId, MemStore, encode_range, process_file_with_outboard};
+use connetto_file_core::{FileId, Manifest, MemStore, encode_range, process_file_with_outboard};
 use connetto_peer::test_support::{DAY, Deployment, Issuer, Peer, node, serve, whole_second};
 use connetto_peer::{CloseReason, Node, PeerEvent};
 use diesel::prelude::*;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
+use sqlite_diff_rs::{DiffOps, PatchSet, PatchsetFormat, SimpleTable, Update, Value};
 use tokio::sync::mpsc;
 
 use crate::support::{RecordingHttp, Scripted, attach_content, cold_over, started};
 
-/// A photo table with a thumbnail column, each person reading only their own
-/// rows, which the device, signed in as the suite's tester, curates whole.
+/// A photo table with a thumbnail column and the state column the server's
+/// setter writes, each person reading only their own rows, which the device,
+/// signed in as the suite's tester, curates whole.
 const PHOTO_SCHEMA: &str = "-- connetto:major 1\n \
                             CREATE TABLE photos (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, \
-                            content_id BYTEA NOT NULL, thumb_id BYTEA); \
+                            content_id BYTEA NOT NULL, thumb_id BYTEA, content_state TEXT); \
                             ALTER TABLE photos ENABLE ROW LEVEL SECURITY;";
 
 const PHOTO_POLICIES: &str = "CREATE POLICY photos_read ON photos FOR SELECT \
                               USING (owner = current_setting('app.user_id', true)); \
                               CREATE POLICY photos_curate ON photos FOR SELECT \
-                              USING (current_setting('app.user_id', true) = 'tester'); \
+                              USING (current_setting('app.user_id', true) IN ('tester', 'curator')); \
                               CREATE POLICY photos_insert ON photos FOR INSERT WITH CHECK (true); \
                               CREATE POLICY photos_update ON photos FOR UPDATE USING (true) \
                               WITH CHECK (true);";
@@ -50,6 +57,93 @@ diesel::table! {
         content_id -> Binary,
         /// The photo's thumbnail, a file of its own.
         thumb_id -> Nullable<Binary>,
+        /// What the server holds of the file, written by its setter.
+        content_state -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    /// The copies a device holds in custody for another device's rows.
+    _connetto_content_custody (file_id) {
+        /// The held file.
+        file_id -> Binary,
+        /// `held`, or `leaving` or `pressed` for a copy marked leaving.
+        state -> Text,
+    }
+}
+
+/// Writes `state` into `file_id`'s custody record on `client`, as placement
+/// does when it marks the copy leaving or withdraws the mark.
+pub async fn set_custody_state(client: &ConnettoClient<Scripted>, file_id: FileId, state: &str) {
+    let state = state.to_owned();
+    let written = client
+        .with_conn(move |conn| {
+            diesel::update(_connetto_content_custody::table)
+                .filter(_connetto_content_custody::file_id.eq(file_id.as_bytes().to_vec()))
+                .set(_connetto_content_custody::state.eq(state))
+                .execute(conn.conn())
+        })
+        .await
+        .expect("the replica is open")
+        .expect("write the custody state");
+    assert_eq!(written, 1, "the file is in custody");
+}
+
+/// The state of `file_id`'s custody copy on `client`, `None` for none.
+pub async fn custody_state(client: &ConnettoClient<Scripted>, file_id: FileId) -> Option<String> {
+    client
+        .with_conn(move |conn| {
+            _connetto_content_custody::table
+                .filter(_connetto_content_custody::file_id.eq(file_id.as_bytes().to_vec()))
+                .select(_connetto_content_custody::state)
+                .first::<String>(conn.conn())
+                .optional()
+        })
+        .await
+        .expect("the replica is open")
+        .expect("read the custody record")
+}
+
+diesel::table! {
+    /// The chunk rows of every manifest a device holds.
+    _connetto_content_chunks (file_id, ordinal) {
+        /// The file.
+        file_id -> Binary,
+        /// The chunk's place in the file.
+        ordinal -> BigInt,
+    }
+}
+
+/// How many chunk rows of `file_id`'s manifest `client` holds.
+pub async fn held_chunks(client: &ConnettoClient<Scripted>, file_id: FileId) -> i64 {
+    client
+        .with_conn(move |conn| {
+            _connetto_content_chunks::table
+                .filter(_connetto_content_chunks::file_id.eq(file_id.as_bytes().to_vec()))
+                .count()
+                .get_result(conn.conn())
+        })
+        .await
+        .expect("the replica is open")
+        .expect("count the chunk rows")
+}
+
+diesel::table! {
+    /// connetto's record of each peer author's last verified offer, whose
+    /// certificate end the custody proofs move into the past.
+    _connetto_peer_cursor (author) {
+        /// The author's key id.
+        author -> Binary,
+        /// The author's account.
+        account -> Text,
+        /// The last verified sequence.
+        seq -> BigInt,
+        /// The chain hash at it.
+        head -> Binary,
+        /// The author's verified offer.
+        offer -> Binary,
+        /// The author's certificate end, in Unix seconds.
+        expires_at -> BigInt,
     }
 }
 
@@ -96,24 +190,91 @@ impl Devices {
     }
 }
 
+/// The number of `node`'s live link to `peer`.
+pub fn link_to(node: &Node, peer: &DeviceIdentity) -> u64 {
+    node.linked()
+        .into_iter()
+        .find(|link| &link.peer == peer)
+        .and_then(|link| link.link)
+        .expect("the peer is linked")
+}
+
+/// The media event the enrolment task forwards for `event`, `None` for one
+/// it keeps to itself.
+fn forwarded(event: PeerEvent) -> Option<MediaEvent> {
+    Some(match event {
+        PeerEvent::Linked {
+            peer,
+            link,
+            bot_list,
+            ..
+        }
+        | PeerEvent::LinkReplaced {
+            peer,
+            link,
+            bot_list,
+            ..
+        } => MediaEvent::Linked {
+            peer,
+            link,
+            bot_list,
+        },
+        PeerEvent::Unlinked { peer, .. } => MediaEvent::Unlinked { peer },
+        PeerEvent::Media {
+            peer,
+            link,
+            message,
+        } => MediaEvent::Message {
+            peer,
+            link,
+            message,
+        },
+        _ => return None,
+    })
+}
+
 /// A media port over a bare node, fed the link events and media frames the
 /// enrolment task would forward.
-pub fn port(node: Node, mut events: mpsc::UnboundedReceiver<PeerEvent>) -> MediaPort {
-    let (tx, rx) = mpsc::unbounded_channel();
+pub fn port(node: Node, events: mpsc::UnboundedReceiver<PeerEvent>) -> MediaPort {
+    relay(node, events).port()
+}
+
+/// Media ports over one bare node, the latest taken fed what the enrolment
+/// task would forward, so a proof can start a device's media driver again
+/// on links that stay up.
+pub struct Relay {
+    node: Node,
+    to: Arc<Mutex<Option<mpsc::UnboundedSender<MediaEvent>>>>,
+}
+
+impl Relay {
+    /// The node the relay feeds from.
+    pub fn node(&self) -> &Node {
+        &self.node
+    }
+
+    /// A fresh port, which takes the events from here on.
+    pub fn port(&self) -> MediaPort {
+        let (tx, rx) = mpsc::unbounded_channel();
+        *self.to.lock() = Some(tx);
+        MediaPort::over(self.node.clone(), rx)
+    }
+}
+
+/// A relay over `node` and its `events`.
+pub fn relay(node: Node, mut events: mpsc::UnboundedReceiver<PeerEvent>) -> Relay {
+    let to: Arc<Mutex<Option<mpsc::UnboundedSender<MediaEvent>>>> = Arc::default();
+    let feeding = Arc::clone(&to);
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
-            let forwarded = match event {
-                PeerEvent::Linked { peer, bot_list, .. } => MediaEvent::Linked { peer, bot_list },
-                PeerEvent::Unlinked { peer, .. } => MediaEvent::Unlinked { peer },
-                PeerEvent::Media { peer, message } => MediaEvent::Message { peer, message },
-                _ => continue,
-            };
-            if tx.send(forwarded).is_err() {
-                return;
+            if let Some(event) = forwarded(event)
+                && let Some(port) = feeding.lock().as_ref()
+            {
+                let _ = port.send(event);
             }
         }
     });
-    MediaPort::over(node, rx)
+    Relay { node, to }
 }
 
 /// A replica over the photo policies, with `transport` attached when one is
@@ -122,10 +283,23 @@ pub async fn replica(
     dir: &std::path::Path,
     transport: Option<Scripted>,
 ) -> (ConnettoClient<Scripted>, Device) {
+    replica_with(dir, transport, RecordingHttp::default()).await
+}
+
+/// [`replica`] whose content client speaks HTTP through `http`.
+pub async fn replica_with(
+    dir: &std::path::Path,
+    transport: Option<Scripted>,
+    http: RecordingHttp,
+) -> (ConnettoClient<Scripted>, Device) {
     let schema = SyncSchema::new(
         connetto_schema::translate::<String, connetto_core::bots::TextIds>(
-            PHOTO_SCHEMA,
-            PHOTO_POLICIES,
+            connetto_schema::Documents::new(
+                PHOTO_SCHEMA,
+                PHOTO_POLICIES,
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
+            ),
         )
         .expect("translate the photo schema"),
     );
@@ -134,12 +308,7 @@ pub async fn replica(
         conn.attach(transport).await.expect("attach the transport");
     }
     let client = started(conn);
-    let content = attach_content(
-        client.clone(),
-        &dir.join("chunks"),
-        RecordingHttp::default(),
-    )
-    .await;
+    let content = attach_content(client.clone(), &dir.join("chunks"), http).await;
     (client, content)
 }
 
@@ -157,6 +326,108 @@ pub async fn declare(
         .await
         .expect("declare the content column");
     (client, content)
+}
+
+/// `device` with `photos.content_id` declared and replicated to three
+/// copies, acknowledged by `photos.content_state`.
+pub async fn declare_replicated(
+    (client, content): (ConnettoClient<Scripted>, Device),
+) -> (ConnettoClient<Scripted>, Device) {
+    let content = content
+        .with_peer_content("photos", "content_id")
+        .replicate(3, "content_state")
+        .await
+        .expect("declare the replicated column");
+    (client, content)
+}
+
+/// Writes `state` into photo `id`'s state column straight on the replica,
+/// for a proof that runs the retention pass itself.
+pub async fn set_state(client: &ConnettoClient<Scripted>, id: i64, state: &str) {
+    let state = state.to_owned();
+    client
+        .with_conn(move |conn| {
+            diesel::update(photos::table.filter(photos::id.eq(id)))
+                .set(photos::content_state.eq(state))
+                .execute(conn.conn())
+        })
+        .await
+        .expect("the replica is open")
+        .expect("write the state");
+}
+
+/// Delivers the server setter's write of `state` into photo `id`'s state
+/// column as a live patch at `cursor`, the way sync carries it.
+pub fn deliver_state(server: &Scripted, cursor: u8, id: i64, state: &str) {
+    let schema = SimpleTable::new(
+        "photos",
+        &[
+            ("id", ""),
+            ("owner", ""),
+            ("content_id", ""),
+            ("thumb_id", ""),
+            ("content_state", ""),
+        ],
+        &[0],
+    );
+    let update = Update::<_, PatchsetFormat, String, Vec<u8>>::from(schema)
+        .set(0, Value::Integer(id))
+        .expect("set the key")
+        .set(4, Value::Text(state.to_owned()))
+        .expect("set the state");
+    let patch = PatchSet::<SimpleTable, String, Vec<u8>>::new()
+        .update(update)
+        .build();
+    server.say(IncomingFrame::Bulk(BulkMessage::LivePatch(LivePatch::new(
+        "custody".to_owned(),
+        Cursor::new(vec![cursor]),
+        zstd::encode_all(patch.as_slice(), 3).expect("compress the patch"),
+    ))));
+}
+
+/// Records a cursor for `author` whose certificate end puts its lapse,
+/// the end plus `DEVICE_SKEW`, `seconds` from now, negative for the past.
+pub async fn lapse_in(client: &ConnettoClient<Scripted>, author: &PeerAuthor, seconds: i64) {
+    let author = author.clone();
+    client
+        .with_conn(move |conn| {
+            let now = i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("after the epoch")
+                    .as_secs(),
+            )
+            .expect("a Unix time fits");
+            let skew = i64::try_from(DEVICE_SKEW.as_secs()).expect("the skew fits");
+            diesel::replace_into(_connetto_peer_cursor::table)
+                .values((
+                    _connetto_peer_cursor::author.eq(author.key_id),
+                    _connetto_peer_cursor::account.eq(author.account),
+                    _connetto_peer_cursor::seq.eq(1),
+                    _connetto_peer_cursor::head.eq(vec![0; 32]),
+                    _connetto_peer_cursor::offer.eq(Vec::<u8>::new()),
+                    _connetto_peer_cursor::expires_at.eq(now + seconds - skew),
+                ))
+                .execute(conn.conn())
+        })
+        .await
+        .expect("the replica is open")
+        .expect("store the cursor");
+}
+
+/// Every media message a bare node receives, as it arrives.
+pub fn listener(mut events: mpsc::UnboundedReceiver<PeerEvent>) -> mpsc::UnboundedReceiver<Media> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            if let PeerEvent::Media { message, .. } = event
+                && tx.send(message).is_err()
+            {
+                return;
+            }
+        }
+    });
+    rx
 }
 
 /// Stages `bytes` as photo `id` owned by `owner`.
@@ -214,21 +485,42 @@ pub async fn hand_over(client: &ConnettoClient<Scripted>, id: i64, owner: &str) 
     assert_eq!(now, owner);
 }
 
-/// Runs `proof` beside `device`'s media driver.
+/// Runs `proof` beside `device`'s media driver, the driver polled first so
+/// it is up before the proof's first step, which another worker thread can
+/// carry to its end within one poll.
 pub async fn beside(device: &Device, port: MediaPort, proof: impl Future<Output = ()>) {
     tokio::select! {
+        biased;
         () = device.drive_media(port) => panic!("the port ended under the proof"),
         () = proof => {}
     }
 }
 
-/// Runs `proof` beside the media drivers of two devices.
+/// Runs `proof` beside the media drivers of every device in `drivers`,
+/// each polled before the proof as [`beside`] polls its one.
+pub async fn beside_all(drivers: Vec<(&Device, MediaPort)>, proof: impl Future<Output = ()>) {
+    let mut running: futures_util::stream::FuturesUnordered<_> = drivers
+        .into_iter()
+        .map(|(device, port)| device.drive_media(port))
+        .collect();
+    tokio::select! {
+        biased;
+        Some(()) = futures_util::StreamExt::next(&mut running) => {
+            panic!("a port ended under the proof")
+        }
+        () = proof => {}
+    }
+}
+
+/// Runs `proof` beside the media drivers of two devices, both polled before
+/// the proof as [`beside`] polls its one.
 pub async fn beside_both(
     (first, first_port): (&Device, MediaPort),
     (second, second_port): (&Device, MediaPort),
     proof: impl Future<Output = ()>,
 ) {
     tokio::select! {
+        biased;
         () = first.drive_media(first_port) => panic!("the first port ended under the proof"),
         () = second.drive_media(second_port) => panic!("the second port ended under the proof"),
         () = proof => {}
@@ -244,87 +536,132 @@ pub enum Fault {
     ForgePiece,
     /// It names every chunk by a hash the chunk does not have.
     LieInManifest,
+    /// It answers with another file's genuine chunks.
+    WrongFileManifest,
     /// It closes every link at its second `Fetch`.
     DropAtSecondFetch,
     /// It answers every request `Busy`.
     AlwaysBusy,
+    /// It answers its first request `Busy` and serves the file after.
+    BusyFirst,
     /// It answers nothing.
     Silent,
     /// It names a chunk of no bytes.
     EmptyChunk,
-    /// It sends more manifest rows than a manifest may hold, in two runs.
+    /// It exceeds the manifest bound before sending its final run.
     TooManyRows,
+    /// It waits [`SLOW_PIECE`] before sending each encoded range, a link
+    /// far slower than loopback.
+    Slow,
+}
+
+/// How long a [`Fault::Slow`] holder takes over each range it sends.
+pub const SLOW_PIECE: Duration = Duration::from_millis(250);
+
+/// The peer, link and message of a media event, `None` for any other.
+fn media_of(event: PeerEvent) -> Option<(DeviceIdentity, u64, Media)> {
+    match event {
+        PeerEvent::Media {
+            peer,
+            link,
+            message,
+        } => Some((peer, link, message)),
+        _ => None,
+    }
 }
 
 /// A bare node serving `bytes` as a holder would, chunked as the generic
 /// class chunks it, with `fault`, answering the requests it records.
 pub fn bare_holder(
     node: Node,
-    mut events: mpsc::UnboundedReceiver<PeerEvent>,
+    events: mpsc::UnboundedReceiver<PeerEvent>,
     bytes: Vec<u8>,
     fault: Fault,
 ) -> Arc<Mutex<Vec<Media>>> {
+    bare_holder_of(node, events, vec![bytes], fault).0
+}
+
+/// A bare node serving each of `files` as a holder would, chunked as the
+/// generic class chunks it, with `fault`, answering the requests it records
+/// and refusing one naming a file it lacks, with the inbox every message it
+/// receives also arrives in.
+pub fn bare_holder_of(
+    node: Node,
+    mut events: mpsc::UnboundedReceiver<PeerEvent>,
+    files: Vec<Vec<u8>>,
+    fault: Fault,
+) -> (Arc<Mutex<Vec<Media>>>, mpsc::UnboundedReceiver<Media>) {
     let asked = Arc::new(Mutex::new(Vec::new()));
     let record = Arc::clone(&asked);
+    let (inbox, received) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         let store = MemStore::new();
-        let (manifest, outboard) =
-            process_file_with_outboard(bytes.as_slice(), MimeClass::Generic, &store)
-                .await
-                .expect("chunk the file");
+        let mut held = HashMap::new();
+        for bytes in files {
+            let (manifest, outboard) =
+                process_file_with_outboard(bytes.as_slice(), MimeClass::Generic, &store)
+                    .await
+                    .expect("chunk the file");
+            held.insert(*manifest.file_id().as_bytes(), (manifest, outboard));
+        }
         let mut fetches = 0;
+        let mut busy = fault == Fault::AlwaysBusy || fault == Fault::BusyFirst;
         while let Some(event) = events.recv().await {
-            let PeerEvent::Media { peer, message } = event else {
+            let Some((peer, link, message)) = media_of(event) else {
                 continue;
             };
             record.lock().push(message.clone());
-            let request_id = message.request_id();
+            let _ = inbox.send(message.clone());
+            let Some(request_id) = message.request_id() else {
+                continue;
+            };
+            let lacks = match &message {
+                Media::Want { file_id, .. } | Media::Fetch { file_id, .. } => {
+                    !held.contains_key(file_id)
+                }
+                _ => false,
+            };
             match (fault, message) {
                 (Fault::Silent, _) => {}
-                (Fault::AlwaysBusy, _) => {
-                    let _ = node.send_media(&peer, Media::Busy { request_id }).await;
+                _ if lacks => {
+                    let _ = node
+                        .send_media(&peer, link, Media::Refused { request_id })
+                        .await;
+                }
+                _ if busy => {
+                    busy = fault == Fault::AlwaysBusy;
+                    let _ = node
+                        .send_media(&peer, link, Media::Busy { request_id })
+                        .await;
                 }
                 (Fault::TooManyRows, Media::Want { .. }) => {
-                    for last in [false, true] {
+                    for last in [false, false, true] {
                         let run = Media::Manifest {
                             request_id,
                             chunks: vec![([7; 32], 1); 5_000],
                             last,
+                            owner: None,
                         };
-                        let _ = node.send_media(&peer, run).await;
+                        let _ = node.send_media(&peer, link, run).await;
                     }
                 }
-                (_, Media::Want { .. }) => {
-                    let chunks = manifest
-                        .chunks()
-                        .iter()
-                        .map(|chunk| {
-                            let mut hash = *chunk.hash.as_bytes();
-                            if fault == Fault::LieInManifest {
-                                hash[0] ^= 1;
-                            }
-                            let len = if fault == Fault::EmptyChunk {
-                                0
-                            } else {
-                                chunk.len
-                            };
-                            (hash, len)
-                        })
-                        .collect();
+                (_, Media::Want { file_id, .. }) => {
+                    let manifest = requested_manifest(&held, &file_id, fault);
                     let run = Media::Manifest {
                         request_id,
-                        chunks,
+                        chunks: manifest_rows(manifest, fault),
                         last: true,
+                        owner: None,
                     };
-                    let _ = node.send_media(&peer, run).await;
+                    let _ = node.send_media(&peer, link, run).await;
                 }
                 (
                     _,
                     Media::Fetch {
                         request_id,
+                        file_id,
                         start,
                         len,
-                        ..
                     },
                 ) => {
                     fetches += 1;
@@ -332,30 +669,85 @@ pub fn bare_holder(
                         node.stop(CloseReason::Closed);
                         return;
                     }
+                    let (manifest, outboard) = &held[&file_id];
                     let mut encoded = Vec::new();
-                    encode_range(&manifest, &store, &outboard, start, len, &mut encoded)
+                    encode_range(manifest, &store, outboard, start, len, &mut encoded)
                         .await
                         .expect("encode the range");
                     if fault == Fault::ForgePiece {
                         let middle = encoded.len() / 2;
                         encoded[middle] ^= 1;
                     }
-                    let pieces: Vec<&[u8]> = encoded.chunks(MAX_PIECE_BYTES).collect();
-                    let last = pieces.len() - 1;
-                    for (index, piece) in pieces.into_iter().enumerate() {
-                        let piece = Media::Piece {
-                            request_id,
-                            encoded: piece.to_vec(),
-                            last: index == last,
-                        };
-                        let _ = node.send_media(&peer, piece).await;
+                    if fault == Fault::Slow {
+                        // The delay is the slow link the receiver measures.
+                        tokio::time::sleep(SLOW_PIECE).await;
                     }
+                    send_pieces(&node, &peer, link, request_id, &encoded).await;
                 }
                 _ => {}
             }
         }
     });
-    asked
+    (asked, received)
+}
+
+/// Sends `encoded` to `peer` over `link` as the pieces answering
+/// `request_id`.
+async fn send_pieces(
+    node: &Node,
+    peer: &DeviceIdentity,
+    link: u64,
+    request_id: u64,
+    encoded: &[u8],
+) {
+    let pieces: Vec<&[u8]> = encoded.chunks(MAX_PIECE_BYTES).collect();
+    let last = pieces.len() - 1;
+    for (index, piece) in pieces.into_iter().enumerate() {
+        let piece = Media::Piece {
+            request_id,
+            encoded: piece.to_vec(),
+            last: index == last,
+        };
+        let _ = node.send_media(peer, link, piece).await;
+    }
+}
+
+/// The manifest rows a bare holder with `fault` sends for `manifest`.
+fn manifest_rows(manifest: &Manifest, fault: Fault) -> Vec<([u8; 32], u64)> {
+    manifest
+        .chunks()
+        .iter()
+        .map(|chunk| {
+            let mut hash = *chunk.hash.as_bytes();
+            if fault == Fault::LieInManifest {
+                hash[0] ^= 1;
+            }
+            let len = if fault == Fault::EmptyChunk {
+                0
+            } else {
+                chunk.len
+            };
+            (hash, len)
+        })
+        .collect()
+}
+
+/// The requested file's manifest, or another file's under the substitution fault.
+fn requested_manifest<'a>(
+    held: &'a HashMap<[u8; 32], (Manifest, connetto_file_core::Outboard)>,
+    file_id: &[u8; 32],
+    fault: Fault,
+) -> &'a Manifest {
+    if fault == Fault::WrongFileManifest {
+        &held
+            .iter()
+            .find(|(id, _)| *id != file_id)
+            .expect("another file")
+            .1
+            .0
+    } else {
+        &held[file_id].0
+    }
 }
 
 /// How many `Want` requests a bare holder saw.
@@ -382,7 +774,7 @@ pub fn fetches(asked: &Mutex<Vec<Media>>) -> Vec<(u64, u64)> {
 /// The photo table on an author's plain replica, the columns the policy
 /// table has.
 const PLAIN_PHOTOS: &str = "CREATE TABLE photos (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, \
-                            content_id BLOB NOT NULL, thumb_id BLOB)";
+                            content_id BLOB NOT NULL, thumb_id BLOB, content_state TEXT)";
 
 /// One captured queue entry's body.
 #[derive(QueryableByName)]

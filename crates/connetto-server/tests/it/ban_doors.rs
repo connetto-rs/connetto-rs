@@ -20,8 +20,10 @@ use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::bb8::Pool;
 use tokio::net::TcpListener;
 
-use super::e2e::{PG_SERIAL, audit_ops, exec, mint_tokens, reset_fixture};
 use super::lifecycle::{admin_pool, builder_over, live_session, next_control, wait_ready};
+use connetto_test_harness::server_fixture::{
+    PG_SERIAL, audit_ops, exec, mint_tokens, reset_fixture,
+};
 
 /// How long a ban's consequences may take to land.
 const SETTLE: Duration = Duration::from_secs(10);
@@ -77,10 +79,7 @@ async fn served(fixture: &Fixture) -> Served {
         change_stream,
         handle,
         ..
-    } = builder
-        .bans(true)
-        .abuse(two_strikes())
-        .build()
+    } = Box::pin(builder.bans(true).abuse(two_strikes()).build())
         .await
         .expect("the deployment assembles");
     let stream = tokio::spawn(async move {
@@ -234,13 +233,12 @@ async fn a_ban_in_the_store_alone_refuses_refresh_sign_in_and_liveness() {
         .await
         .expect("live")
         .session_id;
-    pg_ban_store::<ConnettoDefaults>(served.pool.clone())
-        .impose(NewBan::starting_now(
-            user,
-            session,
-            "the operator's call",
-            None,
-        ))
+    let mut owner = served.pool.get().await.expect("owner connection");
+    pg_ban_store::<ConnettoDefaults>()
+        .impose(
+            &mut owner,
+            NewBan::starting_now(user, session, "the operator's call", None),
+        )
         .await
         .expect("impose a ban");
 

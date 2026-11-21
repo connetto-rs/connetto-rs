@@ -13,6 +13,7 @@ use axum::{Router, extract::DefaultBodyLimit, routing};
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::bb8::Pool;
 
+use crate::error::ServerError;
 use crate::preflight::PreflightError;
 use crate::schema::ConnettoFileSchema;
 use crate::store::AnyStore;
@@ -57,9 +58,62 @@ pub struct Config<S: ConnettoFileSchema> {
     /// The cached deployment totals behind the ceiling checks, refreshed by
     /// the task `serve` spawns whenever any ceiling is configured.
     pub ceilings: crate::quotas::CeilingCache,
+    /// Hears every carried upload once its commit is durable (R79 decision
+    /// 17), `None` to record nothing.
+    pub on_carried: Option<CarriedObserver>,
+    /// Answers whether the login session a ticket names is still live, asked
+    /// on every ticketed request before any pool connection is taken, so a
+    /// logout or a revocation ends the session's tickets at their next
+    /// request. A ticket naming no session is never asked about.
+    pub sessions: Arc<dyn connetto_core::SessionLiveness>,
     /// Carries the schema type without a runtime value.
     pub _schema: PhantomData<fn() -> S>,
 }
+
+impl<S: ConnettoFileSchema> Config<S> {
+    /// Verify `token` for `verb` and confirm the login session it names is
+    /// still live, the admission every ticketed endpoint runs first.
+    ///
+    /// A session that ended answers [`ServerError::NotFound`], the answer for
+    /// a file the caller may not see, so a refusal says nothing about the
+    /// session.
+    ///
+    /// # Errors
+    ///
+    /// [`ServerError::Ticket`] for a ticket that does not verify,
+    /// [`ServerError::NotFound`] for a session that ended, and
+    /// [`ServerError::Liveness`] when the store cannot answer.
+    pub(crate) async fn admit(
+        &self,
+        token: &str,
+        verb: crate::ticket::Verb,
+    ) -> Result<crate::ticket::TicketPayload, ServerError> {
+        let ticket = self.verifier.verify_verb(token, verb)?;
+        if let Some(session) = ticket.caller.session()
+            && !self.sessions.session_is_live(session).await?
+        {
+            return Err(ServerError::NotFound);
+        }
+        Ok(ticket)
+    }
+}
+
+/// One carried upload whose commit is durable: a device of another account
+/// uploaded the file for its owner (R79 decision 17).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CarriedCommit {
+    /// The committed file.
+    pub file_id: [u8; 32],
+    /// The account the file was uploaded for, which the manifest records.
+    pub owner: String,
+    /// The carrier's account.
+    pub carrier: String,
+    /// The carrier's login session, the one its ticket names.
+    pub session: connetto_core::SessionId,
+}
+
+/// What a deployment hears each [`CarriedCommit`] through.
+pub type CarriedObserver = Arc<dyn Fn(CarriedCommit) + Send + Sync>;
 
 /// Shared state pointer passed to every axum handler.
 pub type AppState<S> = Arc<Config<S>>;

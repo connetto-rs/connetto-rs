@@ -14,7 +14,8 @@ use std::time::Duration;
 use connetto_core::messages::ControlMessage;
 use connetto_server::{PgSnapshotSource, RlsAuth, RuntimeWritableCatalog};
 use connetto_test_harness::{
-    Fixture, HarnessAuth, ServerConfig, insert_changeset, pool_for, spawn_server, with_user,
+    Fixture, HarnessAuth, ServerConfig, engine_ddl, insert_changeset, pool_for, spawn_server,
+    with_user,
 };
 use diesel::{QueryDsl, SelectableHelper};
 use diesel_async::AsyncPgConnection;
@@ -93,9 +94,13 @@ async fn write_lands_under_rls_and_fans_out_over_cdc() {
         )
         .await;
     let writer_pool = pool_for(&with_user(fixture.admin_url(), "app_writer", "app_writer")).await;
-    let snapshot =
-        PgSnapshotSource::from_ddl(writer_pool.clone(), PG_DDL).expect("snapshot source");
-    let auth = HarnessAuth::rls(RlsAuth::from_ddl(writer_pool.clone(), PG_DDL).expect("rls auth"));
+    // The one catalog the server parts read, the way the harness appends it
+    // inside `spawn_server` (R77 decision 11).
+    let snapshot = PgSnapshotSource::from_ddl(writer_pool.clone(), &engine_ddl(PG_DDL))
+        .expect("snapshot source");
+    let auth = HarnessAuth::rls(
+        RlsAuth::from_ddl(writer_pool.clone(), &engine_ddl(PG_DDL)).expect("rls auth"),
+    );
     let server = spawn_server(
         ServerConfig::new(PG_DDL, fixture.admin_url())
             .with_policies(POLICIES)

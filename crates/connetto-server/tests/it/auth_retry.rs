@@ -91,7 +91,7 @@ impl SnapshotSource for EmptySnapshot {
     async fn estimate(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &Principal,
     ) -> Result<SnapshotEstimate, Self::Error> {
         Ok(SnapshotEstimate {
@@ -107,7 +107,7 @@ impl SnapshotSource for EmptySnapshot {
     async fn snapshot_page(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _auth: &Principal,
         _page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {
@@ -131,19 +131,32 @@ async fn next_control<T: Transport>(transport: &mut T) -> ControlMessage {
 }
 
 /// The aggregate updates `counter` receives until it goes idle, in order.
-async fn aggregate_updates(counter: &mut Client) -> Vec<Option<String>> {
+async fn aggregate_updates(counter: &mut Client) -> Vec<i64> {
     let mut counts = Vec::new();
     loop {
         let control =
             tokio::time::timeout(Duration::from_millis(500), counter.next_control()).await;
         match control {
             Err(_) => break,
-            Ok(ControlMessage::AggregateUpdate(update)) => counts.push(update.result_json),
+            Ok(ControlMessage::AggregateUpdate(update)) => {
+                counts.push(super::reexec::integer(&update));
+            }
             Ok(ControlMessage::DeliveryPaused { .. } | ControlMessage::DeliveryResumed) => {}
             Ok(other) => panic!("unexpected control {other:?}"),
         }
     }
     counts
+}
+
+/// The first row change `source` produces. The table's relation message leads
+/// the stream and the commit ends it, so both are skipped over.
+async fn first_event(source: &mut PgSqliteEmuSource) -> PgChangeEvent {
+    while let Some(item) = source.next_item().await.expect("poll source") {
+        if let subql::SourceItem::Event(event) = item {
+            return event;
+        }
+    }
+    panic!("the stream ended without a row change");
 }
 
 /// When `may_see` returns an error, `dispatch_event` must return
@@ -216,12 +229,7 @@ async fn dispatch_event_returns_auth_unavailable_and_holds_cursor() {
     source
         .execute_sql("INSERT INTO items (id, data) VALUES (1, 'hello')")
         .expect("execute dml");
-    let event = source
-        .next_item()
-        .await
-        .expect("poll source")
-        .and_then(subql::SourceItem::into_event)
-        .expect("one event");
+    let event = first_event(&mut source).await;
 
     // The key assertion. Before the fix: Ok(()) (error discarded, cursor
     // would advance). After the fix: Err(AuthUnavailable) (cursor held).
@@ -606,12 +614,7 @@ async fn a_row_level_security_outage_holds_the_event() {
     source
         .execute_sql("INSERT INTO items (id, data) VALUES (7, 'held')")
         .expect("execute dml");
-    let event = source
-        .next_item()
-        .await
-        .expect("poll source")
-        .and_then(subql::SourceItem::into_event)
-        .expect("one event");
+    let event = first_event(&mut source).await;
 
     let result = manager.dispatch_event(&event).await;
     assert!(
@@ -785,21 +788,17 @@ async fn an_auth_outage_retry_folds_the_held_event_once() {
     counter
         .subscribe("count", "SELECT COUNT(*) FROM items")
         .await;
+    counter.expect_aggregate_columns("count").await;
     let ControlMessage::AggregateUpdate(seed) = counter.next_control().await else {
         panic!("expected the count seed");
     };
-    assert_eq!(seed.result_json.as_deref(), Some("0"));
+    assert_eq!(super::reexec::integer(&seed), 0);
 
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
     source
         .execute_sql("INSERT INTO items (id, data) VALUES (1, 'held')")
         .expect("execute dml");
-    let insert = source
-        .next_item()
-        .await
-        .expect("poll source")
-        .and_then(subql::SourceItem::into_event)
-        .expect("one event");
+    let insert = first_event(&mut source).await;
     fixture
         .exec("INSERT INTO items (id, data) VALUES (1, 'held')")
         .await;
@@ -813,7 +812,7 @@ async fn an_auth_outage_retry_folds_the_held_event_once() {
     .expect("ingest succeeds after the outage");
 
     let counts = aggregate_updates(&mut counter).await;
-    assert_eq!(counts, [Some("1".to_owned())]);
+    assert_eq!(counts, [1]);
     let live = rows.wait_for_live(Duration::from_secs(5)).await;
     assert_eq!(live.sub_id, "items");
 }
@@ -864,22 +863,18 @@ async fn an_auth_outage_during_the_refusal_verdict_refuses_once_and_folds_once()
     counter
         .subscribe("count", "SELECT COUNT(*) FROM stamps")
         .await;
+    counter.expect_aggregate_columns("count").await;
     let ControlMessage::AggregateUpdate(seed) = counter.next_control().await else {
         panic!("expected the count seed");
     };
-    assert_eq!(seed.result_json.as_deref(), Some("0"));
+    assert_eq!(super::reexec::integer(&seed), 0);
 
     // The event the replica cannot store, stamped the way a committed row arrives.
     let mut source = PgSqliteEmuSource::open_in_memory(STAMPS_PG).expect("open emu source");
     source
         .execute_sql("INSERT INTO stamps (id, at) VALUES (1, 'infinity')")
         .expect("execute dml");
-    let insert = source
-        .next_item()
-        .await
-        .expect("poll source")
-        .and_then(subql::SourceItem::into_event)
-        .expect("one event");
+    let insert = first_event(&mut source).await;
     fixture
         .exec("INSERT INTO stamps (id, at) VALUES (1, 'infinity')")
         .await;
@@ -974,7 +969,7 @@ async fn an_auth_outage_during_the_refusal_verdict_refuses_once_and_folds_once()
     let counts = aggregate_updates(&mut counter).await;
     assert_eq!(
         counts,
-        [Some("1".to_owned()), Some("2".to_owned())],
+        [1, 2],
         "the held event folded once and the later change still arrived"
     );
     let later_live = rows.try_live(Duration::from_millis(500)).await;

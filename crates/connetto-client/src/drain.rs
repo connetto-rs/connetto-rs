@@ -31,6 +31,7 @@ use connetto_core::messages::{
 use connetto_core::messages::{WriterAnswer, WriterOutcome};
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Backoff, Major, RetryPolicy, SchemaVersion};
+use core::sync::atomic::Ordering;
 use core::time::Duration;
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
@@ -49,6 +50,39 @@ use crate::{
 /// doubling to 5 s, for ever.
 static DRAIN_POLICY: std::sync::LazyLock<RetryPolicy> = std::sync::LazyLock::new(RetryPolicy::new);
 
+/// The class of a refused drain or courier dial, the outcomes each caller
+/// maps to its own state.
+pub(crate) enum DrainRefusal {
+    /// The server no longer serves the major at the build's schema.
+    MajorGone,
+    /// The session the dial rode was revoked.
+    SessionRevoked,
+    /// The device's key was revoked.
+    DeviceRevoked,
+    /// The asked writer is unknown or retired, carrying the reason.
+    WriterRefused(FatalErrorReason),
+    /// Anything else, the dial backing off.
+    BackOff,
+}
+
+/// Classify a refused dial's error into its [`DrainRefusal`].
+pub(crate) fn drain_refusal_class(err: &ClientError) -> DrainRefusal {
+    match err {
+        ClientError::UpdateRequired { .. }
+        | ClientError::ServerBehind { .. }
+        | ClientError::SchemaOutdated { .. } => DrainRefusal::MajorGone,
+        ClientError::Refused { reason } => match reason {
+            FatalErrorReason::SessionRevoked => DrainRefusal::SessionRevoked,
+            FatalErrorReason::DeviceRevoked => DrainRefusal::DeviceRevoked,
+            FatalErrorReason::WriterUnknown | FatalErrorReason::WriterRetired => {
+                DrainRefusal::WriterRefused(reason.clone())
+            }
+            _ => DrainRefusal::BackOff,
+        },
+        _ => DrainRefusal::BackOff,
+    }
+}
+
 /// A dial the drain owes, identified so a stale one is recognized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DrainTimer {
@@ -57,10 +91,56 @@ pub struct DrainTimer {
 }
 
 impl DrainTimer {
+    /// A fresh dial identity with its wait.
+    #[must_use]
+    pub const fn new(armed: u64, wait: Duration) -> Self {
+        Self { armed, wait }
+    }
+
     /// How long to wait before dialing.
     #[must_use]
     pub const fn wait(&self) -> Duration {
         self.wait
+    }
+
+    /// The arm count the dial rode on.
+    #[must_use]
+    pub const fn armed(&self) -> u64 {
+        self.armed
+    }
+}
+
+/// The backoff a courier dial owes, the drain's own shape (R78 decision 47).
+#[cfg(feature = "peer")]
+#[derive(Debug)]
+pub(crate) struct OwedDial {
+    /// The wait before the next dial.
+    wait: Duration,
+    /// The backoff the failed dials count on.
+    episode: Backoff<'static>,
+}
+
+#[cfg(feature = "peer")]
+impl OwedDial {
+    /// A fresh dial, waiting nothing, on a fresh episode.
+    pub(crate) fn fresh() -> Self {
+        Self {
+            wait: Duration::ZERO,
+            episode: DRAIN_POLICY.start(),
+        }
+    }
+
+    /// The wait before the next dial.
+    pub(crate) fn wait(&self) -> Duration {
+        self.wait
+    }
+
+    /// Owe the next dial on the backoff.
+    pub(crate) fn back_off(&mut self) {
+        self.wait = self
+            .episode
+            .next_wait()
+            .unwrap_or_else(|| DRAIN_POLICY.max_backoff());
     }
 }
 
@@ -197,6 +277,18 @@ where
     T: Transport,
     T::Error: core::fmt::Display,
 {
+    /// Forget what the drain wire was bound to and had in flight, which
+    /// moves its sent writes back to queued in the unsynced snapshot.
+    fn unbind_drain(&mut self) {
+        self.drain.unbind();
+        self.unsynced_moved.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the drain wire sent `writer`'s held `seq` and awaits its answer.
+    pub(crate) fn drain_sent(&self, writer: &WriterRef, seq: u64) -> bool {
+        self.drain.writer.as_ref() == Some(writer) && self.drain.in_flight.contains(&seq)
+    }
+
     /// Load the oldest held batch and owe a dial for it at once.
     pub(crate) fn load_drain(&mut self) -> Result<(), ClientError> {
         let build = self.config.schema_major;
@@ -245,9 +337,20 @@ where
         }
     }
 
+    /// Cancel the matching dial or attachment and back off its retained work.
+    ///
+    /// Stale timers leave the current attempt unchanged.
+    pub fn cancel_drain_dial(&mut self, timer: DrainTimer) {
+        if self.drain.batch.is_some() && self.drain.armed == timer.armed {
+            self.drain.wire = None;
+            self.unbind_drain();
+            self.drain.back_off();
+        }
+    }
+
     /// The writer the draining major's next write is queued under: the one
     /// holding its entry of the lowest append position.
-    fn drain_writer(&self, major: Major) -> Option<WriterRef> {
+    pub(crate) fn drain_writer(&self, major: Major) -> Option<WriterRef> {
         // A run's entries of the major precede its writer's pending ones.
         if let Some(restore) = self.restore.as_ref()
             && restore
@@ -311,7 +414,7 @@ where
 
     /// What the drain presents for `writer`, or `None` while it is a device
     /// whose bind cannot be signed yet.
-    fn drain_request(
+    pub(crate) fn drain_request(
         &mut self,
         writer: Option<WriterRef>,
     ) -> Result<Option<WriterRequest>, ClientError> {
@@ -342,7 +445,7 @@ where
     /// that key in standing, an issued number when the key is gone, and a
     /// wait while the certificate is outside its window.
     #[cfg(feature = "device-identity")]
-    fn drain_device_request(
+    pub(crate) fn drain_device_request(
         &mut self,
         key_id: [u8; 32],
     ) -> Result<Option<WriterRequest>, ClientError> {
@@ -372,11 +475,49 @@ where
         clippy::unused_self,
         reason = "the device build's body reads the certificate and can fail"
     )]
-    fn drain_device_request(
+    pub(crate) fn drain_device_request(
         &mut self,
         _key_id: [u8; 32],
     ) -> Result<Option<WriterRequest>, ClientError> {
         Ok(Some(crate::issue_request()))
+    }
+
+    /// Present the held major `major` at `version` over `transport`, the
+    /// writer asked as `request` and `settled_through` on, the handshake
+    /// answering with the major's ack.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the clock cannot be read or the handshake cannot
+    /// be exchanged.
+    pub(crate) async fn handshake_majored_wire(
+        &mut self,
+        transport: &mut T,
+        major: Major,
+        version: SchemaVersion,
+        request: WriterRequest,
+        settled_through: Option<u64>,
+    ) -> Result<HandshakeOk, ClientError> {
+        let now = clock::now_secs(&mut self.db)?;
+        let presented = self
+            .config
+            .clone()
+            .with_schema_major(Some(major))
+            .with_schema_version(Some(version));
+        exchange_handshake(
+            transport,
+            HandshakeInput {
+                config: &presented,
+                token_source: self.token_source.as_ref(),
+                resume: None,
+                resume_token: None,
+                writer: request,
+                settled_through,
+                now,
+                cursor_subjects: None,
+            },
+        )
+        .await
     }
 
     /// Present the held major over `transport`, bound to the writer of its
@@ -388,6 +529,8 @@ where
     /// entries to a number the next dial is issued. A revoked session stops
     /// the drain and keeps the rows for teardown. Anything else backs off and
     /// dials again.
+    ///
+    /// After cancelling this future, call [`Self::cancel_drain_dial`] with its timer.
     ///
     /// # Errors
     ///
@@ -423,62 +566,37 @@ where
             }
             WriterRequest::Issue { .. } | WriterRequest::Device => None,
         };
-        let now = clock::now_secs(&mut self.db)?;
-        let presented = self
-            .config
-            .clone()
-            .with_schema_major(Some(major))
-            .with_schema_version(Some(version));
-        let outcome = exchange_handshake(
-            &mut transport,
-            HandshakeInput {
-                config: &presented,
-                token_source: self.token_source.as_ref(),
-                resume: None,
-                resume_token: None,
-                writer: request,
-                settled_through,
-                now,
-                cursor_subjects: None,
-            },
-        )
-        .await;
+        let outcome = self
+            .handshake_majored_wire(&mut transport, major, version, request, settled_through)
+            .await;
         match outcome {
             Ok(ack) => {
                 self.drain.dial = timer.armed;
                 self.drain.wire = Some(transport);
-                self.drain.unbind();
+                self.unbind_drain();
                 self.drain.authorization = DrainAuthorization::Current(self.share_key_generation);
                 self.drain_bound(major, writer, request, ack).await
             }
-            Err(
-                ClientError::UpdateRequired { .. }
-                | ClientError::ServerBehind { .. }
-                | ClientError::SchemaOutdated { .. },
-            ) => self.lose_major(major).await,
-            Err(ClientError::Refused {
-                reason: reason @ (FatalErrorReason::WriterUnknown | FatalErrorReason::WriterRetired),
-            }) => {
-                if let Some(writer) = writer {
-                    self.drain.dead.insert(writer, crate::carry_after(&reason));
+            Err(err) => match drain_refusal_class(&err) {
+                DrainRefusal::MajorGone => self.lose_major(major).await,
+                DrainRefusal::WriterRefused(reason) => {
+                    if let Some(writer) = writer {
+                        self.drain.dead.insert(writer, crate::carry_after(&reason));
+                    }
+                    self.drain.arm(Duration::ZERO);
+                    Ok(())
                 }
-                self.drain.arm(Duration::ZERO);
-                Ok(())
-            }
-            Err(ClientError::Refused {
-                reason: FatalErrorReason::SessionRevoked,
-            }) => Ok(()),
-            Err(ClientError::Refused {
-                reason: FatalErrorReason::DeviceRevoked,
-            }) => {
-                self.exclude_device_writers(crate::Carry::Named)?;
-                self.drain.arm(Duration::ZERO);
-                Ok(())
-            }
-            Err(_) => {
-                self.drain.back_off();
-                Ok(())
-            }
+                DrainRefusal::SessionRevoked => Ok(()),
+                DrainRefusal::DeviceRevoked => {
+                    self.exclude_device_writers(crate::Carry::Named)?;
+                    self.drain.arm(Duration::ZERO);
+                    Ok(())
+                }
+                DrainRefusal::BackOff => {
+                    self.drain.back_off();
+                    Ok(())
+                }
+            },
         }
     }
 
@@ -544,8 +662,9 @@ where
             self.drop_drain_wire().await;
             return Ok(());
         };
-        let opened = keys.open().await?;
-        if *connetto_core::device_cert::key_id(&*opened.key).as_bytes() != key_id {
+        let Some((request_id, signature)) =
+            Self::sign_device_bind(&keys, &challenge, key_id).await?
+        else {
             // The device holds another key now, so the old one's entries move.
             self.drain
                 .dead
@@ -553,14 +672,7 @@ where
             self.drop_drain_wire().await;
             self.drain.arm(Duration::ZERO);
             return Ok(());
-        }
-        let signature = opened
-            .key
-            .sign(&connetto_core::messages::writer_bind_message(&challenge))
-            .map_err(|err| {
-                ClientError::DeviceChip(crate::device_key::ChipError::Failed(Box::new(err)))
-            })?;
-        let request_id = crate::writer_request_id();
+        };
         let Some(wire) = self.drain.wire.as_mut() else {
             return Ok(());
         };
@@ -783,6 +895,7 @@ where
                 return Ok(());
             }
             self.drain.in_flight.insert(seq);
+            self.unsynced_moved.store(true, Ordering::Relaxed);
         }
         self.after_drain_settle(major).await
     }
@@ -836,7 +949,7 @@ where
     /// writer once nothing of the major is left on its own or can still go up.
     async fn after_drain_settle(&mut self, major: Major) -> Result<(), ClientError> {
         if !self.holds_major(major) {
-            if (self.config.held_content.count)(&mut self.db, major)? > 0 {
+            if (self.config.content_hooks.count)(&mut self.db, major)? > 0 {
                 // The content layer's held files still ask for tickets on this wire.
                 return Ok(());
             }
@@ -906,7 +1019,7 @@ where
         }
         let files = {
             let _suspended = ExemptWrites::raise(&self.write_flags);
-            crate::majors::forget_batch(&mut self.db, major, self.config.held_content)?
+            crate::majors::forget_batch(&mut self.db, major, self.config.content_hooks)?
         };
         let mut device_retired = false;
         for writer in hit {
@@ -1006,14 +1119,22 @@ where
         let Some(major) = self.draining_major() else {
             return Ok(());
         };
-        if self.holds_major(major) || (self.config.held_content.count)(&mut self.db, major)? > 0 {
+        if self.holds_major(major) || (self.config.content_hooks.count)(&mut self.db, major)? > 0 {
             return Ok(());
         }
         {
             let _suspended = ExemptWrites::raise(&self.write_flags);
-            crate::majors::forget_batch(&mut self.db, major, self.config.held_content)?;
+            crate::majors::forget_batch(&mut self.db, major, self.config.content_hooks)?;
         }
-        self.drop_drain_wire().await;
+        // A range riding the shared wire settles on it after the batch's
+        // own writes, so its wire stands (R78 decision 47).
+        #[cfg(feature = "peer")]
+        let rides = self.courier_rides_the_drain();
+        #[cfg(not(feature = "peer"))]
+        let rides = false;
+        if !rides {
+            self.drop_drain_wire().await;
+        }
         self.notices
             .push_back(ClientEvent::Held(HeldWork::Drained { major }));
         self.load_drain()?;
@@ -1051,7 +1172,7 @@ where
         if let Some(mut wire) = self.drain.wire.take() {
             let _ = wire.close().await;
         }
-        self.drain.unbind();
+        self.unbind_drain();
         if self.drain.batch.is_some() && self.drain.timer.is_none() {
             self.drain.back_off();
         }
@@ -1059,7 +1180,7 @@ where
             return;
         };
         if self.holds_major(major)
-            || (self.config.held_content.count)(&mut self.db, major).unwrap_or(0) > 0
+            || (self.config.content_hooks.count)(&mut self.db, major).unwrap_or(0) > 0
         {
             self.notices
                 .push_back(ClientEvent::Held(HeldWork::WireLost { major }));
@@ -1080,6 +1201,17 @@ where
         frame: Option<IncomingFrame>,
     ) -> Result<(), ClientError> {
         let Some(major) = self.draining_major() else {
+            // The batch's own writes can settle before the shared range's
+            // answer, which this wire still carries (R78 decision 47).
+            #[cfg(feature = "peer")]
+            if self.courier_rides_the_drain() {
+                if let Some(IncomingFrame::Control(ControlMessage::CourierAnswer(answer))) = frame {
+                    self.settle_courier_answer_and_queue(&answer).await?;
+                    return Ok(());
+                }
+                self.drop_drain_wire().await;
+                return Ok(());
+            }
             self.drop_drain_wire().await;
             return Ok(());
         };
@@ -1207,6 +1339,13 @@ where
                 self.notices.push_back(event);
                 return Ok(());
             }
+            // A shared courier range the device's own drain settled (R78
+            // decision 47), correlated by request id like the main wire.
+            #[cfg(feature = "peer")]
+            Some(IncomingFrame::Control(ControlMessage::CourierAnswer(answer))) => {
+                self.settle_courier_answer_and_queue(&answer).await?;
+                return Ok(());
+            }
             // Nothing else concerns a session with no subscription.
             Some(_) => return Ok(()),
             None => {
@@ -1304,7 +1443,7 @@ where
             FatalErrorReason::MajorMismatch { .. } => self.lose_major(major).await,
             FatalErrorReason::SessionRevoked => {
                 self.drain.wire = None;
-                self.drain.unbind();
+                self.unbind_drain();
                 self.drain.timer = None;
                 Ok(())
             }
@@ -1355,6 +1494,7 @@ where
             request_id,
             file_id,
             verb,
+            for_owner: None,
         }))
         .await
         .map_err(|e| ClientError::Transport(e.to_string()))
@@ -1378,7 +1518,7 @@ where
         let Some(major) = self.draining_major() else {
             return Ok(false);
         };
-        Ok((self.config.held_content.count)(&mut self.db, major)? > 0)
+        Ok((self.config.content_hooks.count)(&mut self.db, major)? > 0)
     }
 
     /// The total held files across every held major (R31), the pending-work
@@ -1402,7 +1542,7 @@ where
                 .ok_or_else(|| {
                     ClientError::Session(format!("a held batch records major {stored}"))
                 })?;
-            total = total.saturating_add((self.config.held_content.count)(&mut self.db, major)?);
+            total = total.saturating_add((self.config.content_hooks.count)(&mut self.db, major)?);
         }
         Ok(total)
     }

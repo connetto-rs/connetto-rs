@@ -10,6 +10,8 @@
 		01A12D9897FBD8F3B0853E31 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 4FCEB0307C5AF4BB10CB822A /* Assets.xcassets */; };
 		11245FAD97927F4DEBF40F46 /* DioxusSwiftPlugins.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1A9A719832D86B6AA9F859B9 /* DioxusSwiftPlugins.framework */; };
 		1FBFFC836A0A1E7F1554733D /* libapp.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 191904205107476C4636B0D5 /* libapp.a */; };
+		27928A4D61007B85950AEAEA /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F51D2905E2A5E2A912467DF0 /* NetworkExtension.framework */; };
+		30027894A859B52D9C0C5C74 /* CoreLocation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 39361143236F0BD41DB08039 /* CoreLocation.framework */; };
 		34AC60788DB898F5640F22D2 /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = DA0370C0146D8F4FDCD92EF0 /* Security.framework */; };
 		46695DEAAFE1CC31E0CFE5A0 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 860EA9257DEC2511DC5FB27D /* Metal.framework */; };
 		477439B47113E6722C95A8E5 /* DeviceCheck.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AB4EC1316B82FBB8DAEA4A45 /* DeviceCheck.framework */; };
@@ -22,6 +24,7 @@
 		9707B2B7286246A617DA2A5B /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 93F242372AF98321DEE6AD68 /* QuartzCore.framework */; };
 		985DE7989F8BC128005A2FE0 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 2AED0C088BB2AB9F87A0ABBE /* CoreGraphics.framework */; };
 		A46BF1A591F781A60C679743 /* MetalKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 6C3FB2434BA7F2109C0E155C /* MetalKit.framework */; };
+		B9C3CE054A242E28CB86DE85 /* CoreBluetooth.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 356F205D55DC479483A016F5 /* CoreBluetooth.framework */; };
 		BA1B7BC9E638E824495395CA /* assets in Resources */ = {isa = PBXBuildFile; fileRef = 52E60E28205DE506BBE10345 /* assets */; };
 		D3819C48DC617EAA6C437DE9 /* AuthSessionPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF7866A1157BA3AA96936688 /* AuthSessionPlugin.swift */; };
 		F130A12868571D1D32D98673 /* LocalAuthentication.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1F53D73CA573CBD5514B0F2E /* LocalAuthentication.framework */; };
@@ -61,7 +64,9 @@
 		2AED0C088BB2AB9F87A0ABBE /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
 		2C8DD751CF132F16DC75D624 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		312D30AFC46A2B4D116442D2 /* main.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = main.mm; sourceTree = "<group>"; };
+		356F205D55DC479483A016F5 /* CoreBluetooth.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreBluetooth.framework; path = System/Library/Frameworks/CoreBluetooth.framework; sourceTree = SDKROOT; };
 		377A5500819D6C386EDBCE9A /* AuthenticationServices.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AuthenticationServices.framework; path = System/Library/Frameworks/AuthenticationServices.framework; sourceTree = SDKROOT; };
+		39361143236F0BD41DB08039 /* CoreLocation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreLocation.framework; path = System/Library/Frameworks/CoreLocation.framework; sourceTree = SDKROOT; };
 		4972BA8F13C4FD257801AF53 /* connetto-tauri-demo_iOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "connetto-tauri-demo_iOS.entitlements"; sourceTree = "<group>"; };
 		4E9514C9F8C4B07532D3D487 /* connetto-tauri-demo_iOS.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = "connetto-tauri-demo_iOS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		4FCEB0307C5AF4BB10CB822A /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -77,6 +82,7 @@
 		DA0370C0146D8F4FDCD92EF0 /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
 		DC48A172090F1A98C631A276 /* bindings.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = bindings.h; sourceTree = "<group>"; };
 		EE8E36A367F81B75970DF0D3 /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
+		F51D2905E2A5E2A912467DF0 /* NetworkExtension.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = NetworkExtension.framework; path = System/Library/Frameworks/NetworkExtension.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -93,6 +99,9 @@
 				F130A12868571D1D32D98673 /* LocalAuthentication.framework in Frameworks */,
 				34AC60788DB898F5640F22D2 /* Security.framework in Frameworks */,
 				4FADDC710C2989F2C515F20F /* SystemConfiguration.framework in Frameworks */,
+				B9C3CE054A242E28CB86DE85 /* CoreBluetooth.framework in Frameworks */,
+				30027894A859B52D9C0C5C74 /* CoreLocation.framework in Frameworks */,
+				27928A4D61007B85950AEAEA /* NetworkExtension.framework in Frameworks */,
 				6EEFDEB9F7D9412D6F20D665 /* UIKit.framework in Frameworks */,
 				685650EB5E44872DBC3D49E2 /* WebKit.framework in Frameworks */,
 				11245FAD97927F4DEBF40F46 /* DioxusSwiftPlugins.framework in Frameworks */,
@@ -189,12 +198,15 @@
 			isa = PBXGroup;
 			children = (
 				377A5500819D6C386EDBCE9A /* AuthenticationServices.framework */,
+				356F205D55DC479483A016F5 /* CoreBluetooth.framework */,
 				2AED0C088BB2AB9F87A0ABBE /* CoreGraphics.framework */,
+				39361143236F0BD41DB08039 /* CoreLocation.framework */,
 				AB4EC1316B82FBB8DAEA4A45 /* DeviceCheck.framework */,
 				191904205107476C4636B0D5 /* libapp.a */,
 				1F53D73CA573CBD5514B0F2E /* LocalAuthentication.framework */,
 				860EA9257DEC2511DC5FB27D /* Metal.framework */,
 				6C3FB2434BA7F2109C0E155C /* MetalKit.framework */,
+				F51D2905E2A5E2A912467DF0 /* NetworkExtension.framework */,
 				93F242372AF98321DEE6AD68 /* QuartzCore.framework */,
 				DA0370C0146D8F4FDCD92EF0 /* Security.framework */,
 				1FB610430CBFAC19877C7222 /* SystemConfiguration.framework */,

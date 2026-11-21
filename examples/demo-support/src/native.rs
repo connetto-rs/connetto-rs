@@ -22,6 +22,17 @@ pub const SIGN_IN_OPEN: &str = "the browser page is open";
 /// How long the app may be away before it asks for Face ID, a fingerprint or
 /// the device passcode again, where the platform gates the stored secrets.
 pub const RECHECK_AFTER: Duration = Duration::from_secs(30);
+
+/// The gate the session runs under. An unattended build turns it off, so no
+/// launch locks the stored secret and no return asks for Face ID, a
+/// fingerprint or the passcode.
+fn demo_gate() -> Gate {
+    if cfg!(feature = "unattended") {
+        Gate::off()
+    } else {
+        Gate::default().with_recheck(Some(RECHECK_AFTER))
+    }
+}
 /// How long a login in the browser tab may take.
 #[cfg(any(target_os = "android", target_os = "ios"))]
 const LOGIN_WINDOW: Duration = Duration::from_secs(600);
@@ -157,6 +168,17 @@ pub fn content_label(event: &ContentEvent) -> String {
         ContentEvent::Fetched { file_id } => {
             format!("fetched {}", crate::short_hex(file_id.as_bytes()))
         }
+        ContentEvent::Replicated {
+            file_id,
+            holders,
+            leaving,
+        } => format!(
+            "{holders} devices hold {}, {leaving} handing it on",
+            crate::short_hex(file_id.as_bytes())
+        ),
+        ContentEvent::CustodyPressed { held_bytes } => {
+            format!("storage low, {held_bytes} bytes held for others with nobody to take them")
+        }
         ContentEvent::LostRequeued { file_id } => {
             format!("re-uploading lost {}", crate::short_hex(file_id.as_bytes()))
         }
@@ -246,6 +268,34 @@ pub struct Connected {
     pub authenticator: Option<NativeAuthenticator>,
 }
 
+/// The content piece every native demo builds with, healing a lost photo or
+/// thumbnail and, with the `peer` feature, declaring both columns to peers,
+/// the thumbnail prefetched and each replicated to three devices.
+#[must_use]
+pub fn photo_content() -> ContentPiece {
+    let content = ContentPiece::new()
+        .with_heal_lost(
+            "SELECT content_id FROM photos WHERE content_state = 'lost'",
+            "content_id",
+        )
+        .with_heal_lost(
+            "SELECT thumb_id FROM photos WHERE thumb_state = 'lost'",
+            "thumb_id",
+        );
+    #[cfg(feature = "peer")]
+    let content = content
+        .with_peer_content(
+            connetto_file_client::PeerDeclaration::new("photos", "content_id")
+                .replicate(3, "content_state"),
+        )
+        .with_peer_content(
+            connetto_file_client::PeerDeclaration::new("photos", "thumb_id")
+                .prefetch()
+                .replicate(3, "thumb_state"),
+        );
+    content
+}
+
 /// Connect the demo's native client with the shared chain, and answer with
 /// the session pieces and the pump the caller drives.
 ///
@@ -273,13 +323,10 @@ pub async fn connect(
     // while offline upload once the server is reachable again.
     let base_builder = NativeClientBuilder::new(server, crate::demo_schema())
         .with_tuning(SyncTuning::default().with_trim_threshold(5))
-        .with_content(ContentPiece::new().with_heal_lost(
-            "SELECT content_id FROM photos WHERE content_state = 'lost'",
-            "content_id",
-        ))
+        .with_content(photo_content())
         .signed_in(sign_in)
         .durable(data_dir)
-        .with_gate(Gate::default().with_recheck(Some(RECHECK_AFTER)));
+        .with_gate(demo_gate());
 
     // The roots install method only exists in a device-identity build, so the
     // roots the caller ships are applied there and nowhere else.
@@ -340,4 +387,67 @@ pub async fn switch_account_guard(client: &ConnettoClient<NativeTransport>) -> O
         )),
         Err(err) => Some(format!("Cannot change account: {err}")),
     }
+}
+
+/// Stages a thumbnail before its full photo and the row naming both.
+///
+/// # Errors
+///
+/// Returns the content staging error if either file cannot be stored.
+pub async fn stage_photo(
+    content: &ContentClient<NativeTransport, FsStore, ReqwestHttp>,
+    bytes: &[u8],
+    mime: connetto_file_core::MimeClass,
+    identity: &str,
+    team: Option<&str>,
+) -> Result<(connetto_file_core::FileId, rosetta_uuid::Uuid), connetto_file_client::ContentError> {
+    let thumb_id = if let Some(thumbnail) = crate::make_photo_thumbnail(bytes) {
+        Some(
+            content
+                .stage(
+                    thumbnail.as_slice(),
+                    connetto_file_core::MimeClass::Jpeg,
+                    |_, _| Ok(()),
+                )
+                .await?
+                .0,
+        )
+    } else {
+        None
+    };
+    content
+        .stage(bytes, mime, |conn, file_id| {
+            crate::stage_photo_row(conn, file_id, identity, thumb_id, team)
+        })
+        .await
+}
+
+/// The file in the app's data folder the login names of the device's stored
+/// accounts live in.
+pub const STORED_NAMES_FILE: &str = "stored-names.json";
+
+/// The login names the device keeps for its stored accounts in `data_dir`,
+/// empty when none were kept or the file does not decode.
+#[must_use]
+pub fn read_stored_names(data_dir: &Path) -> crate::view::StoredNames {
+    std::fs::read(data_dir.join(STORED_NAMES_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Keep `names` in `data_dir`, written beside the file and renamed over it,
+/// so a crash mid-write leaves the previous names.
+///
+/// # Errors
+///
+/// The I/O error of the write or the rename.
+pub fn write_stored_names(
+    data_dir: &Path,
+    names: &crate::view::StoredNames,
+) -> std::io::Result<()> {
+    let file = data_dir.join(STORED_NAMES_FILE);
+    let partial = file.with_extension("json.partial");
+    std::fs::write(&partial, serde_json::to_vec(names)?)?;
+    std::fs::rename(partial, file)
 }

@@ -16,6 +16,7 @@ use iroh_io::AsyncStreamWriter;
 
 use super::super::{ContentClient, FETCHED_CLASS};
 use crate::db;
+use crate::error::ContentError;
 use crate::http::ContentHttp;
 
 impl<T, B, H> ContentClient<T, B, H>
@@ -25,46 +26,56 @@ where
     B: ChunkStore + Clone + Sync + MaybeSend + 'static,
     H: ContentHttp,
 {
-    /// Answers `ask` from `peer` under `request_id`, `Refused` when the gate
-    /// refuses the requester or the device cannot serve the file.
+    /// Answers `ask` from `peer` over its link numbered `link` under
+    /// `request_id`, `Refused` when the gate refuses the requester or the
+    /// device cannot serve the file.
     pub(super) async fn serve(
         &self,
         sender: &MediaSender,
         peer: &DeviceIdentity,
+        link: u64,
         request_id: u64,
         ask: Ask,
     ) {
+        let to = Requester { peer, link };
         let served = match ask {
-            Ask::Want { file_id } => self.serve_manifest(sender, peer, request_id, file_id).await,
+            Ask::Want { file_id } => self.serve_manifest(sender, to, request_id, file_id).await,
             Ask::Fetch {
                 file_id,
                 start,
                 len,
             } => {
-                self.serve_range(sender, peer, request_id, file_id, start, len)
+                self.serve_range(sender, to, request_id, file_id, start, len)
                     .await
             }
         };
         if !served {
-            let _ = sender.send(peer, Media::Refused { request_id }).await;
+            let _ = sender.send(peer, link, Media::Refused { request_id }).await;
         }
     }
 
-    /// Streams the manifest of `file_id`, `false` to refuse `peer`, whom the
-    /// gate refuses, or a file the device holds no manifest for.
+    /// Streams the manifest of `file_id`, its last run naming the owner of
+    /// the device's custody copy, `false` to refuse `peer`, whom the gate
+    /// refuses, or a file the device holds no manifest for.
     async fn serve_manifest(
         &self,
         sender: &MediaSender,
-        peer: &DeviceIdentity,
+        to: Requester<'_>,
         request_id: u64,
         file_id: [u8; 32],
     ) -> bool {
-        if !self.admits(sender, peer, &file_id).await {
+        if !self.admits(sender, to.peer, &file_id).await {
             return false;
         }
-        let Ok(Ok(Some(manifest))) = self
+        let file_id = FileId::from_bytes(file_id);
+        let Ok(Ok((Some(manifest), mut owner))) = self
             .client
-            .with_conn(|conn| db::load_manifest(conn.conn(), FileId::from_bytes(file_id)))
+            .with_conn(|conn| -> Result<_, ContentError> {
+                Ok((
+                    db::load_manifest(conn.conn(), file_id)?,
+                    db::custody_owner(conn.conn(), file_id)?,
+                ))
+            })
             .await
         else {
             return false;
@@ -84,10 +95,11 @@ where
                 request_id,
                 chunks: run.to_vec(),
                 last: index == last,
+                owner: if index == last { owner.take() } else { None },
             };
             // A send fails only once the link is gone, which takes the
             // refusal with it.
-            if sender.send(peer, run).await.is_err() {
+            if sender.send(to.peer, to.link, run).await.is_err() {
                 break;
             }
         }
@@ -101,13 +113,13 @@ where
     async fn serve_range(
         &self,
         sender: &MediaSender,
-        peer: &DeviceIdentity,
+        to: Requester<'_>,
         request_id: u64,
         file_id: [u8; 32],
         start: u64,
         len: u64,
     ) -> bool {
-        if !self.admits(sender, peer, &file_id).await {
+        if !self.admits(sender, to.peer, &file_id).await {
             return false;
         }
         let file_id = FileId::from_bytes(file_id);
@@ -123,7 +135,7 @@ where
         };
         let mut pieces = Pieces {
             sender,
-            peer,
+            to,
             request_id,
             pending: Vec::new(),
         };
@@ -140,23 +152,23 @@ where
 
     /// Whether `peer`, still linked, reads a row of a declared column naming
     /// `file_id`, judged under the bot list its certificate carries now.
-    async fn admits(
+    pub(super) async fn admits(
         &self,
         sender: &MediaSender,
         peer: &DeviceIdentity,
         file_id: &[u8; 32],
     ) -> bool {
-        let Some((_, bot_list)) = sender
+        let Some(linked) = sender
             .linked()
             .into_iter()
-            .find(|(linked, _)| linked == peer)
+            .find(|linked| linked.peer == *peer)
         else {
             return false;
         };
         let requester = PeerAuthor {
             key_id: peer.key().as_bytes().to_vec(),
             account: peer.account().to_owned(),
-            bot_list,
+            bot_list: linked.bot_list,
         };
         let declared = &self.peer_content;
         self.client
@@ -171,11 +183,18 @@ where
     }
 }
 
+/// The peer a stream answers and the link it asked over.
+#[derive(Clone, Copy)]
+struct Requester<'a> {
+    peer: &'a DeviceIdentity,
+    link: u64,
+}
+
 /// The sink a range's encoding streams into, cut into pieces of at most
 /// [`MAX_PIECE_BYTES`] as it grows.
 struct Pieces<'a> {
     sender: &'a MediaSender,
-    peer: &'a DeviceIdentity,
+    to: Requester<'a>,
     request_id: u64,
     pending: Vec<u8>,
 }
@@ -185,7 +204,8 @@ impl Pieces<'_> {
     async fn send(&self, encoded: Vec<u8>, last: bool) -> io::Result<()> {
         self.sender
             .send(
-                self.peer,
+                self.to.peer,
+                self.to.link,
                 Media::Piece {
                     request_id: self.request_id,
                     encoded,

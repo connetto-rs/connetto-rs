@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime};
 
+use super::auth_hooks::{Notice, Told};
+use connetto_core::SessionId;
 use connetto_core::device_cert::{
     ANDROID_ATTESTATION_CHALLENGE, AttestationLevel, CertificateRequest, CertificateSerial,
     DeploymentId, DeviceCertificate, DeviceIssuer, KeyId, RootCa,
@@ -13,11 +15,18 @@ use connetto_core::messages::{
     EnrolRefusal, EnrolRefused, EnrolRequest,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
+use connetto_server::defaults::{connetto_device_certificates, connetto_device_enrolments};
 use connetto_server::device_cert::{
-    AndroidStatus, DeviceCertConfig, DeviceEnrolment, MemoryEnrolments, RandomSource, StatusList,
+    AndroidStatus, DeviceCertConfig, DeviceEnrolment, EnrolmentStore, RandomSource, StatusList,
 };
 use connetto_server::{AbuseConfig, LoopbackTransport, RequestGuard, ThrottleConfig, loopback};
-use connetto_test_harness::{Fixture, RosterAuth, WITHHELD_ID};
+use connetto_server::{
+    AuthHooks, AuthService, CommittedNotice, DefaultAuthHooks, DeviceEnrolled, HookError,
+    HookFuture, VerifiedClaims,
+};
+use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
+use diesel::{ExpressionMethods as _, JoinOnDsl as _, QueryDsl as _};
+use diesel_async::{AsyncPgConnection, RunQueryDsl as _};
 use rcgen::{
     BasicConstraints, CertificateParams, CustomExtension, IsCa, Issuer, KeyPair,
     PKCS_ECDSA_P256_SHA256, PublicKeyData as _,
@@ -28,6 +37,126 @@ use super::ticket_shared::{
     OkSigner, TicketManager, build_manager_with_guard, do_handshake_anon, do_handshake_with,
     setup_reader,
 };
+
+#[derive(Debug, PartialEq, Eq, diesel::Queryable)]
+struct CertificateRow {
+    user: String,
+    key_id: Vec<u8>,
+    serial: Vec<u8>,
+}
+
+/// Read every recorded certificate with its enrolling account and key.
+async fn records(fixture: &Fixture) -> Vec<CertificateRow> {
+    connetto_device_enrolments::table
+        .inner_join(
+            connetto_device_certificates::table
+                .on(connetto_device_certificates::key_id.eq(connetto_device_enrolments::key_id)),
+        )
+        .select((
+            connetto_device_enrolments::user_id,
+            connetto_device_enrolments::key_id,
+            connetto_device_certificates::serial,
+        ))
+        .load(&mut *fixture.admin().get().await.expect("connection"))
+        .await
+        .expect("certificates")
+}
+
+diesel::table! {
+    enrolment_hook_writes (key_id) {
+        key_id -> Binary,
+    }
+}
+
+struct RecordThenRefuse {
+    notices: Arc<Told<ConnettoDefaults>>,
+}
+
+impl AuthHooks<ConnettoDefaults> for RecordThenRefuse {
+    fn user_for<'a>(
+        &'a self,
+        transaction: &'a mut AsyncPgConnection,
+        claims: &'a VerifiedClaims,
+    ) -> HookFuture<'a, String> {
+        AuthHooks::<ConnettoDefaults>::user_for(&DefaultAuthHooks, transaction, claims)
+    }
+
+    fn device_enrolled<'a>(
+        &'a self,
+        transaction: &'a mut AsyncPgConnection,
+        enrolled: &'a DeviceEnrolled<'a, String, ()>,
+    ) -> HookFuture<'a, ()> {
+        Box::pin(async move {
+            diesel::insert_into(enrolment_hook_writes::table)
+                .values(enrolment_hook_writes::key_id.eq(enrolled.key.as_bytes().as_slice()))
+                .execute(transaction)
+                .await
+                .map_err(|error| HookError::Backend(error.to_string()))?;
+            Err(HookError::Refused(
+                "device registration is closed".to_owned(),
+            ))
+        })
+    }
+
+    fn committed(&self, notice: Notice<ConnettoDefaults>) {
+        self.notices.committed(notice);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_enrolment_rolls_back_the_device_and_the_hooks_write() {
+    let fixture = Fixture::acquire().await;
+    let (notices_hook, mut notices) = Told::<ConnettoDefaults>::channel();
+    let auth = fixture
+        .enrolment_auth(Arc::new(RecordThenRefuse {
+            notices: notices_hook,
+        }))
+        .await;
+    fixture
+        .exec("CREATE TABLE enrolment_hook_writes (key_id BYTEA PRIMARY KEY)")
+        .await;
+    let mut client = session(
+        &fixture,
+        Some("alice"),
+        Some(DeviceCertConfig::new(issuer().1)),
+        &auth,
+    )
+    .await;
+    let key = device_key();
+    let handed = nonce(&mut client).await;
+    assert_eq!(
+        enrol(&mut client, &key, handed, None, vec![0xc0]).await,
+        refused(
+            EnrolRefusal::Refused {
+                reason: "device registration is closed".to_owned()
+            },
+            "e"
+        )
+    );
+    let mut connection = fixture.admin().get().await.expect("connection");
+    assert!(
+        EnrolmentStore::<ConnettoDefaults>::default()
+            .key_record(
+                &mut connection,
+                None,
+                KeyId::of_public_key(&key.subject_public_key_info())
+            )
+            .await
+            .expect("enrolment")
+            .is_none()
+    );
+    assert_eq!(records(&fixture).await.len(), 0, "no certificate recorded");
+    let writes: i64 = enrolment_hook_writes::table
+        .count()
+        .get_result(&mut *connection)
+        .await
+        .expect("hook writes");
+    assert_eq!(writes, 0);
+    assert!(matches!(
+        notices.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+}
 
 const DAY: Duration = Duration::from_hours(24);
 
@@ -59,26 +188,25 @@ pub(super) fn rooted_issuer() -> (Vec<u8>, Vec<u8>, DeviceIssuer) {
     (root.certificate().to_vec(), cert, issuer)
 }
 
-/// A session for `identity`, `None` meaning anonymous, against a manager that
-/// enrols through `config` into `store` unless `config` is `None`.
+/// A session for `identity`, enrolling through `auth` when configured.
 async fn session(
     fixture: &Fixture,
     identity: Option<&str>,
     config: Option<DeviceCertConfig>,
-    store: &Arc<MemoryEnrolments<String>>,
+    auth: &Arc<AuthService<ConnettoDefaults>>,
 ) -> LoopbackTransport {
     let manager = enrolling_manager(
         fixture,
-        config.map(|config| DeviceEnrolment::new(config, Arc::clone(store) as _)),
+        config.map(|config| DeviceEnrolment::new(config, Arc::clone(auth))),
     )
     .await;
-    connect(&manager, identity).await
+    connect(fixture, &manager, identity).await
 }
 
 /// A manager that enrols through `enrolment` when one is given.
 pub(super) async fn enrolling_manager(
     fixture: &Fixture,
-    enrolment: Option<DeviceEnrolment<String>>,
+    enrolment: Option<DeviceEnrolment<ConnettoDefaults>>,
 ) -> Arc<TicketManager<OkSigner>> {
     let manager = build_manager_with_guard(
         setup_reader(fixture).await,
@@ -99,6 +227,7 @@ pub(super) async fn enrolling_manager(
 
 /// A session for `identity`, `None` meaning anonymous, on `manager`.
 pub(super) async fn connect(
+    fixture: &Fixture,
     manager: &Arc<TicketManager<OkSigner>>,
     identity: Option<&str>,
 ) -> LoopbackTransport {
@@ -110,12 +239,11 @@ pub(super) async fn connect(
     let handle = format!("conn-{}", NEXT.fetch_add(1, Ordering::Relaxed));
     match identity {
         Some(identity) => {
-            do_handshake_with(
-                &mut client,
-                &handle,
-                &[&format!("user:{identity}#{handle}")],
-            )
-            .await;
+            let grant = format!("user:{identity}#{handle}");
+            fixture
+                .live_session(identity, SessionId::from_token_hash(&grant))
+                .await;
+            do_handshake_with(&mut client, &handle, &[&grant]).await;
         }
         None => do_handshake_anon(&mut client, &handle).await,
     }
@@ -287,19 +415,19 @@ pub(super) fn android_evidence(chain: Vec<Vec<u8>>) -> DeviceAttestation {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_signed_in_device_enrols_and_is_recorded() {
     let fixture = Fixture::acquire().await;
-    let store = Arc::new(MemoryEnrolments::default());
+    let auth = fixture.enrolment_auth(Arc::new(DefaultAuthHooks)).await;
     let (issuer_cert, issuer) = issuer();
     let mut client = session(
         &fixture,
         Some("alice"),
         Some(DeviceCertConfig::new(issuer)),
-        &store,
+        &auth,
     )
     .await;
     let key = device_key();
     let handed = nonce(&mut client).await;
 
-    let reply = enrol(&mut client, &key, handed, None, vec![0x91, 0x01]).await;
+    let reply = enrol(&mut client, &key, handed, None, vec![0xc0]).await;
     let ControlMessage::EnrolGrant(EnrolGrant {
         request_id, chain, ..
     }) = reply
@@ -319,21 +447,41 @@ async fn a_signed_in_device_enrols_and_is_recorded() {
         .expect("ordered");
     assert_eq!(lifetime, DAY, "an unrequested lifetime is the default");
 
-    let records = store.records();
+    let records = records(&fixture).await;
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].user, "alice");
-    assert_eq!(records[0].key, key_id);
+    assert_eq!(records[0].key_id.as_slice(), key_id.as_bytes());
     assert_eq!(records[0].serial.as_slice(), leaf.serial());
-    assert_eq!(records[0].descriptor, vec![0x91, 0x01]);
+    let devices = EnrolmentStore::<ConnettoDefaults>::default()
+        .devices(
+            &mut fixture.admin().get().await.expect("connection"),
+            &"alice".to_owned(),
+        )
+        .await
+        .expect("devices");
+    assert_eq!(devices[0].descriptor, vec![0xc0]);
 }
 
 /// A session presenting the login grant `grant`, on `manager`, a distinct
 /// connection from the ones `connect` opens.
-async fn connect_granted(manager: &Arc<TicketManager<OkSigner>>, grant: &str) -> LoopbackTransport {
+async fn connect_granted(
+    fixture: &Fixture,
+    manager: &Arc<TicketManager<OkSigner>>,
+    grant: &str,
+) -> LoopbackTransport {
     static NEXT: AtomicU32 = AtomicU32::new(10_000);
     let (server_end, mut client) = loopback();
     tokio::spawn(Arc::clone(manager).serve(server_end));
     let handle = format!("conn-granted-{}", NEXT.fetch_add(1, Ordering::Relaxed));
+    let user = grant
+        .strip_prefix("bot:")
+        .expect("bot grant")
+        .split_once('#')
+        .expect("bot list")
+        .0;
+    fixture
+        .live_session(user, SessionId::from_token_hash(grant))
+        .await;
     do_handshake_with(&mut client, &handle, &[grant]).await;
     client
 }
@@ -344,21 +492,21 @@ async fn connect_granted(manager: &Arc<TicketManager<OkSigner>>, grant: &str) ->
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_enrolled_certificate_carries_the_sessions_bot_list() {
     let fixture = Fixture::acquire().await;
-    let store = Arc::new(MemoryEnrolments::default());
+    let auth = fixture.enrolment_auth(Arc::new(DefaultAuthHooks)).await;
     let (_, issuer) = issuer();
     let manager = enrolling_manager(
         &fixture,
         Some(DeviceEnrolment::new(
             DeviceCertConfig::new(issuer),
-            Arc::clone(&store) as _,
+            Arc::clone(&auth),
         )),
     )
     .await;
 
     let key = device_key();
-    let mut person = connect(&manager, Some("alice")).await;
+    let mut person = connect(&fixture, &manager, Some("alice")).await;
     let handed = nonce(&mut person).await;
-    let reply = enrol(&mut person, &key, handed, None, vec![0x91, 0x01]).await;
+    let reply = enrol(&mut person, &key, handed, None, vec![0xc0]).await;
     let ControlMessage::EnrolGrant(EnrolGrant { chain, .. }) = reply else {
         panic!("expected a grant, got {reply:?}");
     };
@@ -370,9 +518,9 @@ async fn an_enrolled_certificate_carries_the_sessions_bot_list() {
     );
 
     let key = device_key();
-    let mut bot = connect_granted(&manager, "bot:alice#orders:read").await;
+    let mut bot = connect_granted(&fixture, &manager, "bot:alice#orders:read").await;
     let handed = nonce(&mut bot).await;
-    let reply = enrol(&mut bot, &key, handed, None, vec![0x91, 0x01]).await;
+    let reply = enrol(&mut bot, &key, handed, None, vec![0xc0]).await;
     let ControlMessage::EnrolGrant(EnrolGrant { chain, .. }) = reply else {
         panic!("expected a grant, got {reply:?}");
     };
@@ -389,21 +537,21 @@ async fn an_enrolled_certificate_carries_the_sessions_bot_list() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_renewal_carries_the_changed_bot_list_and_keeps_the_level() {
     let fixture = Fixture::acquire().await;
-    let store = Arc::new(MemoryEnrolments::default());
+    let auth = fixture.enrolment_auth(Arc::new(DefaultAuthHooks)).await;
     let (_, issuer) = issuer();
     let manager = enrolling_manager(
         &fixture,
         Some(DeviceEnrolment::new(
             DeviceCertConfig::new(issuer),
-            Arc::clone(&store) as _,
+            Arc::clone(&auth),
         )),
     )
     .await;
     let key = device_key();
 
-    let mut first = connect_granted(&manager, "bot:alice#orders:read").await;
+    let mut first = connect_granted(&fixture, &manager, "bot:alice#orders:read").await;
     let handed = nonce(&mut first).await;
-    let reply = enrol(&mut first, &key, handed, None, vec![0x91, 0x01]).await;
+    let reply = enrol(&mut first, &key, handed, None, vec![0xc0]).await;
     let ControlMessage::EnrolGrant(EnrolGrant { chain, .. }) = reply else {
         panic!("expected a grant, got {reply:?}");
     };
@@ -414,9 +562,10 @@ async fn a_renewal_carries_the_changed_bot_list_and_keeps_the_level() {
         "the first enrolment carries the list"
     );
 
-    let mut second = connect_granted(&manager, "bot:alice#orders:read,orders:insert").await;
+    let mut second =
+        connect_granted(&fixture, &manager, "bot:alice#orders:read,orders:insert").await;
     let handed = nonce(&mut second).await;
-    let reply = enrol(&mut second, &key, handed, None, vec![0x91, 0x02]).await;
+    let reply = enrol(&mut second, &key, handed, None, vec![0xc0]).await;
     let ControlMessage::EnrolGrant(EnrolGrant { chain, .. }) = reply else {
         panic!("the renewal is a grant, got {reply:?}");
     };
@@ -438,34 +587,55 @@ async fn a_renewal_carries_the_changed_bot_list_and_keeps_the_level() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn only_a_keys_first_enrolment_tells_the_application() {
     let fixture = Fixture::acquire().await;
-    let store = Arc::new(MemoryEnrolments::default());
+    let (hooks, mut notices) = Told::<ConnettoDefaults>::channel();
+    let auth = fixture.enrolment_auth(hooks).await;
     let (_, issuer) = issuer();
-    let told = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let sink = Arc::clone(&told);
-    let enrolment = DeviceEnrolment::new(DeviceCertConfig::new(issuer), Arc::clone(&store) as _)
-        .with_first_enrolment_hook(Arc::new(move |first| sink.lock().push(first)));
+    let enrolment = DeviceEnrolment::new(DeviceCertConfig::new(issuer), auth);
     let manager = enrolling_manager(&fixture, Some(enrolment)).await;
-    let mut client = connect(&manager, Some("alice")).await;
+    let mut client = connect(&fixture, &manager, Some("alice")).await;
     let key = device_key();
 
     let handed = nonce(&mut client).await;
-    let reply = enrol(&mut client, &key, handed, None, vec![0x91, 0x01]).await;
+    let reply = enrol(&mut client, &key, handed, None, vec![0xc0]).await;
     assert!(matches!(reply, ControlMessage::EnrolGrant(_)), "{reply:?}");
-    let handed = nonce(&mut client).await;
-    let reply = enrol(&mut client, &key, handed, None, vec![0x91, 0x02]).await;
-    assert!(matches!(reply, ControlMessage::EnrolGrant(_)), "{reply:?}");
-
-    let told = told.lock().clone();
-    let [first] = told.as_slice() else {
-        panic!("expected the first enrolment alone, got {told:?}");
+    let notice = notices
+        .try_recv()
+        .expect("first enrolment committed before grant");
+    let CommittedNotice::DeviceEnrolled {
+        session,
+        key: enrolled_key,
+        device,
+        ..
+    } = notice
+    else {
+        panic!("expected device enrolment, got {notice:?}");
     };
-    assert_eq!(first.user, "alice");
+    assert_eq!(session.user_id, "alice");
     assert_eq!(
-        first.key,
+        enrolled_key,
         KeyId::of_public_key(&key.subject_public_key_info())
     );
-    assert_eq!(first.descriptor, vec![0x91, 0x01]);
-    assert_eq!(first.session, store.records()[0].session);
+    assert_eq!(device, vec![0xc0]);
+    let devices = EnrolmentStore::<ConnettoDefaults>::default()
+        .devices(
+            &mut fixture.admin().get().await.expect("connection"),
+            &"alice".to_owned(),
+        )
+        .await
+        .expect("devices");
+    assert_eq!(session.session_id, devices[0].session);
+    assert!(matches!(
+        notices.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    let handed = nonce(&mut client).await;
+    let reply = enrol(&mut client, &key, handed, None, vec![0xc0]).await;
+    assert!(matches!(reply, ControlMessage::EnrolGrant(_)), "{reply:?}");
+    assert!(matches!(
+        notices.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
 }
 
 /// The serial a held draw hands the enrolment, its leading zero a
@@ -499,17 +669,17 @@ impl RandomSource for HeldDraw {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_held_zero_leading_draw_is_redrawn_and_recorded_as_issued() {
     let fixture = Fixture::acquire().await;
-    let store = Arc::new(MemoryEnrolments::default());
+    let auth = fixture.enrolment_auth(Arc::new(DefaultAuthHooks)).await;
     let (issuer_cert, issuer) = issuer();
-    let enrolment = DeviceEnrolment::new(DeviceCertConfig::new(issuer), Arc::clone(&store) as _)
+    let enrolment = DeviceEnrolment::new(DeviceCertConfig::new(issuer), Arc::clone(&auth))
         .with_random(Box::new(HeldDraw {
             held: AtomicU32::new(0),
         }));
     let manager = enrolling_manager(&fixture, Some(enrolment)).await;
-    let mut client = connect(&manager, Some("alice")).await;
+    let mut client = connect(&fixture, &manager, Some("alice")).await;
     let key = device_key();
     let handed = nonce(&mut client).await;
-    let reply = enrol(&mut client, &key, handed, None, vec![0x91, 0x01]).await;
+    let reply = enrol(&mut client, &key, handed, None, vec![0xc0]).await;
     let ControlMessage::EnrolGrant(EnrolGrant { chain, .. }) = reply else {
         panic!("expected a grant, got {reply:?}");
     };
@@ -517,7 +687,7 @@ async fn a_held_zero_leading_draw_is_redrawn_and_recorded_as_issued() {
     assert_eq!(chain[1].as_slice(), issuer_cert.as_slice());
     let leaf = DeviceCertificate::parse(&chain[0]).expect("the leaf meets the profile");
     assert_eq!(leaf.serial(), REDRAWN.as_slice());
-    let records = store.records();
+    let records = records(&fixture).await;
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].serial.as_slice(), leaf.serial());
 }
@@ -525,47 +695,110 @@ async fn a_held_zero_leading_draw_is_redrawn_and_recorded_as_issued() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_anonymous_caller_cannot_enrol() {
     let fixture = Fixture::acquire().await;
-    let store = Arc::new(MemoryEnrolments::default());
+    let auth = fixture.enrolment_auth(Arc::new(DefaultAuthHooks)).await;
     let mut client = session(
         &fixture,
         None,
         Some(DeviceCertConfig::new(issuer().1)),
-        &store,
+        &auth,
     )
     .await;
     assert_eq!(
         challenge(&mut client).await,
         refused(EnrolRefusal::Unidentified, "c")
     );
-    let reply = enrol(&mut client, &device_key(), [0; 32], None, Vec::new()).await;
+    let reply = enrol(&mut client, &device_key(), [0; 32], None, vec![0xc0]).await;
     assert_eq!(reply, refused(EnrolRefusal::Unidentified, "e"));
-    assert_eq!(store.records(), Vec::new());
+    assert_eq!(records(&fixture).await, Vec::new());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_server_without_an_issuer_refuses() {
     let fixture = Fixture::acquire().await;
-    let store = Arc::new(MemoryEnrolments::default());
-    let mut client = session(&fixture, Some("alice"), None, &store).await;
+    let auth = fixture.enrolment_auth(Arc::new(DefaultAuthHooks)).await;
+    let mut client = session(&fixture, Some("alice"), None, &auth).await;
     assert_eq!(
         challenge(&mut client).await,
         refused(EnrolRefusal::IssuerUnavailable, "c")
     );
 }
 
+/// An account no certificate can name, one holding a character outside the
+/// identity URI's path set, is refused unidentified and nothing is recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_account_no_certificate_can_name_is_refused() {
+    let fixture = Fixture::acquire().await;
+    let auth = fixture.enrolment_auth(Arc::new(DefaultAuthHooks)).await;
+    let mut client = session(
+        &fixture,
+        Some("al@ice"),
+        Some(DeviceCertConfig::new(issuer().1)),
+        &auth,
+    )
+    .await;
+    let key = device_key();
+    let handed = nonce(&mut client).await;
+    let reply = enrol(&mut client, &key, handed, None, vec![0xc0]).await;
+    assert_eq!(reply, refused(EnrolRefusal::Unidentified, "e"));
+    assert_eq!(records(&fixture).await, Vec::new());
+}
+
+/// An issuer expiring before the certificate would cannot sign it, so the
+/// enrolment is refused as an unavailable issuer and nothing is recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_issuer_expiring_before_the_certificate_refuses() {
+    let fixture = Fixture::acquire().await;
+    let auth = fixture.enrolment_auth(Arc::new(DefaultAuthHooks)).await;
+    let now = SystemTime::now();
+    let root = RootCa::create(
+        DeploymentId::from_uuid(uuid::Uuid::from_u128(0x5eed)),
+        now - DAY,
+        3650 * DAY,
+    )
+    .expect("root");
+    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("issuer key");
+    let cert = root
+        .sign_issuer(
+            &key.subject_public_key_info(),
+            now - DAY,
+            2 * DAY,
+            CertificateSerial::new([1; 16]).expect("the serial is positive"),
+        )
+        .expect("issuer");
+    let lapsing = DeviceIssuer::new(cert, key, root.certificate()).expect("load");
+    let mut client = session(
+        &fixture,
+        Some("alice"),
+        Some(DeviceCertConfig::new(lapsing)),
+        &auth,
+    )
+    .await;
+    let handed = nonce(&mut client).await;
+    let reply = enrol(
+        &mut client,
+        &device_key(),
+        handed,
+        Some(7 * DAY.as_secs()),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(reply, refused(EnrolRefusal::IssuerUnavailable, "e"));
+    assert_eq!(records(&fixture).await, Vec::new());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_nonce_serves_one_request_only() {
     let fixture = Fixture::acquire().await;
-    let store = Arc::new(MemoryEnrolments::default());
+    let auth = fixture.enrolment_auth(Arc::new(DefaultAuthHooks)).await;
     let mut client = session(
         &fixture,
         Some("alice"),
         Some(DeviceCertConfig::new(issuer().1)),
-        &store,
+        &auth,
     )
     .await;
     let key = device_key();
-    let reply = enrol(&mut client, &key, [9; 32], None, Vec::new()).await;
+    let reply = enrol(&mut client, &key, [9; 32], None, vec![0xc0]).await;
     assert_eq!(
         reply,
         refused(EnrolRefusal::ChallengeExpired, "e"),
@@ -573,13 +806,13 @@ async fn a_nonce_serves_one_request_only() {
     );
 
     let handed = nonce(&mut client).await;
-    let reply = enrol(&mut client, &key, [9; 32], None, Vec::new()).await;
+    let reply = enrol(&mut client, &key, [9; 32], None, vec![0xc0]).await;
     assert_eq!(
         reply,
         refused(EnrolRefusal::ChallengeExpired, "e"),
         "a nonce the server never handed"
     );
-    let reply = enrol(&mut client, &key, handed, None, Vec::new()).await;
+    let reply = enrol(&mut client, &key, handed, None, vec![0xc0]).await;
     assert_eq!(
         reply,
         refused(EnrolRefusal::ChallengeExpired, "e"),
@@ -588,35 +821,35 @@ async fn a_nonce_serves_one_request_only() {
 
     let handed = nonce(&mut client).await;
     assert!(matches!(
-        enrol(&mut client, &key, handed, None, Vec::new()).await,
+        enrol(&mut client, &key, handed, None, vec![0xc0]).await,
         ControlMessage::EnrolGrant(_)
     ));
-    let reply = enrol(&mut client, &key, handed, None, Vec::new()).await;
+    let reply = enrol(&mut client, &key, handed, None, vec![0xc0]).await;
     assert_eq!(
         reply,
         refused(EnrolRefusal::ChallengeExpired, "e"),
         "a nonce is spent once used"
     );
-    assert_eq!(store.records().len(), 1);
+    assert_eq!(records(&fixture).await.len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_expired_nonce_is_refused() {
     let fixture = Fixture::acquire().await;
-    let store = Arc::new(MemoryEnrolments::default());
+    let auth = fixture.enrolment_auth(Arc::new(DefaultAuthHooks)).await;
     let config = DeviceCertConfig::new(issuer().1).with_challenge_window(Duration::ZERO);
-    let mut client = session(&fixture, Some("alice"), Some(config), &store).await;
+    let mut client = session(&fixture, Some("alice"), Some(config), &auth).await;
     let handed = nonce(&mut client).await;
-    let reply = enrol(&mut client, &device_key(), handed, None, Vec::new()).await;
+    let reply = enrol(&mut client, &device_key(), handed, None, vec![0xc0]).await;
     assert_eq!(reply, refused(EnrolRefusal::ChallengeExpired, "e"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lifetime_over_the_ceiling_is_refused_and_one_under_it_granted() {
     let fixture = Fixture::acquire().await;
-    let store = Arc::new(MemoryEnrolments::default());
+    let auth = fixture.enrolment_auth(Arc::new(DefaultAuthHooks)).await;
     let config = DeviceCertConfig::new(issuer().1).with_lifetime_ceiling(7 * DAY);
-    let mut client = session(&fixture, Some("alice"), Some(config), &store).await;
+    let mut client = session(&fixture, Some("alice"), Some(config), &auth).await;
     let key = device_key();
     let nonce_one = nonce(&mut client).await;
     let over = 7 * 86_400 + 1;
@@ -632,7 +865,7 @@ async fn a_lifetime_over_the_ceiling_is_refused_and_one_under_it_granted() {
     );
 
     let nonce_two = nonce(&mut client).await;
-    let reply = enrol(&mut client, &key, nonce_two, Some(7 * 86_400), Vec::new()).await;
+    let reply = enrol(&mut client, &key, nonce_two, Some(7 * 86_400), vec![0xc0]).await;
     let ControlMessage::EnrolGrant(EnrolGrant { chain, .. }) = reply else {
         panic!("expected a grant, got {reply:?}");
     };
@@ -647,36 +880,48 @@ async fn a_lifetime_over_the_ceiling_is_refused_and_one_under_it_granted() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_revoked_key_is_refused() {
     let fixture = Fixture::acquire().await;
-    let store = Arc::new(MemoryEnrolments::default());
+    let auth = fixture.enrolment_auth(Arc::new(DefaultAuthHooks)).await;
     let key = device_key();
     let mut client = session(
         &fixture,
         Some("alice"),
         Some(DeviceCertConfig::new(issuer().1)),
-        &store,
+        &auth,
     )
     .await;
     let handed = nonce(&mut client).await;
     assert!(matches!(
-        enrol(&mut client, &key, handed, None, Vec::new()).await,
+        enrol(&mut client, &key, handed, None, vec![0xc0]).await,
         ControlMessage::EnrolGrant(_)
     ));
-    store.revoke_key(KeyId::of_public_key(&key.subject_public_key_info()));
+    EnrolmentStore::<ConnettoDefaults>::default()
+        .revoke(
+            &mut fixture.admin().get().await.expect("connection"),
+            None,
+            KeyId::of_public_key(&key.subject_public_key_info()),
+            SystemTime::now(),
+        )
+        .await
+        .expect("revoke");
     let handed = nonce(&mut client).await;
-    let reply = enrol(&mut client, &key, handed, None, Vec::new()).await;
+    let reply = enrol(&mut client, &key, handed, None, vec![0xc0]).await;
     assert_eq!(reply, refused(EnrolRefusal::Revoked, "e"));
-    assert_eq!(store.records().len(), 1, "the renewal records nothing");
+    assert_eq!(
+        records(&fixture).await.len(),
+        1,
+        "the renewal records nothing"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_malformed_request_or_oversized_descriptor_is_refused() {
     let fixture = Fixture::acquire().await;
-    let store = Arc::new(MemoryEnrolments::default());
+    let auth = fixture.enrolment_auth(Arc::new(DefaultAuthHooks)).await;
     let mut client = session(
         &fixture,
         Some("alice"),
         Some(DeviceCertConfig::new(issuer().1)),
-        &store,
+        &auth,
     )
     .await;
 
@@ -697,18 +942,18 @@ async fn a_malformed_request_or_oversized_descriptor_is_refused() {
     let handed = nonce(&mut client).await;
     let reply = enrol(&mut client, &device_key(), handed, None, vec![0; 4097]).await;
     assert_eq!(reply, refused(EnrolRefusal::InvalidRequest, "e"));
-    assert_eq!(store.records(), Vec::new());
+    assert_eq!(records(&fixture).await, Vec::new());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_app_attestation_that_does_not_parse_is_refused() {
     let fixture = Fixture::acquire().await;
-    let store = Arc::new(MemoryEnrolments::default());
+    let auth = fixture.enrolment_auth(Arc::new(DefaultAuthHooks)).await;
     let mut client = session(
         &fixture,
         Some("alice"),
         Some(DeviceCertConfig::new(issuer().1)),
-        &store,
+        &auth,
     )
     .await;
     let handed = nonce(&mut client).await;
@@ -725,13 +970,13 @@ async fn an_app_attestation_that_does_not_parse_is_refused() {
     )
     .await;
     assert_eq!(reply, refused(EnrolRefusal::InvalidRequest, "e"));
-    assert_eq!(store.records(), Vec::new());
+    assert_eq!(records(&fixture).await, Vec::new());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_renewal_keeps_the_attestation_level_the_first_enrolment_recorded() {
     let fixture = Fixture::acquire().await;
-    let store = Arc::new(MemoryEnrolments::default());
+    let auth = fixture.enrolment_auth(Arc::new(DefaultAuthHooks)).await;
     let (_, issuer) = issuer();
     let key = device_key();
     let (root, chain, status) = chip_attestation(&key);
@@ -740,10 +985,10 @@ async fn a_renewal_keeps_the_attestation_level_the_first_enrolment_recorded() {
         .with_accepted_attestation([AttestationLevel::ChipProven]);
     let manager = enrolling_manager(
         &fixture,
-        Some(DeviceEnrolment::new(config, Arc::clone(&store) as _).with_status_list(status)),
+        Some(DeviceEnrolment::new(config, Arc::clone(&auth)).with_status_list(status)),
     )
     .await;
-    let mut client = connect(&manager, Some("alice")).await;
+    let mut client = connect(&fixture, &manager, Some("alice")).await;
 
     // The first enrolment: a chip-proven chain records `chip-proven`.
     let handed = nonce(&mut client).await;
@@ -752,7 +997,7 @@ async fn a_renewal_keeps_the_attestation_level_the_first_enrolment_recorded() {
         &key,
         handed,
         None,
-        vec![],
+        vec![0xc0],
         Some(android_evidence(chain)),
     )
     .await;
@@ -770,7 +1015,7 @@ async fn a_renewal_keeps_the_attestation_level_the_first_enrolment_recorded() {
 
     // A renewal without any attestation keeps the recorded level.
     let handed = nonce(&mut client).await;
-    let reply = enrol(&mut client, &key, handed, None, vec![]).await;
+    let reply = enrol(&mut client, &key, handed, None, vec![0xc0]).await;
     let ControlMessage::EnrolGrant(EnrolGrant { chain: renewed, .. }) = reply else {
         panic!("a renewal keeps the stored level, got {reply:?}");
     };

@@ -520,6 +520,9 @@ async fn a_photo_round_trips_through_stage_commit_resolve_and_http_fetch() {
         owner_id: available.owner_id.clone(),
         content_id: available.content_id.clone(),
         content_state: Some("available".to_owned()),
+        thumb_id: Some(available.content_id.clone()),
+        thumb_state: Some("available".to_owned()),
+        team_id: None,
     };
     let srcs = demo.sources(&[held]).await;
     let src = srcs

@@ -21,8 +21,10 @@
 #[cfg(test)]
 mod cursor_lock_tests;
 
+mod courier_audit;
 mod input;
 
+use courier_audit::AuditState;
 use input::HeldInput;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -32,23 +34,29 @@ use std::sync::Weak;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-use connetto_core::auth::{AuthContext, Principal, Subject, VerifiedSession};
+use connetto_core::auth::{AuthContext, ContentCarry, Principal, Subject, VerifiedSession};
 use connetto_core::chain::{self, GENESIS};
 use connetto_core::device_cert::{KeyId, spki_point};
-use connetto_core::exchange::{Origin, SignedOffer};
+use connetto_core::exchange::{
+    CourierEntryOutcome, CourierOutcome, CourierRefusal, ManifestRow, Origin, SignedOffer,
+};
 use connetto_core::messages::{
-    AggregateUpdate, BindDevice, BindValue, BotRegistered, BulkMessage, CONTENT_TICKET_REFUSED,
-    CONTENT_TICKET_SIGNER_ERROR, Challenge, ConflictRow, ContentTicketGrant, ContentTicketRequest,
-    ContentVerb, ControlMessage, DeviceRevokedAck, DevicesList, DevicesRequest, EnrolChallenge,
-    EnrolRefusal, EnrolRefused, EnrolRequest, FatalError, FatalErrorReason, FullResyncReason,
-    FullResyncRequired, Grant, Handshake, HandshakeAck, LivePatch, MembershipOpened,
-    MutationApplied, MutationConflict, MutationHeader, MutationPatch, MutationReject,
-    MutationRejectReason, NonFatalError, PROVISIONAL_ASK_REFUSED, PauseCause, Pong, PriorRefusal,
-    Provenance, ProvisionalStatus, ProvisionalVerdicts, RateLimited, RegisterBot, ReplaceShareKeys,
-    RetireWriter, RevocationUpdate, RevokeDeviceRequest, SUBSCRIPTION_REFUSED, ShareKeysReplaced,
-    SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionSpec,
-    WriterAnswer, WriterGrant, WriterOutcome, WriterRef, WriterRequest, WriterSecret,
-    bot_registration_message, writer_bind_message,
+    AggregateChange, AggregateColumns, AggregateUpdate, BindDevice, BotRegistered, BulkMessage,
+    CONTENT_TICKET_REFUSED, CONTENT_TICKET_SIGNER_ERROR, Challenge, ConflictRow,
+    ContentTicketGrant, ContentTicketRequest, ContentVerb, ControlMessage, DeviceRevokedAck,
+    DevicesList, DevicesRequest, EnrolChallenge, EnrolRefusal, EnrolRefused, EnrolRequest,
+    FatalError, FatalErrorReason, FullResyncReason, FullResyncRequired, Grant, Handshake,
+    HandshakeAck, LivePatch, MembershipOpened, MutationApplied, MutationConflict, MutationHeader,
+    MutationPatch, MutationReject, MutationRejectReason, NonFatalError, PROVISIONAL_ASK_REFUSED,
+    PauseCause, Pong, PriorRefusal, Provenance, ProvisionalStatus, ProvisionalVerdicts,
+    RateLimited, RegisterBot, ReplaceShareKeys, RetireWriter, RevocationUpdate,
+    RevokeDeviceRequest, SUBSCRIPTION_REFUSED, SUBSCRIPTION_REFUSED_SCHEMA, ShareKeysReplaced,
+    SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch, SqliteValue, Subscribe,
+    SubscriptionSpec, WriterAnswer, WriterGrant, WriterOutcome, WriterRef, WriterRequest,
+    WriterSecret, bot_registration_message, writer_bind_message,
+};
+use connetto_core::messages::{
+    CourierAnswer, CourierBody, CourierNotice, CourierNoticeAck, CourierNoticeRow, CourierRange,
 };
 use connetto_core::traits::{
     CheckedGrant, ContentTicketSigner, HandshakeAuthority, IncomingFrame, Transport,
@@ -71,10 +79,12 @@ use subql::term::{TermCaller, TermDescription};
 use subql::visibility::transition::{Transition, TransitionError, Transitions, transitions};
 use subql::visibility::{EventRow, RowWrite, Verdict, VisibilityPolicy};
 use subql::{
-    AdvanceCursorError, CdcSource, Checkpoint, DatabaseLike, EventKind, OpaqueCheckpoint, ParserDB,
-    PgChangeEvent, PgCommit, PgCommitPosition, PgLsn, PgXid, Seen, SourceItem, SubscriptionId,
-    TableLike,
+    AdvanceCursorError, CdcSource, Checkpoint, DatabaseLike, DriftSignal, EventKind,
+    Incompatibility, OpaqueCheckpoint, ParserDB, PgChangeEvent, PgCommit, PgCommitPosition, PgLsn,
+    PgXid, RefusalView, RefusedTables, Seen, SourceItem, SubscriptionId, TableId, TableLike,
 };
+
+use crate::drift::{RefusedSet, StreamSignal};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tracing::Instrument;
 use uuid::Uuid;
@@ -83,8 +93,11 @@ use crate::abuse::{Caller, Reaction};
 use crate::bots::schema::{ListEntry, PgBotRegistry, RegistryError, Verb};
 
 use crate::audit::{AuthEvent, AuthOp};
+use crate::catalog_shapes::CatalogShapes;
 use crate::counters;
-use crate::courier::{CourierDelivery, CourierEntry, CourierRefusal};
+use crate::courier::{
+    Admitted, Applier, CourierAuthor, CourierEntry, CourierRun, CourierViolation, Settling, Slot,
+};
 use crate::fence::{ReadFence, split_snapshot_cursor};
 use crate::guard::RequestGuard;
 use crate::materializer::{
@@ -332,6 +345,63 @@ struct MemberTable {
     subjects: bool,
 }
 
+/// The membership tables a filter's terms watch, one entry per table and
+/// column, carrying every caller kind the terms over it read.
+///
+/// Collapsed rather than one entry per term, because the mirror is keyed by
+/// table and opened once. Two terms over one table under different caller
+/// kinds would otherwise open the first and silently skip the second, leaving
+/// that kind's membership moves undelivered.
+///
+/// # Errors
+///
+/// [`SubscribeRefusal::MembershipTableUnreachable`] when a term's table is not
+/// the one its bare name reaches in `catalog`.
+fn member_tables_of<DB: DatabaseLike>(
+    terms: &[TermDescription],
+    catalog: &DB,
+) -> Result<Arc<[MemberTable]>, SubscribeRefusal> {
+    let mut tables: Vec<MemberTable> = Vec::new();
+    for term in terms {
+        let TermDescription::Membership(membership) = term else {
+            continue;
+        };
+        let stored = &membership.member_table;
+        let reached = subql::catalog_helpers::table_id_for_name::<Postgres, _>(
+            catalog,
+            sql_traits::structs::TargetName::new(&stored.name, true),
+        );
+        if reached.is_none()
+            || reached != subql::catalog_helpers::stored_table_id::<Postgres, _>(catalog, stored)
+        {
+            return Err(SubscribeRefusal::MembershipTableUnreachable(
+                match &stored.schema {
+                    Some(schema) => format!("{schema}.{}", stored.name),
+                    None => stored.name.to_string(),
+                },
+            ));
+        }
+        let held = tables.iter().position(|held| {
+            held.table == membership.member_table.name && held.subject == membership.member_subject
+        });
+        let at = held.unwrap_or_else(|| {
+            tables.push(MemberTable {
+                table: membership.member_table.name.to_string(),
+                subject: membership.member_subject.clone(),
+                identity: false,
+                subjects: false,
+            });
+            tables.len() - 1
+        });
+        let entry = &mut tables[at];
+        match membership.caller {
+            TermCaller::Identity => entry.identity = true,
+            TermCaller::Subjects => entry.subjects = true,
+        }
+    }
+    Ok(tables.into())
+}
+
 /// Why a subscription was not registered, beyond the materializer's own
 /// refusals. Every cause is answered on the wire with the one fixed
 /// `SUBSCRIPTION_REFUSED` detail (R38), so this exists for the structured log.
@@ -356,6 +426,11 @@ enum SubscribeRefusal {
         "membership table {0} is not carried by the publication, so a membership change would never move rows"
     )]
     Unpublished(String),
+    /// A membership term reads a table its bare name does not reach. The seed,
+    /// the mirror and the replica name a membership table bare, so they would
+    /// read another table or none.
+    #[error("membership table {0} is not the table its bare name reaches")]
+    MembershipTableUnreachable(String),
     /// The snapshot source has no publication to verify against.
     #[error(
         "no publication is configured on the snapshot source, so a membership table cannot be verified as replicated"
@@ -450,7 +525,7 @@ pub trait SnapshotSource<Id = String, Key = String>: Send + Sync {
     async fn estimate(
         &self,
         select_sql: &str,
-        binds: &[BindValue],
+        binds: &[SqliteValue],
         caller: &Principal<Id, Key>,
     ) -> Result<SnapshotEstimate, Self::Error>;
 
@@ -466,6 +541,14 @@ pub trait SnapshotSource<Id = String, Key = String>: Send + Sync {
     /// than return its first rows: a truncation the caller cannot tell from a
     /// complete answer is the one outcome this seam may never produce.
     ///
+    /// The page's cursor becomes the client's resume point, and the client
+    /// cannot compare two cursors, so it has to name where the read sat. It
+    /// lies at or past every commit made before the read began, so it never
+    /// moves a resume point behind a change the connection already delivered,
+    /// and before every commit the read did not see, so a catchup from it
+    /// misses none. A source that cannot tell where its read sat returns an
+    /// empty cursor, which leaves the client's resume point where it was.
+    ///
     /// # Errors
     ///
     /// Implementation-defined: a backend read or encoding failure, a row above
@@ -473,7 +556,7 @@ pub trait SnapshotSource<Id = String, Key = String>: Send + Sync {
     async fn snapshot_page(
         &self,
         select_sql: &str,
-        binds: &[BindValue],
+        binds: &[SqliteValue],
         caller: &Principal<Id, Key>,
         page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error>;
@@ -586,6 +669,8 @@ pub struct SessionConfig {
     idle_limit: Duration,
     /// Bytes of live patches one connection may have queued and unsent before it is closed.
     send_queue_bytes: u64,
+    /// Whether the deployment accepts courier ranges (R78 decision 1).
+    courier: bool,
     #[cfg(feature = "test-seams")]
     key_expiry_clock: Option<tokio::sync::watch::Receiver<SystemTime>>,
 }
@@ -603,6 +688,7 @@ impl Default for SessionConfig {
             first_frame_budget: Duration::from_secs(30),
             idle_limit: Duration::from_secs(60),
             send_queue_bytes: 64 * 1024 * 1024,
+            courier: false,
             #[cfg(feature = "test-seams")]
             key_expiry_clock: None,
         }
@@ -643,6 +729,14 @@ impl SessionConfig {
     #[must_use]
     pub fn with_sunset(mut self, sunset: Option<time::OffsetDateTime>) -> Self {
         self.sunset = sunset;
+        self
+    }
+
+    /// Accepts courier ranges when `on` (R78 decision 1), which every
+    /// handshake ack tells the client. Off by default.
+    #[must_use]
+    pub const fn with_courier(mut self, on: bool) -> Self {
+        self.courier = on;
         self
     }
 
@@ -863,8 +957,12 @@ struct Applied {
     narrowings: Option<Vec<TermMove>>,
     /// Computed changes not yet delivered, in delivery order.
     computed: VecDeque<ComputedChange>,
+    /// Computed subscriptions whose values cannot be encoded.
+    computed_refused: Vec<SubscriptionId>,
     /// The read failure still to be answered.
     failure: Option<MaterializerError>,
+    /// The reads subql ended for good, still to be told.
+    stopped: Vec<crate::materializer::EndedRead>,
     /// Whether queued reads remain to be drained.
     drain_due: bool,
     /// Unknown-class read failures counted per subscription.
@@ -879,7 +977,9 @@ impl Applied {
             refused: dispatched.refused,
             narrowings: Some(dispatched.narrowings),
             computed: dispatched.computed.into(),
+            computed_refused: dispatched.computed_refused,
             failure: dispatched.failure,
+            stopped: dispatched.stopped,
             drain_due: false,
             unknown_attempts: HashMap::new(),
         }
@@ -1034,6 +1134,11 @@ pub enum SessionError {
          ALTER TABLE {0} REPLICA IDENTITY FULL"
     )]
     ChangeStreamUnusable(String),
+    /// The drift guard reported a signal this server cannot serve through,
+    /// lost changes of a table or a signal it does not know, so it stops
+    /// serving instead of reconnecting into the same report.
+    #[error("the change stream reported {0}, which this server cannot serve through")]
+    DriftUnserved(String),
     /// The authorization path refused an event for a reason the deployment fixes, so the server stops serving instead of retrying.
     #[error(
         "the authorization path cannot answer for a change in {table}, and asking again \
@@ -1138,6 +1243,21 @@ fn transport_err<E: core::fmt::Display>(err: E) -> SessionError {
     SessionError::Transport(err.to_string())
 }
 
+/// Refuse the content ticket `request_id` asked for with `detail`.
+async fn refuse_ticket<T: Transport>(
+    transport: &mut T,
+    request_id: String,
+    detail: &str,
+) -> Result<(), SessionError> {
+    transport
+        .send_control(ControlMessage::NonFatalError(NonFatalError {
+            related_to: Some(request_id),
+            detail: detail.to_owned(),
+        }))
+        .await
+        .map_err(transport_err)
+}
+
 fn oplog_err<E: core::fmt::Display>(err: E) -> SessionError {
     SessionError::Oplog(err.to_string())
 }
@@ -1233,6 +1353,7 @@ impl ContentTicketSigner for NoSigner {
         _caller: &connetto_core::auth::ContentCaller,
         _file_id: [u8; 32],
         _verb: ContentVerb,
+        _carry: Option<&connetto_core::auth::ContentCarry>,
     ) -> impl core::future::Future<Output = Result<String, Self::Error>> + Send {
         core::future::ready(Err(NoSignerConfigured))
     }
@@ -1378,15 +1499,24 @@ pub(crate) fn reject_reason(err: &MaterializerError) -> MutationRejectReason {
         MaterializerError::Parse(detail) => MutationRejectReason::Malformed {
             detail: detail.clone(),
         },
-        MaterializerError::NotWritable(_) | MaterializerError::SchemaMismatch(_) => {
-            MutationRejectReason::SchemaMismatch
-        }
+        MaterializerError::NotWritable(_)
+        | MaterializerError::SchemaMismatch(_)
+        | MaterializerError::Refused(_) => MutationRejectReason::SchemaMismatch,
         MaterializerError::Apply(inner) => MutationRejectReason::Constraint {
             detail: inner.to_string(),
         },
         other => MutationRejectReason::Other {
             detail: other.to_string(),
         },
+    }
+}
+
+/// Why a catch-up member reached by the emptying `record` of `table` replaces it.
+fn resync_reason(record: &ChangeRecord, table: String) -> FullResyncReason {
+    if record.is_refusal() {
+        FullResyncReason::TableRefused { table }
+    } else {
+        FullResyncReason::TableTruncated { table }
     }
 }
 
@@ -1525,6 +1655,8 @@ enum Outbound {
     Refuse {
         /// The client-facing label of the subscription.
         sub_id: String,
+        /// The fixed phrase the refusal carries.
+        detail: &'static str,
     },
 }
 
@@ -1550,7 +1682,7 @@ struct Route<Id, Key> {
     /// per subscriber per event.
     pg_sql: std::sync::Arc<str>,
     /// The subscription's bind values, paired with `pg_sql`'s placeholders.
-    binds: std::sync::Arc<[BindValue]>,
+    binds: std::sync::Arc<[SqliteValue]>,
     /// The membership tables this subscription's terms watch, empty for a
     /// filter naming none. A grant moved by a change to one of these tables is
     /// served incrementally by the term's own move (R27 decision 2), so the
@@ -1579,6 +1711,19 @@ fn budgeted_bytes(patch: &LivePatch) -> u64 {
         .saturating_add(len_bytes(patch.patchset_zstd.len()))
 }
 
+/// The bytes occupied by typed row values and their variable payloads.
+fn aggregate_row_bytes(row: &[SqliteValue]) -> u64 {
+    row.iter().fold(0_u64, |bytes, value| {
+        bytes
+            .saturating_add(len_bytes(std::mem::size_of::<SqliteValue>()))
+            .saturating_add(match value {
+                SqliteValue::Text(text) => len_bytes(text.len()),
+                SqliteValue::Blob(blob) => len_bytes(blob.len()),
+                SqliteValue::Null | SqliteValue::Integer(_) | SqliteValue::Real(_) => 0,
+            })
+    })
+}
+
 impl Outbound {
     /// The bytes this item counts against the connection's send budget while it waits.
     ///
@@ -1588,20 +1733,24 @@ impl Outbound {
             Self::Live(patch) => budgeted_bytes(patch),
             Self::Aggregate(update) => OUTBOUND_ITEM_BYTES
                 .saturating_add(len_bytes(update.sub_id.len()))
-                .saturating_add(len_bytes(update.group_key.as_ref().map_or(0, Vec::len)))
-                .saturating_add(len_bytes(
-                    update.group_values_json.as_ref().map_or(0, String::len),
-                ))
-                .saturating_add(len_bytes(
-                    update.result_json.as_ref().map_or(0, String::len),
-                )),
+                .saturating_add(match &update.change {
+                    AggregateChange::Upsert { key, row } => {
+                        len_bytes(key.len()).saturating_add(aggregate_row_bytes(row))
+                    }
+                    AggregateChange::Remove { key } => len_bytes(key.len()),
+                    AggregateChange::Replace { rows } => rows.iter().fold(0_u64, |bytes, row| {
+                        bytes
+                            .saturating_add(len_bytes(std::mem::size_of::<Vec<SqliteValue>>()))
+                            .saturating_add(aggregate_row_bytes(row))
+                    }),
+                }),
             Self::Fatal(_) | Self::Drop => 0,
             // Rare and of any shape, so it is measured by its encoding.
             Self::Control(msg) => OUTBOUND_ITEM_BYTES.saturating_add(
                 connetto_core::codec::encode_control(msg).map_or(0, |frame| len_bytes(frame.len())),
             ),
             Self::Resnapshot { sub_id, .. }
-            | Self::Refuse { sub_id }
+            | Self::Refuse { sub_id, .. }
             | Self::ReservedResnapshot { sub_id, .. }
             | Self::Rebootstrap { sub_id, .. } => {
                 OUTBOUND_ITEM_BYTES.saturating_add(len_bytes(sub_id.len()))
@@ -1683,6 +1832,40 @@ struct LiveSession {
     user: Option<String>,
 }
 
+/// One author's open provisional question on one connection (R77 decision 11):
+/// the sequences that answered `Pending`, the row filters that wake it, and
+/// the timer that re-reads it the moment its certificate lapses.
+struct ProvisionalAuthor {
+    /// The author's writer number, learned from its row once the stream or a
+    /// read carries it.
+    writer: Option<i64>,
+    /// The open sequences by the ask that asked them, each ask answered by a
+    /// push naming its own `request_id`.
+    asks: BTreeMap<String, BTreeSet<u64>>,
+    /// The author's row filters, one per registered internal consumer.
+    consumers: Vec<(u64, SubscriptionId)>,
+    /// The instant the author's certificate lapses (its expiry plus the
+    /// tolerance), the deadline its timer sleeps to (R77 decision 11).
+    deadline: Option<SystemTime>,
+    /// The task sleeping to that deadline, aborted the moment the author
+    /// closes so a lapsed certificate of a closed question pushes nothing
+    /// (R77 decision 11).
+    timer: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// A connection's open provisional questions, every author's, with the
+/// connection that owns them so a superseded end cannot drop the successor's.
+struct ProvisionalSessionQ {
+    connection_num: u64,
+    /// The connection's outbound half, pushed on even after the handle is
+    /// superseded, so a verdict answers the ask that asked.
+    tx: OutboundTx,
+    authors: BTreeMap<Vec<u8>, ProvisionalAuthor>,
+    /// The connection's open sequences, every author's sum, the bound the
+    /// asks hold against.
+    open: usize,
+}
+
 /// What a completed handshake establishes for the run loop.
 struct HandshakeOutcome<Id, Key> {
     connection_num: u64,
@@ -1749,7 +1932,7 @@ impl Deliverable {
                 Some(&patch.sub_id)
             }
             Self::Rows(BulkMessage::SnapshotPatch(patch)) => Some(&patch.sub_id),
-            Self::Rows(BulkMessage::MutationPatch(_)) => None,
+            Self::Rows(BulkMessage::MutationPatch(_) | BulkMessage::CourierBody(_)) => None,
             Self::SnapshotComplete(end) => Some(&end.sub_id),
         }
     }
@@ -2041,6 +2224,13 @@ struct SessionState<Id, Key> {
     closing: bool,
     /// The enrolment nonce this session was last handed, spent by its next enrolment request.
     enrol_challenge: Option<crate::device_cert::PendingChallenge>,
+    /// The courier range open on this connection, one at a time (R78
+    /// decision 30).
+    courier: Option<CourierRun<Id, Key>>,
+    /// The courier notice frames this connection was sent, by frame id, each
+    /// holding the notice rows the frame carried, so its ack deletes exactly
+    /// those (R78 decision 39).
+    notices: HashMap<String, Vec<i64>>,
 }
 
 /// One computed subscription, as a key change has to find it again.
@@ -2392,6 +2582,9 @@ pub struct SessionManager<
     /// The visibility question holds a row view across an await, so it cannot
     /// borrow one through the materializer's mutex.
     catalog: Arc<ParserDB>,
+    /// Every catalog table's columns, shared with the materializer, which the
+    /// session's own reads project without the materializer's mutex.
+    shapes: Arc<CatalogShapes>,
     routes: Mutex<HashMap<u64, Route<Id, Key>>>,
     /// Held across one event's dispatch and fan-out, and by a session swapping
     /// its share keys, so no patch filtered under the old keys is queued behind
@@ -2404,6 +2597,13 @@ pub struct SessionManager<
     /// and supersession. The per-subscription route map cannot serve either,
     /// because a session with no subscriptions has no route.
     sessions: Mutex<HashMap<SessionId, LiveSession>>,
+    /// The open provisional questions per connection, answered by a push the
+    /// moment a sequence settles (R77 decision 11).
+    provisional_questions: Mutex<HashMap<SessionId, ProvisionalSessionQ>>,
+    /// The internal row filters those questions watch, the consumer id to the
+    /// connection and author key that owns it.
+    provisional_consumers: Mutex<HashMap<u64, (SessionId, Vec<u8>)>>,
+    courier_audit: Mutex<AuditState<Id>>,
     snapshot_source: Snap,
     auth: Auth,
     /// Checks the grants a handshake presents and signs the resume credential
@@ -2455,7 +2655,7 @@ pub struct SessionManager<
     withdrawal_source: OnceLock<Snap>,
     /// Issues device certificates (R74). Without one, every enrolment is
     /// refused as [`EnrolRefusal::IssuerUnavailable`].
-    device_enrolment: OnceLock<Arc<crate::device_cert::DeviceEnrolment<Id>>>,
+    device_enrolment: OnceLock<Arc<crate::device_cert::DeviceEnrolment<D>>>,
     /// The deployment's content ticket signer, called after a successful
     /// visibility check to mint a signed URL the caller may use at the file
     /// server. Generic rather than boxed so a deployment wires it at compile
@@ -2465,6 +2665,7 @@ pub struct SessionManager<
     history: parking_lot::RwLock<Option<TimelineHistory>>,
     /// Where a reconnect of the change feed resumes, the last row or commit the ingest finished handling.
     resume: ResumePoint,
+    ingested_commits: OnceLock<tokio::sync::broadcast::Sender<PgCommit>>,
     /// The ingest loop's unfinished event, kept across pause retries and stream reconnects so no stage runs twice.
     held: Mutex<Option<EventProgress>>,
     /// Run loops that have started and not yet ended, which the shutdown
@@ -2481,6 +2682,9 @@ pub struct SessionManager<
     /// The sessions bound to each device writer (R75), so a retirement can
     /// close every connection that writes as the retired writer.
     writer_sessions: Mutex<HashMap<i64, HashSet<SessionId>>>,
+    /// The tables this process refused, the materializer's own set, so the
+    /// ingest loop's gate reads it without the materializer lock.
+    refused: RefusedSet,
 }
 
 /// Keeps the open-run-loop count right while one `serve` is in flight.
@@ -2509,6 +2713,46 @@ impl Drop for OpenSessionTally {
 /// The manager over the `String` ids and keys every construction shares.
 pub(crate) type ConnettoManager<Snap, Auth, D, C, O, S> =
     SessionManager<Snap, Auth, D, C, O, <D as ConnettoSchema>::Id, String, S>;
+
+/// End the connection for a courier frame no conforming client sends (R78
+/// decision 29), telling the client why.
+///
+/// # Errors
+///
+/// Always [`SessionError::Protocol`], which ends the connection.
+async fn courier_violation<T: Transport>(
+    transport: &mut T,
+    violation: &CourierViolation,
+) -> Result<(), SessionError> {
+    let detail = violation.to_string();
+    let _ = transport
+        .send_control(ControlMessage::FatalError(FatalError::new(
+            FatalErrorReason::ProtocolViolation {
+                detail: detail.clone(),
+            },
+        )))
+        .await;
+    Err(SessionError::Protocol(detail))
+}
+
+/// Send a finished courier range's one answer.
+///
+/// # Errors
+///
+/// [`SessionError`] when the transport fails.
+async fn answer_courier<T: Transport, Id, Key>(
+    transport: &mut T,
+    run: CourierRun<Id, Key>,
+) -> Result<(), SessionError> {
+    let (request_id, outcome) = run.finish();
+    transport
+        .send_control(ControlMessage::CourierAnswer(CourierAnswer {
+            request_id,
+            outcome,
+        }))
+        .await
+        .map_err(transport_err)
+}
 
 /// The sunset's seconds since the Unix epoch, which the wire carries (R107).
 fn sunset_secs(sunset: time::OffsetDateTime) -> u64 {
@@ -2539,6 +2783,7 @@ async fn sunset_watch<Snap, Auth, D, C, O, S>(
     D: ConnettoSchema,
     D::Id: core::fmt::Display + Clone + Send + Sync + 'static,
     S: ContentTicketSigner,
+    ConnettoManager<Snap, Auth, D, C, O, S>: Send + Sync + 'static,
 {
     let mut ticker = tokio::time::interval(SUNSET_WATCH_CADENCE);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2596,11 +2841,16 @@ where
     let has_major = config.schema_major.is_some();
     let manager = Arc::new(SessionManager {
         catalog: Arc::new(materializer.catalog().clone()),
+        refused: materializer.refused().clone(),
+        shapes: Arc::clone(materializer.shapes()),
         materializer: Arc::new(Mutex::new(materializer)),
         routes: Mutex::new(HashMap::new()),
         dispatch_gate: Mutex::new(()),
         computed_routes: Mutex::new(HashMap::new()),
         sessions: Mutex::new(HashMap::new()),
+        provisional_questions: Mutex::new(HashMap::new()),
+        provisional_consumers: Mutex::new(HashMap::new()),
+        courier_audit: Mutex::new(AuditState::default()),
         snapshot_source,
         auth,
         authority,
@@ -2621,14 +2871,17 @@ where
         signer,
         history: parking_lot::RwLock::new(None),
         resume: ResumePoint::default(),
+        ingested_commits: OnceLock::new(),
         held: Mutex::new(None),
         open_sessions: Arc::new(AtomicUsize::new(0)),
         shutting_down: AtomicBool::new(false),
         bot_registry,
         writer_sessions: Mutex::new(HashMap::new()),
     });
-    // A configured sunset is enforced by the watch, which every construction
-    // shares here, the binary's and the in-process builder's alike (R107).
+    // The sunset watch is the only standing background task; it stands only
+    // when a sunset is configured (R107). The provisional certificate
+    // expiries arm their own timer per open author at ask time (R77
+    // decision 11).
     if let Some(sunset) = sunset
         && has_major
     {
@@ -2666,7 +2919,11 @@ where
     Id: core::fmt::Display + Clone + Send + Sync + 'static,
     Key: CapabilityKey,
     D: ConnettoSchema<Id = Id>,
-    S: ContentTicketSigner,
+    S: ContentTicketSigner + 'static,
+    // A provisional expiry timer spawns a `Send` task on the manager's weak
+    // handle (R77 decision 11), which is `Send` only for a `Send + Sync`
+    // manager, and `tokio::spawn` needs the manager to outlive it.
+    Self: Send + Sync + 'static,
 {
     /// Ask a second executor about every current row alongside the one that
     /// delivers, so a divergence between them is counted and named.
@@ -2707,8 +2964,8 @@ where
     /// The enrolment handed over, when one is already installed.
     pub fn install_device_enrolment(
         &self,
-        enrolment: Arc<crate::device_cert::DeviceEnrolment<Id>>,
-    ) -> Result<(), Arc<crate::device_cert::DeviceEnrolment<Id>>> {
+        enrolment: Arc<crate::device_cert::DeviceEnrolment<D>>,
+    ) -> Result<(), Arc<crate::device_cert::DeviceEnrolment<D>>> {
         self.device_enrolment.set(enrolment)
     }
 
@@ -3180,6 +3437,542 @@ where
         }
     }
 
+    /// The open questions an applied event's bookkeeping rows wake, the
+    /// internal consumers it matched resolved to the connection and author
+    /// key that owns them (R77 decision 11).
+    async fn provisional_targets_of(&self, applied: &Applied) -> HashSet<(SessionId, Vec<u8>)> {
+        let consumers = self.provisional_consumers.lock().await;
+        let mut targets = HashSet::new();
+        for patch in &applied.patches {
+            if let Some((session_id, key)) = consumers.get(&patch.consumer_id) {
+                targets.insert((*session_id, key.clone()));
+            }
+        }
+        for consumer_id in &applied.refused {
+            if let Some((session_id, key)) = consumers.get(consumer_id) {
+                targets.insert((*session_id, key.clone()));
+            }
+        }
+        targets
+    }
+
+    /// Re-read the open questions an event or a reconnect owes, holding the
+    /// dispatch gate so no settle lands between a question's fact read and its
+    /// answer (R77 decision 11).
+    async fn revalidate_provisional_targets(&self, targets: &HashSet<(SessionId, Vec<u8>)>) {
+        if targets.is_empty() {
+            return;
+        }
+        let _gate = self.dispatch_gate.lock().await;
+        for (session_id, key) in targets {
+            self.revalidate_one_locked(*session_id, key).await;
+        }
+    }
+
+    /// Re-read one author's facts, push what turned final, close those
+    /// sequences, and register the settled filter the first time the writer
+    /// number is learned. The caller holds the dispatch gate.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one author's revalidation walks read, rule, push, and close in order"
+    )]
+    async fn revalidate_one_locked(&self, session_id: SessionId, key: &[u8]) {
+        let snapshot = {
+            let questions = self.provisional_questions.lock().await;
+            questions
+                .get(&session_id)
+                .and_then(|q| q.authors.get(key))
+                .map(|author| {
+                    (
+                        author.writer,
+                        author
+                            .asks
+                            .iter()
+                            .map(|(id, seqs)| (id.clone(), seqs.clone()))
+                            .collect::<BTreeMap<_, _>>(),
+                    )
+                })
+        };
+        let Some((writer_known, asks)) = snapshot else {
+            return;
+        };
+        if asks.values().all(BTreeSet::is_empty) {
+            return;
+        }
+        // The facts, read the way the ask answers them, so the push and the
+        // first answer rule identically.
+        let writer_row = match self.target.writer_by_key(key).await {
+            Ok(row) => row,
+            Err(err) => {
+                tracing::warn!(
+                    "the writer read answered no fact for an open question: {}",
+                    err.detail()
+                );
+                return;
+            }
+        };
+        let record = match (self.device_enrolment.get(), key.try_into().ok()) {
+            (Some(enrolment), Some(key_bytes)) => {
+                match enrolment
+                    .key_record(None, KeyId::from_bytes(key_bytes))
+                    .await
+                {
+                    Ok(record) => record,
+                    Err(err) => {
+                        tracing::warn!(
+                            "the enrolment store did not answer for an open question: {err:?}"
+                        );
+                        return;
+                    }
+                }
+            }
+            _ => None,
+        };
+        let abandoned = record
+            .as_ref()
+            .is_none_or(|record| record.revoked || !record.certificate_live_past_skew);
+        let writer = writer_row.as_ref().map(|row| row.writer);
+        let (frontier, retired) = writer_row.as_ref().map_or((0, false), |row| {
+            (
+                u64::try_from(row.frontier).unwrap_or(0),
+                row.retired_at.is_some(),
+            )
+        });
+        let mut records: HashMap<i64, SettledOutcome> = HashMap::new();
+        if let (Some(low), Some(writer)) = (
+            asks.values()
+                .flat_map(BTreeSet::iter)
+                .filter(|seq| **seq <= frontier)
+                .copied()
+                .min(),
+            writer,
+        ) {
+            match self
+                .target
+                .settled_range(
+                    writer,
+                    i64::try_from(low).unwrap_or(0),
+                    i64::try_from(frontier).unwrap_or(i64::MAX),
+                )
+                .await
+            {
+                Ok(rows) => {
+                    for (seq, settled) in rows {
+                        match SettledOutcome::from_json(&settled.outcome) {
+                            Ok(outcome) => {
+                                records.insert(seq, outcome);
+                            }
+                            Err(err) => {
+                                tracing::warn!(error = %err, "a settled record held no outcome the table defines");
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "the settled read answered no fact for an open question: {}",
+                        err.detail()
+                    );
+                    return;
+                }
+            }
+        }
+        let facts = crate::provisional::AskFacts {
+            frontier,
+            retired,
+            abandoned,
+        };
+        // Ruling each open sequence, what turned final goes to the ask that
+        // asked it, never a sequence twice.
+        let mut pushes: BTreeMap<String, Vec<(u64, connetto_core::exchange::Verdict)>> =
+            BTreeMap::new();
+        let mut closed = BTreeSet::new();
+        for (request_id, seqs) in &asks {
+            for seq in seqs {
+                let verdict = crate::provisional::verdict_of(
+                    &facts,
+                    *seq,
+                    records.get(&i64::try_from(*seq).unwrap_or(i64::MAX)),
+                );
+                if verdict != connetto_core::exchange::Verdict::Pending {
+                    closed.insert(*seq);
+                    pushes
+                        .entry(request_id.clone())
+                        .or_default()
+                        .push((*seq, verdict));
+                }
+            }
+        }
+        if !pushes.is_empty() {
+            let tx_opt = {
+                let questions = self.provisional_questions.lock().await;
+                questions.get(&session_id).map(|q| q.tx.clone())
+            };
+            let Some(tx) = tx_opt else {
+                return;
+            };
+            for (request_id, verdicts) in pushes {
+                let _ = tx.send(Outbound::Control(ControlMessage::ProvisionalVerdicts(
+                    ProvisionalVerdicts {
+                        request_id,
+                        verdicts,
+                    },
+                )));
+            }
+        }
+        // The writer number the first read learned, to register the settled
+        // filter the first time it becomes known.
+        let learned_writer = writer.filter(|_| writer_known.is_none());
+        // Close the answered sequences, learn the writer, and retire the
+        // author with its filters and timer when nothing stays open.
+        let mut author_consumers = Vec::new();
+        let mut author_timer = None;
+        let mut author_closed = false;
+        {
+            let mut questions = self.provisional_questions.lock().await;
+            let Some(q) = questions.get_mut(&session_id) else {
+                return;
+            };
+            if let Some(author) = q.authors.get_mut(key) {
+                if let Some(writer) = writer {
+                    author.writer = Some(writer);
+                }
+                for seqs in author.asks.values_mut() {
+                    seqs.retain(|seq| !closed.contains(seq));
+                }
+                author.asks.retain(|_id, seqs| !seqs.is_empty());
+                if author.asks.is_empty() {
+                    author_consumers = std::mem::take(&mut author.consumers);
+                    author_timer = std::mem::take(&mut author.timer);
+                    author_closed = true;
+                }
+            }
+            if author_closed {
+                q.authors.remove(key);
+            }
+            q.open = q.open.saturating_sub(closed.len());
+        }
+        if let Some(timer) = author_timer {
+            timer.abort();
+        }
+        if !author_consumers.is_empty() {
+            let mut materializer = self.materializer.lock().await;
+            for (consumer_id, sub_id) in author_consumers {
+                materializer.unregister(sub_id);
+                self.provisional_consumers.lock().await.remove(&consumer_id);
+            }
+        }
+        // A writer the first read just learned still owes its settled rows to
+        // a question that stays open.
+        if let Some(writer) = learned_writer
+            && self
+                .provisional_questions
+                .lock()
+                .await
+                .get(&session_id)
+                .is_some_and(|q| {
+                    q.authors
+                        .get(key)
+                        .is_some_and(|author| !author.asks.is_empty())
+                })
+        {
+            self.register_settled_filter(session_id, key, writer).await;
+        }
+    }
+
+    /// Register the `_connetto_settled` filter for an author whose writer
+    /// number a revalidation just learned, the settled rows the question
+    /// could not watch while the number was unknown. The caller holds the
+    /// dispatch gate.
+    async fn register_settled_filter(&self, session_id: SessionId, key: &[u8], writer: i64) {
+        let consumer_id = self.next_consumer_id();
+        let sql = "SELECT seq FROM _connetto_settled WHERE writer = $1";
+        let binds = [SqliteValue::Integer(writer)];
+        let mut materializer = self.materializer.lock().await;
+        match materializer.register_translated(
+            consumer_id,
+            sql,
+            &binds,
+            None,
+            self.guard.reexec_budget(),
+            None,
+        ) {
+            Ok(crate::materializer::Registration::Row(sub_id)) => {
+                self.provisional_consumers
+                    .lock()
+                    .await
+                    .insert(consumer_id, (session_id, key.to_vec()));
+                let mut questions = self.provisional_questions.lock().await;
+                if let Some(q) = questions.get_mut(&session_id)
+                    && let Some(author) = q.authors.get_mut(key)
+                {
+                    author.consumers.push((consumer_id, sub_id));
+                }
+            }
+            other => match other {
+                Err(err) => {
+                    tracing::warn!(
+                        "the settled filter would not register, so the question waits for the next row: {err}"
+                    );
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        "the settled filter would not register, so the question waits for the next row"
+                    );
+                }
+            },
+        }
+    }
+
+    /// Open one author's question from a `Pending` answer, recording the ask
+    /// and whether the author's filters still need registering. `Err` refuses
+    /// the ask whole, its open sequences passing the session's bound or its
+    /// connection superseded (R77 decision 11). The caller holds the dispatch
+    /// gate and, on `Ok(true)`, registers the author's filters.
+    async fn open_provisional_author(
+        &self,
+        session_id: SessionId,
+        connection_num: u64,
+        tx: &OutboundTx,
+        ask: &ProvisionalStatus,
+        writer: Option<i64>,
+        pending: Vec<u64>,
+    ) -> Result<bool, ()> {
+        let mut questions = self.provisional_questions.lock().await;
+        let q = questions
+            .entry(session_id)
+            .or_insert_with(|| ProvisionalSessionQ {
+                connection_num,
+                tx: tx.clone(),
+                authors: BTreeMap::new(),
+                open: 0,
+            });
+        // A superseded connection's question belongs to its successor, so a
+        // stale ask opens nothing.
+        if q.connection_num != connection_num {
+            return Err(());
+        }
+        let author = q
+            .authors
+            .entry(ask.author.to_vec())
+            .or_insert_with(|| ProvisionalAuthor {
+                writer,
+                asks: BTreeMap::new(),
+                consumers: Vec::new(),
+                deadline: None,
+                timer: None,
+            });
+        // Only a sequence not already open for this author counts against the
+        // bound, so a repeated ask of the same sequence stays within it.
+        let already_open: BTreeSet<u64> = author
+            .asks
+            .values()
+            .flat_map(BTreeSet::iter)
+            .copied()
+            .collect();
+        let new_open = pending
+            .iter()
+            .copied()
+            .filter(|seq| !already_open.contains(seq))
+            .count();
+        if q.open + new_open > crate::provisional::MAX_OPEN_PROVISIONAL_SEQUENCES {
+            return Err(());
+        }
+        q.open += new_open;
+        author
+            .asks
+            .entry(ask.request_id.clone())
+            .or_default()
+            .extend(pending);
+        Ok(author.consumers.is_empty())
+    }
+
+    /// Register the row filters a fresh author's question watches and arm its
+    /// expiry timer, called while the caller holds the dispatch gate so no
+    /// settle lands between the question's fact read and its filters starting
+    /// to watch. The writers filter projects the `frontier` and `retired_at`
+    /// columns, the ones a settle or a retirement actually change, and binds
+    /// the writer number, or the device key while the number is unknown. The
+    /// settled filter registers at ask time once the writer number is known,
+    /// and later by a revalidation when the number is only learned then, so a
+    /// settle is caught by the change stream rather than by a reconnect (R77
+    /// decision 11).
+    async fn register_author_filters(
+        self: &Arc<Self>,
+        session_id: SessionId,
+        key: &[u8],
+        writer: Option<i64>,
+        expiry: Option<SystemTime>,
+    ) {
+        let (writers_sql, writers_bind) = match writer {
+            Some(writer) => (
+                "SELECT frontier, retired_at FROM _connetto_writers WHERE writer = $1",
+                SqliteValue::Integer(writer),
+            ),
+            None => (
+                "SELECT frontier, retired_at FROM _connetto_writers WHERE device_key = $1",
+                SqliteValue::Blob(key.to_vec()),
+            ),
+        };
+        let mut consumers = Vec::new();
+        let writers_consumer = self.next_consumer_id();
+        if let Some(sub_id) = self
+            .register_one_filter(writers_consumer, writers_sql, &[writers_bind])
+            .await
+        {
+            consumers.push((writers_consumer, sub_id));
+        }
+        let enrolment_consumer = self.next_consumer_id();
+        if let Some(sub_id) = self
+            .register_one_filter(
+                enrolment_consumer,
+                "SELECT revoked_at FROM connetto_device_enrolments WHERE key_id = $1",
+                &[SqliteValue::Blob(key.to_vec())],
+            )
+            .await
+        {
+            consumers.push((enrolment_consumer, sub_id));
+        }
+        // A settled row is the signal the question waits on, so it registers
+        // at ask time once the writer number is known rather than only when a
+        // later revalidation learns it (R77 decision 11).
+        if let Some(writer) = writer {
+            self.register_settled_filter(session_id, key, writer).await;
+        }
+        for (consumer_id, _sub_id) in &consumers {
+            self.provisional_consumers
+                .lock()
+                .await
+                .insert(*consumer_id, (session_id, key.to_vec()));
+        }
+        {
+            let mut questions = self.provisional_questions.lock().await;
+            if let Some(q) = questions.get_mut(&session_id)
+                && let Some(author) = q.authors.get_mut(key)
+            {
+                author.consumers = consumers;
+            }
+        }
+        // The certificate's expiry plus the tolerance, converted to a
+        // monotonic sleep at arm time so the timer needs no periodic sweep
+        // (R77 decision 11).
+        let Some(expiry) = expiry else {
+            return;
+        };
+        let Some(deadline) = expiry.checked_add(connetto_core::clock::DEVICE_SKEW) else {
+            return;
+        };
+        // `duration_since` errors once the deadline has passed, which is the
+        // instant the timer should fire, so it reads as zero.
+        let duration = deadline
+            .duration_since(SystemTime::now())
+            .unwrap_or_default();
+        let weak = Arc::downgrade(self);
+        let owned_key = key.to_vec();
+        // One task per author, sleeping to the certificate lapse, then
+        // re-reading it (R77 decision 11). Aborted the moment the author
+        // closes, and a re-read of a since-closed author is a no-op.
+        let mut timer = Some(tokio::spawn(async move {
+            tokio::time::sleep(duration).await;
+            let Some(manager) = weak.upgrade() else {
+                return;
+            };
+            let targets = HashSet::from([(session_id, owned_key)]);
+            manager.revalidate_provisional_targets(&targets).await;
+        }));
+        {
+            let mut questions = self.provisional_questions.lock().await;
+            if let Some(q) = questions.get_mut(&session_id)
+                && let Some(author) = q.authors.get_mut(key)
+            {
+                author.deadline = Some(deadline);
+                author.timer = timer.take();
+            }
+        }
+        // The caller holds the dispatch gate across the ask, so the author
+        // cannot have closed; abort the task if it somehow did.
+        if let Some(timer) = timer {
+            timer.abort();
+        }
+    }
+
+    /// Register one internal row filter, returning its engine subscription id.
+    async fn register_one_filter(
+        &self,
+        consumer_id: u64,
+        sql: &str,
+        binds: &[SqliteValue],
+    ) -> Option<SubscriptionId> {
+        let mut materializer = self.materializer.lock().await;
+        match materializer.register_translated(
+            consumer_id,
+            sql,
+            binds,
+            None,
+            self.guard.reexec_budget(),
+            None,
+        ) {
+            Ok(crate::materializer::Registration::Row(sub_id)) => Some(sub_id),
+            other => {
+                match other {
+                    Err(err) => {
+                        tracing::warn!("a provisional row filter would not register: {err}");
+                    }
+                    Ok(_) => {
+                        tracing::warn!("a provisional row filter would not register");
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    /// Drop a connection's open questions and their row filters, only if this
+    /// connection still owns them, so a superseded end cannot evict its
+    /// successor's (R77 decision 11).
+    async fn drop_provisional_questions(&self, session_id: SessionId, connection_num: u64) {
+        let removed = {
+            let mut questions = self.provisional_questions.lock().await;
+            match questions.get(&session_id) {
+                Some(q) if q.connection_num == connection_num => questions.remove(&session_id),
+                _ => None,
+            }
+        };
+        let Some(q) = removed else {
+            return;
+        };
+        let mut sub_ids = Vec::new();
+        for author in q.authors.values() {
+            for (_consumer_id, sub_id) in &author.consumers {
+                sub_ids.push(*sub_id);
+            }
+            if let Some(timer) = &author.timer {
+                timer.abort();
+            }
+        }
+        {
+            let mut materializer = self.materializer.lock().await;
+            for sub_id in sub_ids {
+                materializer.unregister(sub_id);
+            }
+        }
+        let mut consumers = self.provisional_consumers.lock().await;
+        consumers.retain(|_id, (sid, _)| *sid != session_id);
+    }
+
+    /// Re-read every open question once after a change-stream (re)connect,
+    /// pushing what settled while the stream was away (R77 decision 11).
+    pub(crate) async fn revalidate_all_provisional(&self) {
+        let targets: HashSet<(SessionId, Vec<u8>)> = self
+            .provisional_questions
+            .lock()
+            .await
+            .iter()
+            .flat_map(|(session_id, q)| q.authors.keys().map(move |key| (*session_id, key.clone())))
+            .collect();
+        self.revalidate_provisional_targets(&targets).await;
+    }
+
     async fn add_route(&self, consumer_id: u64, route: Route<Id, Key>) {
         self.routes.lock().await.insert(consumer_id, route);
     }
@@ -3250,6 +4043,15 @@ where
             self.oplog.append(record).await.map_err(oplog_err)?;
             applied.record = None;
         }
+        // A bookkeeping row an open question watches wakes it (R77 decision
+        // 11), collected before the fan-out drains the patches.
+        let provisional_targets = self.provisional_targets_of(applied).await;
+        for patch in &applied.patches {
+            self.wake_courier_audit_locked(patch.consumer_id).await?;
+        }
+        for consumer_id in &applied.refused {
+            self.wake_courier_audit_locked(*consumer_id).await?;
+        }
         // Every patch still owed, paired with the route it goes to now.
         // Collected before the visibility question because that question names
         // every watcher at once.
@@ -3311,6 +4113,7 @@ where
                 );
                 let _ = route.tx.send(Outbound::Refuse {
                     sub_id: route.label.clone(),
+                    detail: SUBSCRIPTION_REFUSED,
                 });
             }
             applied.refused.clear();
@@ -3319,7 +4122,12 @@ where
             self.fan_out_moves(event, narrowings, &progress.grant_moves)
                 .await;
         }
-        self.deliver_owed(applied).await;
+        self.deliver_owed(applied).await?;
+        // The gate is held here, so the questions an event woke revalidate
+        // in place rather than re-taking it.
+        for (session_id, key) in provisional_targets {
+            self.revalidate_one_locked(session_id, &key).await;
+        }
         self.dispose_read_failure(applied).await
     }
 
@@ -3336,6 +4144,12 @@ where
     /// failure is one this path does not dispose of.
     async fn dispose_read_failure(&self, applied: &mut Applied) -> Result<(), SessionError> {
         loop {
+            // subql already unregistered each of these, so ending the route
+            // is all that remains.
+            for ended in core::mem::take(&mut applied.stopped) {
+                self.refuse_computed(ended.subscription, ended.class, 1, &ended.detail)
+                    .await;
+            }
             if let Some(failure) = applied.failure.take() {
                 applied.drain_due = true;
                 match failure {
@@ -3383,20 +4197,31 @@ where
                 .await;
             applied.drain_due = false;
             applied.computed.extend(drained.computed);
+            applied.computed_refused.extend(drained.computed_refused);
             applied.failure = drained.failure;
-            self.deliver_owed(applied).await;
+            applied.stopped.extend(drained.stopped);
+            self.deliver_owed(applied).await?;
         }
     }
 
-    /// Deliver every computed change an applied event still owes.
-    ///
-    /// Computed results are global by construction (subql refuses shared state
-    /// on RLS tables), so no per-row read filter applies: each change goes
-    /// unconditionally to its owning session.
-    async fn deliver_owed(&self, applied: &mut Applied) {
-        while let Some(change) = applied.computed.pop_front() {
-            self.deliver_computed(change).await;
+    /// Revalidate private audit observers before consuming each computed delivery.
+    async fn deliver_owed(&self, applied: &mut Applied) -> Result<(), SessionError> {
+        for subscription_id in applied.computed_refused.drain(..) {
+            self.refuse_computed(
+                subscription_id,
+                ReadFailure::Deterministic,
+                1,
+                &"computed values cannot be encoded",
+            )
+            .await;
         }
+        while let Some(change) = applied.computed.front() {
+            self.wake_courier_audit_locked(change.consumer_id).await?;
+            if let Some(change) = applied.computed.pop_front() {
+                self.deliver_computed(change).await;
+            }
+        }
+        Ok(())
     }
 
     /// Decide what one event does to every matched caller's copy of the row, and
@@ -3642,7 +4467,7 @@ where
         &self,
         source: &Snap,
         sql: &str,
-        binds: &[BindValue],
+        binds: &[SqliteValue],
         route: &Route<Id, Key>,
     ) -> Option<SnapshotPage> {
         let limits = self.guard.read_limits(Tier::of(&route.principal));
@@ -3720,8 +4545,12 @@ where
         let Some(source) = self.withdrawal_source.get() else {
             return false;
         };
+        let table_id = term_move.table_id;
+        // Project the catalog's columns so a column the live table gained
+        // under the running server stays out of the move-out read.
         let base = format!(
-            "SELECT * FROM {}",
+            "SELECT {} FROM {}",
+            self.shapes.select_list(table_id),
             connetto_core::quote_ident(&term_move.table)
         );
         let Some(sql) = narrowed_sql(&base, &term_move.pairs) else {
@@ -3731,12 +4560,6 @@ where
             return false;
         };
         let Ok(ParsedDiffSet::Patchset(set)) = ParsedDiffSet::parse(&snapshot.patchset) else {
-            return false;
-        };
-        let Some(table_id) = subql::catalog_helpers::table_id::<Postgres, _>(
-            self.catalog.as_ref(),
-            &term_move.table,
-        ) else {
             return false;
         };
         let mut deletes = PatchSet::<TableSchema<String>, String, Vec<u8>>::new();
@@ -3929,6 +4752,13 @@ where
         }
     }
 
+    /// Subscribe to recorded and acknowledged commits through a 64-entry stream whose lag is explicit and whose replays may repeat.
+    pub fn ingested_commits(&self) -> tokio::sync::broadcast::Receiver<PgCommit> {
+        self.ingested_commits
+            .get_or_init(|| tokio::sync::broadcast::channel(64).0)
+            .subscribe()
+    }
+
     /// Drive a CDC source to completion, dispatching every row and, at each
     /// commit, recording it and acking it so the upstream can recycle its log.
     ///
@@ -3951,6 +4781,7 @@ where
     ) -> Result<(), SessionError>
     where
         Src: CdcSource<Event = PgChangeEvent, Commit = PgCommit>,
+        Src::Relation: StreamSignal,
         Src::Error: core::fmt::Display,
     {
         loop {
@@ -3963,6 +4794,16 @@ where
                         .await
                         .map_err(|err| SessionError::Transport(err.to_string()))?;
                     self.resume.set(Some(commit.position()));
+                    if let Some(commits) = self.ingested_commits.get() {
+                        let _ = commits.send(commit);
+                    }
+                }
+                Ok(Some(SourceItem::Event(event)))
+                    if self.refused.holds(&self.event_table(&event)) =>
+                {
+                    // A table this process refused stays refused when a later
+                    // guard accepts it again, until a restart.
+                    self.resume.set(Some(event.position()));
                 }
                 Ok(Some(SourceItem::Event(event))) => {
                     // One hold loop for both pause causes (R89 decision 2):
@@ -4049,6 +4890,7 @@ where
                     // A row is acknowledged with its commit, since acknowledging it alone moves nothing.
                     self.resume.set(Some(event.position()));
                 }
+                Ok(Some(SourceItem::Relation(item))) => self.handle_drift(item).await?,
                 Ok(None) => return Ok(()),
                 Err(err) => return Err(SessionError::Transport(err.to_string())),
             }
@@ -4083,6 +4925,7 @@ where
     ) -> Result<(), SessionError>
     where
         Src: CdcSource<Event = PgChangeEvent, Commit = PgCommit>,
+        Src::Relation: StreamSignal,
         Src::Error: core::fmt::Display,
         Connect: FnMut(ResumePoint) -> F,
         F: core::future::Future<Output = Result<Src, E>>,
@@ -4092,12 +4935,17 @@ where
         loop {
             let error = match connect(self.resume.clone()).await {
                 Ok(mut source) => {
+                    // A (re)connect may have skipped a stretch, so the open
+                    // provisional questions re-read once and push what settled
+                    // meanwhile (R77 decision 11).
+                    self.revalidate_all_provisional().await;
                     let started = Instant::now();
                     match self.ingest(&mut source, &mut on_event).await {
                         Ok(()) => return Ok(()),
                         // The same event meets the same refusal after a reconnect (R6 decision 4).
                         Err(
                             err @ (SessionError::ChangeStreamUnusable(_)
+                            | SessionError::DriftUnserved(_)
                             | SessionError::AuthorizationUnanswerable { .. }),
                         ) => return Err(err),
                         Err(err) => {
@@ -4136,6 +4984,132 @@ where
         }
     }
 
+    /// The name the catalog stores for `table`, for a message a person reads.
+    fn table_name(&self, table: TableId) -> String {
+        subql::catalog_helpers::table_name::<subql::backend::Postgres, _>(
+            self.catalog.as_ref(),
+            table,
+        )
+        .unwrap_or_else(|| format!("table {table}"))
+    }
+
+    /// Refuse `table` for `reasons`, with every table whose policy reads it
+    /// when its identity weakened, and end every subscription reading one
+    /// with [`SUBSCRIPTION_REFUSED_SCHEMA`] (R107 decisions 6, 10 and 11).
+    ///
+    /// Each refusal is persisted before any subscription ends, so the process
+    /// that next serves the table resyncs every cursor older than its return.
+    /// A table already refused draws nothing, so a reconnect re-reporting it
+    /// sends no frame.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::Oplog`] when a refusal could not be persisted.
+    pub async fn refuse_table(
+        &self,
+        table: TableId,
+        reasons: Vec<Incompatibility>,
+    ) -> Result<(), SessionError> {
+        let (refused, subscriptions) = {
+            let materializer = self.materializer.lock().await;
+            let refused = materializer.refuse_table(table, reasons.clone());
+            let subscriptions = materializer.subscriptions_reading(&refused);
+            (refused, subscriptions)
+        };
+        if refused.is_empty() {
+            return Ok(());
+        }
+        for name in &refused {
+            self.oplog.record_refusal(name).await.map_err(oplog_err)?;
+        }
+        tracing::error!(
+            tables = ?refused,
+            reasons = ?reasons,
+            "the live schema no longer matches the catalog, so these tables are refused \
+             until the server restarts on a matching schema"
+        );
+        let rows: Vec<(String, OutboundTx)> = self
+            .routes
+            .lock()
+            .await
+            .values()
+            .filter(|route| subscriptions.contains(&route.sub_id))
+            .map(|route| (route.label.clone(), route.tx.clone()))
+            .collect();
+        for (label, tx) in rows {
+            let _ = tx.send(Outbound::Refuse {
+                sub_id: label,
+                detail: SUBSCRIPTION_REFUSED_SCHEMA,
+            });
+        }
+        for subscription in subscriptions {
+            if self.fail_courier_audit_locked(subscription).await {
+                continue;
+            }
+            let route = { self.computed_routes.lock().await.remove(&subscription) };
+            let Some(route) = route else { continue };
+            self.materializer.lock().await.unregister(subscription);
+            let _ = route
+                .tx
+                .send(Outbound::Control(ControlMessage::NonFatalError(
+                    NonFatalError {
+                        related_to: Some(route.label),
+                        detail: SUBSCRIPTION_REFUSED_SCHEMA.to_owned(),
+                    },
+                )));
+        }
+        Ok(())
+    }
+
+    /// Act on one drift signal the stream carried.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::DriftUnserved`] for a signal connetto cannot serve,
+    /// which stops the stream, and whatever [`Self::refuse_table`] answers.
+    async fn handle_drift(&self, item: impl StreamSignal) -> Result<(), SessionError> {
+        match item.drift() {
+            None => Ok(()),
+            Some(DriftSignal::Refused { table, reasons }) => {
+                self.refuse_table(table, reasons).await
+            }
+            Some(DriftSignal::ChangesLost { table }) => Err(SessionError::DriftUnserved(format!(
+                "lost changes of {}",
+                self.table_name(table)
+            ))),
+            Some(other) => Err(SessionError::DriftUnserved(format!("{other:?}"))),
+        }
+    }
+
+    /// Take a new guard's refusals for the stretch before the ingest loop
+    /// handles them, and serve again every table an earlier process refused
+    /// that neither this process nor the guard refuses.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::Oplog`] when the refusals could not be read or settled.
+    pub async fn watch_guard(&self, guard: RefusedTables) -> Result<(), SessionError> {
+        let readmitted: Vec<String> = self
+            .oplog
+            .refusals()
+            .await
+            .map_err(oplog_err)?
+            .into_iter()
+            .filter(|table| !self.refused.holds(table) && guard.refusal(table).is_none())
+            .collect();
+        self.refused.watch(guard);
+        if readmitted.is_empty() {
+            return Ok(());
+        }
+        self.oplog.readmit(&readmitted).await.map_err(oplog_err)?;
+        tracing::info!(
+            tables = ?readmitted,
+            "tables an earlier process refused match the catalog again, and every client \
+             resuming from before their return resyncs them"
+        );
+        Ok(())
+    }
+
     /// Send one computed-result change to the session owning its
     /// subscription, if routed.
     async fn deliver_computed(&self, change: ComputedChange) {
@@ -4149,10 +5123,7 @@ where
         let Some(route) = route else { return };
         let update = AggregateUpdate {
             sub_id: route.label,
-            group_key: change.group_key,
-            group_values_json: change.group_values_json,
-            result_json: change.result_json,
-            is_full_result: change.is_full_result,
+            change: change.change,
         };
         let _ = route.tx.send(Outbound::Aggregate(update));
     }
@@ -4176,6 +5147,9 @@ where
         attempts: u32,
         cause: &E,
     ) {
+        if self.fail_courier_audit_locked(subscription_id).await {
+            return;
+        }
         let route = { self.computed_routes.lock().await.remove(&subscription_id) };
         self.materializer.lock().await.unregister(subscription_id);
         let Some(route) = route else { return };
@@ -4706,6 +5680,7 @@ where
                 // The major's configured sunset, so the client's application
                 // can prompt an update before the server enforces it (R107).
                 sunset_at_secs: self.config.sunset.map(sunset_secs),
+                courier: self.config.courier,
                 initial_credits: self.config.initial_credits,
                 writer: writer_grant,
             }))
@@ -5179,8 +6154,11 @@ where
             key_expiry,
             closing: refused == Reaction::Close,
             enrol_challenge: None,
+            courier: None,
+            notices: HashMap::new(),
         };
         self.send_revocation_lists(&mut transport, &state).await;
+        self.send_courier_notices(&mut transport, &mut state).await;
 
         // Every exit breaks with its result rather than returning, so the teardown below always runs.
         let mut last_inbound = tokio::time::Instant::now();
@@ -5235,6 +6213,11 @@ where
 
         // Runs on every exit, an error included, so no ended session stays registered.
         self.unregister_connection(session_id, connection_num).await;
+        // The connection is the window its open questions stay pending, so it
+        // ends with the connection (R77 decision 11).
+        self.drop_provisional_questions(session_id, connection_num)
+            .await;
+        self.drop_courier_audit(session_id, connection_num).await;
         self.unregister_writer_session(&state).await;
         // The connection is the window for a caller with no identity, so its
         // tallies die here and nothing else expires them.
@@ -5264,6 +6247,9 @@ where
             Some(IncomingFrame::Control(msg)) => self.handle_control(transport, msg, state).await?,
             Some(IncomingFrame::Bulk(BulkMessage::MutationPatch(patch))) => {
                 self.handle_mutation(transport, patch, state).await?;
+            }
+            Some(IncomingFrame::Bulk(BulkMessage::CourierBody(body))) => {
+                self.handle_courier_body(transport, body, state).await?;
             }
             Some(IncomingFrame::Bulk(_)) => {
                 return Err(SessionError::Protocol(
@@ -5367,8 +6353,9 @@ where
                 self.rebootstrap_computed(transport, state, sub_id, retired_id)
                     .await?;
             }
-            Outbound::Refuse { sub_id } => {
-                self.refuse_subscription(transport, state, &sub_id).await?;
+            Outbound::Refuse { sub_id, detail } => {
+                self.refuse_subscription(transport, state, &sub_id, detail)
+                    .await?;
             }
         }
         Ok(true)
@@ -5572,7 +6559,10 @@ where
                     }
                 }
             } else {
-                Outbound::Refuse { sub_id: label }
+                Outbound::Refuse {
+                    sub_id: label,
+                    detail: SUBSCRIPTION_REFUSED,
+                }
             };
             let _ = state.outbound.send(instruction);
         }
@@ -5681,17 +6671,31 @@ where
             .map_err(transport_err)
     }
 
-    /// Answer one content ticket request: check visibility, call the signer,
-    /// charge the write budget after a successful mint, and send the grant.
+    /// Answer one content ticket request: confirm the login is still live,
+    /// check visibility, call the signer, charge the write budget after a
+    /// successful mint, and send the grant.
     ///
-    /// Visibility runs first on the reader pool, behind the same reader-share
+    /// A connection can stay open after its session ended, past the idle
+    /// window or before this server hears of a revocation, so a login's
+    /// session is asked about first and an ended one refused with the
+    /// invisible file's detail, rather than handed a ticket the file server
+    /// refuses (R109). A caller holding no login has no session to ask about.
+    ///
+    /// Visibility runs next on the reader pool, behind the same reader-share
     /// permit that subscription and mutation reads hold (R39), so an anonymous
     /// caller cannot starve identified callers. Invisibility and a budget
     /// refusal carry the same byte-identical detail so a caller cannot learn
-    /// that a file it cannot see exists. A signer fault carries a distinct
-    /// detail because it discloses nothing about data and a retry is
-    /// meaningful. The budget is charged after a successful mint, so a signer
-    /// failure never consumes the caller's upload window.
+    /// that a file it cannot see exists. A signer fault, or a session store
+    /// that cannot answer, carries a distinct detail because it discloses
+    /// nothing about data and a retry is meaningful. The budget is charged
+    /// after a successful mint, so a signer failure never consumes the
+    /// caller's upload window.
+    ///
+    /// A request naming `for_owner` carries the file for that account (R79
+    /// decision 17). It is minted only for a write by a caller holding a
+    /// login, and only when the deployment's `connetto_file_owner`, read
+    /// with the caller's own rights, answers that account. Every other answer
+    /// is refused with the invisible file's detail.
     async fn handle_content_ticket<T: Transport>(
         &self,
         transport: &mut T,
@@ -5701,6 +6705,19 @@ where
         let request_id = req.request_id;
         let caller = crate::capability::rendered_caller(&state.principal);
         let budget_key = crate::capability::meter_key(&state.principal, state.session_id);
+
+        if let Some(session) = caller.session() {
+            match self.authority.session_is_live(session).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return refuse_ticket(transport, request_id, CONTENT_TICKET_REFUSED).await;
+                }
+                Err(err) => {
+                    tracing::warn!(request_id, %err, "content ticket session check failed");
+                    return refuse_ticket(transport, request_id, CONTENT_TICKET_SIGNER_ERROR).await;
+                }
+            }
+        }
 
         // Reader permit: visibility checks out a reader-pool connection, so
         // the same gate that protects subscriptions and mutations applies here.
@@ -5721,37 +6738,30 @@ where
             Ok(v) => v,
             Err(err) => {
                 tracing::warn!(request_id, ?err, "content ticket visibility check failed");
-                return transport
-                    .send_control(ControlMessage::NonFatalError(NonFatalError {
-                        related_to: Some(request_id),
-                        detail: CONTENT_TICKET_SIGNER_ERROR.to_owned(),
-                    }))
-                    .await
-                    .map_err(transport_err);
+                return refuse_ticket(transport, request_id, CONTENT_TICKET_SIGNER_ERROR).await;
             }
         };
         if !visible {
-            return transport
-                .send_control(ControlMessage::NonFatalError(NonFatalError {
-                    related_to: Some(request_id),
-                    detail: CONTENT_TICKET_REFUSED.to_owned(),
-                }))
-                .await
-                .map_err(transport_err);
+            return refuse_ticket(transport, request_id, CONTENT_TICKET_REFUSED).await;
         }
+        let carry = match self
+            .ticket_carry(req.for_owner, req.file_id, req.verb, &request_id, state)
+            .await
+        {
+            Ok(carry) => carry,
+            Err(detail) => return refuse_ticket(transport, request_id, detail).await,
+        };
 
         // Mint before charging so a signer failure costs the caller nothing.
-        let url = match self.signer.mint(&caller, req.file_id, req.verb).await {
+        let url = match self
+            .signer
+            .mint(&caller, req.file_id, req.verb, carry.as_ref())
+            .await
+        {
             Ok(url) => url,
             Err(err) => {
                 tracing::warn!(request_id, %err, "content ticket signing failed");
-                return transport
-                    .send_control(ControlMessage::NonFatalError(NonFatalError {
-                        related_to: Some(request_id),
-                        detail: CONTENT_TICKET_SIGNER_ERROR.to_owned(),
-                    }))
-                    .await
-                    .map_err(transport_err);
+                return refuse_ticket(transport, request_id, CONTENT_TICKET_SIGNER_ERROR).await;
             }
         };
 
@@ -5763,13 +6773,7 @@ where
                 .bytes()
                 .allow_content_bytes(&budget_key, declared_len)
         {
-            return transport
-                .send_control(ControlMessage::NonFatalError(NonFatalError {
-                    related_to: Some(request_id),
-                    detail: CONTENT_TICKET_REFUSED.to_owned(),
-                }))
-                .await
-                .map_err(transport_err);
+            return refuse_ticket(transport, request_id, CONTENT_TICKET_REFUSED).await;
         }
 
         transport
@@ -5779,6 +6783,43 @@ where
             }))
             .await
             .map_err(transport_err)
+    }
+
+    /// What a content ticket carries for the account `for_owner` names,
+    /// `None` when it names none, or the refusal detail to answer.
+    ///
+    /// Only a write by a caller holding a login may carry, the carry audited
+    /// under the login's session the ticket names, and only when the
+    /// deployment's `connetto_file_owner`, read with the caller's own rights,
+    /// answers that account (R79 decision 17).
+    async fn ticket_carry(
+        &self,
+        for_owner: Option<String>,
+        file_id: [u8; 32],
+        verb: ContentVerb,
+        request_id: &str,
+        state: &SessionState<Id, Key>,
+    ) -> Result<Option<ContentCarry>, &'static str> {
+        let Some(for_owner) = for_owner else {
+            return Ok(None);
+        };
+        if !matches!(verb, ContentVerb::Write { .. })
+            || crate::capability::login_session(&state.principal).is_none()
+        {
+            return Err(CONTENT_TICKET_REFUSED);
+        }
+        let answered = self
+            .target
+            .file_owner_for_caller(file_id, &state.principal)
+            .await
+            .map_err(|err| {
+                tracing::warn!(request_id, ?err, "content ticket owner check failed");
+                CONTENT_TICKET_SIGNER_ERROR
+            })?;
+        if answered.as_deref() != Some(for_owner.as_str()) {
+            return Err(CONTENT_TICKET_REFUSED);
+        }
+        Ok(Some(ContentCarry { owner: for_owner }))
     }
 
     /// Answer a device list request with the caller's devices.
@@ -5806,7 +6847,7 @@ where
         transport.send_control(answer).await.map_err(transport_err)
     }
 
-    /// Revoke one of the caller's devices, answering before its connection closes.
+    /// Await revocation and acknowledge it before closing the caller's own connection.
     async fn handle_revoke_request<T: Transport>(
         &self,
         transport: &mut T,
@@ -5823,6 +6864,7 @@ where
                 .map_err(|err| match err {
                     RevokeError::NotFound => EnrolRefusal::InvalidRequest,
                     RevokeError::NotInstalled => EnrolRefusal::IssuerUnavailable,
+                    RevokeError::Refused(reason) => EnrolRefusal::Refused { reason },
                     RevokeError::Unavailable(source) => {
                         tracing::warn!(error = %source, "a device could not be revoked");
                         EnrolRefusal::IssuerUnavailable
@@ -5831,14 +6873,14 @@ where
             Err(refusal) => Err(refusal),
         };
         match revoked {
-            Ok((enrolment, (_, session, lists))) => {
+            Ok((enrolment, revoked)) => {
+                self.after_revocation(&enrolment, revoked).await;
                 transport
                     .send_control(ControlMessage::DeviceRevokedAck(DeviceRevokedAck {
                         request_id,
                     }))
                     .await
                     .map_err(transport_err)?;
-                self.after_revocation(&enrolment, session, lists).await;
                 Ok(())
             }
             Err(reason) => transport
@@ -5875,21 +6917,102 @@ where
         }
     }
 
+    /// The account's standing courier notices, sent after the identified
+    /// handshake as `CourierNotice` frames of at most
+    /// [`connetto_core::exchange::MAX_MANIFEST_ROWS`] rows, each with a
+    /// fresh id the client's ack quotes back (R78 decisions 12 and 39).
+    ///
+    /// Anonymous sessions hear nothing, a frame the transport drops leaves
+    /// its rows standing for the next handshake, and a row that will not
+    /// render is warned and left standing.
+    async fn send_courier_notices<T: Transport>(
+        &self,
+        transport: &mut T,
+        state: &mut SessionState<Id, Key>,
+    ) {
+        let Some(identity) = state.principal.identity() else {
+            return;
+        };
+        let rows = match self.target.courier_notices(&identity.user_id).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(
+                    error = err.detail(),
+                    "the courier notices could not be read, they stand for the next handshake"
+                );
+                return;
+            }
+        };
+        let facts = crate::provisional::AskFacts {
+            frontier: 0,
+            retired: false,
+            abandoned: false,
+        };
+        for frame in rows.chunks(connetto_core::exchange::MAX_MANIFEST_ROWS) {
+            let mut notices = Vec::with_capacity(frame.len());
+            let mut ids = Vec::with_capacity(frame.len());
+            for (id, courier, key, seq, outcome) in frame {
+                let Ok(key) = <[u8; 32]>::try_from(key.as_slice()) else {
+                    tracing::warn!(id, "a courier notice holds no device key, it stands");
+                    continue;
+                };
+                let Ok(seq) = u64::try_from(*seq) else {
+                    tracing::warn!(id, "a courier notice holds no sequence, it stands");
+                    continue;
+                };
+                let Ok(outcome) = SettledOutcome::from_json(outcome.as_bytes()) else {
+                    tracing::warn!(id, "a courier notice holds no stored outcome, it stands");
+                    continue;
+                };
+                notices.push(CourierNoticeRow {
+                    courier: format!("{courier}"),
+                    writer: WriterRef::Device(key),
+                    seq,
+                    verdict: crate::provisional::verdict_of(&facts, seq, Some(&outcome)),
+                });
+                ids.push(*id);
+            }
+            if notices.is_empty() {
+                continue;
+            }
+            let notice = CourierNotice {
+                notice_id: Uuid::new_v4().to_string(),
+                notices,
+            };
+            let notice_id = notice.notice_id.clone();
+            if transport
+                .send_control(ControlMessage::CourierNotice(notice))
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    notice_id = %notice_id,
+                    "a courier notice frame could not be sent, its rows stand"
+                );
+                break;
+            }
+            state.notices.insert(notice_id, ids);
+        }
+    }
+
     /// Close the revoked device's connection, push the new lists to every
-    /// identified connection, and revoke the auth-store session.
+    /// identified connection, then close and record the auth-store session
+    /// the revocation ended.
     async fn after_revocation(
         &self,
-        enrolment: &crate::device_cert::DeviceEnrolment<Id>,
-        session: SessionId,
-        lists: Vec<SignedList>,
+        enrolment: &crate::device_cert::DeviceEnrolment<D>,
+        revoked: crate::device_cert::KeyRevoked<Id>,
     ) {
-        self.announce_revocation(session, lists).await;
-        enrolment.revoke_session(session).await;
+        self.announce_revocation(revoked.session, revoked.lists)
+            .await;
+        if let Some(user) = &revoked.ended {
+            enrolment.session_ended(user, revoked.session);
+        }
     }
 
     /// Close the revoked device's connection with `DeviceRevoked` and push
     /// the new lists to every identified connection.
-    async fn announce_revocation(&self, session: SessionId, lists: Vec<SignedList>) {
+    pub(crate) async fn announce_revocation(&self, session: SessionId, lists: Vec<SignedList>) {
         self.close_session(session, FatalErrorReason::DeviceRevoked)
             .await;
         let update = ControlMessage::RevocationUpdate(RevocationUpdate { lists });
@@ -5908,48 +7031,30 @@ where
     /// # Errors
     ///
     /// [`RevokeError::NotFound`] for a key never enrolled,
-    /// [`RevokeError::NotInstalled`] when no enrolment is installed, and
+    /// [`RevokeError::NotInstalled`] when no enrolment is installed,
+    /// [`RevokeError::Refused`] when the application's hook refuses, and
     /// [`RevokeError::Unavailable`] when the table or the issuer fails.
     pub async fn revoke_device(&self, key: KeyId) -> Result<bool, RevokeError> {
         let enrolment = self
             .device_enrolment
             .get()
             .ok_or(RevokeError::NotInstalled)?;
-        let (fresh, session, lists) = enrolment.revoke(None, key).await?;
-        self.after_revocation(enrolment, session, lists).await;
+        let revoked = enrolment.revoke(None, key).await?;
+        let fresh = revoked.fresh;
+        self.after_revocation(enrolment, revoked).await;
         Ok(fresh)
     }
 
-    /// `user`'s enrolled devices with the session each last enrolled under,
-    /// none when no enrolment is installed.
-    pub(crate) async fn devices_of(
-        &self,
-        user: &Id,
-    ) -> Result<Vec<crate::device_cert::Device>, crate::device_cert::EnrolmentError> {
-        match self.device_enrolment.get() {
-            Some(enrolment) => enrolment.enrolled(user).await,
-            None => Ok(Vec::new()),
-        }
-    }
-
-    /// Revoke `user`'s device key `key`, publishing the list and closing its
-    /// connection with `DeviceRevoked`, and leave its auth-store session to
-    /// the caller, which ends it with its own cause.
-    pub(crate) async fn revoke_device_of(&self, user: &Id, key: KeyId) -> Result<(), RevokeError> {
-        let enrolment = self
-            .device_enrolment
-            .get()
-            .ok_or(RevokeError::NotInstalled)?;
-        let (_, session, lists) = enrolment.revoke(Some(user), key).await?;
-        self.announce_revocation(session, lists).await;
-        Ok(())
+    /// The installed device enrolment, none when device identity is off.
+    pub(crate) fn device_enrolment(&self) -> Option<&Arc<crate::device_cert::DeviceEnrolment<D>>> {
+        self.device_enrolment.get()
     }
 
     /// The installed enrolment and the account enrolling, or why this session cannot enrol.
     fn enrolling(
         &self,
         state: &SessionState<Id, Key>,
-    ) -> Result<(Arc<crate::device_cert::DeviceEnrolment<Id>>, Id), EnrolRefusal> {
+    ) -> Result<(Arc<crate::device_cert::DeviceEnrolment<D>>, Id), EnrolRefusal> {
         let user = state
             .principal
             .identity()
@@ -6016,6 +7121,22 @@ where
         transport.send_control(answer).await.map_err(transport_err)
     }
 
+    /// Remove row and computed subscriptions owned by the client label.
+    async fn handle_unsubscribe(&self, sub_id: &str, state: &mut SessionState<Id, Key>) {
+        for (consumer_id, sub_id) in take_row_subscription(state, sub_id) {
+            self.remove_route(consumer_id).await;
+            self.materializer.lock().await.unregister(sub_id);
+        }
+        if let Some(ComputedSub {
+            id: subscription_id,
+            ..
+        }) = state.computed_subs.remove(sub_id)
+        {
+            self.remove_computed_route(subscription_id).await;
+            self.materializer.lock().await.unregister(subscription_id);
+        }
+    }
+
     async fn handle_control<T: Transport>(
         self: &Arc<Self>,
         transport: &mut T,
@@ -6032,18 +7153,7 @@ where
         match msg {
             ControlMessage::Subscribe(sub) => self.handle_subscribe(transport, sub, state).await,
             ControlMessage::Unsubscribe(unsub) => {
-                for (consumer_id, sub_id) in take_row_subscription(state, &unsub.sub_id) {
-                    self.remove_route(consumer_id).await;
-                    self.materializer.lock().await.unregister(sub_id);
-                }
-                if let Some(ComputedSub {
-                    id: subscription_id,
-                    ..
-                }) = state.computed_subs.remove(&unsub.sub_id)
-                {
-                    self.remove_computed_route(subscription_id).await;
-                    self.materializer.lock().await.unregister(subscription_id);
-                }
+                self.handle_unsubscribe(&unsub.sub_id, state).await;
                 Ok(())
             }
             ControlMessage::Ping(ping) => transport
@@ -6122,11 +7232,51 @@ where
                 self.handle_retire_writer(transport, retire, state).await
             }
             ControlMessage::ProvisionalStatus(ask) => {
-                self.handle_provisional_status(transport, ask).await
+                self.handle_provisional_status(transport, ask, state).await
+            }
+            ControlMessage::CourierRange(range) => {
+                self.handle_courier_range(transport, range, state).await
+            }
+            ControlMessage::CourierNoticeAck(ack) => {
+                self.handle_courier_notice_ack(ack, state).await
+            }
+            ControlMessage::CourierAuditRequest(request) => {
+                self.handle_courier_audit(request, state).await;
+                Ok(())
+            }
+            ControlMessage::CourierAuditCancel(cancel) => {
+                self.cancel_courier_audit(&cancel.request_id, state).await;
+                Ok(())
             }
             // Server-origin frames received from a client are ignored.
             _ => Ok(()),
         }
+    }
+
+    /// Delete the notice rows a frame of this connection carried, so the
+    /// author's next connection hears the rest, forgetting the frame either
+    /// way so a repeated ack of it deletes nothing (R78 decision 39).
+    ///
+    /// # Errors
+    ///
+    /// Absent. A delete that fails is warned, the rows stand for the next
+    /// handshake, and the connection keeps running.
+    async fn handle_courier_notice_ack(
+        &self,
+        ack: CourierNoticeAck,
+        state: &mut SessionState<Id, Key>,
+    ) -> Result<(), SessionError> {
+        let Some(ids) = state.notices.remove(&ack.notice_id) else {
+            return Ok(());
+        };
+        if let Err(err) = self.target.delete_courier_notices(ids).await {
+            tracing::warn!(
+                notice_id = %ack.notice_id,
+                error = err.detail(),
+                "a courier notice ack could not delete its rows, they stand"
+            );
+        }
+        Ok(())
     }
 
     /// Verify a device key's signature over this connection's bind nonce and
@@ -6298,9 +7448,10 @@ where
         reason = "one ask walks the verifications and the ruling in order and a split would hide the sequence"
     )]
     async fn handle_provisional_status<T: Transport>(
-        &self,
+        self: &Arc<Self>,
         transport: &mut T,
         ask: ProvisionalStatus,
+        state: &mut SessionState<Id, Key>,
     ) -> Result<(), SessionError> {
         let refused = || {
             ControlMessage::NonFatalError(NonFatalError {
@@ -6316,14 +7467,13 @@ where
                 .map_err(transport_err);
         };
         // One ask carries at most the manifest frame's bound, and no sequence
-        // past the offer's signed head.
+        // past the higher of the offer's signed heads (R78 decision 52).
         if ask.seqs.len() > connetto_core::exchange::MAX_MANIFEST_ROWS
             || ask.seqs.iter().any(|seq| {
                 signed
                     .offer
-                    .newest
-                    .as_ref()
-                    .is_none_or(|newest| *seq > newest.seq)
+                    .frontier()
+                    .is_none_or(|frontier| *seq > frontier.seq)
             })
         {
             return transport
@@ -6331,6 +7481,9 @@ where
                 .await
                 .map_err(transport_err);
         }
+        // The gate holds no settle between the facts that answer the ask and
+        // the filters a Pending answer starts watching (R77 decision 11).
+        let _gate = self.dispatch_gate.lock().await;
         let record = match self.device_enrolment.get() {
             Some(enrolment) => enrolment
                 .key_record(None, KeyId::from_bytes(ask.author))
@@ -6373,47 +7526,72 @@ where
             .filter(|seq| **seq <= frontier)
             .copied()
             .min();
-        let mut records: HashMap<i64, SettledOutcome> = HashMap::new();
-        if let (Some(low), Some(writer)) = (low, writer) {
-            for (seq, settled) in self
-                .target
-                .settled_range(
-                    writer,
-                    i64::try_from(low).unwrap_or(0),
-                    i64::try_from(frontier).unwrap_or(i64::MAX),
-                )
-                .await
-                .map_err(|err| SessionError::WriteTarget(err.detail()))?
-            {
-                records.insert(
-                    seq,
-                    SettledOutcome::from_json(&settled.outcome).map_err(|err| {
-                        SessionError::Protocol(format!(
-                            "a settled record holds no outcome the table defines: {err}"
-                        ))
-                    })?,
-                );
-            }
-        }
+        let records = match (low, writer) {
+            (Some(low), Some(writer)) => self.settled_records(writer, low, frontier).await?,
+            _ => HashMap::new(),
+        };
         let facts = crate::provisional::AskFacts {
             frontier,
             retired,
             abandoned,
         };
-        let verdicts = ask
+        let verdicts: Vec<(u64, connetto_core::exchange::Verdict)> = ask
             .seqs
             .iter()
             .map(|seq| {
                 (
                     *seq,
-                    crate::provisional::verdict_of(
-                        &facts,
-                        *seq,
-                        records.get(&i64::try_from(*seq).unwrap_or(i64::MAX)),
-                    ),
+                    crate::provisional::verdict_of(&facts, *seq, records.get(seq)),
                 )
             })
             .collect();
+        // A Pending answer opens the question the connection stays pending for,
+        // refused whole when its open sequences would pass the session's bound.
+        let pending: Vec<u64> = verdicts
+            .iter()
+            .filter(|(_, verdict)| *verdict == connetto_core::exchange::Verdict::Pending)
+            .map(|(seq, _)| *seq)
+            .collect();
+        if !pending.is_empty() {
+            let Some(connection_num) = self
+                .sessions
+                .lock()
+                .await
+                .get(&state.session_id)
+                .map(|live| live.connection_num)
+            else {
+                return Ok(());
+            };
+            let expiry = record.as_ref().and_then(|record| record.certificate_expiry);
+            match self
+                .open_provisional_author(
+                    state.session_id,
+                    connection_num,
+                    &state.outbound,
+                    &ask,
+                    writer,
+                    pending,
+                )
+                .await
+            {
+                Ok(true) => {
+                    self.register_author_filters(
+                        state.session_id,
+                        ask.author.as_ref(),
+                        writer,
+                        expiry,
+                    )
+                    .await;
+                }
+                Ok(false) => {}
+                Err(()) => {
+                    return transport
+                        .send_control(refused())
+                        .await
+                        .map_err(transport_err);
+                }
+            }
+        }
         transport
             .send_control(ControlMessage::ProvisionalVerdicts(ProvisionalVerdicts {
                 request_id: ask.request_id,
@@ -6536,40 +7714,283 @@ where
             .map_err(|err| SessionError::WriteTarget(err.detail()))
     }
 
-    /// Settle a range the courier carried from the author's device (R75),
-    /// with `major` the application schema major the delivering connection
-    /// declared, the capture major of every entry the range settles.
+    /// Open the courier range a connection sent (R78 decisions 1, 28 to 32),
+    /// refused `Disabled` when the deployment accepts none and `Uncertified`
+    /// on a connection that bound no device writer, answering at once when it
+    /// counts no bodies.
     ///
-    /// The author's signature verifies against the author's live enrolment
-    /// over the range's chain, whose head binds every entry's major and
-    /// provenance original, the entries continue the author's settled chain
-    /// from the writer's frontier, and each entry settles at the frontier
-    /// plus one, in order, under the author's identity, so an entry another
-    /// path settled is answered from the record and never applied twice. A
+    /// # Errors
+    ///
+    /// [`SessionError::Protocol`] when a range is already open, which ends
+    /// the connection, and as [`Self::courier_deliver`].
+    async fn handle_courier_range<T: Transport>(
+        &self,
+        transport: &mut T,
+        range: CourierRange,
+        state: &mut SessionState<Id, Key>,
+    ) -> Result<(), SessionError> {
+        if state.courier.is_some() {
+            return courier_violation(transport, &CourierViolation::RangeOpen).await;
+        }
+        let CourierRange {
+            request_id,
+            author,
+            offer,
+            rows,
+            bodies,
+        } = range;
+        let certified = matches!(
+            state.writer,
+            Some(BoundWriter {
+                key: WriterKey::Device(_),
+                ..
+            })
+        );
+        let run = if !self.config.courier {
+            CourierRun::refused(request_id, rows, bodies, CourierRefusal::Disabled)
+        } else if !certified {
+            CourierRun::refused(request_id, rows, bodies, CourierRefusal::Uncertified)
+        } else {
+            // An anonymous session binds no device writer.
+            let identity = state
+                .principal
+                .identity()
+                .expect("a bound device writer implies an identity");
+            self.courier_open(
+                request_id,
+                crate::courier::CourierIdentity {
+                    user_id: identity.user_id.clone(),
+                    session: state.session_id,
+                },
+                KeyId::from_bytes(author),
+                state.schema_major,
+                &offer,
+                rows,
+                bodies,
+            )
+            .await?
+        };
+        if run.done() {
+            return answer_courier(transport, run).await;
+        }
+        state.courier = Some(run);
+        Ok(())
+    }
+
+    /// Take one body of the open courier range, settling it when the range
+    /// is settling and answering the range after its last counted body.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::Protocol`] for a body the stream table counts a
+    /// protocol violation, which ends the connection, and as
+    /// [`Self::courier_deliver`].
+    async fn handle_courier_body<T: Transport>(
+        &self,
+        transport: &mut T,
+        body: CourierBody,
+        state: &mut SessionState<Id, Key>,
+    ) -> Result<(), SessionError> {
+        let Some(run) = state.courier.as_mut() else {
+            return courier_violation(transport, &CourierViolation::NoRange).await;
+        };
+        match run.admit(&body.request_id, body.seq) {
+            Err(violation) => return courier_violation(transport, &violation).await,
+            Ok(Admitted::Dropped) => {
+                // An unread body still drew on the courier's bytes.
+                let _ = self.guard.bytes().allow_courier_bytes(
+                    &crate::capability::meter_key(&state.principal, state.session_id),
+                    u64::try_from(body.changeset_zstd.len()).unwrap_or(u64::MAX),
+                );
+            }
+            Ok(Admitted::Row(mut slot)) => {
+                let Ok(changeset) = crate::materializer::decompress(&body.changeset_zstd) else {
+                    return courier_violation(transport, &CourierViolation::Envelope(body.seq))
+                        .await;
+                };
+                if let Err(violation) = slot.check_digest(&changeset) {
+                    return courier_violation(transport, &violation).await;
+                }
+                let len = u64::try_from(body.changeset_zstd.len()).unwrap_or(u64::MAX);
+                let draw = self.guard.bytes().allow_courier_bytes(
+                    &crate::capability::meter_key(&state.principal, state.session_id),
+                    len,
+                );
+                match draw {
+                    Err(wait) => {
+                        let oversized = self
+                            .guard
+                            .bytes()
+                            .courier_limit()
+                            .is_some_and(|limit| len > limit);
+                        slot.stop_at_next(if oversized {
+                            CourierEntryOutcome::NotCouriered
+                        } else {
+                            CourierEntryOutcome::Retry {
+                                retry_after_ms: retry_ms(wait),
+                            }
+                        });
+                    }
+                    Ok(()) => {
+                        self.courier_settle_row(slot, &changeset, &body.changeset_zstd)
+                            .await?;
+                    }
+                }
+            }
+        }
+        if run.done()
+            && let Some(run) = state.courier.take()
+        {
+            return answer_courier(transport, run).await;
+        }
+        Ok(())
+    }
+
+    /// Settle a range a courier carried for its author in process (R75, R78
+    /// decisions 2 to 4, 6, 8, 9, 13 to 15 and 28 to 32), with `major` the
+    /// schema major the delivering connection declared, the capture major of
+    /// every body the range settles. `courier` is the account and session the
+    /// range settles under, the `write_couriered` audit rows' session and the
+    /// notice rows' courier, and the driver meters nothing, since it holds
+    /// one range the process already admitted.
+    ///
+    /// `offer` is the author's stored [`SignedOffer`] in MessagePack, `rows`
+    /// the manifest rows the courier holds up to the offer's frontier, in
+    /// sequence order, and `bodies` the bodies it holds of them, in the same
+    /// order. Each body is driven through the range as a connection's
+    /// `CourierBody` frame is, so the outcome is the one `CourierAnswer` a
+    /// connection would carry. The range is refused unsettled when it is
+    /// malformed, the author's enrolment is absent, revoked or past its
+    /// expiry plus `DEVICE_SKEW`, the author's account is banned, its writer
+    /// is retired, the offer's signature fails, the rows above the writer's
+    /// frontier do not start right after it, or they do not chain from the
+    /// writer's head to the offer's frontier head. Rows at or below the
+    /// frontier are answered with the verdict their records give and touch
+    /// nothing. The rows above it settle in order under the author's
+    /// account, the bot list its certificate carries and no subjects, so an
+    /// entry another path settled is answered from the record and never
+    /// applied twice. The range stops at a row with no body, of another
+    /// major or with a number original, and at a row that settles nothing. A
     /// carried entry settles its provenance original the way the direct
     /// upload does.
     ///
     /// # Errors
     ///
-    /// [`SessionError::Protocol`] when no enrolment is installed, the store
-    /// does not answer, or the writer row does not stand.
+    /// [`SessionError::Protocol`] when a body names no row, comes out of
+    /// order or disagrees with its row's digest, the bodies a connection is
+    /// closed for, when no enrolment is installed, the store does not answer,
+    /// the writer row does not stand, or a provenance sequence is past its
+    /// original's frontier.
+    /// [`SessionError::BanList`] when the ban list cannot be read.
     /// [`SessionError::WriteTarget`] when the writer tables or the apply
     /// database fail.
-    ///
-    /// # Panics
-    ///
-    /// When one identity cannot settle one run, a guarantee `accept` upholds.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the author's signature verifies the whole range and each entry settles in order under its identity, so the range settles as one unit"
-    )]
     pub async fn courier_deliver(
         &self,
+        courier: crate::courier::CourierIdentity<Id>,
         author: KeyId,
         major: Option<Major>,
-        entries: &[CourierEntry],
-        signature: &[u8],
-    ) -> Result<CourierDelivery, SessionError> {
+        offer: &[u8],
+        rows: &[ManifestRow],
+        bodies: &[CourierEntry],
+    ) -> Result<CourierOutcome, SessionError> {
+        let count = u32::try_from(bodies.len()).unwrap_or(u32::MAX);
+        let mut run = self
+            .courier_open(
+                String::new(),
+                courier,
+                author,
+                major,
+                offer,
+                rows.to_vec(),
+                count,
+            )
+            .await?;
+        // In process nothing is on a wire to drain past a refusal.
+        if let Some(refusal) = run.refusal() {
+            return Ok(CourierOutcome::Refused(refusal));
+        }
+        for body in bodies {
+            let violation = |err: CourierViolation| SessionError::Protocol(err.to_string());
+            if let Admitted::Row(slot) = run.admit("", body.seq).map_err(violation)? {
+                slot.check_digest(&body.changeset).map_err(violation)?;
+                let payload = compress(&body.changeset).map_err(|err| {
+                    SessionError::Protocol(format!("the changeset will not compress, {err}"))
+                })?;
+                self.courier_settle_row(slot, &body.changeset, &payload)
+                    .await?;
+            }
+        }
+        Ok(run.finish().1)
+    }
+
+    /// Open a courier range on R78's checks, its rows at or below the
+    /// writer's frontier answered with the verdict their records give.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::courier_deliver`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the wire frame and the in-process caller both hold the range's fields flat"
+    )]
+    async fn courier_open(
+        &self,
+        request_id: String,
+        courier: crate::courier::CourierIdentity<Id>,
+        author: KeyId,
+        major: Option<Major>,
+        offer: &[u8],
+        rows: Vec<ManifestRow>,
+        bodies: u32,
+    ) -> Result<CourierRun<Id, Key>, SessionError> {
+        let author = match self.courier_checks(author, offer, &rows, bodies).await? {
+            Ok(author) => author,
+            Err(refusal) => return Ok(CourierRun::refused(request_id, rows, bodies, refusal)),
+        };
+        let next = rows.partition_point(|row| row.seq <= author.frontier);
+        let mut answers = Vec::with_capacity(rows.len());
+        if let (Some(first), Some(writer)) = (rows.first().filter(|_| next > 0), author.writer) {
+            let records = self
+                .settled_records(writer, first.seq, author.frontier)
+                .await?;
+            let facts = author.facts();
+            answers.extend(rows[..next].iter().map(|row| {
+                (
+                    row.seq,
+                    CourierEntryOutcome::Ruled(crate::provisional::verdict_of(
+                        &facts,
+                        row.seq,
+                        records.get(&row.seq),
+                    )),
+                )
+            }));
+        }
+        let previous = author.head;
+        Ok(CourierRun::settling(
+            request_id,
+            rows,
+            bodies,
+            answers,
+            Settling::new(author, courier, major, next, previous),
+        ))
+    }
+
+    /// R78's checks of one courier range in their order, the first that
+    /// fails naming the refusal, else the author's standing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::courier_deliver`].
+    async fn courier_checks(
+        &self,
+        author: KeyId,
+        offer: &[u8],
+        rows: &[ManifestRow],
+        bodies: u32,
+    ) -> Result<Result<CourierAuthor<Id>, CourierRefusal>, SessionError> {
+        let Some(signed) = crate::courier::well_formed(offer, rows, bodies) else {
+            return Ok(Err(CourierRefusal::Malformed));
+        };
         let enrolment = self
             .device_enrolment
             .get()
@@ -6578,127 +7999,269 @@ where
             .key_record(None, author)
             .await
             .map_err(|_| SessionError::Protocol("the enrolment store did not answer".into()))?
+            .filter(|record| !record.revoked && record.certificate_live_past_skew)
         else {
-            return Ok(CourierDelivery::Refused(CourierRefusal::NotEnrolled));
+            return Ok(Err(CourierRefusal::NotEnrolled));
         };
-        if record.revoked || !record.certificate_live {
-            return Ok(CourierDelivery::Refused(CourierRefusal::NotEnrolled));
+        if self
+            .guard
+            .banned(&record.user)
+            .await
+            .map_err(|err| SessionError::BanList(err.detail().to_owned()))?
+            .is_some()
+        {
+            return Ok(Err(CourierRefusal::AuthorBanned));
         }
         let key: Vec<u8> = author.as_bytes().to_vec();
-        let writer_row = match self
+        let writer_row = self
             .target
             .writer_by_key(&key)
             .await
-            .map_err(|err| SessionError::WriteTarget(err.detail()))?
+            .map_err(|err| SessionError::WriteTarget(err.detail()))?;
+        if writer_row
+            .as_ref()
+            .is_some_and(|row| row.retired_at.is_some())
         {
-            Some(row) if row.retired_at.is_some() => {
-                return Ok(CourierDelivery::Refused(CourierRefusal::WriterRetired));
-            }
-            Some(row) => row,
-            // A live enrolment that never bound takes its row at frontier 0.
-            None => {
-                self.target
-                    .insert_device_writer(Some(record.user.clone()), &key)
-                    .await
-                    .map_err(|err| SessionError::WriteTarget(err.detail()))?;
-                self.target
-                    .writer_by_key(&key)
-                    .await
-                    .map_err(|err| SessionError::WriteTarget(err.detail()))?
-                    .ok_or_else(|| {
-                        SessionError::Protocol("the device writer row did not stand".into())
-                    })?
-            }
-        };
-        // The entries continue the author's settled chain.
-        let frontier = u64::try_from(writer_row.frontier).unwrap_or(0);
-        let head = writer_row.head.as_deref().map_or(GENESIS, |head| {
-            <[u8; 32]>::try_from(head).unwrap_or(GENESIS)
-        });
-        let mut previous = head;
-        let mut hashes = Vec::with_capacity(entries.len());
-        let mut expected = frontier.saturating_add(1);
-        for entry in entries {
-            if entry.seq != expected {
-                return Ok(CourierDelivery::Refused(CourierRefusal::SequenceGap {
+            return Ok(Err(CourierRefusal::WriterRetired));
+        }
+        if !chain::verify_offer(&record.public_key, author.as_bytes(), &signed) {
+            return Ok(Err(CourierRefusal::Unverified));
+        }
+        let frontier = writer_row
+            .as_ref()
+            .map_or(0, |row| u64::try_from(row.frontier).unwrap_or(0));
+        let head = writer_row
+            .as_ref()
+            .and_then(|row| row.head.as_deref())
+            .map_or(GENESIS, |head| {
+                <[u8; 32]>::try_from(head).unwrap_or(GENESIS)
+            });
+        let unsettled = &rows[rows.partition_point(|row| row.seq <= frontier)..];
+        if let Some(first) = unsettled.first() {
+            let expected = frontier.saturating_add(1);
+            if first.seq != expected {
+                return Ok(Err(CourierRefusal::SequenceGap {
                     expected,
-                    got: entry.seq,
+                    got: first.seq,
                 }));
             }
-            let hash = chain::entry_hash(
-                &previous,
-                entry.seq,
-                major,
-                entry.provenance.map(Origin::from),
-                &entry.changeset,
-            );
-            previous = hash;
-            expected = entry.seq.saturating_add(1);
-            hashes.push(hash);
-        }
-        // The author vouches the range's chain up to its last entry, or its
-        // own head when the range carries none.
-        let (vouch_seq, vouch_head) = match entries.last() {
-            Some(last) => (last.seq, previous),
-            None => (frontier, head),
-        };
-        if !chain::verify_range(
-            &record.public_key,
-            author.as_bytes(),
-            vouch_seq,
-            &vouch_head,
-            signature,
-        ) {
-            return Ok(CourierDelivery::Refused(CourierRefusal::NotEnrolled));
-        }
-        // The author's identity every entry applies under.
-        let session = SessionId::from_uuid(Uuid::new_v4());
-        let session_uuid = *session.as_uuid();
-        let mut author_principal = Principal::unidentified(session);
-        author_principal
-            .accept(Subject::Identity(VerifiedSession {
-                context: AuthContext::new(record.user),
-                session_id: session,
-                bot_list: None,
-            }))
-            .expect("one identity settles one run");
-        let author: Arc<Principal<Id, Key>> = Arc::new(author_principal);
-        let mut outcomes: Vec<SettledOutcome> = Vec::with_capacity(entries.len());
-        let mut previous = head;
-        for (entry, hash) in entries.iter().zip(hashes.iter()) {
-            let outcome = self
-                .courier_entry(
-                    &author,
-                    session_uuid,
-                    major,
-                    writer_row.writer,
-                    entry,
-                    *hash,
-                    previous,
-                )
-                .await?;
-            previous = *hash;
-            // A refusal stops the range.
-            let stops = matches!(outcome, SettledOutcome::Rejected(_));
-            outcomes.push(outcome);
-            if stops {
-                break;
+            // The rows above the frontier run to the offer's frontier and
+            // continue the writer's own head to its hash.
+            let frontier = signed.offer.frontier();
+            let reached = frontier.is_some_and(|frontier| {
+                unsettled
+                    .last()
+                    .is_some_and(|last| last.seq == frontier.seq)
+                    && chain::chain_walk(
+                        &head,
+                        unsettled
+                            .iter()
+                            .map(|row| (row.seq, Some(row.major), row.origin, row.digest)),
+                    ) == frontier.head
+            });
+            if !reached {
+                return Ok(Err(CourierRefusal::Unverified));
             }
         }
-        Ok(CourierDelivery::Entries(outcomes))
+        Ok(Ok(CourierAuthor {
+            user: record.user,
+            bot_list: record.bot_list,
+            key,
+            writer: writer_row.map(|row| row.writer),
+            frontier,
+            head,
+        }))
     }
 
-    /// Settle one courier entry at the frontier as [`SettlePath::Courier`].
+    /// Settle the body `slot` admitted, already checked against its row's
+    /// digest, as the stream table says: a row at or below the frontier is
+    /// consumed, the next row above it settles, and a later row stops the
+    /// range at the one skipped.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::courier_deliver`].
+    ///
+    /// # Panics
+    ///
+    /// When one identity cannot settle one run, a guarantee `accept` upholds.
+    async fn courier_settle_row(
+        &self,
+        mut slot: Slot<'_, Id, Key>,
+        changeset: &[u8],
+        payload: &[u8],
+    ) -> Result<(), SessionError> {
+        let next = slot.settling.next;
+        if slot.index < next {
+            return Ok(());
+        }
+        let row = &slot.rows[next];
+        let number_original = row
+            .origin
+            .is_some_and(|origin| matches!(origin.writer, WriterRef::Number(_)));
+        if slot.index > next || slot.settling.major != Some(row.major) || number_original {
+            slot.answer(next, CourierEntryOutcome::NotCouriered, true);
+            return Ok(());
+        }
+        let courier = crate::write_target::CourierSettle {
+            user_id: slot.settling.courier.user_id.clone(),
+            session: slot.settling.courier.session,
+            author: slot.settling.author.user.clone(),
+            device_key: slot.settling.author.key.clone(),
+        };
+        let settling = &mut *slot.settling;
+        let applier = match settling.applier.take() {
+            Some(applier) => applier,
+            None => self.courier_applier(&settling.author).await?,
+        };
+        let previous = settling.previous;
+        let hash = chain::chain_walk(
+            &previous,
+            [(row.seq, Some(row.major), row.origin, row.digest)],
+        );
+        let outcome = self
+            .courier_entry(
+                &applier.principal,
+                applier.session,
+                settling.major,
+                applier.writer,
+                row,
+                changeset,
+                payload,
+                hash,
+                previous,
+                courier,
+            )
+            .await?;
+        let seq = row.seq;
+        let facts = settling.author.facts();
+        settling.applier = Some(applier);
+        settling.previous = hash;
+        settling.next = next + 1;
+        match outcome {
+            // Settles nothing, so the range is offered again from here.
+            SettledOutcome::Rejected(MutationRejectReason::Indeterminate) => {
+                slot.answer(next, CourierEntryOutcome::Retry { retry_after_ms: 0 }, true);
+            }
+            outcome => {
+                // Another entry stands at the sequence, so the rest of the
+                // range no longer continues the server's chain.
+                let forked = matches!(
+                    outcome,
+                    SettledOutcome::Rejected(MutationRejectReason::Forked)
+                );
+                let verdict = crate::provisional::verdict_of(&facts, seq, Some(&outcome));
+                slot.answer(next, CourierEntryOutcome::Ruled(verdict), forked);
+            }
+        }
+        Ok(())
+    }
+
+    /// The writer a range's entries settle on and the author's identity
+    /// they apply under, made when the first body applies.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::courier_writer`].
+    ///
+    /// # Panics
+    ///
+    /// When one identity cannot settle one run, a guarantee `accept` upholds.
+    async fn courier_applier(
+        &self,
+        author: &CourierAuthor<Id>,
+    ) -> Result<Applier<Id, Key>, SessionError> {
+        let writer = match author.writer {
+            Some(writer) => writer,
+            // A live enrolment that never bound takes its row at frontier 0.
+            None => self.courier_writer(author).await?,
+        };
+        let session = SessionId::from_uuid(Uuid::new_v4());
+        let mut principal = Principal::unidentified(session);
+        principal
+            .accept(Subject::Identity(VerifiedSession {
+                context: AuthContext::new(author.user.clone()),
+                session_id: session,
+                bot_list: crate::courier::author_bot_list(author.bot_list.as_deref()),
+            }))
+            .expect("one identity settles one run");
+        Ok(Applier {
+            writer,
+            principal: Arc::new(principal),
+            session: *session.as_uuid(),
+        })
+    }
+
+    /// The writer row a courier range creates for an author whose live
+    /// enrolment never bound, at frontier 0.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::WriteTarget`] when the writer tables fail,
+    /// [`SessionError::Protocol`] when the row does not stand.
+    async fn courier_writer(&self, author: &CourierAuthor<Id>) -> Result<i64, SessionError> {
+        self.target
+            .insert_device_writer(Some(author.user.clone()), &author.key)
+            .await
+            .map_err(|err| SessionError::WriteTarget(err.detail()))?;
+        self.target
+            .writer_by_key(&author.key)
+            .await
+            .map_err(|err| SessionError::WriteTarget(err.detail()))?
+            .map(|row| row.writer)
+            .ok_or_else(|| SessionError::Protocol("the device writer row did not stand".into()))
+    }
+
+    /// The settled records of `writer` from `low` through `frontier`, by
+    /// sequence, the one read a provisional ask and a courier range's
+    /// settled prefix take (R77 decision 11).
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::WriteTarget`] when the writer tables fail,
+    /// [`SessionError::Protocol`] when a record holds no outcome the table
+    /// defines.
+    async fn settled_records(
+        &self,
+        writer: i64,
+        low: u64,
+        frontier: u64,
+    ) -> Result<HashMap<u64, SettledOutcome>, SessionError> {
+        let mut records = HashMap::new();
+        for (seq, settled) in self
+            .target
+            .settled_range(
+                writer,
+                i64::try_from(low).unwrap_or(i64::MAX),
+                i64::try_from(frontier).unwrap_or(i64::MAX),
+            )
+            .await
+            .map_err(|err| SessionError::WriteTarget(err.detail()))?
+        {
+            records.insert(
+                u64::try_from(seq).unwrap_or(0),
+                SettledOutcome::from_json(&settled.outcome).map_err(|err| {
+                    SessionError::Protocol(format!(
+                        "a settled record holds no outcome the table defines: {err}"
+                    ))
+                })?,
+            );
+        }
+        Ok(records)
+    }
+
+    /// Settle one courier row at the frontier as [`SettlePath::Courier`],
+    /// `changeset` its body and `payload` the same body compressed.
     ///
     /// # Errors
     ///
     /// [`SessionError::WriteTarget`] when the apply database or the writer
     /// tables fail.
-    /// [`SessionError::Protocol`] when the changeset will not compress, or
-    /// the provenance sequence is past the original's frontier.
+    /// [`SessionError::Protocol`] when the provenance sequence is past the
+    /// original's frontier.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the author, its declared major and the entry's hash and predecessor are the range's per-entry identity, and the range hands each over as it settles"
+        reason = "the author, its declared major and the entry's row, body, hash and predecessor are the range's per-entry identity, and the range hands each over as it settles"
     )]
     async fn courier_entry(
         &self,
@@ -6706,29 +8269,36 @@ where
         session_id: uuid::Uuid,
         major: Option<Major>,
         writer: i64,
-        entry: &CourierEntry,
+        row: &ManifestRow,
+        changeset: &[u8],
+        payload: &[u8],
         entry_hash: [u8; 32],
         previous_hash: [u8; 32],
+        courier: crate::write_target::CourierSettle<Id>,
     ) -> Result<SettledOutcome, SessionError> {
-        let changeset = entry.changeset.as_slice();
         let mut settle = SettleSpec {
             writer,
-            seq: entry.seq,
+            seq: row.seq,
             entry_hash,
             previous_hash,
             path: SettlePath::Courier,
             original: None,
+            courier: Some(courier),
         };
         if let Some(outcome) = self
-            .courier_original(author, session_id, major, entry, &mut settle)
+            .courier_original(
+                author,
+                session_id,
+                major,
+                row.origin,
+                changeset,
+                &mut settle,
+            )
             .await?
         {
             return Ok(outcome);
         }
-        let payload = compress(changeset).map_err(|err| {
-            SessionError::Protocol(format!("the changeset will not compress, {err}"))
-        })?;
-        let plan = match self.materializer.lock().await.plan_write(&payload) {
+        let plan = match self.materializer.lock().await.plan_write(payload) {
             Ok(plan) => plan,
             Err(err) => {
                 return self
@@ -6752,23 +8322,30 @@ where
             }
         }
         let outcome = self
-            .commit_with_retry(author, &plan, &payload, &settle)
+            .commit_with_retry(author, &plan, payload, &settle)
             .await;
         match outcome {
-            Ok(WriteOutcome::Applied) => Ok(SettledOutcome::Applied),
+            Ok(WriteOutcome::Applied) => {
+                self.record_couriered(&settle, true);
+                Ok(SettledOutcome::Applied)
+            }
             Ok(WriteOutcome::Conflict {
                 table,
                 version_column,
                 pk_columns,
                 pk_values,
                 ..
-            }) => Ok(SettledOutcome::Conflict {
-                table,
-                version_column,
-                pk_columns,
-                pk_values,
-            }),
+            }) => {
+                self.record_couriered(&settle, true);
+                Ok(SettledOutcome::Conflict {
+                    table,
+                    version_column,
+                    pk_columns,
+                    pk_values,
+                })
+            }
             Ok(WriteOutcome::Settled(settlement)) => {
+                self.record_couriered(&settle, settlement.fresh);
                 self.recorded_outcome(author, &settle, &settlement)
             }
             Err(WriteError::Unauthorized) => {
@@ -6800,14 +8377,21 @@ where
         author: &Arc<Principal<Id, Key>>,
         session_id: uuid::Uuid,
         major: Option<Major>,
-        entry: &CourierEntry,
-        settle: &mut SettleSpec,
+        origin: Option<Origin>,
+        changeset: &[u8],
+        settle: &mut SettleSpec<Id>,
     ) -> Result<Option<SettledOutcome>, SessionError> {
-        let Some(provenance) = entry.provenance else {
+        // A courier never holds a number's secret, so only a device original
+        // reaches here and it names its writer alone.
+        let Some(provenance) = origin.map(|origin| Provenance {
+            writer: origin.writer,
+            seq: origin.seq,
+            secret: None,
+        }) else {
             return Ok(None);
         };
         match self
-            .provenance_original(&provenance, major, &entry.changeset, author, session_id)
+            .provenance_original(&provenance, major, changeset, author, session_id)
             .await?
         {
             Some((writer, frontier, _, _)) if provenance.seq <= frontier => {
@@ -6819,15 +8403,22 @@ where
                 let outcome = match stored {
                     // A pruned record stands applied.
                     None => SettledOutcome::Applied,
-                    Some(row) => {
-                        self.recorded_outcome(author, settle, &Settlement { row, forked: false })?
-                    }
+                    Some(row) => self.recorded_outcome(
+                        author,
+                        settle,
+                        &Settlement {
+                            row,
+                            forked: false,
+                            fresh: false,
+                        },
+                    )?,
                 };
                 let settlement = self
                     .target
                     .settle_refusal(settle, &outcome)
                     .await
                     .map_err(|err| SessionError::WriteTarget(err.detail()))?;
+                self.record_couriered(settle, settlement.fresh);
                 self.recorded_outcome(author, settle, &settlement).map(Some)
             }
             Some((writer, frontier, hash, previous)) if provenance.seq == frontier + 1 => {
@@ -6851,7 +8442,7 @@ where
     async fn courier_settle_refusal(
         &self,
         author: &Principal<Id, Key>,
-        settle: &SettleSpec,
+        settle: &SettleSpec<Id>,
         reason: MutationRejectReason,
     ) -> Result<SettledOutcome, SessionError> {
         let settlement = self
@@ -6859,6 +8450,7 @@ where
             .settle_refusal(settle, &SettledOutcome::Rejected(reason))
             .await
             .map_err(|err| SessionError::WriteTarget(err.detail()))?;
+        self.record_couriered(settle, settlement.fresh);
         self.recorded_outcome(author, settle, &settlement)
     }
 
@@ -6930,13 +8522,24 @@ where
     ) -> WriteVerdict {
         for op in &plan.ops {
             let answer = match &op.write {
-                PlannedWrite::Insert { new } => {
+                PlannedWrite::Insert { new, assigned } => {
                     let new = ValuesRow::new(op.table_id, new);
                     self.auth
-                        .may_write(RowWrite::Insert { new: &new }, caller)
+                        .may_write(
+                            RowWrite::Insert {
+                                new: &new,
+                                assigned,
+                            },
+                            caller,
+                        )
                         .await
                 }
-                PlannedWrite::Update { old, new } => {
+                PlannedWrite::Update {
+                    old,
+                    new,
+                    assigned,
+                    read,
+                } => {
                     let old = ValuesRow::new(op.table_id, old);
                     let new = ValuesRow::new(op.table_id, new);
                     self.auth
@@ -6944,15 +8547,17 @@ where
                             RowWrite::Update {
                                 old: &old,
                                 new: &new,
+                                assigned,
+                                read,
                             },
                             caller,
                         )
                         .await
                 }
-                PlannedWrite::Delete { old } => {
+                PlannedWrite::Delete { old, read } => {
                     let old = ValuesRow::new(op.table_id, old);
                     self.auth
-                        .may_write(RowWrite::Delete { old: &old }, caller)
+                        .may_write(RowWrite::Delete { old: &old, read }, caller)
                         .await
                 }
             };
@@ -7110,6 +8715,7 @@ where
                 previous_hash: previous,
                 path: SettlePath::Direct,
                 original: None,
+                courier: None,
             };
             return self
                 .settle_and_refuse(
@@ -7380,6 +8986,7 @@ where
             previous_hash: previous,
             path: SettlePath::Direct,
             original: None,
+            courier: None,
         };
         // A provenance entry the original already settled settles this copy
         // with the stored outcome, so the logical write applies once.
@@ -7600,10 +9207,33 @@ where
         Ok(Some((row.writer, frontier, entry_hash, previous)))
     }
 
+    /// The one `write_couriered` row of a couriered entry this range settled,
+    /// absent when the range carries no courier or the sequence stood settled
+    /// already.
+    fn record_couriered(&self, settle: &SettleSpec<Id>, fresh: bool) {
+        let Some(courier) = settle.courier.as_ref().filter(|_| fresh) else {
+            return;
+        };
+        self.guard.record(
+            AuthEvent::new(
+                courier.session,
+                Some(courier.author.clone()),
+                AuthOp::WriteCouriered,
+            )
+            .about_write(
+                settle.writer,
+                i64::try_from(settle.seq).unwrap_or(i64::MAX),
+                SettlePath::Courier,
+                SettlePath::Courier,
+            )
+            .about_courier(courier.user_id.clone()),
+        );
+    }
+
     fn recorded_outcome(
         &self,
         caller: &Principal<Id, Key>,
-        settle: &SettleSpec,
+        settle: &SettleSpec<Id>,
         settlement: &Settlement,
     ) -> Result<SettledOutcome, SessionError> {
         let row = &settlement.row;
@@ -7641,7 +9271,7 @@ where
         transport: &mut T,
         outcome: Result<WriteOutcome, WriteError>,
         seq: u64,
-        settle: &SettleSpec,
+        settle: &SettleSpec<Id>,
         state: &mut SessionState<Id, Key>,
     ) -> Result<(), SessionError> {
         match outcome {
@@ -7703,7 +9333,7 @@ where
     async fn settle_and_refuse<T: Transport>(
         &self,
         transport: &mut T,
-        settle: &SettleSpec,
+        settle: &SettleSpec<Id>,
         reason: MutationRejectReason,
         state: &mut SessionState<Id, Key>,
     ) -> Result<(), SessionError> {
@@ -7717,7 +9347,7 @@ where
     async fn settle_prior_refusal<T: Transport>(
         &self,
         transport: &mut T,
-        settle: &SettleSpec,
+        settle: &SettleSpec<Id>,
         refused: &PriorRefusal,
         state: &mut SessionState<Id, Key>,
     ) -> Result<(), SessionError> {
@@ -7738,7 +9368,7 @@ where
     async fn settle_refused<T: Transport>(
         &self,
         transport: &mut T,
-        settle: &SettleSpec,
+        settle: &SettleSpec<Id>,
         outcome: &SettledOutcome,
         state: &mut SessionState<Id, Key>,
     ) -> Result<(), SessionError> {
@@ -7766,7 +9396,7 @@ where
         caller: &Principal<Id, Key>,
         plan: &crate::materializer::WritePlan,
         payload_zstd: &[u8],
-        settle: &SettleSpec,
+        settle: &SettleSpec<Id>,
     ) -> Result<WriteOutcome, WriteError> {
         let policy =
             RetryPolicy::new().with_max_total_backoff(Some(self.config.write_retry_budget));
@@ -7929,7 +9559,7 @@ where
                         .snapshot_source
                         .term_seed(
                             &membership.seed_sql,
-                            &membership.member_table,
+                            &membership.member_table.name,
                             &membership.member_subject,
                             &member_keys,
                             &state.principal,
@@ -7941,7 +9571,7 @@ where
                         Some(true) => {}
                         Some(false) => {
                             return Err(SubscribeRefusal::Unpublished(
-                                membership.member_table.clone(),
+                                membership.member_table.name.to_string(),
                             ));
                         }
                         None => return Err(SubscribeRefusal::NoPublication),
@@ -8014,8 +9644,8 @@ where
         let terms = materializer
             .describe_terms(consumer_id, &pg_sql, &sub.spec.binds, subscriber, subjects)
             .unwrap_or_default();
+        let member_tables = member_tables_of(&terms, materializer.catalog())?;
         let seed = self.seed_for_terms(&terms, state).await?;
-        let member_tables = Self::member_tables_of(&terms);
         let reads_subjects = terms
             .iter()
             .any(|term| caller_of(term) == TermCaller::Subjects);
@@ -8062,42 +9692,6 @@ where
             ))
             .with_statements(binding.setup_statements())
         })
-    }
-
-    /// The membership tables a registration's terms read, paired with the member
-    /// subject column, for the session's term-move routing.
-    /// The membership tables a filter's terms watch, one entry per table and
-    /// column, carrying every caller kind the terms over it read.
-    ///
-    /// Collapsed rather than one entry per term, because the mirror is keyed
-    /// by table and opened once. Two terms over one table under different
-    /// caller kinds would otherwise open the first and silently skip the
-    /// second, leaving that kind's membership moves undelivered.
-    fn member_tables_of(terms: &[TermDescription]) -> std::sync::Arc<[MemberTable]> {
-        let mut tables: Vec<MemberTable> = Vec::new();
-        for term in terms {
-            let TermDescription::Membership(membership) = term else {
-                continue;
-            };
-            let held = tables.iter().position(|held| {
-                held.table == membership.member_table && held.subject == membership.member_subject
-            });
-            let at = held.unwrap_or_else(|| {
-                tables.push(MemberTable {
-                    table: membership.member_table.clone(),
-                    subject: membership.member_subject.clone(),
-                    identity: false,
-                    subjects: false,
-                });
-                tables.len() - 1
-            });
-            let entry = &mut tables[at];
-            match membership.caller {
-                TermCaller::Identity => entry.identity = true,
-                TermCaller::Subjects => entry.subjects = true,
-            }
-        }
-        tables.into()
     }
 
     async fn handle_subscribe<T: Transport>(
@@ -8159,6 +9753,18 @@ where
         let consumer_id = self.next_consumer_id();
         let registered = match self.register_subscription(consumer_id, &sub, state).await {
             Ok(registered) => registered,
+            Err(SubscribeRefusal::Materializer(MaterializerError::RefusedRead(table))) => {
+                // A table refused for its schema says nothing about what the caller named.
+                tracing::warn!(sub_id = %sub.sub_id, table = %table, "subscription reads a refused table");
+                transport
+                    .send_control(ControlMessage::NonFatalError(NonFatalError {
+                        related_to: Some(sub.sub_id),
+                        detail: SUBSCRIPTION_REFUSED_SCHEMA.to_owned(),
+                    }))
+                    .await
+                    .map_err(transport_err)?;
+                return Ok(());
+            }
             Err(err) => {
                 tracing::warn!(sub_id = %sub.sub_id, error = %err, "subscription registration refused");
                 // Naming something that does not resolve is one of the four
@@ -8288,7 +9894,14 @@ where
                         // Without its membership rows the term's local answer is wrong, so the two are refused as a unit.
                         Err(SessionError::Snapshot(detail) | SessionError::ReadRefused(detail)) => {
                             tracing::warn!(sub_id = %sub_label, error = %detail, "membership read failed, refusing the term");
-                            return self.refuse_subscription(transport, state, &sub_label).await;
+                            return self
+                                .refuse_subscription(
+                                    transport,
+                                    state,
+                                    &sub_label,
+                                    SUBSCRIPTION_REFUSED,
+                                )
+                                .await;
                         }
                         Err(other) => return Err(other),
                     }
@@ -8425,6 +10038,12 @@ where
             )
         };
         let table = connetto_core::quote_ident(&member.table);
+        // Project the catalog's columns so a column the live table gained
+        // under the running server stays out of the mirror read.
+        let columns = self
+            .shapes
+            .select_list_named(self.catalog.as_ref(), &member.table)
+            .map_err(|err| SessionError::Snapshot(err.to_string()))?;
         let predicate = mirror_predicate(
             member,
             identity_function.as_deref(),
@@ -8441,7 +10060,7 @@ where
                     .to_owned(),
             })
         })?;
-        let query = format!("SELECT * FROM {table} WHERE {predicate}");
+        let query = format!("SELECT {columns} FROM {table} WHERE {predicate}");
         let hidden = Subscribe {
             sub_id: label.clone(),
             spec: SubscriptionSpec::new(query),
@@ -8595,7 +10214,9 @@ where
                         error = %detail,
                         "replacing a subscription was refused, ending it"
                     );
-                    return self.refuse_subscription(transport, state, sub_label).await;
+                    return self
+                        .refuse_subscription(transport, state, sub_label, SUBSCRIPTION_REFUSED)
+                        .await;
                 }
                 Err(other) => return Err(other),
             }
@@ -8699,7 +10320,6 @@ where
         transport
             .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
                 sub_id: sub.sub_id.clone(),
-                priority: sub.spec.priority,
             }))
             .await
             .map_err(transport_err)?;
@@ -8766,6 +10386,7 @@ where
             let mut payloads = Vec::new();
             let mut truncated = false;
             let mut unencodable = false;
+            let mut refused_table = None;
             for record in records {
                 if replay.fence.seen(record.position()) != Seen::Missed {
                     continue;
@@ -8779,6 +10400,10 @@ where
                 let Some(departing) = matched else {
                     continue;
                 };
+                if record.is_refusal() {
+                    refused_table = Some(record.table().to_owned());
+                    break;
+                }
                 if record.event().kind() == EventKind::Truncate {
                     truncated = true;
                     break;
@@ -8796,12 +10421,23 @@ where
                     }
                 }
             }
+            if let Some(table) = refused_table {
+                self.resnapshot_row(
+                    transport,
+                    state,
+                    &replay.label,
+                    &FullResyncReason::TableRefused { table },
+                    None,
+                )
+                .await?;
+                continue;
+            }
             if truncated || unencodable {
                 tracing::warn!(
                     sub_id = %replay.label,
                     "a missed record the client cannot be sent is refused instead"
                 );
-                self.refuse_subscription(transport, state, &replay.label)
+                self.refuse_subscription(transport, state, &replay.label, SUBSCRIPTION_REFUSED)
                     .await?;
                 continue;
             }
@@ -9007,7 +10643,9 @@ where
         // A page above the ceiling is not a transient failure and a restart
         // would meet the same row, so this one ends the subscription.
         if admit_page(&label, &page, max_rows, average_width, limits).is_err() {
-            return self.refuse_subscription(transport, state, &label).await;
+            return self
+                .refuse_subscription(transport, state, &label, SUBSCRIPTION_REFUSED)
+                .await;
         }
         // Size the next page from what this one measured rather than from the
         // prediction, which cannot see the true size of a value stored out of
@@ -9063,7 +10701,9 @@ where
         let label = start.sub.sub_id.clone();
         if start.restarted {
             let _ = refuse_read(&label, &SubscribeRefusal::Interrupted(detail.to_owned()));
-            return self.refuse_subscription(transport, state, &label).await;
+            return self
+                .refuse_subscription(transport, state, &label, SUBSCRIPTION_REFUSED)
+                .await;
         }
         tracing::warn!(
             sub_id = %label,
@@ -9086,19 +10726,21 @@ where
             Ok(()) => Ok(()),
             Err(SessionError::Snapshot(detail) | SessionError::ReadRefused(detail)) => {
                 let _ = refuse_read(&label, &SubscribeRefusal::Interrupted(detail));
-                self.refuse_subscription(transport, state, &label).await
+                self.refuse_subscription(transport, state, &label, SUBSCRIPTION_REFUSED)
+                    .await
             }
             Err(other) => Err(other),
         }
     }
 
     /// Give up on one subscription: tear the registration down and answer with
-    /// the one fixed phrase (R38).
+    /// `detail`, one of the fixed phrases (R38).
     async fn refuse_subscription<T: Transport>(
         &self,
         transport: &mut T,
         state: &mut SessionState<Id, Key>,
         label: &str,
+        detail: &'static str,
     ) -> Result<(), SessionError> {
         for (consumer_id, sub_id) in take_row_subscription(state, label) {
             self.remove_route(consumer_id).await;
@@ -9107,7 +10749,7 @@ where
         transport
             .send_control(ControlMessage::NonFatalError(NonFatalError {
                 related_to: Some(label.to_owned()),
-                detail: SUBSCRIPTION_REFUSED.to_owned(),
+                detail: detail.to_owned(),
             }))
             .await
             .map_err(transport_err)
@@ -9211,7 +10853,7 @@ where
                     .await
             }
             CatchupWait::Ready(WaveEnd::Refused) => {
-                self.refuse_subscription(transport, state, &sub.sub_id)
+                self.refuse_subscription(transport, state, &sub.sub_id, SUBSCRIPTION_REFUSED)
                     .await
             }
             CatchupWait::Ready(WaveEnd::Failed(error)) => Err(error),
@@ -9650,11 +11292,9 @@ where
         let event = record.event();
         // A truncate replays as a patchset with no operations, so applying it would leave the emptied table populated (R48), and everything after it arrives again in the replacement.
         if event.kind() == EventKind::Truncate {
-            let table = self.event_table(event);
+            let reason = resync_reason(record, self.event_table(event));
             for (at, _) in reached {
-                members[at].end(WaveEnd::Resync(FullResyncReason::TableTruncated {
-                    table: table.clone(),
-                }));
+                members[at].end(WaveEnd::Resync(reason.clone()));
             }
             return;
         }
@@ -9971,8 +11611,9 @@ where
     /// the shared re-execution bound, because that path holds the
     /// materializer lock.
     ///
-    /// `resync` goes out once the answer exists and ahead of it, so a client
-    /// replacing an answer drops the old one only for a new one.
+    /// `resync` goes out once the answer exists and ahead of its column
+    /// declaration and rows, so a client replacing an answer drops the old
+    /// one only for a new one.
     async fn subscribe_computed<T: Transport>(
         &self,
         transport: &mut T,
@@ -9990,6 +11631,21 @@ where
                     .refuse_computed_subscribe(transport, sub.sub_id, subscription_id, &err)
                     .await;
             }
+        };
+        let columns = self
+            .materializer
+            .lock()
+            .await
+            .computed_columns(subscription_id);
+        let Some(columns) = columns else {
+            return self
+                .refuse_computed_subscribe(
+                    transport,
+                    sub.sub_id,
+                    subscription_id,
+                    &"computed columns are unavailable",
+                )
+                .await;
         };
 
         self.add_computed_route(
@@ -10009,14 +11665,18 @@ where
                 .await
                 .map_err(transport_err)?;
         }
+        transport
+            .send_control(ControlMessage::AggregateColumns(AggregateColumns {
+                sub_id: sub.sub_id.clone(),
+                columns,
+            }))
+            .await
+            .map_err(transport_err)?;
         for change in changes {
             transport
                 .send_control(ControlMessage::AggregateUpdate(AggregateUpdate {
                     sub_id: sub.sub_id.clone(),
-                    group_key: change.group_key,
-                    group_values_json: change.group_values_json,
-                    result_json: change.result_json,
-                    is_full_result: change.is_full_result,
+                    change: change.change,
                 }))
                 .await
                 .map_err(transport_err)?;
@@ -10230,6 +11890,107 @@ mod tests {
     use crate::timeline::{Position, TimelineHistory};
     use connetto_core::Cursor;
     use subql::{PgCommitPosition, PgLsn, PgXid};
+
+    /// A write to a table the drift guard refused is rejected as a schema
+    /// mismatch, which names nothing about the table (R107 decision 11, R38).
+    #[test]
+    fn a_write_to_a_refused_table_is_a_schema_mismatch() {
+        let refused = crate::materializer::MaterializerError::Refused(
+            subql::patchset::ApplyError::RefusedTable {
+                table: "docs".to_owned(),
+                reasons: vec![subql::Incompatibility::Unpublished],
+            },
+        );
+        assert_eq!(
+            super::reject_reason(&refused),
+            connetto_core::messages::MutationRejectReason::SchemaMismatch
+        );
+    }
+
+    /// A membership term over a table its bare name does not reach is refused
+    /// before any read, since the seed, the mirror and the replica name the
+    /// table bare. Off the search path the bare name reaches nothing, beside a
+    /// public twin it reaches the twin, and a search path naming another schema
+    /// first shadows a table declared without one. The server's own builder
+    /// refuses such a catalog at boot, so the materializer here takes its
+    /// translator directly, as a manager built over a caller's own materializer
+    /// does.
+    #[test]
+    fn a_membership_table_its_bare_name_misses_is_refused() {
+        const DOCS: &str = "CREATE TABLE docs (id BIGINT PRIMARY KEY, project_id BIGINT NOT NULL);";
+        const ORG: &str = "CREATE SCHEMA org;\nCREATE TABLE org.project_members (project_id BIGINT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (project_id, user_id));";
+        const PUBLIC: &str = "CREATE TABLE project_members (project_id BIGINT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (project_id, user_id));";
+        const ORG_FIRST: &str = "SET search_path TO org, public;";
+        const READER: &str = "app_reader";
+        let term = |column: &str, member_table: &str| {
+            format!(
+                "{column} IN (SELECT project_id FROM {member_table} WHERE user_id = current_app_user())"
+            )
+        };
+        let member_tables = |ddl: &str, filter: &str| {
+            let translator = rls2fga::translator::TranslatorBuilder::new(
+                connetto_schema::deployment::<String>(READER)
+                    .expect("the test deployment's description holds"),
+            )
+            .with_min_confidence(rls2fga::types::ConfidenceLevel::B)
+            .build();
+            let materializer = crate::materializer::Materializer::builder(ddl)
+                .with_translator(translator)
+                .with_caller(
+                    crate::materializer::CallerMappings::of::<String>(READER)
+                        .expect("the test deployment's description holds"),
+                )
+                .build()
+                .expect("the catalog parses");
+            let pg_sql = materializer
+                .translate_subscription_sql(&format!("SELECT * FROM docs WHERE {filter}"))
+                .expect("the caller function reverse translates");
+            let terms = materializer
+                .describe_terms(1, &pg_sql, &[], None, Vec::new())
+                .expect("the membership term describes");
+            let member_tables = super::member_tables_of(&terms, materializer.catalog());
+            (terms.len(), member_tables)
+        };
+        for (ddl, member_table, refused) in [
+            (
+                format!("{DOCS}\n{ORG}"),
+                "org.project_members",
+                "org.project_members",
+            ),
+            (
+                format!("{DOCS}\n{PUBLIC}\n{ORG}"),
+                "org.project_members",
+                "org.project_members",
+            ),
+            (
+                format!("{DOCS}\n{PUBLIC}\n{ORG_FIRST}\n{ORG}"),
+                "public.project_members",
+                "project_members",
+            ),
+        ] {
+            match member_tables(&ddl, &term("project_id", member_table)).1 {
+                Err(SubscribeRefusal::MembershipTableUnreachable(table)) => {
+                    assert_eq!(table, refused);
+                }
+                other => panic!("expected {member_table} refused over {ddl}, got {other:?}"),
+            }
+        }
+        // Two terms over the one reached table share its single entry.
+        let (described, reached) = member_tables(
+            &format!("{DOCS}\n{PUBLIC}\n{ORG}"),
+            &format!(
+                "{} AND {}",
+                term("project_id", "project_members"),
+                term("id", "project_members")
+            ),
+        );
+        assert_eq!(described, 2, "both terms describe");
+        let reached = reached.expect("the table the bare name reaches is watched");
+        let [watched] = &reached[..] else {
+            panic!("one membership table, got {reached:?}");
+        };
+        assert_eq!(watched.table, "project_members");
+    }
 
     /// Bytes released by a sent patch make room again, and an overflow stays final even once the queue drains.
     #[test]
@@ -10520,6 +12281,49 @@ mod tests {
         assert!(concerns(&caller(Some("alice"), &[]), &holder));
         assert!(concerns(&caller(None, &["key:a"]), &holder));
         assert!(concerns(&caller(None, &[]), &holder));
+    }
+
+    #[test]
+    fn aggregate_budget_counts_typed_values_and_payloads() {
+        use super::{AggregateChange, AggregateUpdate, OUTBOUND_ITEM_BYTES, Outbound, SqliteValue};
+
+        let row = vec![
+            SqliteValue::Null,
+            SqliteValue::Integer(7),
+            SqliteValue::Real(1.5),
+            SqliteValue::Text("text".to_owned()),
+            SqliteValue::Blob(vec![1, 2, 3]),
+        ];
+        let row_bytes =
+            u64::try_from(5 * std::mem::size_of::<SqliteValue>() + 7).expect("row size fits");
+        let base = OUTBOUND_ITEM_BYTES + 4;
+        let update = |change| {
+            Outbound::Aggregate(AggregateUpdate {
+                sub_id: "stat".to_owned(),
+                change,
+            })
+        };
+        assert_eq!(
+            update(AggregateChange::Upsert {
+                key: vec![1, 2],
+                row: row.clone(),
+            })
+            .budgeted(),
+            base + 2 + row_bytes,
+        );
+        assert_eq!(
+            update(AggregateChange::Replace { rows: vec![row] }).budgeted(),
+            base + row_bytes
+                + u64::try_from(std::mem::size_of::<Vec<SqliteValue>>()).expect("vector size fits"),
+        );
+        assert_eq!(
+            update(AggregateChange::Remove { key: vec![1, 2] }).budgeted(),
+            base + 2,
+        );
+        assert_eq!(
+            update(AggregateChange::Replace { rows: Vec::new() }).budgeted(),
+            base,
+        );
     }
 
     /// The failed connect that opened the episode is itself one of the

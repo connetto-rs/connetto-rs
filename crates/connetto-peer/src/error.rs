@@ -84,7 +84,8 @@ pub enum PeerSendError<M = Message> {
         /// The message handed back to its sender.
         message: M,
     },
-    /// The peer holds no live link.
+    /// The peer holds no live link, or for a media send no live link by the
+    /// number it named.
     #[error("the peer holds no live link")]
     Unlinked {
         /// The message handed back to its sender.
@@ -104,6 +105,9 @@ pub enum LinkError {
     /// The node holds no identity to present.
     #[error("the node holds no identity to present")]
     NotServing,
+    /// The node's peer links are off, so the dial is refused before a socket.
+    #[error("the node's peer links are off")]
+    LinksOff,
     /// The loopback connect failed.
     #[error("the peer is unreachable")]
     Unreachable(#[source] std::io::Error),
@@ -161,6 +165,9 @@ pub enum ExchangeError {
     /// The exchange's I/O failed.
     #[error("the exchange's I/O failed")]
     Io(#[source] std::io::Error),
+    /// The node's peer links are off, so no link is attempted.
+    #[error("the peer links are off")]
+    LinksOff,
 }
 
 /// A link failure as the exchange's typed error, keeping every distinction.
@@ -176,6 +183,7 @@ impl From<LinkError> for ExchangeError {
             LinkError::UnsupportedVersion { their } => Self::UnsupportedVersion { their },
             LinkError::Protocol(message) => Self::Protocol(message),
             LinkError::Tls(source) => Self::Tls(source),
+            LinkError::LinksOff => Self::LinksOff,
         }
     }
 }

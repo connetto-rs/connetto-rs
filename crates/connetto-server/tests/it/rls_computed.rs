@@ -100,18 +100,21 @@ fn connect(manager: &Arc<Manager>) -> Client {
 
 /// The next aggregate frame for `sub_id`.
 async fn next_aggregate(client: &mut Client, sub_id: &str) -> AggregateUpdate {
-    let ControlMessage::AggregateUpdate(update) = client.next_control().await else {
+    let mut control = client.next_control().await;
+    if let ControlMessage::AggregateColumns(columns) = &control {
+        assert_eq!(columns.sub_id, sub_id);
+        control = client.next_control().await;
+    }
+    let ControlMessage::AggregateUpdate(update) = control else {
         panic!("expected an aggregate frame for {sub_id}");
     };
     assert_eq!(update.sub_id, sub_id);
     update
 }
 
-/// The count a computed answer carries, which the client reads only as a bare number.
+/// The integer in a scalar aggregate answer.
 fn count_of(update: &AggregateUpdate) -> i64 {
-    let body = update.result_json.as_deref().expect("an answer has a body");
-    body.parse()
-        .unwrap_or_else(|_| panic!("a count answers as a bare number, got {body}"))
+    super::reexec::integer(update)
 }
 
 /// Run `sql` on the emulated source and dispatch every event it produced.
@@ -292,12 +295,13 @@ async fn a_grouped_statistic_over_an_rls_table_keeps_its_rows() {
         .await;
     let seed = next_aggregate(&mut alice, "by-owner").await;
 
-    let body: serde_json::Value =
-        serde_json::from_str(seed.result_json.as_deref().expect("an answer has a body"))
-            .expect("the body is JSON");
     assert_eq!(
-        body,
-        serde_json::json!([{ "owner": "alice", "count": 2 }]),
-        "alice's one group, as the whole answer's row objects"
+        seed.change,
+        connetto_core::messages::AggregateChange::Replace {
+            rows: vec![vec![
+                connetto_core::messages::SqliteValue::Text("alice".to_owned()),
+                connetto_core::messages::SqliteValue::Integer(2),
+            ]],
+        },
     );
 }

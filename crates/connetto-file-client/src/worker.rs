@@ -6,7 +6,6 @@ use std::io::Read;
 
 use connetto_client::{ClientEvent, ConnettoConnection, ExportScope, ImportChoices, ImportOutcome};
 use connetto_core::Major;
-use connetto_core::messages::ContentVerb;
 use connetto_core::traits::Transport;
 use connetto_file_core::{
     ChunkHash, ChunkStore, EncryptStoreError, EncryptingStore, FileId, Manifest, MaybeSend,
@@ -108,15 +107,20 @@ fn next_after(waiting: &[FileId], last: Option<FileId>) -> Option<FileId> {
 ///
 /// Split apart, an entry could leave the outbox with nothing recording that
 /// this device ever declared the file while an application row still names it.
-/// A heal entry leaves quietly, since a cache copy lost is no authored data lost.
+/// A heal or carried entry leaves quietly, since a cache or custody copy lost
+/// is no authored data lost, and a carried copy leaves custody with it.
 pub(crate) fn retire(
     conn: &mut diesel::SqliteConnection,
     file_id: FileId,
 ) -> Result<(), ContentError> {
     conn.transaction(|conn| {
-        let heal = db::is_heal(conn, file_id)?;
+        let authored = db::is_authored(conn, file_id)?;
+        let carried = db::carried_for(conn, file_id)?.is_some();
         db::dequeue(conn, file_id)?;
-        if heal {
+        if carried {
+            db::leave_custody(conn, file_id)?;
+        }
+        if !authored {
             return Ok(());
         }
         db::record_retired(conn, file_id)
@@ -400,14 +404,36 @@ where
         F: FnOnce(&mut SqliteConnection, FileId) -> Result<O, StageCommitError>,
     {
         let file_id = manifest.file_id();
+        self.commit_staged_batch(connection, std::slice::from_ref(manifest), |conn| {
+            row(conn, file_id)
+        })
+    }
+
+    /// Commits every manifest and upload entry atomically with the naming rows.
+    ///
+    /// # Errors
+    ///
+    /// A bookkeeping or row error rolls back the entire batch.
+    pub fn commit_staged_batch<T, F, O>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+        manifests: &[Manifest],
+        row: F,
+    ) -> Result<O, StageCommitError>
+    where
+        T: Transport,
+        F: FnOnce(&mut SqliteConnection) -> Result<O, StageCommitError>,
+    {
         connection
             .transact_with_bookkeeping(
                 |conn| {
-                    db::put_manifest(conn, manifest)?;
-                    db::enqueue(conn, file_id)?;
+                    for manifest in manifests {
+                        db::put_manifest(conn, manifest)?;
+                        db::enqueue(conn, manifest.file_id())?;
+                    }
                     Ok(())
                 },
-                |conn| row(conn, file_id),
+                row,
             )
             .map(|((), outcome)| outcome)
     }
@@ -541,7 +567,7 @@ where
         ticket::ensure_pending_request(
             connection,
             file_id,
-            ContentVerb::Read,
+            ticket::TicketAsk::read(),
             &mut pending,
             ticket::TicketWire::Main,
         )
@@ -572,7 +598,7 @@ where
         let url = ticket::request_connection_or(
             connection,
             file_id,
-            ContentVerb::Read,
+            ticket::TicketAsk::read(),
             observed,
             cancel,
             &mut pending,
@@ -971,11 +997,12 @@ where
             ManifestStart::Ready(manifest) => manifest,
             ManifestStart::Complete(flush) => return Ok(ContentFlushStart::Complete(flush)),
         };
+        let for_owner = db::carried_for(cursor.connection.conn(), file_id)?;
         let declared_len = manifest.chunks().iter().map(|chunk| chunk.len).sum();
         let upload_url = match ticket::request_connection_or(
             cursor.connection,
             file_id,
-            ContentVerb::Write { declared_len },
+            ticket::TicketAsk::write(declared_len, for_owner),
             observed,
             cancel,
             &mut cursor.state.pending_ticket,
@@ -1096,7 +1123,7 @@ where
     ) -> Result<ContentFlush, ContentError> {
         match result {
             Ok(()) => {
-                db::dequeue(connection.conn(), file_id)?;
+                db::upload_committed(connection.conn(), file_id)?;
                 Ok(ContentFlush::Progressed)
             }
             Err(error) => match error.outcome() {
@@ -1193,7 +1220,7 @@ where
         let upload_url = match ticket::request_connection_or(
             cursor.connection,
             file_id,
-            ContentVerb::Write { declared_len },
+            ticket::TicketAsk::write(declared_len, None),
             observed,
             cancel,
             &mut cursor.state.pending_ticket,
@@ -1272,7 +1299,8 @@ where
             .map_err(ContentError::Replica)
     }
 
-    /// Exports unsent content and replica data to `sink`.
+    /// Exports unsent content, the copies held in custody for other
+    /// devices' rows with their custody records, and replica data to `sink`.
     ///
     /// The sink is written through as each chunk is read from the store, so
     /// one chunk is in memory at a time. Returns the sink once the archive is
@@ -1287,8 +1315,8 @@ where
         scope: ExportScope,
         sink: W,
     ) -> Result<W, ContentError> {
-        let manifests = outbox_manifests(connection)?;
-        let declaration = crate::archive::declare_content(&manifests)?;
+        let files = archived_files(connection)?;
+        let declaration = crate::archive::declare_content(&files)?;
         let export =
             connection.export_local_data_with_attachments(scope, &declaration.attachments, sink)?;
         write_content_entries(&self.store, &self.root_key, &declaration, export).await
@@ -1324,6 +1352,39 @@ pub(crate) fn outbox_manifests<T: Transport>(
                 .ok_or(ContentError::NoManifest { file_id })
         })
         .collect()
+}
+
+/// The files an export carries, in both scopes: every unsent file this
+/// device authored, then every copy it holds in custody with its record
+/// (R79 decision 18). Other cache stays behind.
+pub(crate) fn archived_files<T: Transport>(
+    connection: &mut ConnettoConnection<T>,
+) -> Result<Vec<crate::archive::Carried>, ContentError> {
+    let mut files: Vec<crate::archive::Carried> = outbox_manifests(connection)?
+        .into_iter()
+        .map(|manifest| crate::archive::Carried {
+            manifest,
+            custody: None,
+        })
+        .collect();
+    for record in db::custody_records(connection.conn())? {
+        if files
+            .iter()
+            .any(|carried| carried.manifest.file_id() == record.file_id)
+        {
+            continue;
+        }
+        let manifest = db::load_manifest(connection.conn(), record.file_id)?.ok_or(
+            ContentError::NoManifest {
+                file_id: record.file_id,
+            },
+        )?;
+        files.push(crate::archive::Carried {
+            manifest,
+            custody: Some(record.custody),
+        });
+    }
+    Ok(files)
 }
 
 /// Writes the content index entry and then one entry per distinct chunk.
@@ -2578,7 +2639,7 @@ mod tests {
         db::refuse(connection.conn(), file_id, "over the quota").expect("refuse the heal");
         db::enqueue(connection.conn(), file_id).expect("author the same file");
 
-        assert!(!db::is_heal(connection.conn(), file_id).expect("read the kind"));
+        assert!(db::is_authored(connection.conn(), file_id).expect("read the kind"));
         assert_eq!(db::outbox_count(connection.conn()).expect("count"), 1);
         assert!(
             db::sendable(connection.conn())
@@ -2755,6 +2816,104 @@ mod tests {
             count(connection.conn(), "SELECT COUNT(*) AS n FROM photos"),
             1,
             "the row committed"
+        );
+    }
+
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[tokio::test]
+    async fn staged_batch_commits_every_manifest_and_upload_with_rows() {
+        use connetto_file_core::MimeClass;
+        use diesel::prelude::*;
+
+        let (_dir, archive, mut connection) = staged_fixture();
+        let mut manifests = Vec::new();
+        for bytes in [b"batch thumbnail".as_slice(), b"batch original".as_slice()] {
+            manifests.push(
+                archive
+                    .chunk_file(bytes, MimeClass::Jpeg)
+                    .await
+                    .expect("chunk"),
+            );
+        }
+        archive
+            .commit_staged_batch(&mut connection, &manifests, |conn| {
+                for (index, manifest) in manifests.iter().enumerate() {
+                    diesel::insert_into(photos::table)
+                        .values((
+                            photos::id.eq(i32::try_from(index).expect("row id")),
+                            photos::content_id.eq(manifest.file_id().as_bytes().as_slice()),
+                        ))
+                        .execute(conn)?;
+                }
+                Ok(())
+            })
+            .expect("batch commits");
+        let queued = crate::db::outbox(connection.conn()).expect("outbox");
+        assert_eq!(queued.len(), manifests.len());
+        for manifest in &manifests {
+            assert!(queued.contains(&manifest.file_id()));
+            assert!(
+                crate::db::load_manifest(connection.conn(), manifest.file_id())
+                    .expect("manifest")
+                    .is_some()
+            );
+        }
+        assert_eq!(
+            photos::table
+                .count()
+                .get_result::<i64>(connection.conn())
+                .expect("rows"),
+            2
+        );
+    }
+
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[tokio::test]
+    async fn staged_batch_row_failure_rolls_back_every_manifest_and_upload() {
+        use crate::error::StageCommitError;
+        use connetto_file_core::MimeClass;
+        use diesel::prelude::*;
+
+        let (_dir, archive, mut connection) = staged_fixture();
+        let mut manifests = Vec::new();
+        for bytes in [
+            b"refused thumbnail".as_slice(),
+            b"refused original".as_slice(),
+        ] {
+            manifests.push(
+                archive
+                    .chunk_file(bytes, MimeClass::Jpeg)
+                    .await
+                    .expect("chunk"),
+            );
+        }
+        let result = archive.commit_staged_batch(&mut connection, &manifests, |conn| {
+            diesel::insert_into(photos::table)
+                .values((
+                    photos::id.eq(1),
+                    photos::content_id.eq(manifests[0].file_id().as_bytes().as_slice()),
+                ))
+                .execute(conn)?;
+            Err::<(), _>(StageCommitError::Row("refused batch".to_owned()))
+        });
+        assert!(matches!(result, Err(StageCommitError::Row(_))));
+        assert_eq!(
+            crate::db::outbox(connection.conn()).expect("outbox"),
+            [] as [connetto_file_core::FileId; 0]
+        );
+        for manifest in &manifests {
+            assert!(
+                crate::db::load_manifest(connection.conn(), manifest.file_id())
+                    .expect("manifest")
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            photos::table
+                .count()
+                .get_result::<i64>(connection.conn())
+                .expect("rows"),
+            0
         );
     }
 

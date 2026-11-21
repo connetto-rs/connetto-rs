@@ -37,6 +37,7 @@ use connetto_server::{
     SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, TimelineHistory,
     Unseen, UnseenIds, loopback, pg_write_target,
 };
+use connetto_test_harness::wire_tables::orders_table;
 use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
 use diesel::sql_query;
@@ -44,8 +45,8 @@ use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 use subql::backend::{CdcEvent, Postgres};
 use subql::visibility::VisibilityPolicy;
 use subql::{
-    CdcSource, PgChangeEvent, PgCommit, PgCommitPosition, PgLsn, PgSqliteEmuSource, PgXid,
-    SourceItem,
+    CdcSource, PgChangeEvent, PgCommit, PgCommitPosition, PgLsn, PgRelation, PgSqliteEmuSource,
+    PgXid, SourceItem,
 };
 
 mod failures;
@@ -73,7 +74,7 @@ impl SnapshotSource for SeedSnapshot {
     async fn estimate(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &connetto_core::Principal,
     ) -> Result<SnapshotEstimate, Self::Error> {
         Ok(SnapshotEstimate {
@@ -89,15 +90,11 @@ impl SnapshotSource for SeedSnapshot {
     async fn snapshot_page(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _auth: &connetto_core::Principal,
         _page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {
-        let table = SimpleTable::new(
-            "orders",
-            &[("id", ""), ("price", ""), ("quantity", ""), ("status", "")],
-            &[0],
-        );
+        let table = orders_table();
         let insert = Insert::<_, String, Vec<u8>>::from(table)
             .set(0, Value::Integer(1))
             .expect("set id")
@@ -239,9 +236,10 @@ async fn drive<A, O>(
     sql: &str,
 ) -> Vec<PgChangeEvent>
 where
-    A: VisibilityPolicy<Watcher = Arc<connetto_core::auth::Principal>, Backend = Postgres>,
+    A: VisibilityPolicy<Watcher = Arc<connetto_core::auth::Principal>, Backend = Postgres>
+        + 'static,
     A::Error: core::fmt::Display + connetto_server::FailedAuthorization,
-    O: Oplog,
+    O: Oplog + 'static,
 {
     source.execute_sql(sql).expect("execute dml");
     let mut events = Vec::new();
@@ -985,6 +983,7 @@ impl Oplog for ScriptedOplog {
     }
 
     async fn record_commit(&self, commit: PgCommit) -> Result<(), Refused> {
+        self.gate("record_commit").await?;
         self.inner
             .record_commit(commit)
             .await
@@ -994,6 +993,24 @@ impl Oplog for ScriptedOplog {
     async fn last_commit(&self) -> Result<Option<PgCommit>, Refused> {
         self.inner
             .last_commit()
+            .await
+            .map_err(|never| match never {})
+    }
+
+    async fn record_refusal(&self, table: &str) -> Result<(), Refused> {
+        self.inner
+            .record_refusal(table)
+            .await
+            .map_err(|never| match never {})
+    }
+
+    async fn refusals(&self) -> Result<Vec<String>, Refused> {
+        self.inner.refusals().await.map_err(|never| match never {})
+    }
+
+    async fn readmit(&self, tables: &[String]) -> Result<(), Refused> {
+        self.inner
+            .readmit(tables)
             .await
             .map_err(|never| match never {})
     }
@@ -1638,6 +1655,97 @@ async fn a_restarted_feed_replaying_rows_a_caught_up_client_holds_keeps_running(
     expect_idle(&mut client).await;
 }
 
+/// A table an earlier process refused serves again once a restarted process's
+/// guard accepts it, and a client resuming from before that return replaces
+/// the table, since changes it never saw were dropped while it was refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_resuming_across_a_refusal_resnapshots_the_table() {
+    let fixture = Fixture::acquire().await;
+    fixture
+        .setup(&[
+            &format!("DROP TABLE IF EXISTS {RESTART_OPLOG}"),
+            &format!(
+                "DROP TABLE IF EXISTS {}",
+                PgOplog::commit_table(RESTART_OPLOG)
+            ),
+            &format!(
+                "DROP TABLE IF EXISTS {}",
+                PgOplog::refused_table(RESTART_OPLOG)
+            ),
+        ])
+        .await;
+    let log = PgOplog::new(
+        fixture.admin().clone(),
+        RESTART_OPLOG,
+        OplogConfig::default(),
+    );
+    log.ensure_schema().await.expect("provision the log");
+
+    // Two committed inserts reach the log, then the process refuses the table and stops.
+    let before = restarted_manager(&fixture);
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    let mut events = Vec::new();
+    for id in 1..=2 {
+        source
+            .execute_sql(&format!(
+                "INSERT INTO orders (id, price, quantity, status) VALUES ({id}, 1.0, 2, 'paid')"
+            ))
+            .expect("execute dml");
+        while let Some(item) = source.next_item().await.expect("poll source") {
+            match item {
+                SourceItem::Event(event) => {
+                    before.dispatch_event(&event).await.expect("dispatch event");
+                    events.push(event);
+                }
+                SourceItem::Commit(commit) => {
+                    log.record_commit(commit).await.expect("record the commit");
+                }
+                SourceItem::Relation(_) => {}
+            }
+        }
+    }
+    log.record_refusal("orders")
+        .await
+        .expect("persist the refusal");
+    drop(before);
+
+    // The restarted process's guard accepts the table again.
+    let after = restarted_manager(&fixture);
+    after
+        .watch_guard(subql::RefusedTables::default())
+        .await
+        .expect("serve the table again");
+    assert!(
+        log.refusals().await.expect("read the refusals").is_empty(),
+        "a table serving again leaves the registry"
+    );
+
+    let mut client = open_restarted_session(&after, cursor_of(&events[0])).await;
+    subscribe(&mut client).await;
+    let resync = loop {
+        match next_frame_bounded(&mut client).await {
+            IncomingFrame::Bulk(BulkMessage::LivePatch(live)) => assert_eq!(
+                live.cursor,
+                cursor_of(&events[1]),
+                "only the change logged before the refusal replays"
+            ),
+            IncomingFrame::Control(ControlMessage::FullResyncRequired(resync)) => break resync,
+            other => panic!("expected a replay or the resync, got {other:?}"),
+        }
+    };
+    assert_eq!(resync.sub_id, "orders");
+    assert_eq!(
+        resync.reason,
+        FullResyncReason::TableRefused {
+            table: "orders".to_owned()
+        }
+    );
+    assert!(matches!(
+        next_control_bounded(&mut client).await,
+        ControlMessage::SnapshotBegin(_)
+    ));
+}
+
 /// A snapshot source serving either the one seed row or no rows, under a cursor the test sets once it knows the positions.
 #[derive(Clone)]
 struct FencedSeed {
@@ -1685,7 +1793,7 @@ impl SnapshotSource for FencedSeed {
     async fn estimate(
         &self,
         select_sql: &str,
-        binds: &[connetto_core::messages::BindValue],
+        binds: &[connetto_core::messages::SqliteValue],
         caller: &connetto_core::Principal,
     ) -> Result<SnapshotEstimate, Self::Error> {
         SeedSnapshot.estimate(select_sql, binds, caller).await
@@ -1694,7 +1802,7 @@ impl SnapshotSource for FencedSeed {
     async fn snapshot_page(
         &self,
         select_sql: &str,
-        binds: &[connetto_core::messages::BindValue],
+        binds: &[connetto_core::messages::SqliteValue],
         auth: &connetto_core::Principal,
         page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {
@@ -2412,17 +2520,18 @@ async fn a_fenced_replay_out_of_room_resumes_where_it_stopped() {
 }
 
 /// Items a test drained from the emulator, handed to [`SessionManager::ingest`] as a source.
-struct Replay(std::collections::VecDeque<SourceItem<PgChangeEvent, PgCommit>>);
+struct Replay(std::collections::VecDeque<SourceItem<PgChangeEvent, PgCommit, PgRelation>>);
 
 impl CdcSource for Replay {
     type Commit = PgCommit;
     type Event = PgChangeEvent;
+    type Relation = PgRelation;
     type Error = std::io::Error;
 
     fn next_item(
         &mut self,
-    ) -> impl std::future::Future<
-        Output = Result<Option<SourceItem<PgChangeEvent, PgCommit>>, std::io::Error>,
+    ) -> impl Future<
+        Output = Result<Option<SourceItem<PgChangeEvent, PgCommit, PgRelation>>, std::io::Error>,
     > + Send {
         std::future::ready(Ok(self.0.pop_front()))
     }
@@ -2434,6 +2543,111 @@ impl CdcSource for Replay {
     async fn ack(&mut self, _upto: PgCommitPosition) -> Result<(), std::io::Error> {
         Ok(())
     }
+}
+
+struct RefusedAck(Replay);
+
+impl CdcSource for RefusedAck {
+    type Commit = PgCommit;
+    type Event = PgChangeEvent;
+    type Relation = PgRelation;
+    type Error = std::io::Error;
+
+    async fn next_item(
+        &mut self,
+    ) -> Result<Option<SourceItem<PgChangeEvent, PgCommit, PgRelation>>, Self::Error> {
+        self.0.next_item().await
+    }
+
+    fn ack(
+        &mut self,
+        _upto: PgCommitPosition,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        std::future::ready(Err(std::io::Error::other("acknowledgement refused")))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ingested_commits_wait_for_the_commit_record() {
+    let fixture = Fixture::acquire().await;
+    let (manager, script, _, _) = scripted(&fixture, SessionConfig::default()).await;
+    let mut commits = manager.ingested_commits();
+    let commit = PgCommit::new(
+        PgCommitPosition::at_commit(PgLsn(0x1000), PgXid(100)),
+        PgLsn(0x1030),
+    );
+    arm(&script, &["record_commit"], false, None);
+    let error = tokio::time::timeout(
+        Duration::from_secs(10),
+        manager.ingest(
+            &mut Replay([SourceItem::Commit(commit)].into()),
+            &mut |_| {},
+        ),
+    )
+    .await
+    .expect("ingest bound")
+    .expect_err("commit recording refused");
+    assert!(matches!(error, connetto_server::SessionError::Oplog(_)));
+    assert_eq!(
+        commits.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    );
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        manager.ingest(
+            &mut Replay([SourceItem::Commit(commit)].into()),
+            &mut |_| {},
+        ),
+    )
+    .await
+    .expect("replay bound")
+    .expect("record replayed commit");
+    assert_eq!(commits.try_recv().expect("ingested commit"), commit);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ingested_commits_wait_for_upstream_acknowledgement() {
+    let fixture = Fixture::acquire().await;
+    let manager = fenced_manager(
+        &fixture,
+        FencedSeed::default(),
+        PG_DDL,
+        RosterAuth::granting("client-a"),
+    );
+    let mut commits = manager.ingested_commits();
+    let commit = PgCommit::new(
+        PgCommitPosition::at_commit(PgLsn(0x1000), PgXid(100)),
+        PgLsn(0x1030),
+    );
+    let error = tokio::time::timeout(
+        Duration::from_secs(10),
+        manager.ingest(
+            &mut RefusedAck(Replay([SourceItem::Commit(commit)].into())),
+            &mut |_| {},
+        ),
+    )
+    .await
+    .expect("ingest bound")
+    .expect_err("upstream acknowledgement refused");
+    assert!(matches!(
+        error,
+        connetto_server::SessionError::Transport(message) if message == "acknowledgement refused"
+    ));
+    assert_eq!(
+        commits.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    );
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        manager.ingest(
+            &mut Replay([SourceItem::Commit(commit)].into()),
+            &mut |_| {},
+        ),
+    )
+    .await
+    .expect("replay bound")
+    .expect("acknowledge replayed commit");
+    assert_eq!(commits.try_recv().expect("ingested commit"), commit);
 }
 
 /// A fenced manager whose log keeps two entries, fed three single-row transactions through the change stream so each commit is recorded, returning their events.
@@ -2471,7 +2685,7 @@ async fn pruned_fenced_manager(
         .iter()
         .filter_map(|item| match item {
             SourceItem::Event(event) => Some(event.clone()),
-            SourceItem::Commit(_) => None,
+            SourceItem::Relation(_) | SourceItem::Commit(_) => None,
         })
         .collect();
     assert!(

@@ -40,5 +40,13 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_connetto-peer._tcp</string>
+	</array>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Find and link to nearby devices</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Find and link to nearby devices</string>
 </dict>
 </plist>

@@ -32,6 +32,7 @@ use connetto_server::{
     RuntimeWritableCatalog, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource,
     loopback, pg_write_target,
 };
+use connetto_test_harness::wire_tables::orders_table;
 use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
 use diesel::sql_query;
@@ -57,7 +58,7 @@ impl SnapshotSource for SeedSnapshot {
     async fn estimate(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &connetto_core::Principal,
     ) -> Result<SnapshotEstimate, Self::Error> {
         Ok(SnapshotEstimate {
@@ -73,15 +74,11 @@ impl SnapshotSource for SeedSnapshot {
     async fn snapshot_page(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &connetto_core::Principal,
         _page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {
-        let table = SimpleTable::new(
-            "orders",
-            &[("id", ""), ("price", ""), ("quantity", ""), ("status", "")],
-            &[0],
-        );
+        let table = orders_table();
         let insert = Insert::<_, String, Vec<u8>>::from(table)
             .set(0, Value::Integer(1))
             .expect("set id")
@@ -223,6 +220,7 @@ fn black_hole() -> LoopbackTransport {
                 resume_token: "black-hole".to_owned(),
                 schema_version: None,
                 sunset_at_secs: None,
+                courier: false,
                 initial_credits: 64,
                 writer: Some(connetto_core::messages::WriterGrant {
                     number,
@@ -317,9 +315,9 @@ async fn sent_but_unprocessed_mutation_replays_after_resume() {
     // Prime the server with this account's writer number so the resume
     // handshake is recognized, then drop the connection.
     {
-        let prime = ClientBuilder::new(
+        let mut prime = ClientBuilder::new(
             super::support::bundle(SQLITE_DDL),
-            super::support::Once::new(open_session(&manager)),
+            super::support::NeverDial::<LoopbackTransport>::default(),
         )
         .signed_in(credential.clone())
         .durable(
@@ -327,9 +325,13 @@ async fn sent_but_unprocessed_mutation_replays_after_resume() {
             keys.clone(),
             MemoryRefreshStore::default(),
         )
-        .connect_driven()
+        .open_driven()
         .await
-        .expect("prime connect");
+        .expect("prime open");
+        prime
+            .attach(open_session(&manager))
+            .await
+            .expect("prime connect");
         drop(prime);
     }
 
@@ -400,6 +402,14 @@ async fn applied_but_unacked_mutation_dedupes_on_resume() {
     reset_orders(&fixture).await;
     let manager = writable_manager(&fixture, Arc::default());
 
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::NeverDial::<LoopbackTransport>::default(),
+    )
+    .signed_in(super::support::held("token"))
+    .open_driven()
+    .expect("open");
+
     // A man in the middle forwards the handshake and the mutation into a
     // real session, reads the acknowledgement (the durable apply happened),
     // and dies without delivering it.
@@ -421,15 +431,8 @@ async fn applied_but_unacked_mutation_dedupes_on_resume() {
         );
         // Dropping both ends here loses the acknowledgement forever.
     });
+    conn.attach(client_end).await.expect("connect");
 
-    let mut conn = ClientBuilder::new(
-        super::support::bundle(SQLITE_DDL),
-        super::support::Once::new(client_end),
-    )
-    .signed_in(super::support::held("token"))
-    .connect_driven()
-    .await
-    .expect("connect");
     insert_local(&mut conn, 61);
     let seq = conn.push().await.expect("push").expect("mutation sent");
     relay.await.expect("mitm relay");
@@ -498,9 +501,9 @@ async fn restart_replays_persisted_pending() {
     // First process: prime the server with this account's writer number, push
     // into the black hole, then die outright.
     {
-        let prime = ClientBuilder::new(
+        let mut prime = ClientBuilder::new(
             super::support::bundle(SQLITE_DDL),
-            super::support::Once::new(open_session(&manager)),
+            super::support::NeverDial::<LoopbackTransport>::default(),
         )
         .signed_in(credential.clone())
         .durable(
@@ -508,9 +511,13 @@ async fn restart_replays_persisted_pending() {
             keys.clone(),
             MemoryRefreshStore::default(),
         )
-        .connect_driven()
+        .open_driven()
         .await
-        .expect("prime connect");
+        .expect("prime open");
+        prime
+            .attach(open_session(&manager))
+            .await
+            .expect("prime connect");
         drop(prime);
 
         let mut conn = ClientBuilder::new(
@@ -534,7 +541,7 @@ async fn restart_replays_persisted_pending() {
     // record, and the connect-time reconcile replays it.
     let mut conn = ClientBuilder::new(
         super::support::bundle(SQLITE_DDL),
-        super::support::Once::new(open_session(&manager)),
+        super::support::NeverDial::<LoopbackTransport>::default(),
     )
     .signed_in(credential)
     .durable(
@@ -542,9 +549,12 @@ async fn restart_replays_persisted_pending() {
         keys,
         MemoryRefreshStore::default(),
     )
-    .connect_driven()
+    .open_driven()
     .await
-    .expect("second connect");
+    .expect("second open");
+    conn.attach(open_session(&manager))
+        .await
+        .expect("second connect");
     loop {
         match conn.pump_one().await.expect("pump") {
             ClientEvent::MutationApplied { client_seq } => {
@@ -634,9 +644,9 @@ async fn a_restored_write_its_device_uploads_again_applies_once_and_is_audited()
     .await
     .expect("the shared store never fails");
     let open = async |dir: &std::path::Path| {
-        ClientBuilder::new(
+        let mut conn = ClientBuilder::new(
             super::support::bundle(SQLITE_DDL),
-            super::support::Once::new(open_session(&manager)),
+            super::support::NeverDial::<LoopbackTransport>::default(),
         )
         .signed_in(credential.clone())
         .durable(
@@ -644,9 +654,11 @@ async fn a_restored_write_its_device_uploads_again_applies_once_and_is_audited()
             keys.clone(),
             MemoryRefreshStore::default(),
         )
-        .connect_driven()
+        .open_driven()
         .await
-        .expect("connect")
+        .expect("open");
+        conn.attach(open_session(&manager)).await.expect("connect");
+        conn
     };
 
     // A takes its number from the server, then writes into a connection that

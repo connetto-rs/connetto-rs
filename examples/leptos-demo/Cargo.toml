@@ -3,7 +3,7 @@ name = "connetto-leptos-demo"
 description = "Leptos web demo of the connetto browser topology: windows converging a synced orders list through Postgres and a device-private notes list through the DB worker."
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.95"
 license = "MIT"
 publish = false
 
@@ -23,8 +23,15 @@ web = [
     "dep:rosetta-uuid",
 ]
 # The Tauri layer, which sends every action over invoke to the native core in
-# `examples/tauri-leptos-demo/src-tauri` and renders the view it emits.
-tauri = ["dep:serde", "dep:serde-wasm-bindgen"]
+# `examples/tauri-leptos-demo/src-tauri`, renders the view it sends, and
+# follows the panes' live queries through the page source. The panes name the
+# demo's query descriptors and rows, which the client feature holds.
+tauri = [
+    "connetto-demo-support/client",
+    "dep:connetto-tauri-page",
+    "dep:serde",
+    "dep:serde-wasm-bindgen",
+]
 
 [dependencies]
 # The shared demo core, holding the view and the actions, the schema rows and
@@ -41,6 +48,11 @@ connetto-client = { path = "../../crates/connetto-client", default-features = fa
 connetto-file-core = { path = "../../crates/connetto-file-core", optional = true }
 # The Leptos 0.8 csr build, as the Tauri UI uses.
 leptos = { version = "0.8", features = ["csr"] }
+# The panes' live queries, through `use_live` on the source either layer
+# gives, and their keyed rows.
+connetto-leptos = { path = "../../crates/connetto-leptos" }
+# The Tauri layer's live source, reaching the client in the native core.
+connetto-tauri-page = { path = "../../crates/connetto-tauri-page", optional = true }
 # Client-authored primary keys, one strongly typed `rosetta_uuid::Uuid` that
 # maps to SQLite BLOB and Postgres uuid from a single schema, minted with the
 # browser CSPRNG through getrandom's wasm_js backend.
@@ -104,6 +116,10 @@ sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", 
 # Until a pg_walstream release carries the startup metadata API subql main
 # uses (isdaniel/pg-walstream #141) and `ChangeEvent::xid`.
 pg_walstream = { git = "https://github.com/isdaniel/pg-walstream", branch = "main" }
+# Until a sql-values release carries PostgreSQL's bpchar, which rls2fga main uses.
+sql-values = { git = "https://github.com/connetto-rs/sql-values", branch = "main" }
+# subql main follows sqlite-diff-rs main for its float4 storage form.
+sqlite-diff-rs = { git = "https://github.com/connetto-rs/sqlite-diff-rs", branch = "main" }
 
 # Headless tests retain function names without loading DWARF into each browser worker.
 [profile.test]

@@ -9,6 +9,9 @@ members = [
   "crates/connetto-client",
   "crates/connetto-dioxus",
   "crates/connetto-yew",
+  "crates/connetto-leptos",
+  "crates/tauri-plugin-connetto",
+  "crates/connetto-tauri-page",
   "crates/connetto-test-harness",
   "crates/connetto-file-core",
   "crates/connetto-file-server",
@@ -23,15 +26,19 @@ members = [
   # The documents and the build-time translation every browser demo shares.
   # A member rather than an exclusion, so the root gate lints it with the rest.
   "examples/deployment",
+  # The demo launchers and device proofs.
+  "examples/demo-stack",
   # The schema rows, wording and browser pieces the browser demos share.
   "examples/demo-support",
+  # The demo's processes: server, client and the operator tools.
+  "examples/demo-tools",
 ]
 exclude = ["crates/connetto-web", "examples/dioxus-demo", "examples/webauthn-unlock"]
 
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.92"
+rust-version = "1.95"
 authors = ["Luca Cappelletti <cappelletti.luca94@gmail.com>"]
 license = "MIT"
 repository = "https://github.com/connetto-rs/connetto-rs"
@@ -162,18 +169,22 @@ objc2-core-location = { git = "https://github.com/madsmtm/objc2", branch = "main
 objc2-core-wlan = { git = "https://github.com/madsmtm/objc2", branch = "main", default-features = false }
 objc2-device-check = { git = "https://github.com/madsmtm/objc2", branch = "main", default-features = false }
 objc2-network-extension = { git = "https://github.com/madsmtm/objc2", branch = "main", default-features = false }
-objc2-ui-kit = { git = "https://github.com/madsmtm/objc2", branch = "main", default-features = false }
 
 # subql's own [patch] blocks do not reach a consumer, so the same crates are patched here.
 [patch.crates-io]
 diesel = { git = "https://github.com/diesel-rs/diesel" }
-# R106, until released: Postgres errors report their SQLSTATE (diesel_async #306).
-diesel-async = { git = "https://github.com/diesel-rs/diesel_async" }
+# Live in diesel-rs, named as `diesel` is above, so they build against that one diesel.
+diesel-async = { git = "https://github.com/diesel-rs/diesel" }
+diesel-dynamic-schema = { git = "https://github.com/diesel-rs/diesel" }
 sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
 sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
 # Until a pg_walstream release carries the startup metadata API subql main
 # uses (isdaniel/pg-walstream #141) and `ChangeEvent::xid`.
 pg_walstream = { git = "https://github.com/isdaniel/pg-walstream", branch = "main" }
+# Until a sql-values release carries PostgreSQL's bpchar, which rls2fga main uses.
+sql-values = { git = "https://github.com/connetto-rs/sql-values", branch = "main" }
+# subql main follows sqlite-diff-rs main for its float4 storage form.
+sqlite-diff-rs = { git = "https://github.com/connetto-rs/sqlite-diff-rs", branch = "main" }
 # R51, until both are released: the keychain store's shared authentication
 # (apple-native-keyring-store #26) on security-framework's typed
 # authentication context (#263 and #264, on upstream main). Pinned by rev,

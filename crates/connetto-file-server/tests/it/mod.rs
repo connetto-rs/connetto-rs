@@ -5,12 +5,14 @@
 //! RLS policy, `connetto_file_server` reader role, visibility view, and
 //! the content-state setter) before each test.
 
+mod carried;
 mod fixture;
 mod macro_hygiene;
 mod preflight;
 mod quotas;
 mod restore;
 mod serve;
+mod session_bound;
 mod sweep;
 mod ticket;
 mod upload;

@@ -16,7 +16,7 @@ use parking_lot::Mutex;
 
 use connetto_core::Cursor;
 use connetto_core::auth::Principal;
-use connetto_core::messages::BindValue;
+use connetto_core::messages::SqliteValue;
 use connetto_core::test_support::TestGrantChecker;
 use connetto_server::{
     ManagerBuilder, Materializer, NoConnector, Oplog, OplogConfig, PageSpec, PgOplog,
@@ -36,7 +36,7 @@ const OPLOG: &str = "connetto_oplog_resume";
 /// The cluster the histories here belong to.
 const CLUSTER: u64 = 7;
 
-type Item = SourceItem<PgChangeEvent, PgCommit>;
+type Item = SourceItem<PgChangeEvent, PgCommit, core::convert::Infallible>;
 
 /// Snapshot that serves nothing, since no subscription is opened.
 struct EmptySnapshot;
@@ -51,7 +51,7 @@ impl SnapshotSource for EmptySnapshot {
     async fn estimate(
         &self,
         _sql: &str,
-        _binds: &[BindValue],
+        _binds: &[SqliteValue],
         _caller: &Principal,
     ) -> Result<SnapshotEstimate, Self::Error> {
         Ok(SnapshotEstimate {
@@ -67,7 +67,7 @@ impl SnapshotSource for EmptySnapshot {
     async fn snapshot_page(
         &self,
         _sql: &str,
-        _binds: &[BindValue],
+        _binds: &[SqliteValue],
         _caller: &Principal,
         _page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {
@@ -93,6 +93,7 @@ struct Scripted {
 impl CdcSource for Scripted {
     type Commit = PgCommit;
     type Event = PgChangeEvent;
+    type Relation = core::convert::Infallible;
     type Error = io::Error;
 
     fn next_item(&mut self) -> impl Future<Output = Result<Option<Item>, io::Error>> + Send {
@@ -125,14 +126,21 @@ fn two_row_transaction() -> (PgChangeEvent, PgChangeEvent, PgCommit) {
         .expect("second row");
     let mut items = source.drain().expect("drain").into_iter();
     let (
+        Some(SourceItem::Relation(_)),
         Some(SourceItem::Event(first)),
         Some(SourceItem::Event(second)),
         Some(SourceItem::Commit(commit)),
         None,
-    ) = (items.next(), items.next(), items.next(), items.next())
+    ) = (
+        items.next(),
+        items.next(),
+        items.next(),
+        items.next(),
+        items.next(),
+    )
     else {
         panic!(
-            "rows accumulated between two drains form one transaction of two rows and its commit"
+            "the table's relation leads the stream, ahead of one transaction of two rows and its commit"
         );
     };
     assert_eq!(
