@@ -498,6 +498,100 @@ async fn local_custom_aggregate_decodes_via_extension_seam() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_grouped_aggregate_recomputes_locally() {
+    let fixture = Fixture::acquire().await;
+    let (_manager, seen, addr, server) = spawn_server(&fixture, 1).await;
+    let conn = connect_with_tier(addr).await;
+    let (client, pump) = ConnettoClient::with_pump(conn);
+    tokio::spawn(pump);
+    let mut events = client.events();
+
+    // Filtered, so the rendered query carries a bind the local run inlines.
+    let mut counts: connetto_client::LiveGroups<String, i64> = notes::table
+        .filter(notes::id.gt(0_i64))
+        .group_by(notes::body)
+        .select((notes::body, diesel::dsl::count(notes::id)))
+        .live(&client)
+        .await
+        .expect("local live grouped aggregate");
+    assert!(counts.map().is_empty(), "bootstrap is answered locally");
+    assert!(
+        counts.as_of_secs().is_some(),
+        "a local answer is current when it is computed"
+    );
+
+    client
+        .with_conn(|conn| {
+            diesel::insert_into(notes::table)
+                .values(&vec![
+                    (notes::id.eq(1_i64), notes::body.eq("a")),
+                    (notes::id.eq(2_i64), notes::body.eq("a")),
+                    (notes::id.eq(3_i64), notes::body.eq("b")),
+                ])
+                .execute(conn.conn())
+        })
+        .await
+        .expect("gate not locked")
+        .expect("insert notes");
+    counts.changed().await.expect("local recompute");
+    assert_eq!(
+        counts.map(),
+        std::collections::HashMap::from([("a".to_owned(), 2_i64), ("b".to_owned(), 1_i64)]),
+        "each group re-executed locally"
+    );
+
+    // Moving the last row of a group out of it removes that group.
+    client
+        .with_conn(|conn| {
+            diesel::update(notes::table.find(3_i64))
+                .set(notes::body.eq("a"))
+                .execute(conn.conn())
+        })
+        .await
+        .expect("gate not locked")
+        .expect("move note");
+    counts.changed().await.expect("second local recompute");
+    assert_eq!(
+        counts.map(),
+        std::collections::HashMap::from([("a".to_owned(), 3_i64)]),
+        "the emptied group leaves the map"
+    );
+
+    // A key of two columns, through the SQL-classified entry point, splits
+    // each answer row into a tuple key and the aggregate after it.
+    let pairs: connetto_client::LiveGroups<(i64, String), i64> = client
+        .watch_groups(notes::table.group_by((notes::id, notes::body)).select((
+            notes::id,
+            notes::body,
+            diesel::dsl::count(notes::id),
+        )))
+        .await
+        .expect("local grouped aggregate keyed by two columns");
+    assert_eq!(
+        pairs.map(),
+        std::collections::HashMap::from([
+            ((1_i64, "a".to_owned()), 1_i64),
+            ((2_i64, "a".to_owned()), 1_i64),
+            ((3_i64, "a".to_owned()), 1_i64),
+        ]),
+        "each row is one group under its two-column key"
+    );
+
+    // Wire silence, fenced like the scalar case.
+    client.ping(7).await.expect("ping");
+    wait_broadcast_strict(&mut events, |e| matches!(e, ClientEvent::Pong { nonce: 7 })).await;
+    assert!(
+        seen.lock().expect("recorder lock").is_empty(),
+        "no subscription may reach the server for a local grouped aggregate"
+    );
+
+    drop(counts);
+    drop(pairs);
+    drop(client);
+    server.await.expect("join server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mixed_tier_aggregate_is_refused_at_registration() {
     let fixture = Fixture::acquire().await;
     let (_manager, _seen, addr, server) = spawn_server(&fixture, 1).await;
