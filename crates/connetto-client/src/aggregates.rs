@@ -49,8 +49,14 @@ fn table_name(query_id: i32) -> String {
 }
 
 /// The data column holding the select-list item at `position`.
-fn data_column(position: usize) -> String {
+pub(crate) fn data_column(position: usize) -> String {
     format!("c{position}")
+}
+
+/// The key a whole answer's row at `position` rests under, so rows sort in
+/// answer order. A scalar is the row at position zero.
+pub(crate) fn position_key(position: usize) -> [u8; 8] {
+    u64::try_from(position).unwrap_or(u64::MAX).to_be_bytes()
 }
 
 /// The data column list of a table with `count` data columns, in select order.
@@ -193,7 +199,7 @@ pub(crate) fn apply(
                 .bind::<Binary, _>(&binds_blob)
                 .execute(conn)?;
             for (position, row) in rows.iter().enumerate() {
-                let key = u64::try_from(position).unwrap_or(u64::MAX).to_be_bytes();
+                let key = position_key(position);
                 write_row(conn, &table, types.len(), &binds_blob, &key, row, now)?;
             }
             Ok(())

@@ -584,12 +584,41 @@ where
 fn run_local_scalar<ST, V: Loadable<ST>>(
     conn: &mut SqliteConnection,
     inlined: &str,
-) -> Result<V, ClientError> {
-    V::load_all(conn, inlined)
+) -> Result<Vec<V>, ClientError> {
+    let value = V::load_all(conn, inlined)
         .map_err(|e| ClientError::Session(e.to_string()))?
         .into_iter()
         .next()
-        .ok_or_else(|| ClientError::Session("a scalar aggregate returned no row".to_owned()))
+        .ok_or_else(|| ClientError::Session("a scalar aggregate returned no row".to_owned()))?;
+    Ok(vec![value])
+}
+
+/// Run a local grouped aggregate, its binds already inlined, and load each
+/// group's key `K` from every column but the last and its aggregate `V` from
+/// the last, with the query's own SQL types `KS` and `VS`.
+///
+/// The answer is named as columns `c0`, `c1`, ... and read twice, once per
+/// side, each time ordered by every column. The group columns are projected
+/// in full, so no two rows share a key and both reads pair up row by row.
+fn run_local_groups<KS, VS, K: Loadable<KS>, V: Loadable<VS>>(
+    conn: &mut SqliteConnection,
+    inlined: &str,
+) -> Result<Vec<(K, V)>, ClientError> {
+    let columns: Vec<String> = (0..K::WIDTH + V::WIDTH)
+        .map(crate::aggregates::data_column)
+        .collect();
+    let every = columns.join(", ");
+    let (keys, values) = columns.split_at(K::WIDTH);
+    let read = |selected: &[String]| {
+        format!(
+            "WITH answer({every}) AS ({inlined}) SELECT {} FROM answer ORDER BY {every}",
+            selected.join(", ")
+        )
+    };
+    let groups = K::load_all(conn, &read(keys)).map_err(|e| ClientError::Session(e.to_string()))?;
+    let aggregates =
+        V::load_all(conn, &read(values)).map_err(|e| ClientError::Session(e.to_string()))?;
+    Ok(groups.into_iter().zip(aggregates).collect())
 }
 
 /// Subscription ids and the wake signal shared with every [`LiveQuery`], so a
@@ -841,16 +870,13 @@ where
     })
 }
 
-/// The key a scalar answer's one row rests under, position zero of a whole
-/// answer, which a local scalar also files its value under.
-const SCALAR_KEY: [u8; 8] = 0_u64.to_be_bytes();
-
 /// How a computed watch treats a query over local tables only, for an
 /// answer whose rows are `X`.
 enum ComputedTier<X> {
-    /// A scalar, answered by exact local re-execution on change, which runs
-    /// the inlined statement and loads its one row.
-    Scalar(fn(&mut SqliteConnection, &str) -> Result<X, ClientError>),
+    /// An aggregate, answered by exact local re-execution on change, which
+    /// runs the inlined statement and loads every answer row in order. Each
+    /// row is filed under its position, as a whole answer rests.
+    Local(fn(&mut SqliteConnection, &str) -> Result<Vec<X>, ClientError>),
     /// Refused, since a complete local tier answers the shape through
     /// `watch`. `kind` names the query in the mixed-tier refusal, `local` is
     /// the refusal of a query over local tables only.
@@ -1153,17 +1179,19 @@ impl<V> LiveValue<V> {
     }
 }
 
-/// A server-maintained grouped aggregate kept fresh by the client's pump, one
-/// entry per group (R84).
+/// A grouped aggregate kept fresh by the client's pump, one entry per group
+/// (R84).
 ///
 /// Created by [`ConnettoClient::watch_groups`] for grouped aggregate queries.
-/// The replica holds only this client's authorized rows, so it cannot answer
-/// a global statistic: the map comes exclusively from server pushes, resting
-/// in the statistic's resting table (R83), so an offline restart shows the
-/// last synced map. A fold delta upserts one entry, a group's departure
-/// removes one, and a server-side demotion to whole answers rebuilds the map
-/// without surfacing as a distinct state. Dropping the handle queues the
-/// server unsubscribe, exactly like [`LiveQuery`].
+/// Over synced tables the replica holds only this client's authorized rows,
+/// so it cannot answer a global statistic. There the map comes exclusively
+/// from server pushes, resting in the statistic's resting table (R83), so an
+/// offline restart shows the last synced map. A fold delta upserts one entry,
+/// a group's departure removes one, and a server-side demotion to whole
+/// answers rebuilds the map without surfacing as a distinct state. Over local
+/// tables, which are complete, the client re-executes the query on each
+/// change instead and nothing reaches the server. Dropping the handle queues
+/// the server unsubscribe, exactly like [`LiveQuery`].
 pub struct LiveGroups<K, V> {
     handle: LiveHandleCore,
     state: Arc<RwLock<Answer<(K, V)>>>,
@@ -2022,7 +2050,7 @@ where
                 binds,
                 parsed,
                 load_whole::<ST, V>,
-                ComputedTier::Scalar(run_local_scalar::<ST, V>),
+                ComputedTier::Local(run_local_scalar::<ST, V>),
             )
             .await?;
         Ok(LiveValue { handle, value })
@@ -2041,9 +2069,8 @@ where
     /// # Errors
     ///
     /// [`ClientError`] when the query cannot be rendered, is not
-    /// grouped-aggregate-shaped, reads a local table (a local tier is
-    /// complete, so `watch` answers it as rows), or the subscribe frame
-    /// cannot be sent. A server-side refusal arrives later as
+    /// grouped-aggregate-shaped, reads both local and synced tables, or the
+    /// subscribe frame cannot be sent. A server-side refusal arrives later as
     /// [`ClientEvent::NonFatal`] on [`events`](Self::events).
     pub async fn watch_groups<Q, K, V>(&self, query: Q) -> Result<LiveGroups<K, V>, ClientError>
     where
@@ -2102,11 +2129,7 @@ where
                 binds,
                 parsed,
                 load_groups::<KS, VS, K, V>,
-                ComputedTier::Refused {
-                    kind: "aggregate",
-                    local: "local grouped query: use watch, a complete local tier answers it as \
-                            rows",
-                },
+                ComputedTier::Local(run_local_groups::<KS, VS, K, V>),
             )
             .await?;
         Ok(LiveGroups { handle, state })
@@ -2171,8 +2194,8 @@ where
     /// Register one computed handle whose answer rows `load` reads as `X`,
     /// and bootstrap it.
     ///
-    /// A computed answer cannot span the tiers. Over local tables only, a
-    /// scalar is answered by exact local re-execution on change, and any
+    /// A computed answer cannot span the tiers. Over local tables only, an
+    /// aggregate is answered by exact local re-execution on change, and any
     /// other shape is refused with the tier's own message. Over synced
     /// tables the handle bootstraps from the resting table before
     /// subscribing, so a same-run late joiner and an offline restart resolve
@@ -2203,7 +2226,7 @@ where
             .count();
         if local_count > 0 {
             let kind = match &tier {
-                ComputedTier::Scalar(_) => "aggregate",
+                ComputedTier::Local(_) => "aggregate",
                 ComputedTier::Refused { kind, .. } => kind,
             };
             if local_count != parsed.tables.len() {
@@ -2212,7 +2235,7 @@ where
                 )));
             }
             let run_local = match tier {
-                ComputedTier::Scalar(run_local) => run_local,
+                ComputedTier::Local(run_local) => run_local,
                 ComputedTier::Refused { local, .. } => {
                     return Err(ClientError::Session(local.to_owned()));
                 }
@@ -2221,12 +2244,17 @@ where
             let publish = Arc::clone(&answer);
             let local = move |conn: &mut ConnettoConnection<T>| -> Result<bool, ClientError> {
                 let now = conn.now_secs()?;
-                let fresh = run_local(conn.conn(), &inlined)?;
+                let fresh: BTreeMap<Vec<u8>, X> = run_local(conn.conn(), &inlined)?
+                    .into_iter()
+                    .enumerate()
+                    .map(|(position, row)| {
+                        (crate::aggregates::position_key(position).to_vec(), row)
+                    })
+                    .collect();
                 let mut slot = publish.write().unwrap_or_else(PoisonError::into_inner);
                 slot.as_of = Some(now);
-                let key = SCALAR_KEY.to_vec();
-                let moved_any = slot.rows.get(&key) != Some(&fresh);
-                slot.rows.insert(key, fresh);
+                let moved_any = slot.rows != fresh;
+                slot.rows = fresh;
                 Ok(moved_any)
             };
             local(&mut state.conn)?;
