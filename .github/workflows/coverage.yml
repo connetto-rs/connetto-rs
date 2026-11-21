@@ -18,6 +18,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # cargo-llvm-cov finds no test binary in a nextest archive built with
+  # Cargo 1.100's build-dir layout, so the server partitions report none of
+  # their tests (taiki-e/cargo-llvm-cov#520). Remove once a release carries
+  # taiki-e/cargo-llvm-cov#538.
+  __CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT: 1
 
 # Caches are saved only from main, which restores exact keys only, so a
 # tree saved after a Cargo.lock change holds none of the artifacts the
