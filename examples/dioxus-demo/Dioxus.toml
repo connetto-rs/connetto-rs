@@ -36,8 +36,8 @@ NSLocationWhenInUseUsageDescription = "Join a nearby device's hotspot"
 # capabilities, which a human enables on the App ID, since the API keeps the
 # set read-only and `connetto-ios-signing` only names the portal step. The
 # Hotspot entitlement is required, since the joiner's
-# `NEHotspotConfiguration` join of the Personal Hotspot of the iPhone or
-# iPad host refuses without it (R76).
+# `NEHotspotConfiguration` join of an Android or Linux host's hotspot
+# refuses without it (R76).
 [ios.entitlements]
 "com.apple.developer.devicecheck.appattest-environment" = "development"
 "com.apple.developer.networking.HotspotConfiguration" = true

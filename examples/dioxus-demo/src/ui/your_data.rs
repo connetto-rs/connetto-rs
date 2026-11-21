@@ -6,7 +6,7 @@ use dioxus::prelude::*;
 use dioxus_free_icons::Icon;
 use dioxus_free_icons::icons::fa_solid_icons::{FaDatabase, FaFileExport};
 
-use super::ContentSlot;
+use super::{ContentSlot, PaneInfo};
 
 /// The your-data pane.
 #[component]
@@ -24,7 +24,7 @@ pub fn YourDataPane() -> Element {
     let import_msg = import_status.read().clone();
 
     rsx! {
-        div { class: "pane",
+        div { class: "pane toned tone-your-data",
             h2 {
                 Icon { icon: FaDatabase, width: 14, height: 14 }
                 {support::YOUR_DATA_PANE_TITLE} " "
@@ -67,6 +67,7 @@ pub fn YourDataPane() -> Element {
             if let Some(message) = import_msg {
                 p { class: "status", {message} }
             }
+            PaneInfo { text: support::YOUR_DATA_INFO }
         }
     }
 }

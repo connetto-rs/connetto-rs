@@ -21,8 +21,8 @@ use connetto_core::{DialError, NativeStream, WebSocketTransport, dial};
 
 #[cfg(feature = "device-identity")]
 use crate::ClientEvent;
+use crate::ContentHooks;
 use crate::GateMechanism;
-use crate::HeldContent;
 #[cfg(feature = "peer")]
 use crate::PeerError;
 use crate::TransportFactory;
@@ -169,7 +169,7 @@ impl NativeClientBuilder<NativeTransport> {
                 dialer: BoxedDialer::server(server.into()),
                 sleeper: None,
                 client_id: None,
-                held_content: None,
+                content_hooks: None,
             },
         }
     }
@@ -322,6 +322,8 @@ where
                 nearby: None,
                 #[cfg(feature = "peer")]
                 bt_state: None,
+                #[cfg(all(feature = "peer", target_os = "android"))]
+                java: None,
             },
             pump,
         ))
@@ -584,6 +586,37 @@ const DESCRIPTOR_LIMIT: usize = 4096;
 impl DeviceSetup {
     /// The account's key on this platform's chip, else in the keyring under `service`.
     fn keys(&self, service: &str, account: &str) -> Result<Arc<dyn DeviceKeys>, ClientError> {
+        self.keys_for(service).keys(account)
+    }
+
+    /// What makes any account's device keys under `service`, kept by the
+    /// teardown for a stored account that is not the live one.
+    fn keys_for(&self, service: &str) -> DeviceKeysFor {
+        DeviceKeysFor {
+            refused: self.refused.clone(),
+            roots: self.roots.clone(),
+            service: service.to_owned(),
+            #[cfg(target_os = "android")]
+            java: self.java.clone(),
+        }
+    }
+}
+
+/// What makes the device keys of any account on this device.
+#[cfg(feature = "device-identity")]
+#[derive(Clone)]
+struct DeviceKeysFor {
+    refused: Option<String>,
+    roots: Vec<Vec<u8>>,
+    service: String,
+    #[cfg(target_os = "android")]
+    java: Option<Arc<dyn crate::device_key::JavaAccess>>,
+}
+
+#[cfg(feature = "device-identity")]
+impl DeviceKeysFor {
+    /// The account's key on this platform's chip, else in the keyring.
+    fn keys(&self, account: &str) -> Result<Arc<dyn DeviceKeys>, ClientError> {
         if let Some(reason) = &self.refused {
             return Err(ClientError::DeviceDescriptor(reason.clone()));
         }
@@ -614,8 +647,8 @@ impl DeviceSetup {
         let chip = Arc::new(crate::device_key::NoChip);
         Ok(Arc::new(PlatformKeys {
             chip,
-            records: crate::keyring::Keyring::new(service),
-            service: service.to_owned(),
+            records: crate::keyring::Keyring::new(&self.service),
+            service: self.service.clone(),
             account: account.to_owned(),
         }))
     }
@@ -897,8 +930,11 @@ where
         );
         let (core, resolved, key_store) = this.into_core().await?;
         #[cfg(feature = "device-identity")]
-        let keys = service
-            .map(|service| device.keys(&service, resolved.credential.replica_name()))
+        let device_keys = service.as_deref().map(|service| device.keys_for(service));
+        #[cfg(feature = "device-identity")]
+        let keys = device_keys
+            .as_ref()
+            .map(|keys_for| keys_for.keys(resolved.credential.replica_name()))
             .transpose()?;
         #[cfg(feature = "native-auth")]
         let (session, teardown) = {
@@ -917,6 +953,9 @@ where
                 share_record,
                 hook,
                 shared,
+                schema: core.base.schema.clone(),
+                #[cfg(feature = "device-identity")]
+                device_keys,
             });
             (session, Some(teardown))
         };
@@ -933,6 +972,10 @@ where
         > = None;
         #[cfg(feature = "peer")]
         let mut bt_state: Option<Arc<dyn crate::bluetooth::ReadinessBackend>> = None;
+        // The application's JNI access, kept for the permission prompt the
+        // panel asks for (R76).
+        #[cfg(all(feature = "peer", target_os = "android"))]
+        let java = device.java.clone();
         #[cfg(feature = "device-identity")]
         let (device, pump) = match keys {
             Some(keys) => {
@@ -991,6 +1034,10 @@ where
                     #[cfg(feature = "peer")]
                     bluetooth_tx,
                 );
+                #[cfg(feature = "peer")]
+                let media = core
+                    .content()
+                    .and_then(|content| C::media_driver(content, || handle.media_port()));
                 core.client()
                     .with_device_writer(keys, handle.steering())
                     .await?;
@@ -1097,18 +1144,25 @@ where
                                 Arc::clone(&backend) as Arc<dyn crate::bluetooth::ReadinessBackend>,
                                 Arc::clone(&backend)
                                     as Arc<dyn crate::bluetooth::PeripheralBackend>,
-                                Some(crate::bluetooth::btleplug_starter()),
+                                Some(crate::bluetooth::btleplug_starter(None)),
                             )
                         }
                         None => crate::bluetooth::unsupported_backends(),
                     };
+                    // Apple devices only join, so no peripheral runs, and the
+                    // central reports the power the readiness reads (R77
+                    // decision 23).
                     #[cfg(any(target_os = "ios", target_os = "macos"))]
                     let (bt_readiness, bt_peripheral, bt_starter) = {
-                        let backend = Arc::new(crate::bluetooth::AppleBluetoothBackend::new());
+                        let readiness = crate::bluetooth::CentralReadiness::new(
+                            crate::bluetooth::apple_permission,
+                        );
+                        let power = readiness.power_report();
                         (
-                            Arc::clone(&backend) as Arc<dyn crate::bluetooth::ReadinessBackend>,
-                            Arc::clone(&backend) as Arc<dyn crate::bluetooth::PeripheralBackend>,
-                            Some(crate::bluetooth::btleplug_starter()),
+                            Arc::new(readiness) as Arc<dyn crate::bluetooth::ReadinessBackend>,
+                            Arc::new(crate::bluetooth::UnsupportedBackend)
+                                as Arc<dyn crate::bluetooth::PeripheralBackend>,
+                            Some(crate::bluetooth::btleplug_starter(Some(power))),
                         )
                     };
                     #[cfg(target_os = "linux")]
@@ -1123,7 +1177,7 @@ where
                                         as Arc<dyn crate::bluetooth::ReadinessBackend>,
                                     Arc::clone(&backend)
                                         as Arc<dyn crate::bluetooth::PeripheralBackend>,
-                                    Some(crate::bluetooth::btleplug_starter()),
+                                    Some(crate::bluetooth::btleplug_starter(None)),
                                 )
                             }
                             Err(err) => {
@@ -1143,7 +1197,6 @@ where
                     let bt_state = Arc::clone(&bt_readiness);
                     let serving_handle = handle.clone();
                     let join_handle = handle.clone();
-                    let handed_handle = handle.clone();
                     let beacon_node = peer_node.clone();
                     let bt_machine = crate::bluetooth::Machine::new(
                         bt_readiness,
@@ -1166,10 +1219,6 @@ where
                         }),
                         Arc::new(move |event: ClientEvent| {
                             let _ = event_sender_bt.send(event);
-                        }),
-                        Arc::new({
-                            let handle = handed_handle;
-                            move || handle.personal_offer_handed_out()
                         }),
                     );
                     (
@@ -1196,7 +1245,11 @@ where
                 let pump: CorePump = Box::pin(with_device_tasks(
                     pump,
                     async move {
-                        tokio::join!(enrolment, runner);
+                        tokio::join!(enrolment, runner, async {
+                            if let Some(media) = media {
+                                media.await;
+                            }
+                        });
                     },
                     revoked,
                     close,
@@ -1230,6 +1283,8 @@ where
                 nearby,
                 #[cfg(feature = "peer")]
                 bt_state,
+                #[cfg(all(feature = "peer", target_os = "android"))]
+                java,
             },
             pump,
         ))
@@ -1368,53 +1423,16 @@ where
     KS: ReplicaKeyStore<Error = ClientError> + Send + Sync + 'static,
 {
     for prepared in pending {
-        let PreparedWipe {
-            wipe,
-            refresh,
-            share_keys,
-            #[cfg(feature = "device-identity")]
-            device_keys,
-            shared,
-        } = prepared;
+        let wipe = prepared.wipe.clone();
         let mut report = ForgetIncomplete::default();
-        // Out of the shared store before anything of the replica goes, its
-        // queued shared writes undone while it still exists (R11 slice 6, Q6
-        // and Q7).
         let last_out = SharedStore::leave(
-            shared.as_ref(),
+            prepared.shared.as_ref(),
             &dir.join(&wipe.name),
             key_store,
             &mut report,
         )
         .await;
-        if let (Some(account), Some(store)) = (&wipe.account, refresh) {
-            report.credential = store.clear(account).await.err();
-        }
-        report.wipe = wipe_replica(&dir.join(&wipe.name), key_store, &wipe.name, &[], true)
-            .await
-            .err();
-        if report.wipe.is_none() {
-            report.share_keys = match share_keys {
-                Ok(store) => store.clear(&share_key_record(&wipe.name)).await.err(),
-                Err(err) => Some(err),
-            };
-            if last_out && let Some(shared) = &shared {
-                shared.remove(key_store, &mut report).await;
-            }
-            #[cfg(feature = "device-identity")]
-            if let Some(keys) = device_keys {
-                report.device_key = match keys {
-                    Ok(keys) => keys.delete().await.err(),
-                    Err(err) => Some(err),
-                };
-            }
-        }
-        if let Some(hook) = hook {
-            report.application = hook(wipe.name.clone())
-                .await
-                .err()
-                .map(ApplicationWipeError);
-        }
+        wipe_closed_account(prepared, last_out, dir, key_store, hook, &mut report).await;
         if !report.is_complete() {
             return Err(ClientError::WipePending(Box::new(report)));
         }
@@ -1423,6 +1441,59 @@ where
         })?;
     }
     Ok(())
+}
+
+/// Wipe the account `prepared` names, whose client is not open and which
+/// already left the shared store, as the last identity in it when
+/// `last_out`, filling in the parts of `report` that fail. Each part is
+/// idempotent.
+#[cfg(feature = "native-auth")]
+async fn wipe_closed_account<KS>(
+    prepared: PreparedWipe,
+    last_out: bool,
+    dir: &std::path::Path,
+    key_store: &KS,
+    hook: Option<&DeviceWipeHook>,
+    report: &mut ForgetIncomplete,
+) where
+    KS: ReplicaKeyStore<Error = ClientError> + Send + Sync + 'static,
+{
+    let PreparedWipe {
+        wipe,
+        refresh,
+        share_keys,
+        #[cfg(feature = "device-identity")]
+        device_keys,
+        shared,
+    } = prepared;
+    if let (Some(account), Some(store)) = (&wipe.account, refresh) {
+        report.credential = store.clear(account).await.err();
+    }
+    report.wipe = wipe_replica(&dir.join(&wipe.name), key_store, &wipe.name, &[], true)
+        .await
+        .err();
+    if report.wipe.is_none() {
+        report.share_keys = match share_keys {
+            Ok(store) => store.clear(&share_key_record(&wipe.name)).await.err(),
+            Err(err) => Some(err),
+        };
+        if last_out && let Some(shared) = &shared {
+            shared.remove(key_store, report).await;
+        }
+        #[cfg(feature = "device-identity")]
+        if let Some(keys) = device_keys {
+            report.device_key = match keys {
+                Ok(keys) => keys.delete().await.err(),
+                Err(err) => Some(err),
+            };
+        }
+    }
+    if let Some(hook) = hook {
+        report.application = hook(wipe.name.clone())
+            .await
+            .err()
+            .map(ApplicationWipeError);
+    }
 }
 
 /// The share-key store a durable build names, the refresh store standing in
@@ -1481,6 +1552,10 @@ pub struct NativeClient<T: Transport, C = ()> {
     #[cfg(feature = "peer")]
     /// The platform's Bluetooth standing, readable at any time (R76).
     bt_state: Option<Arc<dyn crate::bluetooth::ReadinessBackend>>,
+    #[cfg(all(feature = "peer", target_os = "android"))]
+    /// The application's JNI access, for the peer link's permission prompt
+    /// (R76).
+    java: Option<Arc<dyn crate::device_key::JavaAccess>>,
 }
 
 impl<T, C> NativeClient<T, C>
@@ -1516,7 +1591,7 @@ where
     ///
     /// # Errors
     ///
-    /// [`CertificateError::Offline`] without a server connection, [`CertificateError::OverCeiling`] for a refused lifetime, [`CertificateError::Revoked`] when revocation deletes the key and prevents enrolment until the next build, [`CertificateError::Refused`] for another refusal, and [`CertificateError::NoIdentity`] without a device identity.
+    /// [`CertificateError::Offline`] without a server connection, [`CertificateError::OverCeiling`] for a refused lifetime, [`CertificateError::Revoked`] when revocation deletes the key and prevents enrolment until the next build, [`CertificateError::ApplicationRefused`] when the deployment's application refuses the enrolment, [`CertificateError::Refused`] for another refusal, and [`CertificateError::NoIdentity`] without a device identity.
     #[cfg(feature = "device-identity")]
     pub async fn reissue_certificate(
         &self,
@@ -1561,8 +1636,10 @@ where
     /// # Errors
     ///
     /// [`CertificateError::Offline`] with no server reachable,
-    /// [`CertificateError::Refused`] for a key that is not the account's, and
-    /// [`CertificateError::NoIdentity`] for a build without a device identity.
+    /// [`CertificateError::ApplicationRefused`] when the deployment's
+    /// application refuses the revocation, [`CertificateError::Refused`] for
+    /// a key that is not the account's, and [`CertificateError::NoIdentity`]
+    /// for a build without a device identity.
     #[cfg(feature = "device-identity")]
     pub async fn revoke_device(
         &self,
@@ -1641,6 +1718,48 @@ where
         self.client().provisional_rows().await
     }
 
+    /// The session's courier candidates, one per author with a stored offer
+    /// (R78 decision 16).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Locked`] while the gate is locked, and the
+    /// [`ClientError`] the read surfaces.
+    #[cfg(feature = "peer")]
+    pub async fn courier_candidates(&self) -> Result<Vec<crate::CourierCandidate>, ClientError> {
+        self.client().courier_candidates().await
+    }
+
+    /// Courier the author's held rows to the server on the main wire (R78
+    /// decision 48).
+    ///
+    /// # Errors
+    ///
+    /// The [`crate::CourierError`] the call surfaces.
+    #[cfg(feature = "peer")]
+    pub async fn courier(
+        &self,
+        author: &[u8],
+    ) -> Result<crate::CourierReport, crate::CourierError> {
+        self.client().courier(author).await
+    }
+
+    /// Await committed courier audit receipts within one monotonic bound across reconnects.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`crate::CourierAuditError`] reported by the observer.
+    pub async fn observe_courier_audit(
+        &self,
+        author: &[u8],
+        seqs: &[u64],
+        within: core::time::Duration,
+    ) -> Result<(), crate::CourierAuditError> {
+        self.client()
+            .observe_courier_audit(author, seqs, within)
+            .await
+    }
+
     /// Dial `addr`, refusing by this device's standing before any socket
     /// opens and handing back the peer's identity once the link is live
     /// (R76).
@@ -1680,45 +1799,6 @@ where
         match &self.device {
             Some(device) => device.host_hotspot().await,
             None => Err(HotspotError::Unsupported),
-        }
-    }
-
-    /// Host this device's personal hotspot under the caller's typed
-    /// details, the beacon's outcome beside the offer, within the
-    /// machines' bounds (R76 decision 26).
-    ///
-    /// # Errors
-    ///
-    /// [`HotspotError::Unsupported`] on a system without a personal
-    /// hotspot or for a build without a device identity,
-    /// [`HotspotError::Incompatible`] on a model that cannot host, and
-    /// [`HotspotError::TimedOut`] when the answer does not stand within
-    /// its bound. The beacon's refusal stands beside the offer on the
-    /// success.
-    #[cfg(feature = "peer")]
-    pub async fn host_personal_hotspot(
-        &self,
-        ssid: &str,
-        passphrase: &str,
-    ) -> Result<crate::bluetooth::Hosted, HotspotError> {
-        match &self.device {
-            Some(device) => device.host_personal_hotspot(ssid, passphrase).await,
-            None => Err(HotspotError::Unsupported),
-        }
-    }
-
-    /// The personal hotspot's network name, where the platform answers one
-    /// (R76 decision 26).
-    #[cfg(feature = "peer")]
-    #[must_use]
-    pub fn personal_hotspot_name(&self) -> Option<String> {
-        #[cfg(target_os = "ios")]
-        {
-            connetto_peer_apple::device_name()
-        }
-        #[cfg(not(target_os = "ios"))]
-        {
-            None
         }
     }
 
@@ -1825,6 +1905,23 @@ where
         }
     }
 
+    /// Ask the system for the peer link's permissions, over the
+    /// application's screen in front, the prompt a host or join that named a
+    /// missing permission leads to (R76). The platform wants it asked from
+    /// its main thread.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::MissingJavaAccess`] in a build without the JNI access,
+    /// [`ClientError::NoAndroidScreen`] when the application shows no screen,
+    /// and [`ClientError::AndroidJava`] when the plugin refuses.
+    #[cfg(all(feature = "peer", target_os = "android"))]
+    pub fn request_peer_permissions(&self) -> Result<(), ClientError> {
+        let java = self.java.as_ref().ok_or(ClientError::MissingJavaAccess)?;
+        crate::hotspot::android::request_permissions(&**java)
+            .map_err(|failure| ClientError::AndroidJava(failure.to_string()))
+    }
+
     /// Join the nearby host's hotspot through the exchange, answered with
     /// the host's proved identity and the network's gateway, within the
     /// machines' bounds (R76 decisions 19 and 25).
@@ -1898,6 +1995,30 @@ where
     pub fn set_bluetooth_prompt(&self, prompt: bool) {
         if let Some(device) = &self.device {
             device.set_bluetooth_prompt(prompt);
+        }
+    }
+
+    /// The peer link's standing, at run time (R77 slice 8). Off means no
+    /// peer link of any kind, every path refusing, and off closes every live
+    /// link with the existing `Closed` frame. On again, every found
+    /// peer dials at once and a joined hotspot whose gateway and port are
+    /// known starts its dial. The standing lasts for the running client,
+    /// every start beginning with links on. A no-op for a build without a
+    /// device identity.
+    #[cfg(feature = "peer")]
+    pub fn set_peer_links(&self, on: bool) {
+        if let Some(device) = &self.device {
+            device.set_peer_links(on);
+        }
+    }
+
+    /// Whether the peer link's standing is on, at run time (R77 slice 8),
+    /// always on for a build without a device identity.
+    #[cfg(feature = "peer")]
+    pub fn peer_links_on(&self) -> bool {
+        match &self.device {
+            Some(device) => device.peer_links_on(),
+            None => true,
         }
     }
 }
@@ -1986,6 +2107,111 @@ where
             Err(ForgetError::Incomplete(Box::new(report)))
         }
     }
+
+    /// Delete `account`, a stored account that is not the live one: revoke
+    /// its session at the server, then wipe its replica, its tier, its
+    /// content, its key, its share keys and its device key, and clear its
+    /// stored credential. The live client and everything of the live account
+    /// stay.
+    ///
+    /// The account's replica is opened offline first, and the writes in it
+    /// the server has not acknowledged block the delete unless `force` is
+    /// set, since once its credential is gone they can never be uploaded. A
+    /// build that shares tables first takes the account out of the shared
+    /// store, undoing the shared writes a forced delete discards, and only
+    /// then revokes and wipes. A wipe marker stands until every part did, so
+    /// a start after a crash midway finishes the delete.
+    ///
+    /// # Errors
+    ///
+    /// [`ForgetError::Refused`] when nothing was destroyed: the build kept no
+    /// replica on this device, `account` is the live one, the device stores
+    /// no such account, the account's unsynced writes cannot be read or
+    /// block the delete, or the shared store refused its departure.
+    /// [`ForgetError::Incomplete`] when part of the delete failed, naming
+    /// each part.
+    pub async fn forget_stored_account(
+        &self,
+        account: &str,
+        force: bool,
+    ) -> Result<(), ForgetError> {
+        let teardown = self.teardown.as_ref().ok_or(ForgetRefusal::NoReplica)?;
+        let StoredAccount {
+            account,
+            name,
+            path,
+            opening,
+        } = teardown.stored(account).await?;
+        match opening
+            .and_then(|opening| stored_unsynced::<T>(&path, &name, opening, teardown.schema()))
+        {
+            Ok(unsynced) if !unsynced.is_empty() && !force => {
+                return Err(ForgetRefusal::Unsynced(unsynced).into());
+            }
+            Err(err) if !force => return Err(ForgetRefusal::Unreadable(err).into()),
+            _ => {}
+        }
+        let report = teardown.forget_stored(account, name).await?;
+        if report.is_complete() {
+            Ok(())
+        } else {
+            Err(ForgetError::Incomplete(Box::new(report)))
+        }
+    }
+}
+
+/// A stored account that is not the live one, with what opening its replica
+/// offline needs.
+#[cfg(feature = "native-auth")]
+struct StoredAccount {
+    account: String,
+    name: String,
+    path: PathBuf,
+    opening: Result<ReplicaOpening, ClientError>,
+}
+
+/// The keys a stored account's replica opens under.
+#[cfg(feature = "native-auth")]
+struct ReplicaOpening {
+    /// The replica's key, `None` when the store holds none.
+    key: Option<ReplicaKey>,
+    /// The shared store and its key, when the build shares tables.
+    shared: Option<(Located, ReplicaKey)>,
+}
+
+/// The writes in the replica `name` at `path` the server has not
+/// acknowledged, read on a connection of its own that closes before the
+/// answer returns. A replica that was never opened holds none.
+#[cfg(feature = "native-auth")]
+fn stored_unsynced<T: Transport>(
+    path: &std::path::Path,
+    name: &str,
+    opening: ReplicaOpening,
+    schema: &SyncSchema,
+) -> Result<Vec<crate::UnsyncedWrite>, ClientError> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let key = opening.key.ok_or(ClientError::ReplicaKeyMissing)?;
+    let location = path
+        .to_str()
+        .ok_or_else(|| ClientError::Session("the replica path is not valid UTF-8".to_owned()))?;
+    let tier = schema.local_tier_ddl().map(str::to_owned);
+    let replica = crate::builder::core::open_encrypted_replica(
+        location,
+        &key,
+        false,
+        tier.as_ref(),
+        opening.shared,
+    )?;
+    let config = crate::builder::core::storage_config(schema, name);
+    let conn = crate::ConnettoConnection::<T>::open_existing(
+        &replica,
+        schema.replica_ddl(),
+        &config,
+        None,
+    )?;
+    Ok(conn.unsynced())
 }
 
 /// The session a provider sign-in acquired.
@@ -2050,6 +2276,21 @@ trait Forget: Send + Sync {
     fn pending(&self) -> PendingWipe;
     /// The directory the replica and that record live in.
     fn dir(&self) -> &std::path::Path;
+    /// The schema the build opens its replicas with.
+    fn schema(&self) -> &SyncSchema;
+    /// `account`, when the device stores it and it is not the live one.
+    fn stored<'a>(
+        &'a self,
+        account: &'a str,
+    ) -> core::pin::Pin<Box<dyn Future<Output = Result<StoredAccount, ForgetRefusal>> + Send + 'a>>;
+    /// Take the stored `account` out of the shared store, then revoke its
+    /// session and wipe its replica `name`, past its unsynced guard. A
+    /// departure that fails refuses the delete with nothing destroyed.
+    fn forget_stored(
+        &self,
+        account: String,
+        name: String,
+    ) -> core::pin::Pin<Box<dyn Future<Output = Result<ForgetIncomplete, ForgetRefusal>> + Send + '_>>;
 }
 
 /// The replica a durable build wrote, and what revokes its session.
@@ -2065,6 +2306,12 @@ struct ReplicaTeardown<KS> {
     hook: Option<DeviceWipeHook>,
     /// The shared store, when the build shares tables.
     shared: Option<SharedStore>,
+    /// The schema the build opens its replicas with.
+    schema: SyncSchema,
+    /// What makes the device keys of a stored account, when the build has a
+    /// device identity.
+    #[cfg(feature = "device-identity")]
+    device_keys: Option<DeviceKeysFor>,
 }
 
 /// The shared store a durable build's identity leaves when it is wiped, and
@@ -2088,9 +2335,7 @@ impl SharedStore {
         Some(Self {
             path: dir.join(&record),
             record,
-            config: crate::ClientConfig::new(name.to_owned())
-                .with_storage_schema(schema)
-                .with_sql_functions(schema.sql_functions().clone()),
+            config: crate::builder::core::storage_config(schema, name),
         })
     }
 
@@ -2230,6 +2475,122 @@ where
     fn dir(&self) -> &std::path::Path {
         &self.dir
     }
+
+    fn schema(&self) -> &SyncSchema {
+        &self.schema
+    }
+
+    fn stored<'a>(
+        &'a self,
+        account: &'a str,
+    ) -> core::pin::Pin<Box<dyn Future<Output = Result<StoredAccount, ForgetRefusal>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let authenticator = self
+                .authenticator
+                .as_ref()
+                .ok_or(ForgetRefusal::UnknownAccount)?;
+            if authenticator.account().as_deref() == Some(account) {
+                return Err(ForgetRefusal::LiveAccount);
+            }
+            let listed = authenticator
+                .stored_accounts()
+                .await
+                .map_err(ForgetRefusal::Unreadable)?;
+            if !listed.iter().any(|listed| listed == account) {
+                return Err(ForgetRefusal::UnknownAccount);
+            }
+            let name = crate::replica::replica_name_of_account(crate::REPLICA_PREFIX, account);
+            let opening = async {
+                let key = self.key_store.load(&name).await?;
+                let shared = match &self.shared {
+                    Some(shared) => match self.key_store.load(&shared.record).await? {
+                        Some(key) => Some((DataDir(self.dir.clone()).locate(&shared.record)?, key)),
+                        None => None,
+                    },
+                    None => None,
+                };
+                Ok(ReplicaOpening { key, shared })
+            }
+            .await;
+            Ok(StoredAccount {
+                account: account.to_owned(),
+                path: self.dir.join(&name),
+                name,
+                opening,
+            })
+        })
+    }
+
+    fn forget_stored(
+        &self,
+        account: String,
+        name: String,
+    ) -> core::pin::Pin<Box<dyn Future<Output = Result<ForgetIncomplete, ForgetRefusal>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let wipe = PendingWipe {
+                name: name.clone(),
+                account: Some(account.clone()),
+            };
+            if let Err(err) = wipe.mark(&self.dir) {
+                tracing::warn!(error = %err, "the stored account's wipe could not be marked pending");
+            }
+            let mut report = ForgetIncomplete::default();
+            // The departure undoes the queued shared writes the replica
+            // still holds, so the replica stays until it stood. The marker
+            // is already down, so a crash past a departure that stood
+            // finishes the delete at the next start.
+            let shared = SharedStore::of(&self.schema, &self.dir, &name);
+            let last_out = SharedStore::leave(
+                shared.as_ref(),
+                &self.dir.join(&name),
+                self.key_store.as_ref(),
+                &mut report,
+            )
+            .await;
+            if let Some(departure) = report.shared.take() {
+                if let Err(err) = wipe.clear(&self.dir) {
+                    tracing::warn!(error = %err, "the refused delete's wipe marker could not be removed");
+                }
+                return Err(ForgetRefusal::Shared(departure));
+            }
+            // The revoke clears the stored credential whether or not the
+            // server answers, so the wipe below has no credential left to
+            // clear.
+            if let Some(authenticator) = &self.authenticator {
+                let signed_out = authenticator.for_account(account).sign_out().await;
+                report.credential = signed_out.credential.err();
+                report.revoke = signed_out.revoke.err();
+            }
+            let prepared = PreparedWipe {
+                wipe: wipe.clone(),
+                refresh: None,
+                share_keys: Ok(self.share_key_store.clone()),
+                #[cfg(feature = "device-identity")]
+                device_keys: self
+                    .device_keys
+                    .as_ref()
+                    .map(|keys_for| keys_for.keys(&name)),
+                shared,
+            };
+            wipe_closed_account(
+                prepared,
+                last_out,
+                &self.dir,
+                self.key_store.as_ref(),
+                self.hook.as_ref(),
+                &mut report,
+            )
+            .await;
+            if report.is_complete()
+                && let Err(err) = wipe.clear(&self.dir)
+            {
+                tracing::warn!(error = %err, "the deleted account's wipe marker could not be removed");
+            }
+            Ok(report)
+        })
+    }
 }
 
 /// A key store the build and the client's teardown both hold.
@@ -2290,6 +2651,8 @@ impl<T: Transport, C> NativeClient<T, C> {
             nearby: None,
             #[cfg(feature = "peer")]
             bt_state: None,
+            #[cfg(all(feature = "peer", target_os = "android"))]
+            java: None,
         }
     }
 }
@@ -2537,15 +2900,6 @@ mod tests {
         );
         assert!(
             matches!(
-                client
-                    .host_personal_hotspot("iphone", "the passphrase")
-                    .await,
-                Err(crate::hotspot::HotspotError::Unsupported)
-            ),
-            "the build has no device identity to host personally"
-        );
-        assert!(
-            matches!(
                 client.join_hotspot(&offer).await,
                 Err(crate::hotspot::JoinError::Unsupported)
             ),
@@ -2575,10 +2929,6 @@ mod tests {
             "the build has no device identity to join nearby"
         );
         assert_eq!(client.bluetooth_state(), BluetoothState::Unsupported);
-        assert!(
-            client.personal_hotspot_name().is_none(),
-            "no personal hotspot name without the device"
-        );
         assert_eq!(
             client.beacon_state(),
             BeaconState::Off {
@@ -2614,6 +2964,15 @@ mod tests {
         client.set_hotspot_scan(true);
         client.set_hotspot_autojoin(true);
         client.set_bluetooth_prompt(false);
+        assert!(
+            client.peer_links_on(),
+            "a build without a device identity stands its links on"
+        );
+        client.set_peer_links(false);
+        assert!(
+            client.peer_links_on(),
+            "turning links off is a no-op without a device identity"
+        );
 
         client.close().await;
     }
@@ -2672,16 +3031,8 @@ mod tests {
                         Some(crate::hotspot::Command::Leave) => {
                             let _ = note_tx.send("leave").await;
                         }
-                        // The personal request the runner links stands
-                        // unanswered here, and the hand out notes its
-                        // arrival.
-                        Some(command) => {
-                            if matches!(
-                                command,
-                                crate::hotspot::Command::PersonalOfferHandedOut
-                            ) {
-                                let _ = note_tx.send("handed out").await;
-                            }
+                        Some(crate::hotspot::Command::Links { on }) => {
+                            let _ = note_tx.send(if on { "links true" } else { "links false" }).await;
                         }
                         None => break,
                     },
@@ -2716,8 +3067,6 @@ mod tests {
                                 .send(if on { "prompt true" } else { "prompt false" })
                                 .await;
                         }
-                        // The personal hotspot is the iPhone's, which this test does not host.
-                        Some(_) => {}
                         None => break,
                     },
                 }
@@ -2770,7 +3119,7 @@ mod tests {
         let (nearby_tx, nearby_rx) = watch::channel(Vec::new());
         nearby_tx.send_replace(vec![crate::bluetooth::NearbyHost {
             host: 9,
-            prefix: Some([3; 8]),
+            prefix: [3; 8],
             rssi: Some(-55),
         }]);
         let (readiness, _, _) = crate::bluetooth::unsupported_backends();
@@ -2788,6 +3137,8 @@ mod tests {
             nearby: Some(nearby_rx),
             #[cfg(feature = "peer")]
             bt_state: Some(readiness),
+            #[cfg(all(feature = "peer", target_os = "android"))]
+            java: None,
         };
 
         // The calls hand back what the machines answer.
@@ -2839,23 +3190,6 @@ mod tests {
             "the machine's offer reaches the caller"
         );
 
-        // The personal host's call reaches the Bluetooth machine, whose
-        // dropped reply fails it, and the hand out notes its arrival on
-        // the hotspot's side.
-        let error = client
-            .host_personal_hotspot("iphone", "the passphrase")
-            .await
-            .expect_err("the machine drops the personal host's reply");
-        assert!(
-            matches!(error, crate::hotspot::HotspotError::Failed),
-            "a machine that drops the reply fails the call, got {error:?}"
-        );
-        client
-            .device
-            .as_ref()
-            .expect("the device stands")
-            .personal_offer_handed_out();
-
         // The standings read the machines', and the cancels and the run-time
         // standings reach them.
         assert_eq!(
@@ -2872,7 +3206,7 @@ mod tests {
             client.nearby_hosts(),
             vec![crate::bluetooth::NearbyHost {
                 host: 9,
-                prefix: Some([3; 8]),
+                prefix: [3; 8],
                 rssi: Some(-55)
             }],
             "the nearby read stands beside the device"
@@ -2886,10 +3220,20 @@ mod tests {
         client.set_hotspot_scan(true);
         client.set_hotspot_autojoin(false);
         client.set_bluetooth_prompt(true);
+        assert!(client.peer_links_on(), "every start begins with links on");
+        client.set_peer_links(false);
+        assert!(
+            !client.peer_links_on(),
+            "the off standing holds once the call returns"
+        );
+        // A standing already held reaches no machine.
+        client.set_peer_links(false);
+        client.set_peer_links(true);
+        assert!(client.peer_links_on(), "the links stand on again");
         // The standings reach their machines, from the two machines' channels,
         // so the order the notes come back in is not the order sent.
         let mut noted: Vec<&str> = Vec::new();
-        for _ in 0..6 {
+        for _ in 0..7 {
             let got = tokio::time::timeout(Duration::from_secs(10), note_rx.recv())
                 .await
                 .expect("the machine notes the standing within its bound")
@@ -2901,13 +3245,20 @@ mod tests {
             noted,
             [
                 "autojoin false",
-                "handed out",
                 "leave",
+                "links false",
+                "links true",
                 "prompt true",
                 "scan true",
                 "stop"
             ],
             "each standing reaches its machine"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), note_rx.recv())
+                .await
+                .is_err(),
+            "the repeated off standing reaches no machine"
         );
 
         // A certificate-less device refuses the peer's calls by its standing.

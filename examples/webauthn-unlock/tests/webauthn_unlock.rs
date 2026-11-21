@@ -15,6 +15,8 @@
 //! ChromeDriver is resolved in order: the `CHROMEDRIVER` environment variable,
 //! then `chromedriver` on PATH, then the wasm-pack cache at
 //! `~/.cache/.wasm-pack/`.
+//!
+//! ChromeDriver, browser and streaming network logs are written to `target/passkey-gate/`.
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -23,8 +25,9 @@ use reqwest::Client;
 use serde_json::{Value, json};
 use std::{
     net::TcpListener,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 use tokio::time::sleep;
@@ -96,8 +99,8 @@ struct WebDriver {
 }
 
 impl WebDriver {
-    /// Create a headless Chrome session. `chromedriver_url` is already running.
-    async fn new(chromedriver_url: &str) -> Result<Self> {
+    /// Creates a headless Chrome session through the running driver.
+    async fn new(chromedriver_url: &str, diagnostics: &Path) -> Result<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -113,12 +116,10 @@ impl WebDriver {
                             "--no-sandbox",
                             "--disable-dev-shm-usage",
                             "--disable-gpu",
-                            // No --user-data-dir: chromedriver mints a fresh
-                            // temporary profile per session and removes it
-                            // afterwards, which is what "empty IndexedDB every
-                            // run" needs. A fixed path is the opposite, and a
-                            // profile left locked by an earlier run makes
-                            // Chrome exit at startup.
+                            "--enable-logging",
+                            format!("--log-net-log={}", diagnostics.join("network.jsonl").display()),
+                            "--net-log-file-format=ndjson",
+                            // ChromeDriver's fresh profile isolates IndexedDB between runs.
                             "--disable-search-engine-choice-screen"
                         ]
                     }
@@ -249,6 +250,30 @@ async fn poll_result(driver: &WebDriver, timeout: Duration) -> Result<String> {
 
 // ── file server ───────────────────────────────────────────────────────────
 
+/// Record each asset request and its response status.
+async fn log_asset_request(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+    let id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let started = Instant::now();
+    eprintln!(
+        "passkey asset {id} start {} {} host={:?}",
+        request.method(),
+        request.uri(),
+        request.headers().get(axum::http::header::HOST)
+    );
+    let response = next.run(request).await;
+    eprintln!(
+        "passkey asset {id} response {} after {:?}",
+        response.status(),
+        started.elapsed()
+    );
+    response
+}
+
 /// Start an axum file server in the background and return its URL.
 /// Serves the workspace root (index.html, db-worker.js) and pkg/ directory.
 async fn start_file_server(port: u16) -> Result<()> {
@@ -256,7 +281,9 @@ async fn start_file_server(port: u16) -> Result<()> {
     use std::net::SocketAddr;
     use tower_http::services::ServeDir;
 
-    let router = Router::new().fallback_service(get_service(ServeDir::new(".")));
+    let router = Router::new()
+        .fallback_service(get_service(ServeDir::new(".")))
+        .layer(axum::middleware::from_fn(log_asset_request));
 
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
     let listener = tokio::net::TcpListener::bind(addr)
@@ -264,7 +291,9 @@ async fn start_file_server(port: u16) -> Result<()> {
         .with_context(|| format!("binding file server on port {port}"))?;
 
     tokio::spawn(async move {
-        axum::serve(listener, router).await.ok();
+        if let Err(error) = axum::serve(listener, router).await {
+            eprintln!("passkey file server on port {port} failed {error}");
+        }
     });
 
     Ok(())
@@ -275,16 +304,29 @@ async fn start_file_server(port: u16) -> Result<()> {
 struct ChromeDriver {
     child: Child,
     url: String,
+    diagnostics: PathBuf,
 }
 
 impl ChromeDriver {
     async fn start() -> Result<Self> {
         let path = chromedriver_path()?;
         let port = free_port()?;
+        let diagnostics = std::env::current_dir()
+            .context("finding the passkey workspace")?
+            .join("target/passkey-gate");
+        std::fs::create_dir_all(&diagnostics).context("creating passkey diagnostics directory")?;
+        let driver_stderr = std::fs::File::create(diagnostics.join("chromedriver-stderr.log"))
+            .context("creating ChromeDriver stderr log")?;
         let child = Command::new(&path)
             .arg(format!("--port={port}"))
+            .arg("--verbose")
+            .arg(format!(
+                "--log-path={}",
+                diagnostics.join("chromedriver.log").display()
+            ))
+            .env("CHROME_LOG_FILE", diagnostics.join("browser.log"))
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(driver_stderr)
             .spawn()
             .with_context(|| format!("spawning chromedriver from {path}"))?;
 
@@ -303,7 +345,11 @@ impl ChromeDriver {
             sleep(Duration::from_millis(100)).await;
         }
 
-        Ok(Self { child, url })
+        Ok(Self {
+            child,
+            url,
+            diagnostics,
+        })
     }
 }
 
@@ -339,7 +385,7 @@ async fn passkey_gate_enrol_use_and_lock() -> Result<()> {
     // domain`, and `localhost` is the one exempt name that is also a secure
     // context over plain HTTP.
     let page_url = format!("http://localhost:{page_port}/index.html");
-    let driver = WebDriver::new(&cd.url).await?;
+    let driver = WebDriver::new(&cd.url, &cd.diagnostics).await?;
 
     let auth_id = driver
         .add_authenticator()

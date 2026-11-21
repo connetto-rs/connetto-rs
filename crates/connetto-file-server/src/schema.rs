@@ -295,11 +295,13 @@ where
         hash: Vec<u8>,
     ) -> impl QueryFragment<Pg> + QueryId + Send + 'static;
 
-    /// Build `UPDATE manifests SET committed=TRUE WHERE file_id=? AND uploaded_by=?
-    /// AND committed=FALSE`.
+    /// Build `UPDATE manifests SET committed=TRUE, carried_by=? WHERE file_id=?
+    /// AND uploaded_by=? AND committed=FALSE`, `carried_by` the carrier's key
+    /// for a carried upload and `NULL` for the uploader's own.
     fn mark_manifest_committed_stmt(
         file_id: Vec<u8>,
         caller: String,
+        carried_by: Option<String>,
     ) -> impl QueryFragment<Pg> + QueryId + Send + 'static;
 
     /// Mark locked, still-unreferenced registry rows `deleting` and return their hashes.
@@ -463,6 +465,9 @@ macro_rules! connetto_file_tables {
                 created_at -> diesel::sql_types::Timestamptz,
                 /// Set at boot when the store lost chunks this manifest names, until a re-upload.
                 lost -> diesel::sql_types::Bool,
+                /// The carrier's key when another account's device uploaded the file for
+                /// `uploaded_by`, `NULL` for the uploader's own upload.
+                carried_by -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
             }
         }
 
@@ -793,6 +798,7 @@ macro_rules! connetto_file_tables {
             fn mark_manifest_committed_stmt(
                 file_id: Vec<u8>,
                 caller: String,
+                carried_by: Option<String>,
             ) -> impl diesel::query_builder::QueryFragment<diesel::pg::Pg>
             + diesel::query_builder::QueryId
             + Send
@@ -804,7 +810,10 @@ macro_rules! connetto_file_tables {
                     ),
                     diesel::ExpressionMethods::eq($manifests::committed, false),
                 ))
-                .set(diesel::ExpressionMethods::eq($manifests::committed, true))
+                .set((
+                    diesel::ExpressionMethods::eq($manifests::committed, true),
+                    diesel::ExpressionMethods::eq($manifests::carried_by, carried_by),
+                ))
             }
             fn mark_unreferenced_deleting_stmt(
                 hashes: Vec<Vec<u8>>,

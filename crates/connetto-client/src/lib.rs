@@ -1,8 +1,9 @@
 #![doc = include_str!("../README.md")]
 
 pub use connetto_core::messages::{
-    FullResyncReason, Grant, PauseCause, SharedStoreUse, StorageUse, StoreBytes, SyncStatus,
-    WriterGrant, WriterRef, WriterRequest, WriterSecret,
+    FileState, FullResyncReason, Grant, KeyValue, PauseCause, RowOp, SharedStoreUse, StorageUse,
+    StoreBytes, SyncStatus, TrackedWrite, UnsyncedFile, UnsyncedWork, UnsyncedWrite, WriteState,
+    WriterGrant, WriterRef, WriterRequest, WriterSecret, WrittenRow,
 };
 pub use connetto_core::{Custody, NoGate};
 /// The peer link's close reasons, dial errors and chain refusals (R76).
@@ -20,12 +21,14 @@ use connetto_core::device_cert::DeviceIdentity;
 use connetto_core::device_cert::DeviceKey;
 use connetto_core::exchange::Origin;
 use connetto_core::messages::{
-    AckCredits, BindValue, BulkMessage, ConflictRow, ContentTicketRequest, ContentVerb,
-    ControlMessage, FatalErrorReason, GateState, Handshake, HeldWork, MutationHeader,
-    MutationPatch, MutationReject, MutationRejectReason, Ping, PriorRefusal, Provenance,
-    ReplaceShareKeys, RetireWriter, SUBSCRIPTION_REFUSED, ShareKeyChange, Subscribe,
-    SubscriptionSpec, TabIdentity, TabShareKeyAnswer, TabShareKeyChange, TabShareKeyOutcome,
-    TabStorageAnswer, TabStorageOutcome, TabStorageUse, Unsubscribe, WriterAnswer,
+    AckCredits, BulkMessage, ConflictRow, ContentTicketRequest, ContentVerb, ControlMessage,
+    CourierNotice, CourierNoticeAck, CourierNoticeRow, FatalErrorReason, GateState, Handshake,
+    HeldWork, MutationHeader, MutationPatch, MutationReject, MutationRejectReason, Ping,
+    PriorRefusal, Provenance, ReplaceShareKeys, RetireWriter, SUBSCRIPTION_REFUSED,
+    SUBSCRIPTION_REFUSED_SCHEMA, ShareKeyChange, SqliteValue, Subscribe, SubscriptionSpec,
+    TabDismissAnswer, TabDismissOutcome, TabDismissRefusal, TabIdentity, TabShareKeyAnswer,
+    TabShareKeyChange, TabShareKeyOutcome, TabStorageAnswer, TabStorageOutcome, TabStorageUse,
+    Unsubscribe, WriterAnswer,
 };
 #[cfg(feature = "device-identity")]
 use connetto_core::messages::{BindDevice, WriterOutcome, writer_bind_message};
@@ -77,6 +80,7 @@ pub mod bots;
 pub mod builder;
 pub mod cipher;
 mod clock;
+mod courier_audit;
 #[cfg(feature = "device-identity")]
 pub mod device_key;
 mod drain;
@@ -93,6 +97,9 @@ mod hotspot;
 #[cfg(feature = "native-auth")]
 mod keyring;
 pub mod live;
+mod live_source;
+mod live_spec;
+pub mod live_wire;
 mod majors;
 #[cfg(feature = "peer")]
 pub mod media;
@@ -113,11 +120,13 @@ pub mod share_keys;
 mod subscriptions;
 mod tier_migration;
 
+pub use aggregates::RestedAnswer;
 #[cfg(feature = "peer")]
 pub use bluetooth::{
     BeaconState, BluetoothError, BluetoothState, HostId, Hosted, JoinNearbyError, NearbyHost,
     PromptOutcome,
 };
+pub use courier_audit::{CourierAuditError, CourierAuditWait};
 #[cfg(feature = "device-identity")]
 pub use enrolment::{CertificateError, DeviceEntry};
 #[cfg(feature = "peer")]
@@ -167,11 +176,13 @@ pub use keyring::{Backend, KeyFile, LinuxStore};
 #[cfg(all(feature = "native-auth", target_os = "windows"))]
 pub use keyring::{HelloCancellation, HelloOwner, HelloWindow};
 pub use live::{
-    ConnettoClient, LiveGroups, LiveHandle, LiveQuery, LiveRows, LiveValue,
+    ConnettoClient, LiveGroups, LiveHandle, LiveQuery, LiveRows, LiveUnsynced, LiveValue, Loadable,
     subscription_is_aggregate, subscription_tables,
 };
-pub use majors::HeldContent;
+pub use live_source::{LiveSnapshot, LiveSource, follow};
+pub use live_spec::{KeyedSpec, LiveSpec, Unsynced};
 pub use memory_stores::{MemoryKeyStore, MemoryRefreshStore};
+pub use pending::ContentHooks;
 pub use pending::PendingWork;
 #[cfg(feature = "native-transport")]
 pub use reconnect::TokioSleeper;
@@ -379,6 +390,11 @@ pub enum ClientError {
     /// The client's pump stopped on a fault no reconnect can cure, named here.
     #[error("the client stopped: {0}")]
     Stopped(String),
+    /// A client in another process ended the live subscription this one
+    /// follows, with the error named here, as a Tauri core does for its
+    /// webview.
+    #[error("the remote client failed: {0}")]
+    Remote(String),
     /// Acquiring or refreshing the access token failed.
     #[error("authentication error: {0}")]
     Auth(String),
@@ -411,6 +427,15 @@ pub enum ClientError {
     #[cfg(all(feature = "device-identity", target_os = "android"))]
     #[error("the device key needs JNI access: call NativeDurable::with_java_access")]
     MissingJavaAccess,
+    /// A platform prompt needs the application's screen in front, and the
+    /// application shows none, a backgrounded one or one not started yet.
+    #[cfg(all(feature = "device-identity", target_os = "android"))]
+    #[error("no screen of the application is in front for the prompt")]
+    NoAndroidScreen,
+    /// A call into the application's Java code failed, kept as its text.
+    #[cfg(all(feature = "device-identity", target_os = "android"))]
+    #[error("the application's Java code refused: {0}")]
+    AndroidJava(String),
     /// A build with a device identity connected without naming the roots its
     /// certificates and revocation lists are checked against (R74 decision 23).
     #[cfg(feature = "device-identity")]
@@ -584,24 +609,89 @@ pub enum PeerError {
     /// The local clock puts the device's certificate outside its window.
     #[error("the device clock is outside the certificate window")]
     ClockOutsideWindow,
+    /// The device's peer links are off, so the dial is refused before a
+    /// socket (R77 slice 8).
+    #[error("the device's peer links are off")]
+    LinksOff,
     /// The dial failed.
     #[error(transparent)]
     Link(#[from] LinkError),
 }
 
-/// One queued write awaiting its final answer, named by the writer and the
-/// sequence it is the writer's, with the application schema major it was
-/// captured under.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct UnsyncedWrite {
-    /// The writer the entry is queued under.
-    pub writer: WriterRef,
-    /// The entry's sequence in that writer's queue.
-    pub seq: u64,
-    /// The major the write was captured under, absent for a build declaring
-    /// none. Only that major's server can apply it (R31).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub major: Option<Major>,
+/// One author's courier candidates the session would offer on the main wire,
+/// the run of its held rows the build's major stands (R78 decision 16).
+#[cfg(feature = "peer")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CourierCandidate {
+    /// The author's device key.
+    pub author: Vec<u8>,
+    /// The account the author's stored offer names.
+    pub account: String,
+    /// The sequences the run covers, lowest first.
+    pub seqs: Vec<u64>,
+    /// The bytes the run's bodies stand.
+    pub bytes: u64,
+    /// The verdict the session last heard from the server on the run's
+    /// lowest sequence, `None` while it heard none (R78 decision 50).
+    pub last: Option<connetto_core::exchange::Verdict>,
+}
+
+/// How one courier range ended on the server (R78 decision 32).
+#[cfg(feature = "peer")]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CourierReport {
+    /// The sequences the range settled.
+    pub settled: Vec<u64>,
+    /// The sequences the range refused.
+    pub refused: Vec<u64>,
+    /// The sequences the range left held.
+    pub kept: Vec<u64>,
+    /// The wait the server named before the run is offered again.
+    pub retry_after: Option<Duration>,
+}
+
+/// Why a [`ConnettoClient::courier`] call could not settle its range.
+#[cfg(feature = "peer")]
+#[derive(Debug, thiserror::Error)]
+pub enum CourierError {
+    /// No server session, or the deployment's courier path is off (C0).
+    #[error("the courier path is off")]
+    Unavailable,
+    /// The author holds no rows to offer (C1).
+    #[error("the author holds nothing to courier")]
+    NothingHeld,
+    /// The author's range is outstanding or queued (C3).
+    #[error("the author's range is outstanding")]
+    Busy,
+    /// The server refused the range before settling any of it.
+    #[error("the server refused the range: {0:?}")]
+    Refused(connetto_core::exchange::CourierRefusal),
+    /// The range's answer overran its bound and the wait dropped.
+    #[error("the courier answer overran its bound")]
+    TimedOut,
+    /// The deployment no longer serves the range's major (R78 decision 47).
+    #[error("the deployment no longer serves major {0}")]
+    MajorUnserved(Major),
+    /// The session ended before the range's answer.
+    #[error("the session ended before the answer")]
+    SessionLost,
+    /// The range is queued behind the late answer its wait already dropped.
+    #[error("the range is queued behind a late answer")]
+    QueuedBehindLateAnswer,
+    /// A local failure sending or settling the range.
+    #[error(transparent)]
+    Client(#[from] ClientError),
+}
+
+/// The wait on one author's courier range, resolved by the pump (R78
+/// decision 48).
+#[cfg(feature = "peer")]
+#[derive(Debug)]
+pub(crate) struct CourierWait {
+    /// The reply the pump settles, resolved as soon as it does.
+    pub receiver: tokio::sync::oneshot::Receiver<Result<CourierReport, CourierError>>,
+    /// How long the caller may wait on it, from any clock.
+    pub bound: Duration,
 }
 
 /// Why a sign-in switch was refused.
@@ -1085,11 +1175,11 @@ pub(crate) struct ClientConfig {
     /// Whether this connection mirrors a relay's worker, which holds the share
     /// keys, so a key change travels to the relay instead of committing here.
     relay_mirror: bool,
-    /// The content layer's hooks for an old major's unsent files across a
-    /// rebuild and its drain (R31): `hold` moves them aside, `count` says how
-    /// many remain, `forget` drops them. A build that attaches no content uses
-    /// [`HeldContent::NONE`].
-    held_content: HeldContent,
+    /// The content layer's hooks for its unsent files: an old major's across
+    /// a rebuild and its drain (R31), and every one for the unsynced
+    /// snapshot. A build that attaches no content uses
+    /// [`ContentHooks::NONE`].
+    content_hooks: ContentHooks,
     /// What brings an existing device-private tier to this build's major,
     /// `None` for a build declaring no major (R31).
     tier_plan: Option<TierPlan>,
@@ -1116,7 +1206,7 @@ impl ClientConfig {
             shared_tables: HashSet::new(),
             connection_ddl: None,
             relay_mirror: false,
-            held_content: HeldContent::NONE,
+            content_hooks: ContentHooks::NONE,
             tier_plan: None,
         }
     }
@@ -1283,12 +1373,12 @@ impl ClientConfig {
 
     /// The same, unchanged when nothing is named.
     #[must_use]
-    pub(crate) const fn with_optional_held_content(
+    pub(crate) const fn with_optional_content_hooks(
         mut self,
-        held_content: Option<HeldContent>,
+        content_hooks: Option<ContentHooks>,
     ) -> Self {
-        if let Some(held_content) = held_content {
-            self.held_content = held_content;
+        if let Some(content_hooks) = content_hooks {
+            self.content_hooks = content_hooks;
         }
         self
     }
@@ -1347,24 +1437,25 @@ pub enum ClientEvent {
         /// mirrors) without re-encoding.
         patchset_zstd: Arc<[u8]>,
     },
-    /// An aggregate result update, mirroring the wire
-    /// [`AggregateUpdate`](connetto_core::messages::AggregateUpdate) field for
-    /// field so a relay can rebuild a faithful frame for a downstream tab.
+    /// The declared columns of a computed subscription's answer, mirroring the
+    /// wire [`AggregateColumns`](connetto_core::messages::AggregateColumns)
+    /// so a relay can rebuild a faithful frame for a downstream tab. The
+    /// replica has already declared the answer's resting table with them.
+    AggregateColumns {
+        /// Subscription id.
+        sub_id: String,
+        /// One declared type per select-list item, in select order.
+        columns: Vec<connetto_core::messages::ColumnType>,
+    },
+    /// One movement of a computed subscription's answer, mirroring the wire
+    /// [`AggregateUpdate`](connetto_core::messages::AggregateUpdate) so a
+    /// relay can rebuild a faithful frame for a downstream tab. The replica
+    /// has already rested it.
     Aggregate {
         /// Subscription id.
         sub_id: String,
-        /// JSON-encoded aggregate value, or `None` when this key was removed
-        /// from the result set (the group or keyed row departed).
-        result_json: Option<String>,
-        /// Opaque group key, or `None` for a single-group aggregate.
-        group_key: Option<Vec<u8>>,
-        /// The decoded group values as a JSON array in `GROUP BY` order,
-        /// present exactly when `group_key` is. A typed keyed handle decodes
-        /// its public map key from these, never from the key bytes (R84).
-        group_values_json: Option<String>,
-        /// Whether this update replaces the entire result set or upserts a
-        /// single group.
-        is_full_result: bool,
+        /// What moved.
+        change: connetto_core::messages::AggregateChange,
     },
     /// The server requires a full resync for this subscription.
     FullResync {
@@ -1373,6 +1464,16 @@ pub enum ClientEvent {
         /// Why the rows had to be replaced, carried so a relay tells its own
         /// consumers the truth rather than restating one cause as another.
         reason: FullResyncReason,
+    },
+    /// The last live handle on a watch dropped, so its grace started (R116).
+    /// A watch is the subscription every handle on the same query shares, and
+    /// it is raised once per release, again after a re-watch inside the grace
+    /// is dropped. A handle served from the local tier alone holds no watch
+    /// and raises nothing.
+    WatchReleased {
+        /// The watch's subscription id, the one its snapshot and patch events
+        /// name.
+        sub_id: String,
     },
     /// The server opened a membership subscription on this client's behalf
     /// (R27): a filter narrowing through a membership table needs that
@@ -1639,10 +1740,6 @@ pub enum ClientEvent {
     /// The hotspot stopped, on a system stop (R76).
     #[cfg(feature = "peer")]
     HotspotStopped,
-    /// The personal hotspot's offer was handed out but no device landed on
-    /// the network within its bound (R76 decision 26).
-    #[cfg(feature = "peer")]
-    HotspotUnreached,
     /// The joined network was left (R76).
     #[cfg(feature = "peer")]
     HotspotLeft,
@@ -1667,9 +1764,8 @@ pub enum ClientEvent {
     HostNearby {
         /// The host's device.
         host: crate::bluetooth::HostId,
-        /// The beacon's prefix, where the beacon carries one (R76 decision
-        /// 25).
-        prefix: Option<[u8; 8]>,
+        /// The beacon's prefix (R76 decision 18).
+        prefix: [u8; 8],
         /// The signal the beacon carried.
         rssi: Option<i16>,
     },
@@ -1686,6 +1782,20 @@ pub enum ClientEvent {
     ProvisionalConfirmed {
         /// The confirmed provenance rows, as stored.
         rows: Vec<provisional::ProvisionalRow>,
+    },
+    /// A verdict or an author's frontier settled a peer entry whose rows
+    /// still awaited one, handing them to ordinary coverage (R79 decision
+    /// 15). Raised once per settled entry.
+    #[cfg(feature = "peer")]
+    ProvisionalSettled {
+        /// The author's key id.
+        author: Vec<u8>,
+        /// The author's queue sequence.
+        seq: i64,
+        /// Whether this device's courier call carried the entry to the
+        /// server, so a holder of its files uploads them at once (R79
+        /// decision 17).
+        by_courier: bool,
     },
     /// A peer entry's rows applied, its records written (R77), raised once
     /// per entry naming every record the apply wrote, the receiver's own
@@ -1733,37 +1843,41 @@ pub enum ClientEvent {
         /// The keys the retraction inverted.
         rows: Vec<(String, Vec<KeyValue>)>,
     },
+    /// The session's courier candidates for one author changed, the set it
+    /// would offer on the main wire, empty when nothing is left to courier
+    /// (R78 decisions 16 and 46).
+    #[cfg(feature = "peer")]
+    CourierCandidates(CourierCandidate),
     /// The server accepted a share-key replacement and queued its authorization resends.
     ShareKeysReplaced {
         /// The correlation token the swap it answers carried.
         request_id: String,
     },
+    /// The entries a courier settled for the session's account, sent after
+    /// the handshake and deleted by the receipt the connection answers at
+    /// once, or, on a connection that
+    /// [relays them](ConnettoConnection::relay_courier_notices), when
+    /// [`ConnettoConnection::ack_courier_notice`] names the frame (R78
+    /// decisions 12, 34 and 41). Raised once per frame, and the same rows
+    /// raise again on a later connection when the receipt did not reach the
+    /// server, so an application may see them twice.
+    WritesCouriered {
+        /// The id of the server's frame, which a relaying connection's
+        /// [`ConnettoConnection::ack_courier_notice`] takes.
+        notice_id: String,
+        /// The settled entries, one row each, naming the courier's account.
+        notices: Vec<CourierNoticeRow>,
+    },
 }
 
-/// A primary-key column value carried on a mutation event.
-#[derive(Debug, Clone, PartialEq)]
-pub enum KeyValue {
-    /// SQL NULL.
-    Null,
-    /// Integer key column.
-    Int(i64),
-    /// Real key column.
-    Real(f64),
-    /// Text key column.
-    Text(String),
-    /// Blob key column.
-    Blob(Vec<u8>),
-}
-
-impl From<Value<String, Vec<u8>>> for KeyValue {
-    fn from(value: Value<String, Vec<u8>>) -> Self {
-        match value {
-            Value::Null => Self::Null,
-            Value::Integer(int) => Self::Int(int),
-            Value::Real(real) => Self::Real(real),
-            Value::Text(text) => Self::Text(text),
-            Value::Blob(blob) => Self::Blob(blob),
-        }
+/// One primary-key column value as the client names it.
+pub(crate) fn key_value(value: Value<String, Vec<u8>>) -> KeyValue {
+    match value {
+        Value::Null => KeyValue::Null,
+        Value::Integer(int) => KeyValue::Int(int),
+        Value::Real(real) => KeyValue::Real(real),
+        Value::Text(text) => KeyValue::Text(text),
+        Value::Blob(blob) => KeyValue::Blob(blob),
     }
 }
 
@@ -1819,6 +1933,9 @@ enum Arrived<F> {
     Main(F),
     /// The wire draining an older major's held work (R31).
     Drain(F),
+    /// The wire dialing an older major for a courier range (R78 slice 4).
+    #[cfg(feature = "peer")]
+    Courier(F),
 }
 
 /// The run a restore rewound a writer below, re-sent from what the replica
@@ -2174,41 +2291,63 @@ pub(crate) fn rename_diffset(
 
 /// Decode a pushed changeset into the rows it touched, each as its table and
 /// primary key, for reporting on a rejected or conflicting mutation.
+fn affected_rows(changeset: &[u8], tables: &PolicyTables) -> Result<Vec<AffectedRow>, ClientError> {
+    Ok(written_rows(changeset, tables)?
+        .into_iter()
+        .map(|WrittenRow { table, key, .. }| AffectedRow { table, key })
+        .collect())
+}
+
+/// Decode a queued changeset into the rows it touched, each named as the
+/// application writes it.
 ///
 /// `tables` maps a split table's backing name back to the logical one the
 /// application wrote against, because a capture records what SQLite actually
 /// changed and the `INSTEAD OF` triggers change the backing table.
-fn affected_rows(changeset: &[u8], tables: &PolicyTables) -> Result<Vec<AffectedRow>, ClientError> {
-    let rows = op_keys(changeset)
+fn written_rows(changeset: &[u8], tables: &PolicyTables) -> Result<Vec<WrittenRow>, ClientError> {
+    Ok(op_keys(changeset)
         .map_err(|err| ClientError::Apply(format!("parsing pushed changeset: {err:?}")))?
         .into_iter()
-        .map(|(table, key)| AffectedRow {
+        .map(|WrittenRow { table, key, op }| WrittenRow {
             table: tables.logical(&table).map(str::to_owned).unwrap_or(table),
             key,
+            op,
         })
-        .collect();
-    Ok(rows)
+        .collect())
 }
 
 /// Every op of a changeset or patchset as its table, named as the payload
-/// names it, and its primary key, in payload order.
-pub(crate) fn op_keys(
-    bytes: &[u8],
-) -> Result<Vec<(String, Vec<KeyValue>)>, sqlite_diff_rs::ParseError> {
-    fn keyed(table: &str, key: Vec<Value<String, Vec<u8>>>) -> (String, Vec<KeyValue>) {
-        (
-            table.to_owned(),
-            key.into_iter().map(KeyValue::from).collect(),
-        )
+/// names it, its primary key and what it did to the row, in payload order.
+pub(crate) fn op_keys(bytes: &[u8]) -> Result<Vec<WrittenRow>, sqlite_diff_rs::ParseError> {
+    fn written(table: &str, key: Vec<Value<String, Vec<u8>>>, op: RowOp) -> WrittenRow {
+        WrittenRow {
+            table: table.to_owned(),
+            key: key.into_iter().map(key_value).collect(),
+            op,
+        }
     }
     Ok(match ParsedDiffSet::parse(bytes)? {
         ParsedDiffSet::Changeset(diff) => diff
             .iter()
-            .map(|op| keyed(op.table().name(), op.primary_key()))
+            .map(|op| {
+                let kind = match op {
+                    sqlite_diff_rs::ChangesetOp::Insert { .. } => RowOp::Insert,
+                    sqlite_diff_rs::ChangesetOp::Update { .. } => RowOp::Update,
+                    sqlite_diff_rs::ChangesetOp::Delete { .. } => RowOp::Delete,
+                };
+                written(op.table().name(), op.primary_key(), kind)
+            })
             .collect(),
         ParsedDiffSet::Patchset(diff) => diff
             .iter()
-            .map(|op| keyed(op.table().name(), op.primary_key()))
+            .map(|op| {
+                let kind = match op {
+                    sqlite_diff_rs::PatchsetOp::Insert { .. } => RowOp::Insert,
+                    sqlite_diff_rs::PatchsetOp::Update { .. } => RowOp::Update,
+                    sqlite_diff_rs::PatchsetOp::Delete { .. } => RowOp::Delete,
+                };
+                written(op.table().name(), op.primary_key(), kind)
+            })
             .collect(),
     })
 }
@@ -2847,8 +2986,8 @@ struct PeerApplyFrame {
 /// How a landed entry is stored when the receiver does not hold it yet.
 #[cfg(feature = "peer")]
 struct EntryToStore<'a> {
-    /// The application schema major the entry was captured under.
-    major: i64,
+    /// The entry's manifest row.
+    row: &'a connetto_core::exchange::ManifestRow,
     /// The entry's captured changeset.
     body: &'a [u8],
     /// When the entry was first received, in seconds.
@@ -2893,11 +3032,13 @@ fn land_peer_entry(
                 peer::store_entry(
                     db,
                     cx.author,
-                    cx.seq,
-                    store.major,
-                    store.body,
-                    store.received_at,
-                    store.position,
+                    &peer::NewEntry {
+                        row: store.row,
+                        state: peer::HeldState::Provisional,
+                        body: Some(store.body),
+                        received_at: store.received_at,
+                        position: store.position,
+                    },
                 )?;
                 store.position
             };
@@ -2912,6 +3053,30 @@ fn land_peer_entry(
         (Err(_), Some(cause)) => Ok(Err(cause)),
         (Err(err), None) => Err(err),
     }
+}
+
+/// Move one provisional entry's records to adjudicated and release their
+/// holdings, the rows handing to ordinary coverage (R77), answering whether
+/// a record still awaited its verdict.
+///
+/// # Errors
+///
+/// [`ClientError`] when the records or holdings cannot be read or written.
+#[cfg(feature = "peer")]
+fn adjudicate_provisional(
+    db: &mut SqliteConnection,
+    config: &ClientConfig,
+    author: &[u8],
+    seq: i64,
+) -> Result<bool, ClientError> {
+    let settled: Vec<(String, Vec<KeyValue>)> = provisional::records_of_entry(db, author, seq)?
+        .into_iter()
+        .filter(|record| record.state == provisional::ProvisionalState::Provisional)
+        .map(|record| (record.table, record.key))
+        .collect();
+    provisional::adjudicate_entry(db, author, seq)?;
+    holdings::release_provisional(db, config, &settled)?;
+    Ok(!settled.is_empty())
 }
 
 /// One re-applied entry's author, its sequence and the rows it lands, which
@@ -3001,7 +3166,11 @@ fn reapply_imported_peer_state(
                     head: cursor.head,
                 },
                 &cursor.offer,
+                cursor.expires_at,
             )?;
+        }
+        if let Some(cursor) = archived {
+            exchange::keep_later_expiry(db, author, cursor.expires_at)?;
         }
         above.insert(author, threshold);
     }
@@ -3014,15 +3183,23 @@ fn reapply_imported_peer_state(
             reapply_archived_entry(db, config, frame, entry, &mut next_position, &mut state)?;
         }
     }
+    peer::prune_retained(db)?;
     Ok(state)
 }
 
-/// One archived entry through the peer apply, recorded in `state` as landed
-/// or refused. An entry captured under another major is left alone.
+/// One archived entry restored (R78 decision 20). A provisional entry of
+/// this build's major goes through the peer apply, recorded in `state` as
+/// landed or refused, a refused one held courier-only (decision 3). A
+/// provisional entry of another major is held courier-only under its major
+/// (decision 43), and a courier-only, digest-only or retained entry is held
+/// as it is. An entry the receiver holds already stays as it stands.
 ///
 /// # Errors
 ///
-/// [`ClientError`] when the entry cannot be parsed or its apply fails.
+/// [`ClientError::Import`] when the entry names no state, a major the build
+/// cannot express, an origin that does not decode, or a body its digest does
+/// not name or that its state forbids, and [`ClientError`] when its apply or
+/// its hold fails.
 #[cfg(feature = "peer")]
 fn reapply_archived_entry(
     db: &mut SqliteConnection,
@@ -3032,49 +3209,90 @@ fn reapply_archived_entry(
     next_position: &mut i64,
     state: &mut PeerImportState,
 ) -> Result<(), ClientError> {
+    let malformed = |what: &str| ClientError::Import(format!("an archived peer entry {what}"));
+    let held = peer::HeldState::from_db(entry.state).map_err(|_| malformed("names no state"))?;
     let major = u32::try_from(entry.major)
         .ok()
         .and_then(Major::new)
-        .ok_or_else(|| {
-            ClientError::Import(
-                "an archived peer entry holds a major the build cannot express".to_owned(),
-            )
-        })?;
-    if Some(major) != config.schema_major {
-        return Ok(());
-    }
-    let diff = peer_changeset(
-        &config.policy_tables,
-        &entry.changeset,
-        "an archived peer entry",
-    )?;
+        .ok_or_else(|| malformed("holds a major the build cannot express"))?;
+    let origin = entry
+        .origin
+        .as_deref()
+        .map(rmp_serde::from_slice)
+        .transpose()
+        .map_err(|_| malformed("holds an origin that does not decode"))?;
+    let body = match (held, entry.changeset.as_deref()) {
+        (peer::HeldState::DigestOnly, None) => None,
+        (peer::HeldState::DigestOnly, Some(_)) => {
+            return Err(malformed("is digest-only and carries a body"));
+        }
+        (_, None) => return Err(malformed("carries no body")),
+        (_, Some(body)) => {
+            let digest: [u8; 32] = Sha256::digest(body).into();
+            if digest != entry.digest {
+                return Err(malformed("carries a body its digest does not name"));
+            }
+            Some(body)
+        }
+    };
+    let row = connetto_core::exchange::ManifestRow {
+        seq: u64::try_from(entry.seq).map_err(|_| malformed("holds a negative sequence"))?,
+        major,
+        origin,
+        digest: entry.digest,
+    };
     let author = peer::PeerAuthor {
         key_id: entry.author.clone(),
         account: entry.account.clone(),
         bot_list: entry.bot_list.clone(),
     };
-    let cx = peer::OpsContext {
-        config,
-        held: &frame.held,
-        author: &author,
-        seq: entry.seq,
-        receiver: &frame.receiver,
-        now: entry.received_at,
-    };
-    let store = EntryToStore {
-        major: entry.major,
-        body: &entry.changeset,
-        received_at: entry.received_at,
-        position: *next_position,
-    };
-    match land_peer_entry(db, &cx, frame.subjects.as_ref(), &diff, &store, None)? {
-        Ok((rows, position)) => {
-            *next_position = (*next_position).max(position + 1);
-            state.applied.push((author.key_id, entry.seq, rows));
+    let hold_as = match (held, body) {
+        (peer::HeldState::Provisional, Some(body)) if Some(major) == config.schema_major => {
+            let diff = peer_changeset(&config.policy_tables, body, "an archived peer entry")?;
+            let cx = peer::OpsContext {
+                config,
+                held: &frame.held,
+                author: &author,
+                seq: entry.seq,
+                receiver: &frame.receiver,
+                now: entry.received_at,
+            };
+            let store = EntryToStore {
+                row: &row,
+                body,
+                received_at: entry.received_at,
+                position: *next_position,
+            };
+            let Err(_) = land_peer_entry(db, &cx, frame.subjects.as_ref(), &diff, &store, None)?
+                .map(|(rows, position)| {
+                    *next_position = (*next_position).max(position + 1);
+                    state.applied.push((author.key_id.clone(), entry.seq, rows));
+                })
+            else {
+                return Ok(());
+            };
+            state.refused.push((
+                author.key_id.clone(),
+                entry.seq,
+                peer::entry_rows(diff.iter()),
+            ));
+            peer::HeldState::CourierOnly
         }
-        Err(_) => state
-            .refused
-            .push((author.key_id, entry.seq, peer::entry_rows(diff.iter()))),
+        (peer::HeldState::Provisional, _) => peer::HeldState::CourierOnly,
+        (held, _) => held,
+    };
+    if peer::store_entry(
+        db,
+        &author,
+        &peer::NewEntry {
+            row: &row,
+            state: hold_as,
+            body,
+            received_at: entry.received_at,
+            position: *next_position,
+        },
+    )? {
+        *next_position += 1;
     }
     Ok(())
 }
@@ -3631,6 +3849,9 @@ struct WriterQueue {
     /// leaves the server a gap. Held in memory only, since a new transport
     /// starts from nothing sent.
     sent_through: u64,
+    /// The sequences the server deferred and this transport has not sent
+    /// again yet. Held in memory only, like `sent_through`.
+    deferred: BTreeSet<u64>,
 }
 
 impl WriterQueue {
@@ -3642,6 +3863,7 @@ impl WriterQueue {
             secret: None,
             pending: BTreeMap::new(),
             sent_through: 0,
+            deferred: BTreeSet::new(),
         }
     }
 }
@@ -3726,6 +3948,7 @@ fn load_writer_states(
                 secret: stored_secret(row.secret),
                 pending: BTreeMap::new(),
                 sent_through: 0,
+                deferred: BTreeSet::new(),
             };
             Some((writer_from_id(&row.id)?, queue))
         })
@@ -3971,6 +4194,48 @@ fn load_pending(
     Ok(queues)
 }
 
+/// Queued writes read from a closed account's replica.
+#[derive(Debug, Default)]
+pub struct StoredReplicaWork {
+    /// Writes the server has not acknowledged.
+    pub unsynced: Vec<UnsyncedWrite>,
+    /// Their changesets ordered newest first for rollback.
+    pub changesets: Vec<Vec<u8>>,
+}
+
+/// Read queued writes without installing a schema or attaching shared storage.
+///
+/// The caller opens and unlocks the account replica before calling this.
+///
+/// # Errors
+///
+/// [`ClientError`] when the pending queue cannot be read.
+pub fn stored_replica_work(
+    connection: &mut SqliteConnection,
+) -> Result<StoredReplicaWork, ClientError> {
+    let queued = load_pending(connection)?;
+    let mut unsynced = Vec::new();
+    let mut changesets = Vec::new();
+    for (writer, entries) in queued {
+        for entry in entries {
+            unsynced.push(UnsyncedWrite {
+                writer,
+                seq: entry.seq,
+                major: entry.major,
+            });
+            changesets.push((entry.position, entry.changeset));
+        }
+    }
+    changesets.sort_unstable_by_key(|(position, _)| core::cmp::Reverse(*position));
+    Ok(StoredReplicaWork {
+        unsynced,
+        changesets: changesets
+            .into_iter()
+            .map(|(_, changeset)| changeset)
+            .collect(),
+    })
+}
+
 /// Remember a writer to retire on the next connection, with the secret a
 /// number writer was issued under.
 fn persist_retire(
@@ -4082,6 +4347,9 @@ struct HandshakeOk {
     writer: Option<WriterGrant>,
     schema_version: Option<SchemaVersion>,
     sunset_at_secs: Option<u64>,
+    /// Whether the deployment accepts courier ranges (R78 decision 1).
+    #[cfg(feature = "peer")]
+    courier: bool,
     #[cfg(feature = "device-identity")]
     challenge: Option<[u8; 32]>,
 }
@@ -4250,6 +4518,8 @@ where
                 writer: ack.writer,
                 schema_version: ack.schema_version,
                 sunset_at_secs: ack.sunset_at_secs,
+                #[cfg(feature = "peer")]
+                courier: ack.courier,
                 #[cfg(feature = "device-identity")]
                 challenge,
             })
@@ -4309,10 +4579,8 @@ async fn timer_wait(remaining: Duration) {
     use js_sys::wasm_bindgen::JsValue;
     use js_sys::wasm_bindgen::closure::Closure;
     let (tx, rx) = tokio::sync::oneshot::channel();
-    // The u32 clamp keeps the JS delay finite, so `try_from` cannot fail.
-    let ms = f64::from(
-        u32::try_from(remaining.as_millis().min(u128::from(u32::MAX))).unwrap_or(u32::MAX),
-    );
+    // Browser timers use a signed 32-bit millisecond delay.
+    let ms = f64::from(i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX));
     // The sender sits in a shared cell so the callback stays `Fn` (it takes
     // the sender at most once) and the fallback below can still settle a
     // page with no `setTimeout`.
@@ -4355,19 +4623,28 @@ async fn timer_wait(remaining: Duration) {
 /// `staging`. `apply_patch` merges staging into `applied_rows` only after the
 /// transaction commits, so a rolled-back apply leaves no phantom counts.
 /// One atomic load and one map bump per row, the O(1) the decision asked for.
+///
+/// A change to a table in `outbox_tables` raises `unsynced_moved`, since the
+/// unsynced snapshot reads those tables and the live refresh never sees them.
 fn install_change_tracker(
     conn: &mut SqliteConnection,
     changed: &Arc<Mutex<HashSet<String>>>,
     staging: &Arc<Mutex<HashMap<String, u64>>>,
     counting: &Arc<AtomicBool>,
+    unsynced_moved: &Arc<AtomicBool>,
+    outbox_tables: Vec<&'static str>,
 ) {
     let sink = Arc::clone(changed);
     let rows = Arc::clone(staging);
     let gate = Arc::clone(counting);
+    let moved = Arc::clone(unsynced_moved);
     conn.on_update(
         SqliteUpdateRouter::new().on_any(SqliteChangeOps::ALL, move |event| {
             if let Ok(mut tables) = sink.lock() {
                 tables.insert(event.table_name.to_owned());
+            }
+            if outbox_tables.contains(&event.table_name) {
+                moved.store(true, Ordering::Relaxed);
             }
             if gate.load(Ordering::Relaxed)
                 && !is_internal_table(event.table_name)
@@ -4433,6 +4710,14 @@ fn storage_request_id() -> String {
     )
 }
 
+/// A fresh request id for a relay tab's refusal dismissal.
+fn dismiss_request_id() -> String {
+    format!(
+        "dismiss-{}",
+        NEXT_SHARE_KEY_REQUEST.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+    )
+}
+
 static NEXT_DECLARATION_FENCE: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(1);
 
@@ -4458,6 +4743,10 @@ struct Wire<T> {
     /// Which of the connection's handshakes attached this wire.
     #[cfg(feature = "device-identity")]
     number: ConnectionNumber,
+    /// The courier notice frames a relaying connection received on this wire
+    /// and has not acked, in arrival order (R78 decision 41 as amended). They
+    /// go with the wire, since their ids name this connection's frames alone.
+    held_notices: Vec<CourierNotice>,
 }
 
 /// Which handshake of a [`ConnettoConnection`] a wire came from, counted from
@@ -4520,21 +4809,25 @@ struct ProvisionalAsk {
     offer: Vec<u8>,
     /// The sequences asked about, at most one manifest frame's rows.
     seqs: Vec<u64>,
+    /// Whether the ask is about retained rows, whose `Pending` answers mark
+    /// them candidates (R78 decision 45, R114 decision 1).
+    retained: bool,
 }
 
-/// The provisional ask sent and awaited, with the monotonic deadline its
-/// ruling is owed by, counted from the send.
+/// The ask sent and awaited, its id in the sent map, with the deadline its
+/// ruling is owed by.
 #[derive(Debug, Clone)]
 #[cfg(feature = "peer")]
 struct SentAsk {
-    /// The ask as sent.
-    ask: ProvisionalAsk,
+    /// The id of the ask in the sent map.
+    request_id: String,
     /// The monotonic deadline the ruling is owed by.
     deadline: Duration,
 }
 
-/// The session's provisional asks, the queued ones and the one sent and
-/// awaited, held together so the connection's future stays small.
+/// The session's provisional asks, the queued ones, the one sent and
+/// awaited and the ones sent on this connection, held together so the
+/// connection's future stays small.
 #[derive(Debug, Default, Clone)]
 #[cfg(feature = "peer")]
 struct ProvisionalQueue {
@@ -4542,6 +4835,9 @@ struct ProvisionalQueue {
     pending: VecDeque<ProvisionalAsk>,
     /// The ask sent and awaited, at most one at a time.
     in_flight: Option<SentAsk>,
+    /// The asks sent on this connection, keyed by request id, until the
+    /// connection ends, so a pushed ruling can name one (R77 slice 11).
+    sent: HashMap<String, ProvisionalAsk>,
 }
 
 #[cfg(feature = "peer")]
@@ -4554,6 +4850,201 @@ fn provisional_request_id() -> String {
     format!(
         "provisional-{}",
         NEXT_PROVISIONAL_REQUEST.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+/// How long a courier range waits for its answer before the wait drops
+/// (decision 33), the same bound a provisional ask waits under.
+#[cfg(feature = "peer")]
+const COURIER_RANGE_WAIT: Duration = Duration::from_secs(30);
+
+/// The slack a courier call's own bound keeps over the range's deadline, so
+/// the pump settles the lapse before the call gives up.
+#[cfg(feature = "peer")]
+const COURIER_CALL_SLACK: Duration = Duration::from_secs(5);
+
+/// One major's run of the held rows one courier range rides (R78 slice 4).
+#[derive(Debug)]
+#[cfg(feature = "peer")]
+struct PlannedRange {
+    /// The major the rows were captured under.
+    major: Major,
+    /// The bundle hash its server was built from.
+    version: Option<SchemaVersion>,
+    /// The manifest rows, in sequence order.
+    rows: Vec<connetto_core::exchange::ManifestRow>,
+    /// The bodies of the rows holding one, in sequence order.
+    bodies: Vec<(u64, Vec<u8>)>,
+}
+
+/// The author's held rows grouped by major, the ranges the call rides in
+/// major order (R78 slice 4).
+#[derive(Debug)]
+#[cfg(feature = "peer")]
+struct CourierPlan {
+    /// The account the author's stored offer names.
+    account: String,
+    /// The bytes the ranges' offer stands.
+    offer: Vec<u8>,
+    /// The ranges, the older majors first, each contiguous from its first
+    /// row to a gap or the manifest's bound.
+    ranges: Vec<PlannedRange>,
+}
+
+/// The wire the open courier range rides (R78 decision 47).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "peer")]
+enum CourierOpenWire {
+    /// The connection's own wire.
+    Main,
+    /// The device's own drain, draining the range's major (R31).
+    Drain,
+    /// The wire the range's major dials, attached or owed.
+    Courier,
+}
+
+/// A dial the session's courier range owes on its major's server, its backoff
+/// episode and the deadline the range's answer is owed by (R78 decision 47).
+#[derive(Debug)]
+#[cfg(feature = "peer")]
+struct CourierDrainOwed {
+    /// The major the range waits for.
+    major: Major,
+    /// The bundle hash its server was built from.
+    version: SchemaVersion,
+    /// The monotonic deadline the range's answer is owed by, the backoff's
+    /// lapses keeping it.
+    deadline: Duration,
+    /// The dial's backoff.
+    dial: drain::OwedDial,
+}
+
+/// One courier range the server is answering, its deadline and the wait's
+/// reply (R78 decisions 30 and 47), the open call's ranges in major order.
+#[derive(Debug)]
+#[cfg(feature = "peer")]
+struct CourierOpen {
+    /// The id the bodies and the answer quote, fresh for every range.
+    request_id: String,
+    /// The author's device key.
+    author: [u8; 32],
+    /// The sequences the call's ranges cover, for the kept report.
+    seqs: Vec<u64>,
+    /// The bytes the ranges' offer stands, sent beside each range.
+    offer: Vec<u8>,
+    /// The range riding the wire.
+    range: PlannedRange,
+    /// The ranges yet to ride the wire, in major order.
+    next: VecDeque<PlannedRange>,
+    /// The rulings the settled rows heard, across the ranges.
+    report: CourierReport,
+    /// The monotonic deadline the answer is owed by.
+    deadline: Duration,
+    /// Whether the wait dropped on the deadline, the range staying open for
+    /// its late answer.
+    wait_dropped: bool,
+    /// The wire the open range rides.
+    wire: CourierOpenWire,
+    /// The courier wire's device bind the range waits on, while one is
+    /// outstanding.
+    #[cfg(feature = "device-identity")]
+    bind: Option<String>,
+    /// The wait's reply, `None` once it dropped.
+    reply: Option<tokio::sync::oneshot::Sender<Result<CourierReport, CourierError>>>,
+}
+
+/// A courier range queued behind the open one, its reply `None` when the
+/// caller heard [`CourierError::QueuedBehindLateAnswer`] at once.
+#[derive(Debug)]
+#[cfg(feature = "peer")]
+struct CourierQueued {
+    /// The author's device key.
+    author: [u8; 32],
+    /// The wait's reply, when the caller is still waiting.
+    reply: Option<tokio::sync::oneshot::Sender<Result<CourierReport, CourierError>>>,
+    /// The report settled so far, when the call re-queued on an advance
+    /// whose next range holds for the device's bind.
+    report: Option<CourierReport>,
+    /// The call's whole sequences, beside the report.
+    seqs: Option<Vec<u64>>,
+}
+
+/// The stance a courier range takes against the session's device bind (R78
+/// decision 31 and its 2026-11-10 refinement): a range that rides the main
+/// wire waits for the main bind, one that rides a wire the device certifies
+/// there (the dial, its own drain) waits only for the keys, and a range the
+/// session cannot certify fails at once, no frame riding.
+#[cfg(feature = "peer")]
+enum CourierStance {
+    /// The range's wire certifies the device ahead of the range, or the
+    /// device is bound: the range rides.
+    Ride,
+    /// The range's wire still owes the device a bind (the main bind, owed
+    /// or deferring to the keys arriving, or the keys for the dial's own):
+    /// the call holds in the queue.
+    Hold,
+    /// No bind can come this session: the call fails at once without
+    /// sending, the author standing a candidate.
+    Uncertified,
+}
+
+/// Why an author's courier rows wait, cleared by the next offer (decisions 7
+/// and 29), a ruling taking the writer's exclusion and a session the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "peer")]
+enum CourierExclusion {
+    /// The rows wait for the author's next offer, the answer having stopped
+    /// at one of them (`NotCouriered` or `SequenceGap`).
+    NewOffer,
+    /// The rows wait for the next session, the refusal being the
+    /// deployment's (`Uncertified` or `AuthorBanned`).
+    NextSession,
+    /// The rows wait for the author's next ruling, its writer having dropped
+    /// out (`NotEnrolled`, `WriterRetired` or `Unverified`).
+    NextRuling,
+}
+
+/// The session's courier ranges, the open one, the queued ones, the authors
+/// whose rows wait and the candidates last raised (R78 slice 4), held
+/// together so the connection's future stays small.
+#[derive(Debug, Default)]
+#[cfg(feature = "peer")]
+struct CourierQueue {
+    /// Whether the deployment's courier path is on, the attach's flag.
+    enabled: bool,
+    /// The range sent and awaited, at most one at a time.
+    open: Option<CourierOpen>,
+    /// The ranges queued behind it, in call order.
+    queued: VecDeque<CourierQueued>,
+    /// The authors whose rows wait, and why.
+    excluded: BTreeMap<[u8; 32], CourierExclusion>,
+    /// The sequences the server ruled Pending on, the candidates' last
+    /// ruling.
+    heard: BTreeMap<[u8; 32], BTreeSet<u64>>,
+    /// The retained rows the session's asks answered Pending, beside the
+    /// other candidates until a ruling names them (R78 decision 45).
+    marked: BTreeMap<[u8; 32], BTreeSet<u64>>,
+    /// The candidates last raised, author by author.
+    raised: BTreeMap<[u8; 32], CourierCandidate>,
+    /// The dial the open range owes on its major's server (R78 decision 47).
+    drain_owed: Option<CourierDrainOwed>,
+    /// How many courier dials the session has owed, so a stale timer is
+    /// recognized.
+    drain_dials: u64,
+    /// The majors the server no longer serves, author by author, until the
+    /// next session (R78 decision 47).
+    unserved: BTreeMap<[u8; 32], BTreeSet<Major>>,
+}
+
+#[cfg(feature = "peer")]
+static NEXT_COURIER_REQUEST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+/// A fresh request id for a courier range this session will send.
+#[cfg(feature = "peer")]
+fn courier_request_id() -> String {
+    format!(
+        "courier-{}",
+        NEXT_COURIER_REQUEST.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
     )
 }
 
@@ -4592,6 +5083,7 @@ const MEMBERSHIP_LABEL_PREFIX: &str = "connetto-membership:";
 pub struct ConnettoConnection<T: Transport> {
     /// The live socket, absent when no server is reachable.
     wire: Option<Wire<T>>,
+    courier_audit: courier_audit::CourierAuditState,
     /// The second wire draining an older major's held work, boxed since it is idle nearly always (R31).
     drain: Box<drain::Drain<T>>,
     /// The run this caller's work belongs to, absent until a first handshake
@@ -4602,6 +5094,10 @@ pub struct ConnettoConnection<T: Transport> {
     /// State changes waiting to be handed to the application, drained ahead of
     /// the transport so an offline connection can still report itself.
     notices: VecDeque<ClientEvent>,
+    /// Whether this connection relays courier notices to other connections,
+    /// holding each frame until [`Self::ack_courier_notice`] names it, rather
+    /// than acking it at once (R78 decision 41 as amended).
+    relays_courier_notices: bool,
     /// How many handshakes this connection has completed.
     #[cfg(feature = "device-identity")]
     handshakes: u64,
@@ -4629,6 +5125,14 @@ pub struct ConnettoConnection<T: Transport> {
     /// small.
     #[cfg(feature = "peer")]
     provisional: Box<ProvisionalQueue>,
+    /// The session's courier ranges, boxed so the connection's future stays
+    /// small.
+    #[cfg(feature = "peer")]
+    courier: Box<CourierQueue>,
+    /// The wire dialing an older major for the open courier range, absent
+    /// while its dial is owed or nothing owes one (R78 decision 47).
+    #[cfg(feature = "peer")]
+    courier_wire: Option<T>,
     /// A device bind signed and held, sent once the number's tail settles.
     #[cfg(feature = "device-identity")]
     pending_bind: Option<WriterTask>,
@@ -4663,6 +5167,13 @@ pub struct ConnettoConnection<T: Transport> {
     /// Names of tables whose rows changed since the last drain, from the
     /// connection's update hook (local writes and server patches alike).
     changed: Arc<Mutex<HashSet<String>>>,
+    /// Raised whenever the unsynced snapshot may have moved: a write to a
+    /// table it reads, a send, a deferral or a relayed snapshot. Taken by
+    /// whoever follows the snapshot.
+    unsynced_moved: Arc<AtomicBool>,
+    /// The latest snapshot a relay mirror's worker stated, which a mirror
+    /// answers from since its worker owns the outbox.
+    relayed_unsynced: UnsyncedWork,
     /// Rows applied per application table since the last residual pass, the
     /// R60 measure. Accumulated via `apply_staging` during each apply and
     /// merged here only after the transaction commits.
@@ -4752,6 +5263,8 @@ pub struct ConnettoConnection<T: Transport> {
     relay_share_key_waits: RelayWaits<()>,
     /// A relay mirror's storage reads awaiting their answers.
     relay_storage_waits: RelayWaits<StorageUse>,
+    /// A relay mirror's refusal dismissals awaiting their answers.
+    relay_dismiss_waits: RelayWaits<()>,
     /// The earliest parsed expiry of a held key, refreshed at every set
     /// change, so an unrelated frame never parses a grant.
     share_key_expiry: Option<i64>,
@@ -4852,6 +5365,7 @@ fn install_replica_metadata(
         "ALTER TABLE _connetto_meta ADD COLUMN cursor_subjects BLOB",
         "ALTER TABLE _connetto_pending ADD COLUMN major INTEGER",
         acked::VERSION_COLUMN,
+        acked::DISMISSED_COLUMN,
     ]
     .into_iter();
     #[cfg(feature = "peer")]
@@ -4864,20 +5378,24 @@ fn install_replica_metadata(
             Err(error) => return Err(error.into()),
         }
     }
-    db.batch_execute(subscriptions::SUBSCRIPTION_DDL)?;
+    subscriptions::install(db)?;
     db.batch_execute(holdings::HOLDING_DDL)?;
-    // After the subscription tables, since it references `_connetto_query`.
-    db.batch_execute(aggregates::AGGREGATE_DDL)?;
+    // Each statistic's resting table is created when its columns arrive.
+    db.batch_execute(aggregates::LEGACY_DDL)?;
     #[cfg(feature = "device-identity")]
     db.batch_execute(enrolment::CERTIFICATE_DDL)?;
     #[cfg(feature = "peer")]
     db.batch_execute(provisional::PROVISIONAL_DDL)?;
     #[cfg(feature = "peer")]
-    db.batch_execute(peer::PEER_ENTRY_DDL)?;
-    #[cfg(feature = "peer")]
-    db.batch_execute(author::RETRACTION_DDL)?;
-    #[cfg(feature = "peer")]
-    db.batch_execute(exchange::PEER_CURSOR_DDL)?;
+    {
+        let now = crate::clock::now_secs(db)?;
+        peer::upgrade_entries(db)?;
+        db.batch_execute(peer::PEER_ENTRY_DDL)?;
+        db.batch_execute(author::RETRACTION_DDL)?;
+        exchange::upgrade_cursors(db, now)?;
+        db.batch_execute(exchange::PEER_CURSOR_DDL)?;
+        peer::prune_retained(db)?;
+    }
     // A watch the previous run died still holding counts down from now.
     subscriptions::anchor_launch(db)?;
     Ok(())
@@ -4931,7 +5449,7 @@ fn install_replica_schema<S: ReplicaStorage>(
             majors::Record::Current => Some(build),
             majors::Record::Unrecorded => None,
             majors::Record::Behind(from) => {
-                majors::prepare_rebuild(db, from, config.held_content)?;
+                majors::prepare_rebuild(db, from, config.content_hooks)?;
                 Some(from.major)
             }
         };
@@ -5141,7 +5659,19 @@ where
         }
         let schema_open = Arc::new(AtomicBool::new(false));
         outbox::guard_schema(&mut db, &schema_open);
-        install_change_tracker(&mut db, &changed, &apply_staging, &apply_counting);
+        let unsynced_moved = Arc::new(AtomicBool::new(true));
+        let outbox_tables = ["_connetto_pending", "_connetto_acked"]
+            .into_iter()
+            .chain(config.content_hooks.tables.iter().copied())
+            .collect();
+        install_change_tracker(
+            &mut db,
+            &changed,
+            &apply_staging,
+            &apply_counting,
+            &unsynced_moved,
+            outbox_tables,
+        );
         {
             let dirty = Arc::clone(&dirty);
             db.on_commit(move || {
@@ -5156,9 +5686,11 @@ where
 
         let mut conn = Self {
             wire: None,
+            courier_audit: courier_audit::CourierAuditState::default(),
             run: None,
             attach_replay: AttachReplay::Idle,
             notices: VecDeque::new(),
+            relays_courier_notices: false,
             #[cfg(feature = "device-identity")]
             handshakes: 0,
             db,
@@ -5172,6 +5704,10 @@ where
             writer_in_flight: None,
             #[cfg(feature = "peer")]
             provisional: Box::default(),
+            #[cfg(feature = "peer")]
+            courier: Box::default(),
+            #[cfg(feature = "peer")]
+            courier_wire: None,
             #[cfg(feature = "device-identity")]
             pending_bind: None,
             #[cfg(feature = "device-identity")]
@@ -5186,6 +5722,8 @@ where
             write_flags,
             schema_open,
             changed,
+            unsynced_moved,
+            relayed_unsynced: UnsyncedWork::default(),
             applied_rows,
             apply_counting,
             apply_staging,
@@ -5220,6 +5758,7 @@ where
             share_key_save_pending: false,
             relay_share_key_waits: HashMap::new(),
             relay_storage_waits: HashMap::new(),
+            relay_dismiss_waits: HashMap::new(),
             share_key_expiry: None,
             share_key_deadline: None,
             share_key_armed: 0,
@@ -5485,6 +6024,7 @@ where
         {
             self.handshakes += 1;
         }
+        self.courier_audit.disconnected();
         self.wire = Some(Wire {
             transport,
             connection_id: ack.connection_id,
@@ -5492,6 +6032,7 @@ where
             challenge: ack.challenge,
             #[cfg(feature = "device-identity")]
             number: ConnectionNumber(self.handshakes),
+            held_notices: Vec::new(),
         });
         // The ack is the first inbound frame, so the clock starts with it.
         self.keepalive = KeepalivePhase::Idle {
@@ -5513,6 +6054,10 @@ where
             .push_back(ClientEvent::SyncStatus(SyncStatus::Connected));
         // Relaxed: same-task flag, no ordering dependency.
         self.dirty.store(true, Ordering::Relaxed);
+        // The durable record alone stands for what is owed at a fresh
+        // connection, so a queue an operation left behind no connection goes
+        // before the re-queueing and nothing sends twice.
+        self.writer_tasks.clear();
         #[cfg(feature = "device-identity")]
         self.plan_bind().await?;
         // A retirement owed before the last connection is re-sent here, queued
@@ -5526,7 +6071,12 @@ where
         }
         self.flush_writer_tasks().await?;
         self.resume_attach().await?;
-        // The session's asks go out once the replay stands, one per author.
+        // The deployment's courier path stands from the ack, the session's
+        // ranges, exclusions and candidates fresh (R78 decision 1).
+        #[cfg(feature = "peer")]
+        self.reset_courier_state(ack.courier);
+        // The session's asks go out once the replay stands, one per author,
+        // the resync's retained ones beside them when the row owes them.
         #[cfg(feature = "peer")]
         self.plan_provisional_asks().await?;
         Ok(())
@@ -5979,9 +6529,9 @@ where
     }
 
     /// Plan the session's provisional asks (R77 decision 11) for every author
-    /// its provisional records name and the replica holds a signed offer from,
-    /// the author's sequences in ascending chunks of one manifest frame, one
-    /// ask each.
+    /// whose provisional records or unretained entries the replica holds and
+    /// whose signed offer it stores, the author's sequences in ascending
+    /// chunks of one manifest frame, one ask each.
     ///
     /// An author the replica holds no stored offer from is never asked, its
     /// rows waiting for the author's frontier over a link.
@@ -6001,32 +6551,87 @@ where
                     .push(row.seq);
             }
         }
-        for (author, mut seqs) in by_author {
-            let Ok(key) = <[u8; 32]>::try_from(author.as_slice()) else {
-                continue;
-            };
-            let Some(offer) = exchange::offer_of(&mut self.db, &key)? else {
-                continue;
-            };
-            seqs.sort_unstable();
-            seqs.dedup();
-            let seqs: Vec<u64> = seqs
-                .into_iter()
-                .map(|seq| u64::try_from(seq).unwrap_or(u64::MAX))
-                .collect();
-            for chunk in seqs.chunks(connetto_core::exchange::MAX_MANIFEST_ROWS) {
-                self.provisional.pending.push_back(ProvisionalAsk {
-                    author: key,
-                    request_id: provisional_request_id(),
-                    offer: offer.clone(),
-                    seqs: chunk.to_vec(),
-                });
-            }
+        // Every stored entry but the retained awaits its ruling, a provisional
+        // one whose records a patch confirmed among them (R115 decision 1).
+        for (author, seq) in peer::unretained(&mut self.db)? {
+            by_author.entry(author).or_default().push(seq);
         }
+        for (author, seqs) in by_author {
+            // An author without a stored offer or a 32-byte key asks for
+            // nothing.
+            self.queue_author_asks(&author, seqs, false)?;
+        }
+        // Every session asks about the retained rows after these (R114 decision 1).
+        self.plan_retained_asks()?;
         self.flush_provisional_asks().await
     }
 
-    /// Send the next queued provisional ask, one at a time.
+    /// Queue the session's asks about the authors' retained rows, one per
+    /// manifest frame of an author's sequences (R114 decision 1).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the rows or the offers cannot be read.
+    #[cfg(feature = "peer")]
+    fn plan_retained_asks(&mut self) -> Result<(), ClientError> {
+        let mut by_author: BTreeMap<Vec<u8>, Vec<i64>> = BTreeMap::new();
+        for (author, seq) in peer::retained_rows(&mut self.db)? {
+            by_author.entry(author).or_default().push(seq);
+        }
+        for (author, seqs) in by_author {
+            self.queue_author_asks(&author, seqs, true)?;
+        }
+        Ok(())
+    }
+
+    /// Queue an author's provisional asks, one per manifest frame of its
+    /// sequences up to the stored offer's frontier (R77, R78 decision 52).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the stored offer cannot be read.
+    #[cfg(feature = "peer")]
+    fn queue_author_asks(
+        &mut self,
+        author: &[u8],
+        mut seqs: Vec<i64>,
+        retained: bool,
+    ) -> Result<(), ClientError> {
+        let Ok(key) = <[u8; 32]>::try_from(author) else {
+            return Ok(());
+        };
+        let Some(offer) = exchange::offer_of(&mut self.db, &key)? else {
+            return Ok(());
+        };
+        // The server refuses a whole ask naming a sequence past the offer's
+        // frontier, so a later sequence waits for the author's next offer.
+        let Some(frontier) = rmp_serde::from_slice::<connetto_core::exchange::SignedOffer>(&offer)
+            .ok()
+            .and_then(|signed| signed.offer.frontier().map(|frontier| frontier.seq))
+        else {
+            return Ok(());
+        };
+        seqs.sort_unstable();
+        seqs.dedup();
+        let seqs: Vec<u64> = seqs
+            .into_iter()
+            .map(|seq| u64::try_from(seq).unwrap_or(u64::MAX))
+            .filter(|seq| *seq <= frontier)
+            .collect();
+        for chunk in seqs.chunks(connetto_core::exchange::MAX_MANIFEST_ROWS) {
+            self.provisional.pending.push_back(ProvisionalAsk {
+                author: key,
+                request_id: provisional_request_id(),
+                offer: offer.clone(),
+                seqs: chunk.to_vec(),
+                retained,
+            });
+        }
+        Ok(())
+    }
+
+    /// Send the next queued provisional ask, one at a time, and register it
+    /// among this connection's sent asks.
     ///
     /// # Errors
     ///
@@ -6053,57 +6658,70 @@ where
             ))
             .await
             .map_err(|err| ClientError::Transport(err.to_string()))?;
+        let request_id = ask.request_id.clone();
+        self.provisional.sent.insert(ask.request_id.clone(), ask);
         self.provisional.in_flight = Some(SentAsk {
-            ask,
+            request_id,
             deadline: crate::away::SystemClock.monotonic() + PROVISIONAL_ASK_WAIT,
         });
         Ok(())
     }
 
-    /// Settle the ask a `NonFatalError` or `RateLimited` names, stopping this
-    /// session's ask of that author, which the next one re-asks (R77
-    /// decision 11).
+    /// Drop the ask `related_to` names, and forget it from the sent asks on
+    /// a refusal, the server having opened nothing of it, keeping it on a
+    /// lapse for the push the server still owes (R77 slice 11), naming the
+    /// ask's author so the courier candidates can restate.
     #[cfg(feature = "peer")]
-    fn drop_provisional_ask(&mut self, related_to: Option<&str>) {
-        let Some(related_to) = related_to else {
-            return;
-        };
+    fn drop_provisional_ask(
+        &mut self,
+        related_to: Option<&str>,
+        forget_sent: bool,
+    ) -> Option<[u8; 32]> {
+        let related_to = related_to?;
+        let author = self.provisional.sent.get(related_to).map(|ask| ask.author);
         if self
             .provisional
             .in_flight
             .as_ref()
-            .is_some_and(|sent| sent.ask.request_id == related_to)
+            .is_some_and(|sent| sent.request_id == related_to)
         {
-            let author = self
-                .provisional
-                .in_flight
-                .take()
-                .expect("the ask matched")
-                .ask
-                .author;
-            self.provisional.pending.retain(|ask| ask.author != author);
+            self.provisional.in_flight = None;
+            self.provisional
+                .pending
+                .retain(|ask| ask.author != author.expect("the in-flight ask was sent"));
         }
+        if forget_sent {
+            self.provisional.sent.remove(related_to);
+        }
+        author
     }
 
-    /// Drop the wait on a provisional ask that overran its bound, the ask
-    /// re-owing itself at the next session, the connection standing (R77
-    /// decision 11).
+    /// Drop the wait on an over-bound provisional ask, which re-ows itself at
+    /// the next session (R77 decision 11), restating the author's courier
+    /// candidates on the way.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the rows or the stored offer cannot be read.
     #[cfg(feature = "peer")]
-    fn check_provisional_deadlines(&mut self) {
+    fn check_provisional_deadlines(&mut self) -> Result<(), ClientError> {
         let Some(sent) = self.provisional.in_flight.as_ref() else {
-            return;
+            return Ok(());
         };
         if crate::away::SystemClock.monotonic() >= sent.deadline {
             tracing::debug!("the provisional ruling overran its bound, dropping the ask");
-            let request_id = sent.ask.request_id.clone();
-            self.drop_provisional_ask(Some(request_id.as_str()));
+            let request_id = sent.request_id.clone();
+            if let Some(author) = self.drop_provisional_ask(Some(request_id.as_str()), false) {
+                self.raise_courier_candidates_if_changed(author)?;
+            }
         }
+        Ok(())
     }
 
-    /// Apply a ruling's verdicts (R77 decision 11): `Applied` and `Settled`
-    /// adjudicate the sequence the way the frontier does, `Refused` and
-    /// `Abandoned` retract the entry through the retraction, and `Pending`
-    /// keeps it.
+    /// Apply a ruling's verdicts for the ask it names among this connection's
+    /// sent asks, skipping a sequence whose record no longer awaits a verdict,
+    /// and hand the queue on only when that ask is the in-flight one (R77
+    /// slice 11).
     ///
     /// # Errors
     ///
@@ -6112,93 +6730,1701 @@ where
     async fn settle_provisional_ask(
         &mut self,
         answer: &connetto_core::messages::ProvisionalVerdicts,
-    ) -> Result<ClientEvent, ClientError> {
-        // A ruling that quotes no open ask stands ignored, and the one it
-        // stands beside stays owed (R77).
+    ) -> Result<Option<ClientEvent>, ClientError> {
+        // A ruling that names no ask this connection sent stands ignored (R77).
+        let Some(sent) = self.provisional.sent.get(&answer.request_id) else {
+            return Ok(Some(ClientEvent::NonFatal {
+                related_to: Some(answer.request_id.clone()),
+                detail: "a provisional ruling arrived with no open ask".to_owned(),
+            }));
+        };
+        let author = sent.author;
+        let retained = sent.retained;
+        let mut applied = false;
+        for (seq, verdict) in &answer.verdicts {
+            if self.settle_verdict_row(&author, *seq, verdict, false)? {
+                applied = true;
+                if matches!(verdict, connetto_core::exchange::Verdict::Pending) {
+                    self.courier.heard.entry(author).or_default().insert(*seq);
+                }
+                continue;
+            }
+            if retained
+                && matches!(verdict, connetto_core::exchange::Verdict::Pending)
+                && self.courier.marked.entry(author).or_default().insert(*seq)
+            {
+                self.courier.heard.entry(author).or_default().insert(*seq);
+                applied = true;
+            }
+        }
+        // A ruling stands for the author, so its rows wait no longer for one
+        // held back by a courier refusal (R78 slice 4).
+        if matches!(
+            self.courier.excluded.get(&author),
+            Some(CourierExclusion::NextRuling)
+        ) {
+            self.courier.excluded.remove(&author);
+        }
+        self.raise_courier_candidates_if_changed(author)?;
+        // Only the in-flight ask's ruling hands the queue on (R77 slice 11).
         if self
             .provisional
             .in_flight
             .as_ref()
-            .is_none_or(|sent| sent.ask.request_id != answer.request_id)
+            .is_some_and(|sent| sent.request_id == answer.request_id)
         {
-            return Ok(ClientEvent::NonFatal {
-                related_to: Some(answer.request_id.clone()),
-                detail: "a provisional ruling arrived with no open ask".to_owned(),
-            });
+            self.provisional.in_flight = None;
+            self.flush_provisional_asks().await?;
         }
-        let ask = self
-            .provisional
-            .in_flight
-            .take()
-            .expect("the ruling named the open ask")
-            .ask;
-        for (seq, verdict) in &answer.verdicts {
-            match verdict {
-                connetto_core::exchange::Verdict::Applied
-                | connetto_core::exchange::Verdict::Settled => {
-                    self.adjudicate_peer_seq(&ask.author, *seq)?;
-                }
-                connetto_core::exchange::Verdict::Refused(cause) => {
-                    self.retract_peer_entry(
-                        &peer::PeerAuthor {
-                            key_id: ask.author.to_vec(),
-                            account: String::new(),
-                            bot_list: None,
-                        },
-                        &connetto_core::exchange::Retraction {
-                            seq: *seq,
-                            cause: cause.clone(),
-                        },
-                    )?;
-                }
-                connetto_core::exchange::Verdict::Abandoned => {
-                    self.retract_peer_entry(
-                        &peer::PeerAuthor {
-                            key_id: ask.author.to_vec(),
-                            account: String::new(),
-                            bot_list: None,
-                        },
-                        &connetto_core::exchange::Retraction {
-                            seq: *seq,
-                            cause: connetto_core::exchange::RetractCause::Abandoned,
-                        },
-                    )?;
-                }
-                connetto_core::exchange::Verdict::Pending => {}
-            }
-        }
-        self.flush_provisional_asks().await?;
-        Ok(ClientEvent::NonFatal {
+        Ok(applied.then(|| ClientEvent::NonFatal {
             related_to: Some(answer.request_id.clone()),
             detail: "a provisional ruling was applied".to_owned(),
-        })
+        }))
     }
 
-    /// Adjudicate one stored peer entry on a verdict (R77): its records move
-    /// to adjudicated and the entry goes, the rows handing to ordinary
-    /// coverage.
+    /// Whether one author's sequence still awaits a verdict, its stored entry
+    /// held unretained, or with no stored entry its records standing
+    /// provisional (R77 slice 11, R78 held-row table).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the entry or the records cannot be read.
+    #[cfg(feature = "peer")]
+    fn seq_awaits_verdict(&mut self, author: &[u8], seq: u64) -> Result<bool, ClientError> {
+        let seq = i64::try_from(seq).unwrap_or(i64::MAX);
+        match peer::state_of(&mut self.db, author, seq)? {
+            Some(peer::HeldState::Retained) => Ok(false),
+            Some(
+                peer::HeldState::Provisional
+                | peer::HeldState::CourierOnly
+                | peer::HeldState::DigestOnly,
+            ) => Ok(true),
+            None => Ok(provisional::records_of_entry(&mut self.db, author, seq)?
+                .iter()
+                .any(|record| record.state == provisional::ProvisionalState::Provisional)),
+        }
+    }
+
+    /// Adjudicate one held peer entry on a verdict (R77): a provisional
+    /// entry's records move to adjudicated, the rows handing to ordinary
+    /// coverage, and the entry is retained until its author's certificate
+    /// ends (R78 decision 17). `by_courier` says this device's courier call
+    /// carried the verdict.
     ///
     /// # Errors
     ///
     /// [`ClientError`] when the entry or the records cannot be read or
     /// written.
     #[cfg(feature = "peer")]
-    fn adjudicate_peer_seq(&mut self, author: &[u8], seq: u64) -> Result<(), ClientError> {
+    fn adjudicate_peer_seq(
+        &mut self,
+        author: &[u8],
+        seq: u64,
+        by_courier: bool,
+    ) -> Result<(), ClientError> {
         let seq = i64::try_from(seq).unwrap_or(i64::MAX);
         let _exempt = ExemptWrites::raise(&self.write_flags);
         let config = &self.config;
-        self.db.transaction::<_, ClientError, _>(|db| {
-            let settled: Vec<(String, Vec<KeyValue>)> =
-                provisional::records_of_entry(db, author, seq)?
-                    .into_iter()
-                    .filter(|record| record.state == provisional::ProvisionalState::Provisional)
-                    .map(|record| (record.table, record.key))
-                    .collect();
-            provisional::adjudicate_entry(db, author, seq)?;
-            holdings::release_provisional(db, config, &settled)?;
-            peer::delete_entry(db, author, seq)?;
-            Ok(())
+        let settled = self.db.transaction::<_, ClientError, _>(|db| {
+            let settled = match peer::state_of(db, author, seq)? {
+                // A record with no stored entry still moves, as R77 left it.
+                Some(peer::HeldState::Provisional) | None => {
+                    adjudicate_provisional(db, config, author, seq)?
+                }
+                Some(peer::HeldState::CourierOnly | peer::HeldState::DigestOnly) => false,
+                Some(peer::HeldState::Retained) => return Ok(false),
+            };
+            peer::retain(db, author, seq)?;
+            peer::prune_retained(db)?;
+            Ok(settled)
+        })?;
+        if settled {
+            self.notices.push_back(ClientEvent::ProvisionalSettled {
+                author: author.to_vec(),
+                seq,
+                by_courier,
+            });
+        }
+        self.settle_pruned_marks()
+    }
+
+    /// The retention pass may have taken a marked retained row, so its mark
+    /// drops and the author's candidates restate (R78 slice 4).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the rows or the stored offer cannot be read.
+    #[cfg(feature = "peer")]
+    fn settle_pruned_marks(&mut self) -> Result<(), ClientError> {
+        if self.courier.marked.is_empty() {
+            return Ok(());
+        }
+        let authors: Vec<[u8; 32]> = self.courier.marked.keys().copied().collect();
+        for author in authors {
+            let marked: Vec<u64> = self.courier.marked[&author].iter().copied().collect();
+            let mut dropped = false;
+            for seq in marked {
+                if peer::state_of(
+                    &mut self.db,
+                    &author,
+                    i64::try_from(seq).unwrap_or(i64::MAX),
+                )?
+                .is_none()
+                {
+                    self.courier
+                        .marked
+                        .get_mut(&author)
+                        .expect("the mark stood")
+                        .remove(&seq);
+                    dropped = true;
+                }
+            }
+            if dropped {
+                self.raise_courier_candidates_if_changed(author)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The session's courier state stands fresh from the attach's flag
+    /// (R78 decision 1), the previous session's ranges and exclusions gone.
+    #[cfg(feature = "peer")]
+    fn reset_courier_state(&mut self, on: bool) {
+        self.courier.enabled = on;
+        self.courier.open = None;
+        self.courier.queued.clear();
+        self.courier.excluded.clear();
+        self.courier.heard.clear();
+        self.courier.marked.clear();
+        self.courier.raised.clear();
+        self.courier.drain_owed = None;
+        self.courier.drain_dials = 0;
+        self.courier.unserved.clear();
+        self.courier_wire = None;
+    }
+
+    /// Settle one author's sequence on a verdict (R77, R78 slice 4),
+    /// reporting whether the row still awaited it, a row the server ruled
+    /// twice changing nothing the second time (decision 44).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the verdict cannot be applied.
+    #[cfg(feature = "peer")]
+    fn settle_verdict_row(
+        &mut self,
+        author: &[u8],
+        seq: u64,
+        verdict: &connetto_core::exchange::Verdict,
+        by_courier: bool,
+    ) -> Result<bool, ClientError> {
+        let seq_db = i64::try_from(seq).unwrap_or(i64::MAX);
+        let abandoned = matches!(verdict, connetto_core::exchange::Verdict::Abandoned);
+        // A retained row the session's asks answered Pending ends its
+        // candidacy on whatever ruling names it, staying retained unless the
+        // ruling is Abandoned (R78 decision 45, R114 decision 2).
+        if let Ok(key) = <[u8; 32]>::try_from(author)
+            && let Some(mark) = self.courier.marked.get_mut(&key)
+            && mark.remove(&seq)
+        {
+            if abandoned {
+                peer::delete_entry(&mut self.db, author, seq_db)?;
+            }
+            return Ok(true);
+        }
+        // An Abandoned ruling takes a retained row no candidacy marked
+        // (R114 decision 2).
+        if abandoned
+            && matches!(
+                peer::state_of(&mut self.db, author, seq_db)?,
+                Some(peer::HeldState::Retained)
+            )
+        {
+            peer::delete_entry(&mut self.db, author, seq_db)?;
+            return Ok(true);
+        }
+        if !self.seq_awaits_verdict(author, seq)? {
+            return Ok(false);
+        }
+        match verdict {
+            connetto_core::exchange::Verdict::Applied
+            | connetto_core::exchange::Verdict::Settled => {
+                self.adjudicate_peer_seq(author, seq, by_courier)?;
+            }
+            cause @ (connetto_core::exchange::Verdict::Refused(_)
+            | connetto_core::exchange::Verdict::Abandoned) => {
+                let cause = match cause {
+                    connetto_core::exchange::Verdict::Refused(cause) => cause.clone(),
+                    _ => connetto_core::exchange::RetractCause::Abandoned,
+                };
+                self.retract_peer_entry(
+                    &peer::PeerAuthor {
+                        key_id: author.to_vec(),
+                        account: String::new(),
+                        bot_list: None,
+                    },
+                    &connetto_core::exchange::Retraction { seq, cause },
+                )?;
+            }
+            connetto_core::exchange::Verdict::Pending => {}
+        }
+        Ok(true)
+    }
+
+    /// The ranges the courier offers one author (R78 slice 4): its held rows
+    /// of each major the build's major stands or the stored offer builds,
+    /// contiguous from the lowest and running to the offer's frontier, beside
+    /// the bodies that cross. `None` when the path is off, the author waits
+    /// excluded, or it holds no stored offer.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the cursor or the held rows cannot be read, or a
+    /// stored offer does not decode.
+    #[cfg(feature = "peer")]
+    fn courier_plan(&mut self, author: [u8; 32]) -> Result<Option<CourierPlan>, ClientError> {
+        if !self.courier.enabled || self.courier.excluded.contains_key(&author) {
+            return Ok(None);
+        }
+        let Some(build) = self.config.schema_major else {
+            return Ok(None);
+        };
+        let Some((offer, account)) = exchange::offer_and_account(&mut self.db, &author)? else {
+            return Ok(None);
+        };
+        let signed: connetto_core::exchange::SignedOffer = rmp_serde::from_slice(&offer[..])
+            .map_err(|_| ClientError::Session("a stored offer does not decode".to_owned()))?;
+        // The range runs to the offer's frontier (R78 decision 52), the
+        // higher of its signed settled and newest.
+        let frontier = signed.offer.frontier().map_or(i64::MAX, |frontier| {
+            i64::try_from(frontier.seq).unwrap_or(i64::MAX)
+        });
+        let marked: Option<Vec<i64>> = self.courier.marked.get(&author).map(|rows| {
+            rows.iter()
+                .map(|seq| i64::try_from(*seq).unwrap_or(i64::MAX))
+                .collect()
+        });
+        let held = peer::held_at_or_below(&mut self.db, &author, frontier, marked)?;
+        Ok(Some(Self::plan_ranges(
+            offer,
+            account,
+            &signed.offer.builds,
+            held,
+            build,
+            self.config.schema_version.as_ref(),
+            self.courier.unserved.get(&author),
+        )))
+    }
+
+    /// Group the held rows into the ranges the call rides (R78 slice 4): one
+    /// per major in major order, the majors the build stands or the offer
+    /// builds, each contiguous from its first row to a gap or the
+    /// manifest's bound, the majors the server no longer serves out.
+    #[cfg(feature = "peer")]
+    fn plan_ranges(
+        offer: Vec<u8>,
+        account: String,
+        builds: &[(Major, SchemaVersion)],
+        held: Vec<peer::HeldRow>,
+        build: Major,
+        build_version: Option<&SchemaVersion>,
+        unserved: Option<&BTreeSet<Major>>,
+    ) -> CourierPlan {
+        let mut ranges: Vec<PlannedRange> = Vec::new();
+        let mut last: Option<(Major, i64)> = None;
+        for row in held {
+            if row.major > build
+                || unserved.is_some_and(|majors| majors.contains(&row.major))
+                || (row.major < build && !builds.iter().any(|(major, _)| *major == row.major))
+            {
+                // The major's rows ride their own dial or wait for the next
+                // session, so they hold.
+                last = None;
+                continue;
+            }
+            let contiguous =
+                last.is_some_and(|(major, seq)| major == row.major && row.seq == seq + 1);
+            if !contiguous {
+                ranges.push(PlannedRange {
+                    major: row.major,
+                    version: if row.major == build {
+                        build_version.cloned()
+                    } else {
+                        builds
+                            .iter()
+                            .find(|(major, _)| *major == row.major)
+                            .map(|(_, version)| version.clone())
+                    },
+                    rows: Vec::new(),
+                    bodies: Vec::new(),
+                });
+            }
+            let range = ranges.last_mut().expect("the run stands");
+            last = Some((row.major, row.seq));
+            if range.rows.len() >= connetto_core::exchange::MAX_MANIFEST_ROWS {
+                // The run stands full, so the row and its run's tail hold.
+                continue;
+            }
+            let seq = u64::try_from(row.seq).unwrap_or(u64::MAX);
+            range.rows.push(connetto_core::exchange::ManifestRow {
+                seq,
+                major: row.major,
+                origin: row.origin,
+                digest: row.digest,
+            });
+            if let Some(changeset) = row.changeset {
+                range.bodies.push((seq, changeset));
+            }
+        }
+        CourierPlan {
+            account,
+            offer,
+            ranges,
+        }
+    }
+
+    /// One author's courier candidates, the run of its held rows the ranges
+    /// stand beside its account, the bytes and the last ruling heard on its
+    /// lowest sequence, `None` while the path is off, the author waits
+    /// excluded, or it holds no rows to offer (R78 decision 16).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the cursor or the held rows cannot be read, or a
+    /// stored offer does not decode.
+    #[cfg(feature = "peer")]
+    fn courier_candidate(
+        &mut self,
+        author: [u8; 32],
+    ) -> Result<Option<CourierCandidate>, ClientError> {
+        let Some(plan) = self.courier_plan(author)? else {
+            return Ok(None);
+        };
+        let mut seqs: Vec<u64> = Vec::new();
+        let mut bytes: u64 = 0;
+        for range in &plan.ranges {
+            for row in &range.rows {
+                seqs.push(row.seq);
+            }
+            for (_, body) in &range.bodies {
+                bytes = bytes.saturating_add(u64::try_from(body.len()).unwrap_or(0));
+            }
+        }
+        if seqs.is_empty() {
+            return Ok(None);
+        }
+        let last = seqs
+            .first()
+            .filter(|seq| {
+                self.courier
+                    .heard
+                    .get(&author)
+                    .is_some_and(|heard| heard.contains(seq))
+            })
+            .map(|_| connetto_core::exchange::Verdict::Pending);
+        Ok(Some(CourierCandidate {
+            author: author.to_vec(),
+            account: plan.account,
+            seqs,
+            bytes,
+            last,
+        }))
+    }
+
+    /// The session's courier candidates, one per author with a stored offer,
+    /// author order (R78 decision 16), the empty list when the path is off.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the cursors or the held rows cannot be read.
+    #[cfg(feature = "peer")]
+    pub fn courier_candidates(&mut self) -> Result<Vec<CourierCandidate>, ClientError> {
+        let mut candidates = Vec::new();
+        for cursor in exchange::all_cursors(&mut self.db)? {
+            let Ok(author) = <[u8; 32]>::try_from(cursor.author.as_slice()) else {
+                continue;
+            };
+            if let Some(candidate) = self.courier_candidate(author)? {
+                candidates.push(candidate);
+            }
+        }
+        Ok(candidates)
+    }
+
+    /// Courier the author's held rows to the server on the main wire (R78
+    /// decision 48): the range goes out when none is open, queues behind the
+    /// open one otherwise, holds in the queue while the wire the range
+    /// would ride still owes the device a bind (the main bind, owed or
+    /// deferring to the keys arriving, or the dial's own), and the wait
+    /// resolves as the pump settles the answer, the lapse or the session's
+    /// end.
+    ///
+    /// # Errors
+    ///
+    /// [`CourierError`] when the path is off (`Unavailable`), the author's
+    /// range is outstanding or queued (`Busy`), it holds nothing to offer
+    /// (`NothingHeld`), it is queued behind a late answer
+    /// (`QueuedBehindLateAnswer`), or a send fails. When no device bind can
+    /// come this session the call fails at once
+    /// `Refused(Uncertified)`, no frame riding and the author standing a
+    /// candidate. A held call ends `TimedOut` when its bound runs out and
+    /// `SessionLost` when the session ends before the bind answers.
+    #[cfg(feature = "peer")]
+    pub(crate) async fn courier(&mut self, author: [u8; 32]) -> Result<CourierWait, CourierError> {
+        if self.wire.is_none() || !self.courier.enabled {
+            return Err(CourierError::Unavailable);
+        }
+        let busy = self
+            .courier
+            .open
+            .as_ref()
+            .is_some_and(|open| open.author == author)
+            || self
+                .courier
+                .queued
+                .iter()
+                .any(|queued| queued.author == author);
+        if busy {
+            return Err(CourierError::Busy);
+        }
+        // A range whose bound already ran out has dropped its wait (decision
+        // 33), so a call for another author hears the queue at once.
+        if let Some(open) = self.courier.open.as_mut()
+            && (open.wait_dropped || crate::away::SystemClock.monotonic() >= open.deadline)
+        {
+            open.wait_dropped = true;
+            if let Some(reply) = open.reply.take() {
+                let _ = reply.send(Err(CourierError::TimedOut));
+            }
+        }
+        let Some(plan) = self.courier_plan(author)? else {
+            return Err(CourierError::NothingHeld);
+        };
+        if plan.ranges.is_empty() {
+            return Err(CourierError::NothingHeld);
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        // A queued call waits out what is left of the open range's bound,
+        // then its own (decision 48).
+        let now = crate::away::SystemClock.monotonic();
+        let open_deadline = self.courier.open.as_ref().map(|open| {
+            open.deadline.saturating_sub(now) + COURIER_RANGE_WAIT + COURIER_CALL_SLACK
+        });
+        let wait_dropped = self
+            .courier
+            .open
+            .as_ref()
+            .is_some_and(|open| open.wait_dropped);
+        if let Some(bound) = open_deadline {
+            if wait_dropped {
+                self.courier.queued.push_back(CourierQueued {
+                    author,
+                    reply: None,
+                    report: None,
+                    seqs: None,
+                });
+                return Err(CourierError::QueuedBehindLateAnswer);
+            }
+            self.courier.queued.push_back(CourierQueued {
+                author,
+                reply: Some(tx),
+                report: None,
+                seqs: None,
+            });
+            return Ok(CourierWait {
+                receiver: rx,
+                bound,
+            });
+        }
+        // No open range: ride the call's first range, or hold the call for
+        // the session's device bind (decision 48).
+        self.open_courier_range(author, plan, tx, rx).await
+    }
+
+    /// Ride `plan`'s first range as the open one (decision 48), hold the
+    /// call in the queue for the wire's device bind, or fail at once
+    /// `Refused(Uncertified)` when no bind can come this session, no frame
+    /// riding.
+    ///
+    /// # Errors
+    ///
+    /// [`CourierError::Client`] when the send fails, and
+    /// [`CourierError::Refused`] with `Uncertified` when no device bind can
+    /// come this session.
+    #[cfg(feature = "peer")]
+    async fn open_courier_range(
+        &mut self,
+        author: [u8; 32],
+        plan: CourierPlan,
+        tx: tokio::sync::oneshot::Sender<Result<CourierReport, CourierError>>,
+        rx: tokio::sync::oneshot::Receiver<Result<CourierReport, CourierError>>,
+    ) -> Result<CourierWait, CourierError> {
+        let mut ranges = plan.ranges;
+        let range = ranges.remove(0);
+        let stance = self.courier_stance(&range).map_err(CourierError::Client)?;
+        match stance {
+            CourierStance::Uncertified => {
+                // No bind can come this session, so the range would ride its
+                // wire uncertified: fail at once without sending, the author
+                // standing a candidate.
+                return Err(CourierError::Refused(
+                    connetto_core::exchange::CourierRefusal::Uncertified,
+                ));
+            }
+            CourierStance::Hold => {
+                // The wire still owes the device a bind, so the call waits
+                // in the queue for the bind's answer rather than ride
+                // uncertified.
+                self.courier.queued.push_back(CourierQueued {
+                    author,
+                    reply: Some(tx),
+                    report: None,
+                    seqs: None,
+                });
+                let bound = WRITER_ANSWER_WAIT + COURIER_RANGE_WAIT + COURIER_CALL_SLACK;
+                return Ok(CourierWait {
+                    receiver: rx,
+                    bound,
+                });
+            }
+            CourierStance::Ride => {}
+        }
+        let mut seqs: Vec<u64> = range.rows.iter().map(|row| row.seq).collect();
+        for pending in &ranges {
+            seqs.extend(pending.rows.iter().map(|row| row.seq));
+        }
+        let next = VecDeque::from(ranges);
+        let bound = COURIER_RANGE_WAIT
+            .saturating_mul(u32::try_from(1 + next.len()).expect("the ranges fit"))
+            + COURIER_CALL_SLACK;
+        let offer = plan.offer;
+        let wire = self.courier_range_wire(&range);
+        let request_id = courier_request_id();
+        let result = self
+            .send_on_wire(wire, &request_id, author, &offer, &range)
+            .await;
+        if let Err(err) = result {
+            self.courier_send_failed(wire)
+                .await
+                .map_err(CourierError::Client)?;
+            return Err(CourierError::Client(err));
+        }
+        self.courier.open = Some(CourierOpen {
+            request_id,
+            author,
+            seqs,
+            offer,
+            range,
+            next,
+            report: CourierReport::default(),
+            deadline: crate::away::SystemClock.monotonic() + COURIER_RANGE_WAIT,
+            wait_dropped: false,
+            wire,
+            #[cfg(feature = "device-identity")]
+            bind: None,
+            reply: Some(tx),
+        });
+        Ok(CourierWait {
+            receiver: rx,
+            bound,
         })
+    }
+
+    /// The wire a range of `major` rides (R78 decision 47): the main wire
+    /// for the build's major, the device's own drain while it drains the
+    /// major, and the courier's dial otherwise, owed when nothing rides it
+    /// yet.
+    #[cfg(feature = "peer")]
+    fn courier_range_wire(&mut self, range: &PlannedRange) -> CourierOpenWire {
+        if Some(range.major) == self.config.schema_major {
+            return CourierOpenWire::Main;
+        }
+        if self.drain.wire_mut().is_some() && self.draining_major() == Some(range.major) {
+            return CourierOpenWire::Drain;
+        }
+        if self.courier_wire.is_none() {
+            self.courier.drain_dials += 1;
+            self.courier.drain_owed = Some(CourierDrainOwed {
+                major: range.major,
+                version: range
+                    .version
+                    .clone()
+                    .expect("the range's major stands a version"),
+                deadline: crate::away::SystemClock.monotonic() + COURIER_RANGE_WAIT,
+                dial: drain::OwedDial::fresh(),
+            });
+        }
+        CourierOpenWire::Courier
+    }
+
+    /// The stance `range` takes against the session's device bind (R78
+    /// decision 31 and its 2026-11-10 refinement): the range would ride its
+    /// wire uncertified, so the call holds for the bind the wire owes, or
+    /// fails at once when no bind can come this session, the author
+    /// standing a candidate.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the device's certificate cannot be read.
+    #[cfg(feature = "peer")]
+    fn courier_stance(&mut self, range: &PlannedRange) -> Result<CourierStance, ClientError> {
+        // The main wire stands certified by the session's writer: a
+        // bound number or device, or a device bind still owed.
+        if Some(range.major) == self.config.schema_major {
+            if matches!(
+                self.bound_writer,
+                Some(WriterRef::Number(_) | WriterRef::Device(_))
+            ) {
+                return Ok(CourierStance::Ride);
+            }
+            #[cfg(feature = "device-identity")]
+            {
+                // A bind owed, in flight or queued, will answer and flush
+                // the held call.
+                let owed = self
+                    .writer_tasks
+                    .iter()
+                    .chain(self.writer_in_flight.iter())
+                    .chain(self.pending_bind.iter())
+                    .any(|task| matches!(task.kind, WriterTaskKind::Bind { .. }));
+                if owed {
+                    return Ok(CourierStance::Hold);
+                }
+                // A stored certificate defers the bind to the keys
+                // arriving, so the session still owes a bound device.
+                if self.device_bindable()? && self.writer_keys.is_none() {
+                    return Ok(CourierStance::Hold);
+                }
+            }
+            return Ok(CourierStance::Uncertified);
+        }
+        // The device's own drain certifies the device on its own wire.
+        if self.drain.wire_mut().is_some() && self.draining_major() == Some(range.major) {
+            return Ok(CourierStance::Ride);
+        }
+        // The dial certifies the device on its own wire, once the
+        // certificate and keys stand.
+        #[cfg(feature = "device-identity")]
+        {
+            if !self.device_bindable()? {
+                return Ok(CourierStance::Uncertified);
+            }
+            if self.writer_keys.is_none() {
+                return Ok(CourierStance::Hold);
+            }
+        }
+        #[cfg(not(feature = "device-identity"))]
+        {
+            // A build without a device identity certifies no dial.
+            return Ok(CourierStance::Uncertified);
+        }
+        Ok(CourierStance::Ride)
+    }
+
+    /// Send one courier range and its declared bodies on `wire` (R78
+    /// decisions 5 and 28), the range first on the control plane and each
+    /// body on the bulk plane in sequence order.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Transport`] when a frame cannot be sent, and the
+    /// compression failure a body surfaces.
+    #[cfg(feature = "peer")]
+    async fn send_courier_range(
+        wire: &mut T,
+        request_id: &str,
+        author: [u8; 32],
+        offer: &[u8],
+        range: &PlannedRange,
+    ) -> Result<(), ClientError> {
+        wire.send_control(ControlMessage::CourierRange(
+            connetto_core::messages::CourierRange {
+                request_id: request_id.to_owned(),
+                author,
+                offer: offer.to_vec(),
+                rows: range.rows.clone(),
+                bodies: u32::try_from(range.bodies.len()).expect("the bodies fit the count"),
+            },
+        ))
+        .await
+        .map_err(|err| ClientError::Transport(err.to_string()))?;
+        for (seq, changeset) in &range.bodies {
+            wire.send_bulk(BulkMessage::CourierBody(
+                connetto_core::messages::CourierBody {
+                    request_id: request_id.to_owned(),
+                    seq: *seq,
+                    changeset_zstd: zstd::encode_all(&changeset[..], ZSTD_LEVEL)?,
+                },
+            ))
+            .await
+            .map_err(|err| ClientError::Transport(err.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Send `range` and its declared bodies on `wire` (R78 decisions 5 and
+    /// 47): the main wire for the build's major, the device's own drain
+    /// while it drains the major, and nothing yet for a courier dial that
+    /// owns the range until it attaches.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::NotConnected`] when the wire is gone, and the send's
+    /// own transport or compression failure.
+    #[cfg(feature = "peer")]
+    async fn send_on_wire(
+        &mut self,
+        wire: CourierOpenWire,
+        request_id: &str,
+        author: [u8; 32],
+        offer: &[u8],
+        range: &PlannedRange,
+    ) -> Result<(), ClientError> {
+        match wire {
+            CourierOpenWire::Main => {
+                let Some(wire) = self.wire.as_mut() else {
+                    return Err(ClientError::NotConnected);
+                };
+                Self::send_courier_range(&mut wire.transport, request_id, author, offer, range)
+                    .await
+            }
+            CourierOpenWire::Drain => {
+                let Some(drain) = self.drain.wire_mut() else {
+                    return Err(ClientError::NotConnected);
+                };
+                Self::send_courier_range(drain, request_id, author, offer, range).await
+            }
+            // The courier's dial owns the range until it attaches, so
+            // nothing goes yet (R78 decision 47).
+            CourierOpenWire::Courier => Ok(()),
+        }
+    }
+
+    /// Close the call's courier wire and clear its owed dial, when one
+    /// stands (R78 decision 47), so a successor range dials its own wire.
+    #[cfg(feature = "peer")]
+    async fn close_courier_wire(&mut self) {
+        if let Some(mut wire) = self.courier_wire.take() {
+            let _ = wire.close().await;
+        }
+        self.courier.drain_owed = None;
+    }
+
+    /// Whether the open courier range rides the device's own drain wire
+    /// (R78 decision 47), whose batch then finishes beside the open range
+    /// and whose wire stands until the range's answer settles.
+    #[cfg(feature = "peer")]
+    pub(crate) fn courier_rides_the_drain(&self) -> bool {
+        self.courier
+            .open
+            .as_ref()
+            .is_some_and(|open| matches!(open.wire, CourierOpenWire::Drain))
+    }
+
+    /// Drop the wire a courier range's send failed on (R78 decision 47):
+    /// the main wire's loss ends the session, the drain's and the
+    /// courier's drop themselves and redial, the healthy main session
+    /// standing.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the dropped courier's queue cannot be read or
+    /// sent.
+    #[cfg(feature = "peer")]
+    async fn courier_send_failed(&mut self, wire: CourierOpenWire) -> Result<(), ClientError> {
+        match wire {
+            CourierOpenWire::Main => {
+                self.disconnected();
+                Ok(())
+            }
+            CourierOpenWire::Drain => {
+                self.drain_wire_failed().await;
+                Ok(())
+            }
+            CourierOpenWire::Courier => self.drop_courier_wire().await,
+        }
+    }
+
+    /// Send the next queued courier range, one at a time, and register it as
+    /// the open one (decision 30), a call whose rows no longer stand hearing
+    /// `NothingHeld` at once.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the rows cannot be read or a send fails.
+    #[cfg(feature = "peer")]
+    async fn flush_courier_ranges(&mut self) -> Result<(), ClientError> {
+        loop {
+            if self.courier.open.is_some() {
+                return Ok(());
+            }
+            let Some(mut queued) = self.courier.queued.pop_front() else {
+                return Ok(());
+            };
+            let author = queued.author;
+            let plan = match self.courier_plan(author) {
+                Ok(Some(plan)) if !plan.ranges.is_empty() => plan,
+                Ok(_) => {
+                    if let Some(reply) = queued.reply {
+                        let _ = reply.send(Err(CourierError::NothingHeld));
+                    }
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            let mut ranges = plan.ranges;
+            let range = ranges.remove(0);
+            let stance = self.courier_stance(&range)?;
+            match stance {
+                CourierStance::Uncertified => {
+                    // No bind can come this session: end the held call
+                    // without sending, the author standing a candidate.
+                    if let Some(reply) = queued.reply {
+                        let _ = reply.send(Err(CourierError::Refused(
+                            connetto_core::exchange::CourierRefusal::Uncertified,
+                        )));
+                    }
+                    continue;
+                }
+                CourierStance::Hold => {
+                    // The wire still owes the device a bind, so the call
+                    // stands queued for the bind's answer to flush it.
+                    self.courier.queued.push_front(queued);
+                    return Ok(());
+                }
+                CourierStance::Ride => {}
+            }
+            let seqs = queued.seqs.take().unwrap_or_else(|| {
+                let mut seqs: Vec<u64> = range.rows.iter().map(|row| row.seq).collect();
+                for pending in &ranges {
+                    seqs.extend(pending.rows.iter().map(|row| row.seq));
+                }
+                seqs
+            });
+            let next = VecDeque::from(ranges);
+            let offer = plan.offer;
+            let wire = self.courier_range_wire(&range);
+            let request_id = courier_request_id();
+            let result = self
+                .send_on_wire(wire, &request_id, author, &offer, &range)
+                .await;
+            if let Err(err) = result {
+                self.courier.queued.push_front(queued);
+                return Err(err);
+            }
+            self.courier.open = Some(CourierOpen {
+                request_id,
+                author,
+                seqs,
+                offer,
+                range,
+                next,
+                report: queued.report.take().unwrap_or_default(),
+                deadline: crate::away::SystemClock.monotonic() + COURIER_RANGE_WAIT,
+                wait_dropped: false,
+                wire,
+                #[cfg(feature = "device-identity")]
+                bind: None,
+                reply: queued.reply,
+            });
+            return Ok(());
+        }
+    }
+
+    /// Drop the wait on an over-bound courier range (R78 decisions 33 and
+    /// 47): the main and drain lapses hold the range open for its late
+    /// answer, the courier lapse ends the call and its dial, the rows kept.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the queued ranges cannot be read or sent.
+    #[cfg(feature = "peer")]
+    async fn check_courier_deadline(&mut self) -> Result<(), ClientError> {
+        let Some(open) = self.courier.open.as_ref() else {
+            return Ok(());
+        };
+        if open.wait_dropped || crate::away::SystemClock.monotonic() < open.deadline {
+            return Ok(());
+        }
+        if matches!(open.wire, CourierOpenWire::Courier) {
+            return self.drop_courier_wire().await;
+        }
+        tracing::debug!("the courier answer overran its bound, dropping the wait");
+        let open = self.courier.open.as_mut().expect("the open range stands");
+        open.wait_dropped = true;
+        if let Some(reply) = open.reply.take() {
+            let _ = reply.send(Err(CourierError::TimedOut));
+        }
+        Ok(())
+    }
+
+    /// End the open courier call with `reply` (R78 decision 47): the range's
+    /// answer goes out, the courier wire closes, the owed dial goes, the
+    /// author's candidates are restated and the queue flushed.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the candidates cannot be restated or the queued
+    /// ranges cannot be read or sent.
+    #[cfg(feature = "peer")]
+    async fn end_courier_call(
+        &mut self,
+        open: CourierOpen,
+        reply: CourierError,
+    ) -> Result<(), ClientError> {
+        if let Some(sender) = open.reply {
+            let _ = sender.send(Err(reply));
+        }
+        self.close_courier_wire().await;
+        self.courier.drain_owed = None;
+        self.raise_courier_candidates_if_changed(open.author)?;
+        self.flush_courier_ranges().await
+    }
+
+    /// Open the device key and sign the wire's `challenge` with it, the bind
+    /// standing under `key_id`, a fresh request id on (R78 decision 47).
+    ///
+    /// The device holding another key now stands `None`, the callers moving
+    /// the old key's rows or uncertifying the range.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::DeviceChip`] when the key cannot be opened or the bind
+    /// cannot be signed.
+    #[cfg(feature = "device-identity")]
+    pub(crate) async fn sign_device_bind(
+        keys: &Arc<dyn crate::enrolment::DeviceKeys>,
+        challenge: &[u8; 32],
+        key_id: [u8; 32],
+    ) -> Result<Option<(String, Vec<u8>)>, ClientError> {
+        let opened = keys.open().await?;
+        if *connetto_core::device_cert::key_id(&*opened.key).as_bytes() != key_id {
+            return Ok(None);
+        }
+        let signature = opened
+            .key
+            .sign(&connetto_core::messages::writer_bind_message(challenge))
+            .map_err(|err| {
+                ClientError::DeviceChip(crate::device_key::ChipError::Failed(Box::new(err)))
+            })?;
+        let request_id = crate::writer_request_id();
+        Ok(Some((request_id, signature)))
+    }
+
+    /// Close and forget the courier wire and end the range it was dialing
+    /// for, the rows kept and the queue flushed (R78 decision 47).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the queued ranges cannot be read or sent.
+    #[cfg(feature = "peer")]
+    async fn drop_courier_wire(&mut self) -> Result<(), ClientError> {
+        self.close_courier_wire().await;
+        self.courier.drain_owed = None;
+        let Some(open) = self.courier.open.take() else {
+            return self.flush_courier_ranges().await;
+        };
+        self.end_courier_call(open, CourierError::TimedOut).await
+    }
+
+    /// The dial the open courier range owes on its major's server (R78
+    /// decision 47), whoever pumps the connection sleeping on it.
+    #[cfg(feature = "peer")]
+    #[must_use]
+    pub fn courier_drain_timer(&self) -> Option<drain::DrainTimer> {
+        self.courier
+            .drain_owed
+            .as_ref()
+            .map(|owed| drain::DrainTimer::new(self.courier.drain_dials, owed.dial.wait()))
+    }
+
+    /// A dial for `timer` failed, so the courier's dial backs off, the
+    /// range's deadline keeping its bound (R78 decision 47).
+    #[cfg(feature = "peer")]
+    pub fn courier_drain_dial_failed(&mut self, timer: drain::DrainTimer) {
+        if self
+            .courier
+            .drain_owed
+            .as_ref()
+            .is_some_and(|_| self.courier.drain_dials == timer.armed())
+        {
+            self.courier.drain_dials += 1;
+            if let Some(owed) = self.courier.drain_owed.as_mut() {
+                owed.dial.back_off();
+            }
+        }
+    }
+
+    /// The server no longer serves `major` for the author, so its rows wait
+    /// for the next session out of the candidates (R78 decision 47).
+    #[cfg(feature = "peer")]
+    fn major_unserved(&mut self, author: [u8; 32], major: Major) {
+        self.courier
+            .unserved
+            .entry(author)
+            .or_default()
+            .insert(major);
+    }
+
+    /// Present the held major the open range's dial owes over `transport`
+    /// (R78 decision 47), the device writer bound once it answers and the
+    /// range riding the wire when the bind stands.
+    ///
+    /// A stale or lapsed `timer` drops the transport unused, a refusal
+    /// saying the major is gone ends the call `MajorUnserved`, an off
+    /// courier path answers `Unavailable`, and anything else backs the dial
+    /// off.
+    ///
+    /// # Errors
+    ///
+    /// A failure to read or write the queued rows.
+    #[cfg(feature = "peer")]
+    pub async fn attach_courier_drain(
+        &mut self,
+        timer: drain::DrainTimer,
+        mut transport: T,
+    ) -> Result<(), ClientError> {
+        let Some(owed) = self.courier.drain_owed.as_ref() else {
+            let _ = transport.close().await;
+            return Ok(());
+        };
+        if self.courier.drain_dials != timer.armed() {
+            // A stale dial drops the transport unused.
+            let _ = transport.close().await;
+            return Ok(());
+        }
+        let (major, deadline, version) = (owed.major, owed.deadline, owed.version.clone());
+        if crate::away::SystemClock.monotonic() >= deadline {
+            // The range's bound ran out while the dial was owed, so the
+            // call ends now, the rows kept.
+            let _ = transport.close().await;
+            self.courier.drain_owed = None;
+            let Some(open) = self.courier.open.take() else {
+                return Ok(());
+            };
+            return self.end_courier_call(open, CourierError::TimedOut).await;
+        }
+        #[cfg(not(feature = "device-identity"))]
+        {
+            // A build without a device identity holds no device writer to
+            // bind, so the range is uncertified.
+            let _ = transport.close().await;
+            self.uncertify_courier_range().await?;
+            return Ok(());
+        }
+        let writer = self.drain_writer(major);
+        let request = if let Some(WriterRef::Device(key_id)) = writer {
+            if let Some(WriterRequest::Device) = self.drain_device_request(key_id)? {
+                WriterRequest::Device
+            } else {
+                // The certificate stands no bind, so the range is uncertified.
+                let _ = transport.close().await;
+                self.uncertify_courier_range().await?;
+                return Ok(());
+            }
+        } else {
+            // Files alone ride a wire that names no writer, and the device
+            // request does until a bind follows it.
+            WriterRequest::Device
+        };
+        let outcome = self
+            .handshake_majored_wire(&mut transport, major, version, request, None)
+            .await;
+        match outcome {
+            Ok(ack) => self.attach_courier_ack(ack, transport).await,
+            Err(err) => {
+                self.attach_courier_refused(err, major, timer, transport)
+                    .await
+            }
+        }
+    }
+
+    /// The courier wire's ack (R78 decision 47): the courier path off
+    /// answers `Unavailable` and closes the wire, the device writer bound
+    /// once it answers, and a range the device cannot certify uncertified.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the device cannot be opened, the bind cannot be
+    /// signed or sent, or the queue cannot be flushed.
+    #[cfg(feature = "peer")]
+    async fn attach_courier_ack(
+        &mut self,
+        ack: HandshakeOk,
+        mut transport: T,
+    ) -> Result<(), ClientError> {
+        if !ack.courier {
+            // The courier path is off on the major's server.
+            let _ = transport.close().await;
+            self.courier.drain_owed = None;
+            let Some(open) = self.courier.open.take() else {
+                return Ok(());
+            };
+            return self.end_courier_call(open, CourierError::Unavailable).await;
+        }
+        self.courier_wire = Some(transport);
+        let (Some(challenge), Some(keys)) = (ack.challenge, self.writer_keys.clone()) else {
+            // The device cannot sign the bind, so the range is uncertified.
+            return self.uncertify_courier_range().await;
+        };
+        let Some(held) = self.device_certificate()? else {
+            // The certificate is gone, so the range is uncertified.
+            return self.uncertify_courier_range().await;
+        };
+        let key_id = *held.leaf.identity().key().as_bytes();
+        let Some((request_id, signature)) =
+            Self::sign_device_bind(&keys, &challenge, key_id).await?
+        else {
+            // The device holds another key now, so the range is uncertified.
+            return self.uncertify_courier_range().await;
+        };
+        let Some(wire) = self.courier_wire.as_mut() else {
+            return Ok(());
+        };
+        if let Err(err) = wire
+            .send_control(ControlMessage::BindDevice(
+                connetto_core::messages::BindDevice {
+                    request_id: request_id.clone(),
+                    key_id,
+                    signature,
+                },
+            ))
+            .await
+        {
+            tracing::warn!(error = %err, "the courier wire failed while binding the device");
+            return self.uncertify_courier_range().await;
+        }
+        let Some(open) = self.courier.open.as_mut() else {
+            // The range is gone, so the dial's wire goes.
+            if let Some(mut wire) = self.courier_wire.take() {
+                let _ = wire.close().await;
+            }
+            return Ok(());
+        };
+        open.bind = Some(request_id);
+        self.courier.drain_owed = None;
+        Ok(())
+    }
+
+    /// The courier dial's refused handshake (R78 decision 47): the major
+    /// gone ends the call `MajorUnserved`, a revoked session ends it
+    /// `SessionLost`, a revoked device redials uncertified, and anything
+    /// else backs the dial off.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the device exclusion or the queue fails.
+    #[cfg(feature = "peer")]
+    async fn attach_courier_refused(
+        &mut self,
+        err: ClientError,
+        major: Major,
+        timer: drain::DrainTimer,
+        mut transport: T,
+    ) -> Result<(), ClientError> {
+        match crate::drain::drain_refusal_class(&err) {
+            crate::drain::DrainRefusal::MajorGone => {
+                // The major is gone, so its rows wait for the next session.
+                let Some(open) = self.courier.open.take() else {
+                    let _ = transport.close().await;
+                    return Ok(());
+                };
+                self.major_unserved(open.author, major);
+                let _ = transport.close().await;
+                self.end_courier_call(open, CourierError::MajorUnserved(major))
+                    .await
+            }
+            crate::drain::DrainRefusal::SessionRevoked => {
+                let Some(open) = self.courier.open.take() else {
+                    let _ = transport.close().await;
+                    return Ok(());
+                };
+                if let Some(reply) = open.reply {
+                    let _ = reply.send(Err(CourierError::SessionLost));
+                }
+                let _ = transport.close().await;
+                self.courier.drain_owed = None;
+                Ok(())
+            }
+            crate::drain::DrainRefusal::DeviceRevoked => {
+                self.exclude_device_writers(crate::Carry::Named)?;
+                let _ = transport.close().await;
+                self.uncertify_courier_range().await
+            }
+            crate::drain::DrainRefusal::WriterRefused(_) | crate::drain::DrainRefusal::BackOff => {
+                // Anything else backs the dial off, the deadline keeping the
+                // range's bound.
+                let _ = transport.close().await;
+                self.courier_drain_dial_failed(timer);
+                Ok(())
+            }
+        }
+    }
+
+    /// Act on one frame from the courier wire (R78 decision 47): the
+    /// device's bind answer frees the range for the wire, a `CourierAnswer`
+    /// settles it, and a fatal error ends the call, the wire going behind
+    /// its answer. The frame's own event is returned when it has one, the
+    /// queued notices left to the step that pops them.
+    ///
+    /// # Errors
+    ///
+    /// A failure to settle a row or send the queue.
+    #[cfg(feature = "peer")]
+    async fn handle_courier_wire_frame(
+        &mut self,
+        frame: Option<IncomingFrame>,
+    ) -> Result<Option<ClientEvent>, ClientError> {
+        let Some(frame) = frame else {
+            self.drop_courier_wire().await?;
+            return Ok(None);
+        };
+        match frame {
+            IncomingFrame::Control(ControlMessage::WriterAnswer(answer)) => {
+                #[cfg(feature = "device-identity")]
+                {
+                    let Some(mut open) = self.courier.open.take() else {
+                        self.drop_courier_wire().await?;
+                        return Ok(None);
+                    };
+                    let bound = open.bind.as_deref() == Some(answer.request_id.as_str())
+                        && matches!(answer.outcome, WriterOutcome::Bound { .. });
+                    if bound {
+                        open.bind = None;
+                        self.courier.open = Some(open);
+                        let open = self.courier.open.as_ref().expect("the range stands");
+                        let Some(wire) = self.courier_wire.as_mut() else {
+                            // The wire is gone, so the range waits for its deadline.
+                            return Ok(None);
+                        };
+                        if let Err(err) = Self::send_courier_range(
+                            wire,
+                            &open.request_id,
+                            open.author,
+                            &open.offer,
+                            &open.range,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                error = %err,
+                                "the courier wire failed while sending the range"
+                            );
+                            self.courier_send_failed(CourierOpenWire::Courier).await?;
+                            return Ok(None);
+                        }
+                    } else {
+                        // The device's bind stands refused, so the range is
+                        // uncertified.
+                        self.courier.open = Some(open);
+                        self.uncertify_courier_range().await?;
+                    }
+                }
+                #[cfg(not(feature = "device-identity"))]
+                self.drop_courier_wire().await?;
+            }
+            IncomingFrame::Control(ControlMessage::CourierAnswer(answer)) => {
+                return self.settle_courier_answer(&answer).await;
+            }
+            IncomingFrame::Control(ControlMessage::FatalError(
+                connetto_core::messages::FatalError { reason, .. },
+            )) => match reason {
+                FatalErrorReason::MajorMismatch { .. } => {
+                    let Some(open) = self.courier.open.take() else {
+                        self.drop_courier_wire().await?;
+                        return Ok(None);
+                    };
+                    let major = open.range.major;
+                    self.major_unserved(open.author, major);
+                    self.end_courier_call(open, CourierError::MajorUnserved(major))
+                        .await?;
+                }
+                FatalErrorReason::SessionRevoked => {
+                    let Some(open) = self.courier.open.take() else {
+                        self.drop_courier_wire().await?;
+                        return Ok(None);
+                    };
+                    if let Some(reply) = open.reply {
+                        let _ = reply.send(Err(CourierError::SessionLost));
+                    }
+                    if let Some(mut wire) = self.courier_wire.take() {
+                        let _ = wire.close().await;
+                    }
+                    self.courier.drain_owed = None;
+                }
+                _ => {
+                    self.drop_courier_wire().await?;
+                }
+            },
+            _ => {}
+        }
+        Ok(None)
+    }
+
+    /// End the courier range the device cannot certify, the author's rows
+    /// excluded until the next session and the queue flushed (R78 decision
+    /// 47).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the rows cannot be read or the queue cannot be
+    /// sent.
+    #[cfg(feature = "peer")]
+    async fn uncertify_courier_range(&mut self) -> Result<(), ClientError> {
+        let Some(open) = self.courier.open.take() else {
+            return self.drop_courier_wire().await;
+        };
+        let author = open.author;
+        self.refuse_courier_range(
+            &author,
+            connetto_core::exchange::CourierRefusal::Uncertified,
+        )?;
+        self.end_courier_call(
+            open,
+            CourierError::Refused(connetto_core::exchange::CourierRefusal::Uncertified),
+        )
+        .await
+    }
+
+    /// Settle the server's answer on the open courier range (R78 decisions
+    /// 31, 32 and 47): a refusal refuses the whole range, the entries rule
+    /// their rows one by one, the next range rides its own wire when one
+    /// stands, and the call's courier wire closes behind its last range.
+    /// An answer that names no open range stands ignored.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when a row cannot be settled or a send fails.
+    #[cfg(feature = "peer")]
+    async fn settle_courier_answer(
+        &mut self,
+        answer: &connetto_core::messages::CourierAnswer,
+    ) -> Result<Option<ClientEvent>, ClientError> {
+        let matched = self
+            .courier
+            .open
+            .as_ref()
+            .is_some_and(|open| open.request_id == answer.request_id);
+        if !matched {
+            return Ok(Some(ClientEvent::NonFatal {
+                related_to: Some(answer.request_id.clone()),
+                detail: "a courier answer arrived with no open range".to_owned(),
+            }));
+        }
+        let mut open = self
+            .courier
+            .open
+            .take()
+            .expect("the answer matched the open range");
+        let author = open.author;
+        let (ends, result) = self.settle_courier_entries(&mut open, author, &answer.outcome)?;
+        if !ends && result.is_ok() && !open.next.is_empty() {
+            // The settled range's courier wire goes, the next range dials
+            // its own (R78 decision 47).
+            self.close_courier_wire().await;
+            let range = open.next.pop_front().expect("a range stands");
+            self.advance_courier_range(open, author, range).await?;
+            return Ok(None);
+        }
+        self.end_courier_range(open, author, result).await
+    }
+
+    /// Settle one `CourierAnswer` and queue its event on the notices, the
+    /// drain wire riding the call's answers behind its own frames (R78
+    /// decision 47).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the answer cannot be settled.
+    #[cfg(feature = "peer")]
+    async fn settle_courier_answer_and_queue(
+        &mut self,
+        answer: &connetto_core::messages::CourierAnswer,
+    ) -> Result<(), ClientError> {
+        if let Some(event) = self.settle_courier_answer(answer).await? {
+            self.notices.push_back(event);
+        }
+        Ok(())
+    }
+
+    /// Rule the answered entries' rows into `open`'s report (R78 decisions
+    /// 31 and 32), settling each in one transaction, and report whether the
+    /// range ends the call (`NotCouriered` or `Retry`), a whole-range
+    /// refusal refusing it.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when a row cannot be settled or the refusal cannot
+    /// be taken.
+    #[cfg(feature = "peer")]
+    fn settle_courier_entries(
+        &mut self,
+        open: &mut CourierOpen,
+        author: [u8; 32],
+        outcome: &connetto_core::exchange::CourierOutcome,
+    ) -> Result<(bool, Result<CourierReport, CourierError>), ClientError> {
+        match outcome {
+            connetto_core::exchange::CourierOutcome::Refused(refusal) => {
+                self.refuse_courier_range(&author, *refusal)?;
+                Ok((false, Err(CourierError::Refused(*refusal))))
+            }
+            connetto_core::exchange::CourierOutcome::Entries(outcomes) => {
+                let mut ends = false;
+                for (seq, entry) in outcomes {
+                    match entry {
+                        connetto_core::exchange::CourierEntryOutcome::Ruled(verdict) => {
+                            self.settle_verdict_row(&author, *seq, verdict, true)?;
+                            if matches!(
+                                verdict,
+                                connetto_core::exchange::Verdict::Applied
+                                    | connetto_core::exchange::Verdict::Settled
+                            ) {
+                                open.report.settled.push(*seq);
+                            } else if matches!(
+                                verdict,
+                                connetto_core::exchange::Verdict::Refused(..)
+                            ) {
+                                open.report.refused.push(*seq);
+                            }
+                        }
+                        connetto_core::exchange::CourierEntryOutcome::NotCouriered => {
+                            // The rows from it stay held, waiting for the
+                            // author's own device or its next offer.
+                            self.courier
+                                .excluded
+                                .insert(author, CourierExclusion::NewOffer);
+                            ends = true;
+                            break;
+                        }
+                        connetto_core::exchange::CourierEntryOutcome::Retry { retry_after_ms } => {
+                            open.report.retry_after = Some(Duration::from_millis(*retry_after_ms));
+                            ends = true;
+                            break;
+                        }
+                    }
+                }
+                Ok((ends, Ok(CourierReport::default())))
+            }
+        }
+    }
+
+    /// Ride `range` beside the settled one as the call's next range (R78
+    /// decision 47), a fresh deadline and request id, no reply on the
+    /// advance, the range's wire dropped and the wait told when its send
+    /// fails.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the dropped wire's queue cannot be read or sent.
+    #[cfg(feature = "peer")]
+    async fn advance_courier_range(
+        &mut self,
+        mut open: CourierOpen,
+        author: [u8; 32],
+        range: PlannedRange,
+    ) -> Result<(), ClientError> {
+        let stance = self.courier_stance(&range)?;
+        match stance {
+            CourierStance::Uncertified => {
+                // No bind can come this session: end the call without
+                // sending the advance, the settled rows standing ruled.
+                return self
+                    .end_courier_call(
+                        open,
+                        CourierError::Refused(connetto_core::exchange::CourierRefusal::Uncertified),
+                    )
+                    .await;
+            }
+            CourierStance::Hold => {
+                // The wire still owes the device a bind: the settled rows
+                // stand ruled and the rest holds in the queue for the bind's
+                // answer.
+                self.courier.queued.push_back(CourierQueued {
+                    author,
+                    reply: open.reply,
+                    report: Some(open.report),
+                    seqs: Some(open.seqs),
+                });
+                self.raise_courier_candidates_if_changed(author)?;
+                return self.flush_courier_ranges().await;
+            }
+            CourierStance::Ride => {}
+        }
+        let wire = self.courier_range_wire(&range);
+        open.range = range;
+        open.request_id = courier_request_id();
+        open.deadline = crate::away::SystemClock.monotonic() + COURIER_RANGE_WAIT;
+        open.wait_dropped = false;
+        open.wire = wire;
+        #[cfg(feature = "device-identity")]
+        {
+            open.bind = None;
+        }
+        // The range rides its wire before it is registered, so a failure
+        // hands the settled rows' report to the wait and drops the wire.
+        let send = self
+            .send_on_wire(
+                wire,
+                &open.request_id,
+                open.author,
+                &open.offer,
+                &open.range,
+            )
+            .await;
+        if let Err(err) = send {
+            if let Some(reply) = open.reply {
+                let _ = reply.send(Err(CourierError::Client(err)));
+            }
+            return self.courier_send_failed(wire).await;
+        }
+        self.courier.open = Some(open);
+        self.raise_courier_candidates_if_changed(author)?;
+        self.flush_courier_ranges().await
+    }
+
+    /// End the call on its last settled range (R78 decision 48): the report
+    /// names every kept sequence, the wait hears it, the call's courier
+    /// wire closes behind its last range, and the author's candidates
+    /// restate.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the queue cannot be read or sent.
+    #[cfg(feature = "peer")]
+    async fn end_courier_range(
+        &mut self,
+        mut open: CourierOpen,
+        author: [u8; 32],
+        result: Result<CourierReport, CourierError>,
+    ) -> Result<Option<ClientEvent>, ClientError> {
+        let reply = open.reply;
+        let result = match result {
+            Ok(_) => {
+                let settled: HashSet<u64> = open.report.settled.iter().copied().collect();
+                let refused: HashSet<u64> = open.report.refused.iter().copied().collect();
+                for seq in &open.seqs {
+                    if !settled.contains(seq) && !refused.contains(seq) {
+                        open.report.kept.push(*seq);
+                    }
+                }
+                Ok(open.report)
+            }
+            Err(err) => Err(err),
+        };
+        if let Some(reply) = reply {
+            let _ = reply.send(result);
+        }
+        self.close_courier_wire().await;
+        self.raise_courier_candidates_if_changed(author)?;
+        self.flush_courier_ranges().await?;
+        Ok(None)
+    }
+
+    /// Take the server's whole-range refusal on the author's rows (R78
+    /// decision 29): the deployment's refusals end or exclude the path, the
+    /// writer's refusals take the rows the courier offered, and none of them
+    /// touches a row the author still writes under.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the rows cannot be deleted.
+    #[cfg(feature = "peer")]
+    fn refuse_courier_range(
+        &mut self,
+        author: &[u8; 32],
+        refusal: connetto_core::exchange::CourierRefusal,
+    ) -> Result<(), ClientError> {
+        use connetto_core::exchange::CourierRefusal as Refusal;
+        match refusal {
+            Refusal::Disabled => self.courier.enabled = false,
+            Refusal::Uncertified => {
+                tracing::warn!(
+                    "the server refused the courier range as uncertified, \
+                     excluding the author until the next session"
+                );
+                self.courier
+                    .excluded
+                    .insert(*author, CourierExclusion::NextSession);
+            }
+            Refusal::Malformed => {
+                tracing::warn!("the server refused the courier range as malformed");
+            }
+            Refusal::NotEnrolled | Refusal::WriterRetired | Refusal::Unverified => {
+                if refusal == Refusal::Unverified {
+                    self.notices.push_back(ClientEvent::PeerChainInvalid {
+                        author: author.to_vec(),
+                    });
+                }
+                let _exempt = ExemptWrites::raise(&self.write_flags);
+                peer::drop_courier_rows(&mut self.db, author)?;
+                self.courier.marked.remove(author);
+                self.courier
+                    .excluded
+                    .insert(*author, CourierExclusion::NextRuling);
+            }
+            Refusal::AuthorBanned => {
+                self.courier
+                    .excluded
+                    .insert(*author, CourierExclusion::NextSession);
+            }
+            Refusal::SequenceGap { .. } => {
+                self.courier
+                    .excluded
+                    .insert(*author, CourierExclusion::NewOffer);
+            }
+        }
+        Ok(())
+    }
+
+    /// Restate the author's courier candidates once the session's view of its
+    /// rows changed, raising `CourierCandidates` when the set moved (R78
+    /// decisions 16 and 46), an empty set meaning nothing is left to courier.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the rows or the stored offer cannot be read.
+    #[cfg(feature = "peer")]
+    fn raise_courier_candidates_if_changed(&mut self, author: [u8; 32]) -> Result<(), ClientError> {
+        let candidate = self.courier_candidate(author)?;
+        match (candidate, self.courier.raised.get(&author)) {
+            (Some(candidate), Some(raised)) if *raised == candidate => Ok(()),
+            (Some(candidate), _) => {
+                self.courier.raised.insert(author, candidate.clone());
+                self.notices
+                    .push_back(ClientEvent::CourierCandidates(candidate));
+                Ok(())
+            }
+            (None, Some(raised)) => {
+                let empty = CourierCandidate {
+                    author: author.to_vec(),
+                    account: raised.account.clone(),
+                    seqs: Vec::new(),
+                    bytes: 0,
+                    last: None,
+                };
+                self.notices
+                    .push_back(ClientEvent::CourierCandidates(empty));
+                self.courier.raised.remove(&author);
+                Ok(())
+            }
+            (None, None) => Ok(()),
+        }
+    }
+
+    /// A new offer for the author stood, so its courier rows stand again:
+    /// clear whatever waits hold them and restate the candidates (R78 slice
+    /// 4).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the rows or the stored offer cannot be read.
+    #[cfg(feature = "peer")]
+    fn courier_offer_stood(&mut self, author: &[u8]) -> Result<(), ClientError> {
+        let Ok(key) = <[u8; 32]>::try_from(author) else {
+            return Ok(());
+        };
+        self.courier.excluded.remove(&key);
+        self.raise_courier_candidates_if_changed(key)
     }
 
     /// Settle a `WriterAnswer` for a bind or retirement this connection sent.
@@ -6287,6 +8513,9 @@ where
                 self.carry_writers(&stale, &writer, Carry::Named)?;
                 self.flush_writer_tasks().await?;
                 self.replay_pending().await?;
+                // A courier call that held for this bind rides the wire now.
+                #[cfg(feature = "peer")]
+                self.flush_courier_ranges().await?;
                 Ok(ClientEvent::NonFatal {
                     related_to: Some(request_id),
                     detail: "the device writer bind was answered".to_owned(),
@@ -6419,7 +8648,8 @@ where
     /// Atomically carries the entries of `dead` that `carried` admits to
     /// `target`, in append order, re-chained after the target's own. A dead
     /// writer's state goes once nothing of it remains, and a dead device's
-    /// key is excluded either way.
+    /// key is excluded either way, the server's retirement of the writer owed
+    /// beside it and queued to send.
     fn carry_matching(
         &mut self,
         dead: &[WriterRef],
@@ -6455,6 +8685,12 @@ where
                 persist_writer_state(db, target, next_seq, &head)?;
             }
             for writer in dead {
+                if let WriterRef::Device(_) = writer {
+                    // The owed retirement stands with the exclusion, so a
+                    // crash leaves no writer the replica gave up unretired
+                    // on the server.
+                    persist_retire(db, writer, None)?;
+                }
                 #[cfg(feature = "device-identity")]
                 if let WriterRef::Device(key) = writer {
                     persist_retired_key(db, *key)?;
@@ -6489,6 +8725,15 @@ where
         for writer in dead {
             if emptied.contains(writer) {
                 self.writers.remove(writer);
+            }
+            if matches!(writer, WriterRef::Device(_)) {
+                // The connection the exclusion ran on may die before the
+                // answer, so the durable row re-queues the send on the next.
+                self.writer_tasks.push_back(WriterTask {
+                    kind: WriterTaskKind::Retire(*writer, None),
+                    request_id: writer_request_id(),
+                    deadline: crate::away::SystemClock.monotonic() + WRITER_ANSWER_WAIT,
+                });
             }
             #[cfg(feature = "device-identity")]
             if let WriterRef::Device(key) = writer {
@@ -6656,7 +8901,8 @@ where
             .collect()
     }
 
-    /// Durably retires device queues before requesting fresh enrolment.
+    /// Durably retires device queues, owing each writer a server retirement,
+    /// before requesting fresh enrolment.
     ///
     /// # Errors
     ///
@@ -6745,6 +8991,19 @@ where
                 self.resend = unchanged;
                 Ok(())
             }
+        }
+    }
+
+    /// Note that the server deferred the bound writer's pending `seq`, so
+    /// the unsynced snapshot shows it waiting for its resend.
+    fn mark_deferred(&mut self, seq: u64) {
+        if let Some(queue) = self
+            .bound_writer
+            .and_then(|writer| self.writers.get_mut(&writer))
+            .filter(|queue| queue.pending.contains_key(&seq))
+        {
+            queue.deferred.insert(seq);
+            self.unsynced_moved.store(true, Ordering::Relaxed);
         }
     }
 
@@ -6899,10 +9158,12 @@ where
         for queue in self.writers.values_mut() {
             queue.sent_through = 0;
         }
+        self.unsynced_moved.store(true, Ordering::Relaxed);
     }
 
     /// Drop the live socket and announce it, once.
     fn disconnected(&mut self) {
+        self.courier_audit.disconnected();
         self.attach_replay = AttachReplay::Idle;
         // A fresh transport replays every pending write, so no resend stays owed.
         self.resend = Resend::Idle;
@@ -6919,8 +9180,29 @@ where
         self.writer_in_flight = None;
         #[cfg(feature = "peer")]
         {
+            // The server's questions end with the session, so the sent asks go too.
             self.provisional.pending.clear();
             self.provisional.in_flight = None;
+            self.provisional.sent.clear();
+            // An open or queued range's answer no longer arrives, so each
+            // wait ends lost and the session's courier state goes too.
+            if let Some(open) = self.courier.open.take()
+                && let Some(reply) = open.reply
+            {
+                let _ = reply.send(Err(CourierError::SessionLost));
+            }
+            for queued in self.courier.queued.drain(..) {
+                if let Some(reply) = queued.reply {
+                    let _ = reply.send(Err(CourierError::SessionLost));
+                }
+            }
+            self.courier.enabled = false;
+            self.courier.excluded.clear();
+            self.courier.heard.clear();
+            self.courier.marked.clear();
+            self.courier.raised.clear();
+            self.courier.drain_owed = None;
+            self.courier_wire = None;
         }
         #[cfg(feature = "device-identity")]
         {
@@ -6931,6 +9213,7 @@ where
         // A relay answer can no longer arrive, so each waiting tab call fails now.
         self.relay_share_key_waits.clear();
         self.relay_storage_waits.clear();
+        self.relay_dismiss_waits.clear();
         // Desired keys and durable coverage survive a transport failure.
         self.share_key_request = None;
         self.declaration_fence = None;
@@ -6950,6 +9233,55 @@ where
         self.disconnected();
     }
 
+    /// Relay courier notices rather than acking them, for a connection that
+    /// hands the server's frames to the connections an application drives,
+    /// as the browser hub's worker does for its tabs (R78 decision 41 as
+    /// amended). Each frame stays held, unacked, until
+    /// [`Self::ack_courier_notice`] names it or its transport drops, after
+    /// which the server sends its rows again at the next handshake.
+    pub fn relay_courier_notices(&mut self) {
+        self.relays_courier_notices = true;
+    }
+
+    /// The courier notice frames this relaying connection received on its
+    /// current transport and has not acked, in arrival order, empty on a
+    /// connection that acks at once or has no transport.
+    #[must_use]
+    pub fn held_courier_notices(&self) -> &[CourierNotice] {
+        self.wire
+            .as_ref()
+            .map_or(&[], |wire| wire.held_notices.as_slice())
+    }
+
+    /// Ack the held courier notice frame `notice_id` to the server, which
+    /// deletes its rows, and stop holding it. A frame this connection does
+    /// not hold, already acked or received on an earlier transport, sends
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Transport`] when the ack cannot be sent, the frame
+    /// then no longer held and its rows coming again at the next handshake.
+    pub async fn ack_courier_notice(&mut self, notice_id: &str) -> Result<(), ClientError> {
+        let Some(wire) = self.wire.as_mut() else {
+            return Ok(());
+        };
+        let Some(at) = wire
+            .held_notices
+            .iter()
+            .position(|held| held.notice_id == notice_id)
+        else {
+            return Ok(());
+        };
+        let held = wire.held_notices.remove(at);
+        wire.transport
+            .send_control(ControlMessage::CourierNoticeAck(CourierNoticeAck {
+                notice_id: held.notice_id,
+            }))
+            .await
+            .map_err(|e| ClientError::Transport(e.to_string()))
+    }
+
     /// Prepare expiry, protocol work and live-wire coverage before a driver selects its wait, deferring secret writes while `persist` is `false`.
     ///
     /// # Errors
@@ -6960,11 +9292,7 @@ where
         let due = self
             .share_key_deadline
             .is_some_and(|at| crate::away::SystemClock.monotonic() >= at);
-        let changed = if due {
-            self.expire_share_keys(persist).await?
-        } else {
-            false
-        };
+        let changed = due && self.expire_share_keys(persist).await?;
         if persist
             && self.share_key_save_pending
             && let Some(store) = &self.share_key_persistence
@@ -7074,6 +9402,7 @@ where
             .values()
             .map(|wait| wait.deadline)
             .chain(self.relay_storage_waits.values().map(|wait| wait.deadline))
+            .chain(self.relay_dismiss_waits.values().map(|wait| wait.deadline))
             .min()
         {
             deadline = Some(deadline.map_or(relay, |armed| armed.min(relay)));
@@ -7092,7 +9421,9 @@ where
             expire_relay_waits(&mut self.relay_share_key_waits, now, "the share-key change");
         let storage_expired =
             expire_relay_waits(&mut self.relay_storage_waits, now, "the storage read");
-        let expired = share_key_expired || storage_expired;
+        let dismiss_expired =
+            expire_relay_waits(&mut self.relay_dismiss_waits, now, "the refusal dismissal");
+        let expired = share_key_expired || storage_expired || dismiss_expired;
         if self
             .share_key_request
             .as_ref()
@@ -7397,6 +9728,31 @@ where
         Ok(receiver)
     }
 
+    /// Ask a relay tab's worker to dismiss `writer`'s refused write `seq`,
+    /// and the receiver its answer arrives on, within
+    /// [`SHARE_KEY_REQUEST_WAIT`].
+    ///
+    /// The receiver fails at once when the connection drops.
+    pub(crate) async fn ask_relay_dismiss(
+        &mut self,
+        writer: WriterRef,
+        seq: u64,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<(), ClientError>>, ClientError> {
+        let request_id = dismiss_request_id();
+        self.wire()?
+            .transport
+            .send_control(ControlMessage::TabDismissRefusal(TabDismissRefusal {
+                request_id: request_id.clone(),
+                writer,
+                seq,
+            }))
+            .await
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+        let receiver = relay_wait(&mut self.relay_dismiss_waits, request_id);
+        self.recompute_share_key_deadline();
+        Ok(receiver)
+    }
+
     /// Hand a relay's answer to the change waiting on it. An answer nobody
     /// waits for arrived after its wait ended, and is dropped.
     fn settle_relay_share_key(&mut self, answer: TabShareKeyAnswer) {
@@ -7425,6 +9781,22 @@ where
             TabStorageOutcome::Use(used) => Ok(used),
             TabStorageOutcome::Locked => Err(ClientError::Locked),
             TabStorageOutcome::Refused(detail) => Err(ClientError::Session(detail)),
+        };
+        let _ = wait.answer.send(outcome);
+        self.recompute_share_key_deadline();
+    }
+
+    /// Hand a relay's dismissal answer to the call waiting on it. An answer
+    /// nobody waits for arrived after its wait ended, and is dropped.
+    fn settle_relay_dismiss(&mut self, answer: TabDismissAnswer) {
+        let Some(wait) = self.relay_dismiss_waits.remove(&answer.request_id) else {
+            tracing::debug!(request_id = %answer.request_id, "a dismissal answer arrived after its wait");
+            return;
+        };
+        let outcome = match answer.outcome {
+            TabDismissOutcome::Dismissed => Ok(()),
+            TabDismissOutcome::Locked => Err(ClientError::Locked),
+            TabDismissOutcome::Refused(detail) => Err(ClientError::Session(detail)),
         };
         let _ = wait.answer.send(outcome);
         self.recompute_share_key_deadline();
@@ -7764,6 +10136,78 @@ where
             .collect()
     }
 
+    /// Every write and staged file of this device that has not reached the
+    /// server, each with where it stands, and every refused write the
+    /// application has not dismissed.
+    ///
+    /// A relay tab's mirror holds no outbox, so it answers with the latest
+    /// snapshot its worker stated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if a queued changeset, a retained refusal or
+    /// the content outbox does not read back.
+    pub fn unsynced_work(&mut self) -> Result<UnsyncedWork, ClientError> {
+        if self.config.relay_mirror {
+            return Ok(self.relayed_unsynced.clone());
+        }
+        let mut writes = Vec::new();
+        for refusal in acked::refusals(&mut self.db)? {
+            writes.push(TrackedWrite {
+                write: UnsyncedWrite {
+                    writer: refusal.writer,
+                    seq: refusal.seq,
+                    major: refusal.major,
+                },
+                state: WriteState::Refused(refusal.refused),
+                rows: written_rows(&refusal.changeset, &self.config.policy_tables)?,
+            });
+        }
+        for (writer, queue) in &self.writers {
+            for (seq, entry) in &queue.pending {
+                let state = if queue.deferred.contains(seq) {
+                    WriteState::Deferred
+                } else if *seq <= queue.sent_through || self.drain_sent(writer, *seq) {
+                    WriteState::Sent
+                } else {
+                    WriteState::Queued
+                };
+                writes.push(TrackedWrite {
+                    write: UnsyncedWrite {
+                        writer: *writer,
+                        seq: *seq,
+                        major: entry.major,
+                    },
+                    state,
+                    rows: written_rows(&entry.changeset, &self.config.policy_tables)?,
+                });
+            }
+        }
+        let files = (self.config.content_hooks.unsynced)(&mut self.db)?;
+        Ok(UnsyncedWork { writes, files })
+    }
+
+    /// Whether [`unsynced_work`](Self::unsynced_work) may answer differently
+    /// since the last call, clearing the mark. A driver that follows the
+    /// snapshot rebuilds it only when this is true.
+    pub fn take_unsynced_moved(&self) -> bool {
+        self.unsynced_moved.swap(false, Ordering::Relaxed)
+    }
+
+    /// Dismiss `writer`'s refused write `seq`, so the unsynced snapshot no
+    /// longer lists it. Dismissing a write that is not refused, or was
+    /// dismissed before, changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the replica refuses the write, or on a
+    /// relay tab's mirror, whose worker holds the refusals.
+    pub fn dismiss_refusal(&mut self, writer: &WriterRef, seq: u64) -> Result<(), ClientError> {
+        self.refuse_relay_mirror_change()?;
+        let now = clock::now_secs(&mut self.db)?;
+        acked::dismiss(&mut self.db, writer, seq, now)
+    }
+
     /// The provenance of a peer-applied row, standing it back from the table,
     /// since the broadcast event stream can drop events (R77). The key is the
     /// row's primary-key column values, in key order, and the table is named
@@ -7813,6 +10257,58 @@ where
         let physical = self.config.policy_tables.stored(table);
         let backing = backing_of(&self.config.shared_tables, &physical);
         provisional::provisional_blobs(&mut self.db, backing.schema, &physical, column)
+    }
+
+    /// Whether this replica holds a completed delivery, every snapshot and
+    /// resync of its subscriptions ended and fenced, so a synced row missing
+    /// from it is gone rather than not yet delivered, as on a device restored
+    /// from an archive that has not synced (R79 decision 18). A resume cursor
+    /// alone does not count, since a sibling's snapshot stamps one while
+    /// another still owes its rows, and an authorization change reads as not
+    /// synced until its replacement snapshots end.
+    #[must_use]
+    pub fn has_synced(&mut self) -> bool {
+        matches!(load_cursor_and_subjects(&mut self.db), Some((_, Some(_))))
+    }
+
+    /// Whether the certificate `author`'s cursor last carried ended
+    /// [`DEVICE_SKEW`](connetto_core::clock::DEVICE_SKEW) or more before now,
+    /// so its provisional rows can no longer reach the server through a
+    /// courier (R79 decision 15). An author this replica holds no cursor for
+    /// is not known to have lapsed.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the cursor or the clock cannot be read.
+    #[cfg(feature = "peer")]
+    pub fn courier_lapsed(&mut self, author: &[u8]) -> Result<bool, ClientError> {
+        exchange::courier_lapsed(&mut self.db, author)
+    }
+
+    /// When, in Unix seconds, the certificate `author`'s cursor last carried
+    /// lies [`DEVICE_SKEW`](connetto_core::clock::DEVICE_SKEW) in the past,
+    /// the instant [`courier_lapsed`](Self::courier_lapsed) turns true,
+    /// `None` for an author this replica holds no cursor for.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the cursor cannot be read.
+    #[cfg(feature = "peer")]
+    pub fn courier_lapse_at(&mut self, author: &[u8]) -> Result<Option<i64>, ClientError> {
+        exchange::courier_lapse_at(&mut self.db, author)
+    }
+
+    /// The account `author`'s certificate named when this replica last
+    /// stored its cursor, the owner a carried upload of its files credits
+    /// (R79 decision 17), `None` for an author this replica holds no cursor
+    /// for.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the cursor cannot be read.
+    #[cfg(feature = "peer")]
+    pub fn author_account(&mut self, author: &[u8]) -> Result<Option<String>, ClientError> {
+        Ok(exchange::offer_and_account(&mut self.db, author)?.map(|(_, account)| account))
     }
 
     /// Whether `requester`, a linked peer, reads a row of `table` whose
@@ -7868,11 +10364,13 @@ where
         entries.sort_unstable_by_key(|(position, _, _, _)| *position);
         let mut held = HeldKeys::new();
         for (_, writer, seq, entry) in entries {
-            for (table, key) in crate::op_keys(&entry.changeset).map_err(|err| {
-                ClientError::Apply(format!(
-                    "parsing a pending changeset to filter a peer apply: {err:?}"
-                ))
-            })? {
+            for WrittenRow { table, key, .. } in
+                crate::op_keys(&entry.changeset).map_err(|err| {
+                    ClientError::Apply(format!(
+                        "parsing a pending changeset to filter a peer apply: {err:?}"
+                    ))
+                })?
+            {
                 held.insert(
                     (table.to_lowercase(), provisional::encode_key(&key)),
                     (writer_id(writer), i64::try_from(seq).unwrap_or(i64::MAX)),
@@ -7918,8 +10416,10 @@ where
         cursor: Option<&connetto_core::exchange::Frontier>,
     ) -> Result<peer::PeerApplyOutcome, ClientError> {
         // An entry another build captured crosses as its manifest row only,
-        // the version half of the test being the offer's (R77 slice 6).
+        // the version half of the test being the offer's (R77 slice 6), and
+        // is kept digest-only (R78 decision 3).
         if Some(row.major) != self.config.schema_major {
+            self.hold_peer_entry(author, row, peer::HeldState::DigestOnly, None, cursor)?;
             return Ok(peer::PeerApplyOutcome::Skipped);
         }
         let mut hasher = Sha256::new();
@@ -7943,7 +10443,7 @@ where
             now: frame.now,
         };
         let store = EntryToStore {
-            major: i64::from(row.major.get()),
+            row,
             body,
             received_at: frame.now,
             position: i64::try_from(self.peer_next_position).unwrap_or(i64::MAX),
@@ -7974,6 +10474,15 @@ where
                 Ok(peer::PeerApplyOutcome::Applied { rows })
             }
             Err(cause) => {
+                // The refused body is still the author's signed entry, kept
+                // courier-only for a courier to carry (R78 decision 3).
+                self.hold_peer_entry(
+                    author,
+                    row,
+                    peer::HeldState::CourierOnly,
+                    Some(body),
+                    cursor,
+                )?;
                 let rows = peer::entry_rows(diff.iter());
                 self.notices.push_back(ClientEvent::PeerWriteRefused {
                     author: author.key_id.clone(),
@@ -7983,6 +10492,49 @@ where
                 Ok(peer::PeerApplyOutcome::Refused { cause, rows })
             }
         }
+    }
+
+    /// Keep `author`'s entry `row` unapplied as `state`, with `body` when one
+    /// crossed, unless the receiver holds its sequence already, and store
+    /// `cursor` as the author's in the same transaction (R78 decision 3).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the clock cannot be read or the entry or the
+    /// cursor cannot be written.
+    #[cfg(feature = "peer")]
+    fn hold_peer_entry(
+        &mut self,
+        author: &peer::PeerAuthor,
+        row: &connetto_core::exchange::ManifestRow,
+        state: peer::HeldState,
+        body: Option<&[u8]>,
+        cursor: Option<&connetto_core::exchange::Frontier>,
+    ) -> Result<(), ClientError> {
+        let received_at = crate::clock::now_secs(&mut self.db)?;
+        let position = i64::try_from(self.peer_next_position).unwrap_or(i64::MAX);
+        let _exempt = ExemptWrites::raise(&self.write_flags);
+        let written = self.db.transaction::<_, ClientError, _>(|db| {
+            let written = peer::store_entry(
+                db,
+                author,
+                &peer::NewEntry {
+                    row,
+                    state,
+                    body,
+                    received_at,
+                    position,
+                },
+            )?;
+            if let Some(cursor) = cursor {
+                exchange::store_cursor(db, &author.key_id, cursor)?;
+            }
+            Ok(written)
+        })?;
+        if written {
+            self.peer_next_position += 1;
+        }
+        Ok(())
     }
 
     /// The frame a peer apply judges its ops against. The receiver's own
@@ -8029,6 +10581,17 @@ where
         retraction: &connetto_core::exchange::Retraction,
     ) -> Result<(), ClientError> {
         let seq = i64::try_from(retraction.seq).unwrap_or(i64::MAX);
+        match peer::state_of(&mut self.db, &author.key_id, seq)? {
+            // Nothing of the entry applied, so it goes with nothing to invert
+            // (R78 held-row table).
+            Some(peer::HeldState::CourierOnly | peer::HeldState::DigestOnly) => {
+                let _exempt = ExemptWrites::raise(&self.write_flags);
+                return peer::delete_entry(&mut self.db, &author.key_id, seq);
+            }
+            // An adjudicated entry settled for good, so no retraction reaches it.
+            None | Some(peer::HeldState::Retained) => return Ok(()),
+            Some(peer::HeldState::Provisional) => {}
+        }
         let Some(entry) = peer::entry_of(&mut self.db, &author.key_id, seq)? else {
             return Ok(());
         };
@@ -8129,9 +10692,10 @@ where
         Ok(())
     }
 
-    /// Adjudicate the author's stored entries at or below a frontier (R77):
-    /// their records move to adjudicated and the entries go, the rows
-    /// handing to ordinary coverage.
+    /// Adjudicate the author's held entries at or below a frontier (R77): a
+    /// provisional entry's records move to adjudicated, the rows handing to
+    /// ordinary coverage, and every entry is retained until its author's
+    /// certificate ends (R78 decision 17).
     ///
     /// # Errors
     ///
@@ -8146,20 +10710,27 @@ where
         let frontier = i64::try_from(frontier).unwrap_or(i64::MAX);
         let _exempt = ExemptWrites::raise(&self.write_flags);
         let config = &self.config;
-        self.db.transaction::<_, ClientError, _>(|db| {
-            for entry in peer::entries_at_or_below(db, author, frontier)? {
-                let settled: Vec<(String, Vec<KeyValue>)> =
-                    provisional::records_of_entry(db, &entry.author, entry.seq)?
-                        .into_iter()
-                        .filter(|record| record.state == provisional::ProvisionalState::Provisional)
-                        .map(|record| (record.table, record.key))
-                        .collect();
-                provisional::adjudicate_entry(db, &entry.author, entry.seq)?;
-                holdings::release_provisional(db, config, &settled)?;
-                peer::delete_entry(db, &entry.author, entry.seq)?;
+        let settled = self.db.transaction::<_, ClientError, _>(|db| {
+            let mut settled = Vec::new();
+            for held in peer::unsettled_at_or_below(db, author, frontier)? {
+                if held.state == peer::HeldState::Provisional
+                    && adjudicate_provisional(db, config, &held.author, held.seq)?
+                {
+                    settled.push(held.seq);
+                }
+                peer::retain(db, &held.author, held.seq)?;
             }
-            Ok(())
-        })
+            peer::prune_retained(db)?;
+            Ok(settled)
+        })?;
+        for seq in settled {
+            self.notices.push_back(ClientEvent::ProvisionalSettled {
+                author: author.to_vec(),
+                seq,
+                by_courier: false,
+            });
+        }
+        self.settle_pruned_marks()
     }
 
     /// Re-apply the stored peer entries after a resync's replacement
@@ -8186,13 +10757,11 @@ where
                         "a stored peer entry holds a major the build cannot express".to_owned(),
                     )
                 })?;
-            let mut hasher = Sha256::new();
-            hasher.update(&entry.changeset);
             let row = connetto_core::exchange::ManifestRow {
                 seq: u64::try_from(entry.seq).unwrap_or(u64::MAX),
                 major,
-                origin: None,
-                digest: hasher.finalize().into(),
+                origin: entry.origin,
+                digest: entry.digest,
             };
             let _ = self.apply_peer_entry(&author, &row, &entry.changeset)?;
         }
@@ -8294,18 +10863,7 @@ where
         // The retraction log and provisional records are never exported (R77 decision 16).
         #[cfg(feature = "peer")]
         let (peer_entries, peer_cursors) = {
-            let entries = peer::all_entries(&mut self.db)?
-                .into_iter()
-                .map(|entry| archive::ArchivedPeerEntry {
-                    author: entry.author,
-                    seq: entry.seq,
-                    major: entry.major,
-                    changeset: entry.changeset,
-                    account: entry.account,
-                    bot_list: entry.bot_list,
-                    received_at: entry.received_at,
-                })
-                .collect();
+            let entries = peer::all_held(&mut self.db)?;
             let cursors = exchange::all_cursors(&mut self.db)?;
             (entries, cursors)
         };
@@ -8688,11 +11246,13 @@ where
         }
         let mut frame = self.peer_apply_frame()?;
         for entry in &plan.archive.pending {
-            for (table, key) in crate::op_keys(&entry.changeset).map_err(|err| {
-                ClientError::Import(format!(
-                    "parsing a restored write to filter the peer apply: {err:?}"
-                ))
-            })? {
+            for WrittenRow { table, key, .. } in
+                crate::op_keys(&entry.changeset).map_err(|err| {
+                    ClientError::Import(format!(
+                        "parsing a restored write to filter the peer apply: {err:?}"
+                    ))
+                })?
+            {
                 frame.held.insert(
                     (table.to_lowercase(), provisional::encode_key(&key)),
                     (
@@ -8920,11 +11480,34 @@ where
         clock::now_secs(&mut self.db)
     }
 
-    /// Rest one server aggregate frame in `_connetto_aggregates`, then evict
-    /// down to the configured cap.
+    /// Declare the resting table of a computed subscription's answer with the
+    /// columns the server sent.
+    ///
+    /// The frame carries only its run-local subscription id, so the statistic
+    /// is resolved from the persisted subscription record that same id names.
+    /// A frame whose subscription is not on record declares nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Session`] when the replica rejects the statements.
+    fn declare_aggregate(
+        &mut self,
+        sub_id: &str,
+        columns: &[connetto_core::messages::ColumnType],
+    ) -> Result<(), ClientError> {
+        let Some((query_id, _)) = subscriptions::identity_of(&mut self.db, sub_id)? else {
+            return Ok(());
+        };
+        let _suspended = ExemptWrites::raise(&self.write_flags);
+        aggregates::declare(&mut self.db, query_id, columns)?;
+        Ok(())
+    }
+
+    /// Rest one movement of a server-computed answer in its statistic's
+    /// resting table, then evict down to the configured cap.
     ///
     /// The frame carries only its run-local subscription id, so the query
-    /// identity that keys the rested row (query text and binds) is resolved
+    /// identity that keys the rested rows (query text and binds) is resolved
     /// from the persisted subscription record that same id names. A frame
     /// whose subscription is not on record rests nothing: there is no identity
     /// to key it on, and a live frame always has one. The write is a
@@ -8933,11 +11516,12 @@ where
     ///
     /// # Errors
     ///
-    /// [`ClientError::Session`] when the replica rejects the write.
+    /// [`ClientError::Session`] when the replica rejects the write, or when the
+    /// answer's columns never arrived.
     fn rest_aggregate(
         &mut self,
         sub_id: &str,
-        frame: &aggregates::AggregateFrame<'_>,
+        change: &connetto_core::messages::AggregateChange,
     ) -> Result<(), ClientError> {
         let Some((query_id, binds)) = subscriptions::identity_of(&mut self.db, sub_id)? else {
             return Ok(());
@@ -8947,9 +11531,12 @@ where
         // so the cap never evicts a value in use.
         let protected = subscriptions::live_identities(&mut self.db)?;
         let _suspended = ExemptWrites::raise(&self.write_flags);
-        aggregates::apply_frame(&mut self.db, query_id, &binds, frame, now)?;
+        aggregates::apply(&mut self.db, query_id, &binds, change, now)?;
         // A removal cannot add a statistic, so only a write needs the cap.
-        if frame.result_json.is_some() {
+        if !matches!(
+            change,
+            connetto_core::messages::AggregateChange::Remove { .. }
+        ) {
             aggregates::enforce_cap(
                 &mut self.db,
                 self.config.tuning.rested_statistics_cap(),
@@ -8959,36 +11546,20 @@ where
         Ok(())
     }
 
-    /// The rested scalar value and its as-of time for a subscription's query
-    /// and binds, or `None` when none rests. The scalar watch bootstraps from
-    /// this on an offline restart, and a relay answers a tab's aggregate watch
-    /// from it while its worker is offline.
+    /// The rested answer of a computed subscription's query and binds as the
+    /// server sent it, or `None` when its columns never arrived. A relay
+    /// answers a tab's watch from it while its worker is offline, replaying
+    /// the frames the server would have sent.
     ///
     /// # Errors
     ///
     /// [`ClientError::Session`] when the replica cannot be read.
-    pub fn rested_scalar(
+    pub fn rested_answer(
         &mut self,
         query: &str,
-        binds: &[BindValue],
-    ) -> Result<Option<(String, i64)>, ClientError> {
-        aggregates::lookup_scalar(&mut self.db, query, binds)
-    }
-
-    /// Every rested group row for a subscription's query and binds, the
-    /// scalar row excluded, in stored-key order. A keyed or row-shaped handle
-    /// bootstraps from these on an offline restart and a late join, whichever
-    /// resting shape it finds (R84).
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError::Session`] when the replica cannot be read.
-    pub(crate) fn rested_groups(
-        &mut self,
-        query: &str,
-        binds: &[BindValue],
-    ) -> Result<Vec<aggregates::RestedGroup>, ClientError> {
-        aggregates::lookup_groups(&mut self.db, query, binds)
+        binds: &[SqliteValue],
+    ) -> Result<Option<aggregates::RestedAnswer>, ClientError> {
+        aggregates::answer(&mut self.db, query, binds)
     }
 
     /// Every subscription this replica has declared and not dropped, whether
@@ -9094,14 +11665,45 @@ where
             self.check_writer_deadlines();
             #[cfg(feature = "peer")]
             {
-                self.check_provisional_deadlines();
+                self.check_provisional_deadlines()?;
                 self.flush_provisional_asks().await?;
+                self.check_courier_deadline().await?;
+                self.flush_courier_ranges().await?;
             }
             self.check_drain_deadline().await;
             self.step_drain_share_keys().await?;
             if let Some(notice) = self.notices.pop_front() {
                 return Ok(notice);
             }
+            #[cfg(feature = "peer")]
+            let arrived = match (
+                self.wire.as_mut(),
+                self.drain.wire_mut(),
+                self.courier_wire.as_mut(),
+            ) {
+                (None, None, None) => return Err(ClientError::NotConnected),
+                (Some(wire), None, None) => Arrived::Main(wire.transport.recv().await),
+                (None, Some(drain), None) => Arrived::Drain(drain.recv().await),
+                (None, None, Some(courier)) => Arrived::Courier(courier.recv().await),
+                (Some(wire), Some(drain), None) => tokio::select! {
+                    frame = wire.transport.recv() => Arrived::Main(frame),
+                    frame = drain.recv() => Arrived::Drain(frame),
+                },
+                (Some(wire), None, Some(courier)) => tokio::select! {
+                    frame = wire.transport.recv() => Arrived::Main(frame),
+                    frame = courier.recv() => Arrived::Courier(frame),
+                },
+                (None, Some(drain), Some(courier)) => tokio::select! {
+                    frame = drain.recv() => Arrived::Drain(frame),
+                    frame = courier.recv() => Arrived::Courier(frame),
+                },
+                (Some(wire), Some(drain), Some(courier)) => tokio::select! {
+                    frame = wire.transport.recv() => Arrived::Main(frame),
+                    frame = drain.recv() => Arrived::Drain(frame),
+                    frame = courier.recv() => Arrived::Courier(frame),
+                },
+            };
+            #[cfg(not(feature = "peer"))]
             let arrived = match (self.wire.as_mut(), self.drain.wire_mut()) {
                 (None, None) => return Err(ClientError::NotConnected),
                 (Some(wire), None) => Arrived::Main(wire.transport.recv().await),
@@ -9129,11 +11731,14 @@ where
         // A writer answer that overran its bound drops the connection before
         // the next frame is waited on, so the pump redials without stalling.
         self.check_writer_deadlines();
-        // A lapsed, deferred or refused ask hands the session's next ask on.
+        // A lapsed, deferred or refused ask hands the session's next ask on,
+        // a lapsed courier range dropping its wait and a queued range going out.
         #[cfg(feature = "peer")]
         {
-            self.check_provisional_deadlines();
+            self.check_provisional_deadlines()?;
             self.flush_provisional_asks().await?;
+            self.check_courier_deadline().await?;
+            self.flush_courier_ranges().await?;
         }
         self.check_share_key_deadlines();
         self.step_share_keys().await?;
@@ -9145,11 +11750,60 @@ where
         if let Some(notice) = self.notices.pop_front() {
             return Ok(Some(notice));
         }
+        #[cfg(feature = "peer")]
+        let arrived = match (
+            self.wire.as_mut(),
+            self.drain.wire_mut(),
+            self.courier_wire.as_mut(),
+        ) {
+            (None, None, None) => {
+                cancel.await;
+                return Ok(None);
+            }
+            (Some(wire), None, None) => tokio::select! {
+                biased;
+                () = cancel => return Ok(None),
+                frame = wire.transport.recv() => Arrived::Main(frame),
+            },
+            (None, Some(drain), None) => tokio::select! {
+                biased;
+                () = cancel => return Ok(None),
+                frame = drain.recv() => Arrived::Drain(frame),
+            },
+            (None, None, Some(courier)) => tokio::select! {
+                biased;
+                () = cancel => return Ok(None),
+                frame = courier.recv() => Arrived::Courier(frame),
+            },
+            (Some(wire), Some(drain), None) => tokio::select! {
+                biased;
+                () = cancel => return Ok(None),
+                frame = wire.transport.recv() => Arrived::Main(frame),
+                frame = drain.recv() => Arrived::Drain(frame),
+            },
+            (Some(wire), None, Some(courier)) => tokio::select! {
+                biased;
+                () = cancel => return Ok(None),
+                frame = wire.transport.recv() => Arrived::Main(frame),
+                frame = courier.recv() => Arrived::Courier(frame),
+            },
+            (None, Some(drain), Some(courier)) => tokio::select! {
+                biased;
+                () = cancel => return Ok(None),
+                frame = drain.recv() => Arrived::Drain(frame),
+                frame = courier.recv() => Arrived::Courier(frame),
+            },
+            (Some(wire), Some(drain), Some(courier)) => tokio::select! {
+                biased;
+                () = cancel => return Ok(None),
+                frame = wire.transport.recv() => Arrived::Main(frame),
+                frame = drain.recv() => Arrived::Drain(frame),
+                frame = courier.recv() => Arrived::Courier(frame),
+            },
+        };
+        #[cfg(not(feature = "peer"))]
         let arrived = match (self.wire.as_mut(), self.drain.wire_mut()) {
             (None, None) => {
-                // No socket is not a failure here. It is a connection with
-                // nothing to say, exactly like an idle one, and treating it as
-                // an error would end a pump that still has local work to do.
                 cancel.await;
                 return Ok(None);
             }
@@ -9190,6 +11844,14 @@ where
             Arrived::Drain(Err(err)) => {
                 tracing::warn!(error = %err, "the drain wire failed");
                 self.drain_wire_failed().await;
+                Ok(self.notices.pop_front())
+            }
+            #[cfg(feature = "peer")]
+            Arrived::Courier(Ok(frame)) => self.handle_courier_wire_frame(frame).await,
+            #[cfg(feature = "peer")]
+            Arrived::Courier(Err(err)) => {
+                tracing::warn!(error = %err, "the courier wire failed");
+                self.drop_courier_wire().await?;
                 Ok(self.notices.pop_front())
             }
         }
@@ -9256,6 +11918,21 @@ where
                 self.settle_relay_storage(answer);
                 return Ok(None);
             }
+            Some(IncomingFrame::Control(ControlMessage::TabDismissAnswer(answer))) => {
+                self.settle_relay_dismiss(answer);
+                return Ok(None);
+            }
+            // The worker's snapshot of its outbox, which a mirror answers
+            // `unsynced_work` from.
+            Some(IncomingFrame::Control(ControlMessage::TabUnsynced(work))) => {
+                self.relayed_unsynced = work;
+                self.unsynced_moved.store(true, Ordering::Relaxed);
+                return Ok(None);
+            }
+            Some(IncomingFrame::Control(ControlMessage::CourierAuditAnswer(answer))) => {
+                self.settle_courier_audit(&answer);
+                return Ok(None);
+            }
             Some(IncomingFrame::Control(msg)) => {
                 #[cfg(feature = "device-identity")]
                 if enrolment::Answer::is_answer(&msg) {
@@ -9264,7 +11941,7 @@ where
                     }
                     return Ok(None);
                 }
-                self.handle_control(msg).await?
+                return self.handle_control(msg).await;
             }
         };
         Ok(Some(event))
@@ -9289,7 +11966,9 @@ where
             .map_err(|e| ClientError::Transport(e.to_string()))
     }
 
-    /// Ask the server for a content ticket naming one file and one verb.
+    /// Ask the server for a content ticket naming one file and one verb,
+    /// with `for_owner` naming the account a carried upload credits (R79
+    /// decision 17).
     ///
     /// The answer arrives on a later [`pump_one`](Self::pump_one) as
     /// [`ClientEvent::ContentTicket`] carrying `request_id`, or as a refusal
@@ -9306,6 +11985,7 @@ where
         request_id: String,
         file_id: [u8; 32],
         verb: ContentVerb,
+        for_owner: Option<String>,
     ) -> Result<(), ClientError> {
         self.wire()?
             .transport
@@ -9313,6 +11993,7 @@ where
                 request_id,
                 file_id,
                 verb,
+                for_owner,
             }))
             .await
             .map_err(|e| ClientError::Transport(e.to_string()))
@@ -9527,7 +12208,9 @@ where
         .await?;
         if let Some(queue) = self.writers.get_mut(&writer) {
             queue.sent_through = queue.sent_through.max(seq);
+            queue.deferred.remove(&seq);
         }
+        self.unsynced_moved.store(true, Ordering::Relaxed);
         Ok(())
     }
 
@@ -9683,6 +12366,7 @@ where
     ///
     /// [`ClientError::Transport`] when the close fails.
     pub async fn close(&mut self) -> Result<(), ClientError> {
+        self.finish_courier_audit();
         self.wire()?
             .transport
             .close()
@@ -9699,21 +12383,21 @@ where
     /// A server throttle, deferring the pending write it names.
     fn rate_limited(&mut self, limited: connetto_core::messages::RateLimited) -> ClientEvent {
         self.refuse_declaration(limited.related_to.as_deref());
-        // A deferral naming the open provisional ask is the session's lapse,
-        // the next one re-asking (R77 decision 11).
+        // A deferral names the provisional ask, the next session re-asking (R77).
         #[cfg(feature = "peer")]
-        self.drop_provisional_ask(limited.related_to.as_deref());
+        self.drop_provisional_ask(limited.related_to.as_deref(), true);
         // A mutation is correlated by its sequence, and one still pending waits for its resend.
         let throttled_write = limited
             .related_to
             .as_deref()
             .and_then(|related| related.parse::<u64>().ok())
-            .is_some_and(|seq| {
+            .filter(|seq| {
                 self.writers
                     .values()
-                    .any(|queue| queue.pending.contains_key(&seq))
+                    .any(|queue| queue.pending.contains_key(seq))
             });
-        if throttled_write {
+        if let Some(seq) = throttled_write {
+            self.mark_deferred(seq);
             self.defer_pending(Some(Duration::from_millis(limited.retry_after_ms)));
         }
         // A swap its limit refused is deferred by the server's bound, not
@@ -9740,13 +12424,16 @@ where
         clippy::too_many_lines,
         reason = "Each control frame has one explicit protocol dispatch arm."
     )]
-    async fn handle_control(&mut self, msg: ControlMessage) -> Result<ClientEvent, ClientError> {
+    async fn handle_control(
+        &mut self,
+        msg: ControlMessage,
+    ) -> Result<Option<ClientEvent>, ClientError> {
         match msg {
             ControlMessage::SnapshotBegin(begin) => {
                 self.open_snapshots.insert(begin.sub_id.clone());
-                Ok(ClientEvent::SnapshotBegin {
-                    sub_id: begin.sub_id,
-                })
+                Ok(Some(ClientEvent::SnapshotBegin {
+                    sub_id: begin.sub_id.clone(),
+                }))
             }
             ControlMessage::SnapshotEnd(end) => {
                 // This records a resume position for rows delivered on the
@@ -9780,29 +12467,25 @@ where
                 // correlated to this sub is answered.
                 self.refused.remove(&end.sub_id);
                 self.publish_coverage()?;
-                Ok(ClientEvent::SnapshotEnd { sub_id: end.sub_id })
+                Ok(Some(ClientEvent::SnapshotEnd { sub_id: end.sub_id }))
+            }
+            ControlMessage::AggregateColumns(columns) => {
+                self.declare_aggregate(&columns.sub_id, &columns.columns)?;
+                Ok(Some(ClientEvent::AggregateColumns {
+                    sub_id: columns.sub_id,
+                    columns: columns.columns,
+                }))
             }
             ControlMessage::AggregateUpdate(update) => {
                 // Resting is a durable consequence of receiving a server frame,
                 // the same class as the cursor and patch writes above, so it
                 // happens here on the one frame-application path every pump
                 // driver shares, not in a driver's own loop (R83).
-                self.rest_aggregate(
-                    &update.sub_id,
-                    &aggregates::AggregateFrame {
-                        group_key: update.group_key.as_deref(),
-                        group_values_json: update.group_values_json.as_deref(),
-                        result_json: update.result_json.as_deref(),
-                        is_full_result: update.is_full_result,
-                    },
-                )?;
-                Ok(ClientEvent::Aggregate {
+                self.rest_aggregate(&update.sub_id, &update.change)?;
+                Ok(Some(ClientEvent::Aggregate {
                     sub_id: update.sub_id,
-                    result_json: update.result_json,
-                    group_key: update.group_key,
-                    group_values_json: update.group_values_json,
-                    is_full_result: update.is_full_result,
-                })
+                    change: update.change,
+                }))
             }
             ControlMessage::FullResyncRequired(resync) => {
                 if resync.reason == FullResyncReason::AuthorizationChange {
@@ -9818,19 +12501,23 @@ where
                 if !aggregate {
                     self.resyncing.insert(resync.sub_id.clone());
                 }
-                Ok(ClientEvent::FullResync {
+                Ok(Some(ClientEvent::FullResync {
                     sub_id: resync.sub_id,
                     reason: resync.reason,
-                })
+                }))
             }
-            ControlMessage::MutationApplied(ack) => self.mutation_applied(ack.client_seq).await,
-            ControlMessage::MutationReject(reject) => self.mutation_rejected(&reject).await,
+            ControlMessage::MutationApplied(ack) => {
+                self.mutation_applied(ack.client_seq).await.map(Some)
+            }
+            ControlMessage::MutationReject(reject) => {
+                self.mutation_rejected(&reject).await.map(Some)
+            }
             ControlMessage::MutationConflict(conflict) => {
                 let refused = PriorRefusal::Conflict {
                     table: conflict.table.clone(),
                 };
                 if let Some(event) = self.restore_answered(conflict.client_seq, Some(&refused))? {
-                    return Ok(event);
+                    return Ok(Some(event));
                 }
                 self.settle_resend();
                 let writer = self
@@ -9839,17 +12526,21 @@ where
                 let rows = self.rollback(writer, conflict.client_seq, &refused)?;
                 #[cfg(feature = "device-identity")]
                 self.finish_number_tail().await?;
-                Ok(ClientEvent::MutationConflict {
+                Ok(Some(ClientEvent::MutationConflict {
                     client_seq: conflict.client_seq,
                     rows,
                     server_row: conflict.server_row,
-                })
+                }))
             }
-            ControlMessage::WriterAnswer(answer) => self.settle_writer_task(&answer).await,
+            ControlMessage::WriterAnswer(answer) => {
+                self.settle_writer_task(&answer).await.map(Some)
+            }
             #[cfg(feature = "peer")]
             ControlMessage::ProvisionalVerdicts(answer) => {
                 self.settle_provisional_ask(&answer).await
             }
+            #[cfg(feature = "peer")]
+            ControlMessage::CourierAnswer(answer) => self.settle_courier_answer(&answer).await,
             ControlMessage::Pong(pong) => {
                 let fence = if self
                     .declaration_fence
@@ -9868,78 +12559,93 @@ where
                     self.recompute_share_key_deadline();
                     self.publish_coverage()?;
                 }
-                Ok(ClientEvent::Pong { nonce: pong.nonce })
+                Ok(Some(ClientEvent::Pong { nonce: pong.nonce }))
             }
-            ControlMessage::ContentTicketGrant(grant) => Ok(ClientEvent::ContentTicket {
+            ControlMessage::ContentTicketGrant(grant) => Ok(Some(ClientEvent::ContentTicket {
                 request_id: grant.request_id,
                 url: grant.url,
-            }),
+            })),
             ControlMessage::NonFatalError(err) => {
                 if let Some(id) = &err.related_to
-                    && err.detail == SUBSCRIPTION_REFUSED
+                    && (err.detail == SUBSCRIPTION_REFUSED
+                        || err.detail == SUBSCRIPTION_REFUSED_SCHEMA)
                 {
                     self.refused.insert(id.clone());
                 }
-                // A refusal naming the open provisional ask settles it for
-                // the session, the next one re-asking (R77 decision 11).
+                // A refusal names a provisional ask the server opened nothing of (R77).
                 #[cfg(feature = "peer")]
-                self.drop_provisional_ask(err.related_to.as_deref());
+                {
+                    if let Some(author) = self.drop_provisional_ask(err.related_to.as_deref(), true)
+                    {
+                        self.raise_courier_candidates_if_changed(author)?;
+                    }
+                }
                 self.refuse_declaration(err.related_to.as_deref());
-                Ok(ClientEvent::NonFatal {
+                Ok(Some(ClientEvent::NonFatal {
                     related_to: err.related_to,
                     detail: err.detail,
-                })
+                }))
             }
-            ControlMessage::RateLimited(limited) => Ok(self.rate_limited(limited)),
-            // A relay saying whether IT can reach the server. For a tab that is
-            // the answer that matters, because a tab whose own link is fine
-            // still cannot sync while the relay cannot, so it rides the same
-            // event as this connection's own state.
-            ControlMessage::SyncStatus(status) => Ok(ClientEvent::SyncStatus(status)),
-            // A relay stating the worker's gate state. For a tab that is the
-            // answer its application acts on, so it rides the same event as
-            // the client's own gate.
-            ControlMessage::GateState(state) => Ok(match state {
+            ControlMessage::RateLimited(limited) => Ok(Some(self.rate_limited(limited))),
+            // A relay's reachability rides this connection's own state event, a tab reading its world through it.
+            ControlMessage::SyncStatus(status) => Ok(Some(ClientEvent::SyncStatus(status))),
+            // The worker's gate state rides the client's own gate event, the application acting on it.
+            ControlMessage::GateState(state) => Ok(Some(match state {
                 GateState::Locked => ClientEvent::Locked,
                 GateState::Unlocked => ClientEvent::Unlocked,
                 GateState::UnlockDismissed => ClientEvent::UnlockDismissed,
-            }),
-            // A relay stating how the worker's drain of held work settled
-            // (R31). The application acts on it wherever it runs.
-            ControlMessage::HeldWork(held) => Ok(ClientEvent::Held(held)),
-            // A relay telling the tab the worker's major's sunset (R107),
-            // which the worker's ack already raised natively.
-            ControlMessage::TabSunset(at_secs) => Ok(ClientEvent::Sunset { at_secs }),
-            // A relay stating who its worker is. The tab's mirror runs the
-            // worker's translated schema, whose views filter on both values.
+            })),
+            // The worker's held-work drain settles (R31), the application acting on it wherever it runs.
+            ControlMessage::HeldWork(held) => Ok(Some(ClientEvent::Held(held))),
+            // The worker's major sunset reaches the tab (R107), the worker's ack having raised it natively.
+            ControlMessage::TabSunset(at_secs) => Ok(Some(ClientEvent::Sunset { at_secs })),
+            // The worker's identity, the tab's mirror views filtering on both values.
             ControlMessage::TabIdentity(identity) => {
                 self.adopt_relay_identity(identity)?;
-                Ok(ClientEvent::IdentityStated)
+                Ok(Some(ClientEvent::IdentityStated))
             }
-            // The server says why it is closing. Surfaced rather than treated
-            // as a violation: the server behaved exactly as the protocol says.
-            ControlMessage::FatalError(fatal) => self.server_closed(fatal.reason),
-            ControlMessage::DeliveryPaused { cause } => Ok(ClientEvent::DeliveryPaused { cause }),
-            ControlMessage::DeliveryResumed => Ok(ClientEvent::DeliveryResumed),
+            // The server's reason for closing, surfaced rather than treated as a violation.
+            ControlMessage::FatalError(fatal) => self.server_closed(fatal.reason).map(Some),
+            ControlMessage::DeliveryPaused { cause } => {
+                Ok(Some(ClientEvent::DeliveryPaused { cause }))
+            }
+            ControlMessage::DeliveryResumed => Ok(Some(ClientEvent::DeliveryResumed)),
             ControlMessage::MembershipOpened(opened) => {
-                // R27 decisions 3, 4 and 7: the server opened a membership
-                // subscription on this client's behalf. Its data frames apply
-                // like any other subscription's, while the table stays out of
-                // the application-facing changed-tables signal. The server
-                // owns its lifecycle, so nothing is declared or re-declared
-                // here.
+                // R27: the server opened a membership subscription here, its data applying while the table stays out of the changed-tables signal.
                 self.hidden_tables
                     .insert(opened.member_table.to_lowercase());
-                Ok(ClientEvent::MembershipOpened {
+                Ok(Some(ClientEvent::MembershipOpened {
                     sub_id: opened.sub_id,
                     member_table: opened.member_table,
-                })
+                }))
             }
             ControlMessage::ShareKeysReplaced(ack) => {
                 self.settle_share_key_replacement(&ack.request_id)?;
-                Ok(ClientEvent::ShareKeysReplaced {
+                Ok(Some(ClientEvent::ShareKeysReplaced {
                     request_id: ack.request_id,
-                })
+                }))
+            }
+            // The receipt goes ahead of the event, so the rows are deleted
+            // while the connection still stands to carry the event, and a
+            // relaying connection holds the frame for the receipt of the
+            // connection it relays to (R78 decision 41 as amended).
+            ControlMessage::CourierNotice(notice) => {
+                let relays = self.relays_courier_notices;
+                let wire = self.wire()?;
+                if relays {
+                    wire.held_notices.push(notice.clone());
+                } else {
+                    wire.transport
+                        .send_control(ControlMessage::CourierNoticeAck(CourierNoticeAck {
+                            notice_id: notice.notice_id.clone(),
+                        }))
+                        .await
+                        .map_err(|e| ClientError::Transport(e.to_string()))?;
+                }
+                Ok(Some(ClientEvent::WritesCouriered {
+                    notice_id: notice.notice_id,
+                    notices: notice.notices,
+                }))
             }
             other => Err(ClientError::Protocol(format!(
                 "unexpected control frame from server: {other:?}"
@@ -9988,6 +12694,9 @@ where
             }
             _ => {}
         }
+        // The server ended the session, so the wire goes now and the loss is
+        // announced before any redial.
+        self.disconnected();
         Ok(ClientEvent::ServerClosed { reason })
     }
 
@@ -10059,6 +12768,7 @@ where
                 .unwrap_or(false)
                 || self.restoring(client_seq);
             if held {
+                self.mark_deferred(client_seq);
                 self.defer_pending(None);
             }
             return Ok(ClientEvent::MutationDeferred { client_seq });
@@ -10268,7 +12978,8 @@ where
         // Compared case-insensitively because the server names it from the
         // catalog, and a split table's holdings name its backing table.
         let truncated = match reason {
-            FullResyncReason::TableTruncated { table } => {
+            FullResyncReason::TableTruncated { table }
+            | FullResyncReason::TableRefused { table } => {
                 let table = table.to_lowercase();
                 Some(
                     self.config
@@ -10483,6 +13194,35 @@ where
         self.db
             .immediate_transaction(|db| presence::depart(db, config, identity))
             .map(drop)
+    }
+
+    /// Undo a closed identity's queued shared writes and remove its holdings.
+    ///
+    /// Supply changesets newest first. A failed transaction preserves the
+    /// identity and all shared rows. The live identity cannot be removed.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the identity is live or the shared transaction fails.
+    pub fn forget_shared_identity<'changeset>(
+        &mut self,
+        identity: &str,
+        newest_first: impl IntoIterator<Item = &'changeset [u8]>,
+    ) -> Result<(), ClientError> {
+        if identity == self.config.client_id {
+            return Err(ClientError::Session(
+                "cannot forget the live shared identity".to_owned(),
+            ));
+        }
+        if self.config.shared_tables.is_empty() {
+            return Ok(());
+        }
+        let _suspended = ExemptWrites::raise(&self.write_flags);
+        let config = &self.config;
+        self.db.immediate_transaction(|database| {
+            undo_shared(database, &config.shared_tables, newest_first)?;
+            presence::depart(database, config, identity).map(drop)
+        })
     }
 
     /// Return freelist pages to the filesystem: reclaim in
@@ -10972,6 +13712,9 @@ impl<T: Transport + Send> LoadConnection<DefaultLoadingMode> for ConnettoConnect
 }
 
 #[cfg(test)]
+mod courier_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use connetto_core::test_support::FakeTransport;
@@ -11094,18 +13837,20 @@ mod tests {
         }
         conn.resend = Resend::Resent { episode };
 
-        conn.handle_control(ControlMessage::MutationReject(MutationReject {
-            client_seq: first,
-            reason: MutationRejectReason::Unauthorized,
-        }))
-        .await
-        .expect("the refusal settles");
-        conn.handle_control(ControlMessage::MutationReject(MutationReject {
-            client_seq: second,
-            reason: MutationRejectReason::Indeterminate,
-        }))
-        .await
-        .expect("the next outage defers");
+        let _ = conn
+            .handle_control(ControlMessage::MutationReject(MutationReject {
+                client_seq: first,
+                reason: MutationRejectReason::Unauthorized,
+            }))
+            .await
+            .expect("the refusal settles");
+        let _ = conn
+            .handle_control(ControlMessage::MutationReject(MutationReject {
+                client_seq: second,
+                reason: MutationRejectReason::Indeterminate,
+            }))
+            .await
+            .expect("the next outage defers");
         let wait = conn.resend_timer().expect("a resend is armed").wait();
         assert!(
             wait <= RESEND_POLICY.initial_backoff(),
@@ -11509,11 +14254,12 @@ mod tests {
         }
         conn.bound_writer = Some(device);
         for client_seq in [1, 2] {
-            conn.handle_control(ControlMessage::MutationApplied(
-                connetto_core::messages::MutationApplied { client_seq },
-            ))
-            .await
-            .expect("the write settles");
+            let _ = conn
+                .handle_control(ControlMessage::MutationApplied(
+                    connetto_core::messages::MutationApplied { client_seq },
+                ))
+                .await
+                .expect("the write settles");
         }
         conn.bound_writer = None;
         (conn, key, device)
@@ -11568,10 +14314,10 @@ mod tests {
         let refused = PriorRefusal::Rejected(MutationRejectReason::Unauthorized);
         assert_eq!(
             event,
-            ClientEvent::WriteRestored {
+            Some(ClientEvent::WriteRestored {
                 client_seq: 2,
                 refused: Some(refused.clone()),
-            }
+            })
         );
         let logged: Vec<i64> = author::_connetto_retraction::table
             .filter(author::_connetto_retraction::writer.eq(writer_id(&device)))
@@ -11638,6 +14384,42 @@ mod tests {
             conn.writers[&unissued()].pending[&1].provenance,
             None,
             "nothing past the restored frontier is named"
+        );
+    }
+
+    /// Decision 53's device row: the same retirement owes the old writer a
+    /// server retirement, durable in the replica and queued to send.
+    #[cfg(feature = "device-identity")]
+    #[tokio::test]
+    async fn a_rewound_device_retirement_owes_the_writers_retirement() {
+        let (mut conn, key, device) =
+            device_settled_two_of_three(SyncTuning::default().with_acked_retention(Duration::ZERO))
+                .await;
+        conn.answer_bind(
+            key,
+            "below".to_owned(),
+            WriterOutcome::Bound { frontier: 1 },
+        )
+        .await
+        .expect("the bind is answered");
+        let owed: Vec<String> = _connetto_retire::table
+            .select(_connetto_retire::writer)
+            .load(&mut conn.db)
+            .expect("read the owed retirements");
+        assert_eq!(
+            owed,
+            vec![writer_id(&device)],
+            "the old writer owes a retirement, durable for a restart"
+        );
+        assert!(
+            conn.writer_tasks.iter().any(|task| {
+                matches!(
+                    &task.kind,
+                    WriterTaskKind::Retire(writer, secret)
+                        if *writer == device && secret.is_none()
+                )
+            }),
+            "the retirement is queued to go up"
         );
     }
 

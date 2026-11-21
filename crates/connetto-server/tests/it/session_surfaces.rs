@@ -24,9 +24,9 @@ use subql::backend::Value;
 use tokio::net::TcpListener;
 
 use super::device_identity::{challenge_nonce, enrol_request};
-use super::e2e::{PG_SERIAL, audit_ops, mint_tokens, reset_fixture};
 use super::enrolment::{device_key, rooted_issuer};
 use super::lifecycle::{admin_pool, builder_over, live_session, next_control, wait_ready};
+use connetto_test_harness::server_fixture::{PG_SERIAL, audit_ops, mint_tokens, reset_fixture};
 
 /// Record that `session` of `user` minted `subject` over `orders` row `row`,
 /// as a mint through `CapabilityIssuer` records it.
@@ -102,11 +102,13 @@ async fn served(fixture: &Fixture) -> Served {
         change_stream,
         handle,
         ..
-    } = builder
-        .device_identity(Some(DeviceCertConfig::new(issuer)))
-        .build()
-        .await
-        .expect("the deployment assembles");
+    } = Box::pin(
+        builder
+            .device_identity(Some(DeviceCertConfig::new(issuer)))
+            .build(),
+    )
+    .await
+    .expect("the deployment assembles");
     let stream = tokio::spawn(async move {
         let _ = change_stream.await;
     });
@@ -402,7 +404,7 @@ async fn ending_sessions_answers_what_they_left_behind_and_forgets_their_provide
              VALUES ('mine', '{bot}', '{user}', 1), ('theirs', '{bot}', 'someone', 1)"
         ),
     ] {
-        super::e2e::exec(&served.pool, &statement).await;
+        connetto_test_harness::server_fixture::exec(&served.pool, &statement).await;
     }
     assert_eq!(provider_tokens(&served.pool, phone_session).await, 1);
 

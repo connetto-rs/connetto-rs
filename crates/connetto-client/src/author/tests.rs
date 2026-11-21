@@ -68,11 +68,12 @@ async fn an_applied_entry_settles_the_frontier_at_its_hash() {
         })
     );
 
-    conn.handle_control(ControlMessage::MutationApplied(MutationApplied {
-        client_seq: seqs[0],
-    }))
-    .await
-    .expect("the ack lands");
+    let _ = conn
+        .handle_control(ControlMessage::MutationApplied(MutationApplied {
+            client_seq: seqs[0],
+        }))
+        .await
+        .expect("the ack lands");
     let settled = offer(&mut conn);
     assert_eq!(
         settled.settled,
@@ -88,11 +89,12 @@ async fn an_applied_entry_settles_the_frontier_at_its_hash() {
     );
     assert_eq!(settled.retractions, []);
 
-    conn.handle_control(ControlMessage::MutationApplied(MutationApplied {
-        client_seq: seqs[1],
-    }))
-    .await
-    .expect("the ack lands");
+    let _ = conn
+        .handle_control(ControlMessage::MutationApplied(MutationApplied {
+            client_seq: seqs[1],
+        }))
+        .await
+        .expect("the ack lands");
     let drained = offer(&mut conn);
     assert_eq!(
         drained.settled,
@@ -113,25 +115,28 @@ async fn an_applied_entry_settles_the_frontier_at_its_hash() {
 #[tokio::test]
 async fn refused_and_conflicted_entries_settle_into_the_retraction_log() {
     let (mut conn, seqs, _steered) = device_replica(4);
-    conn.handle_control(ControlMessage::MutationReject(MutationReject {
-        client_seq: seqs[0],
-        reason: MutationRejectReason::Unauthorized,
-    }))
-    .await
-    .expect("the refusal lands");
-    conn.handle_control(ControlMessage::MutationConflict(MutationConflict {
-        client_seq: seqs[1],
-        table: "items".to_owned(),
-        server_row: None,
-    }))
-    .await
-    .expect("the conflict lands");
-    conn.handle_control(ControlMessage::MutationReject(MutationReject {
-        client_seq: seqs[2],
-        reason: MutationRejectReason::Indeterminate,
-    }))
-    .await
-    .expect("the deferral lands");
+    let _ = conn
+        .handle_control(ControlMessage::MutationReject(MutationReject {
+            client_seq: seqs[0],
+            reason: MutationRejectReason::Unauthorized,
+        }))
+        .await
+        .expect("the refusal lands");
+    let _ = conn
+        .handle_control(ControlMessage::MutationConflict(MutationConflict {
+            client_seq: seqs[1],
+            table: "items".to_owned(),
+            server_row: None,
+        }))
+        .await
+        .expect("the conflict lands");
+    let _ = conn
+        .handle_control(ControlMessage::MutationReject(MutationReject {
+            client_seq: seqs[2],
+            reason: MutationRejectReason::Indeterminate,
+        }))
+        .await
+        .expect("the deferral lands");
 
     let offer = offer(&mut conn);
     assert_eq!(
@@ -191,27 +196,30 @@ async fn every_change_to_the_device_writers_offer_asks_for_a_fresh_one() {
     queue(&mut conn, WriterRef::Number(7), 10, major(2));
     assert_eq!(refreshes(&mut steered), 0, "a number writer offers nothing");
 
-    conn.handle_control(ControlMessage::MutationApplied(MutationApplied {
-        client_seq: seqs[0],
-    }))
-    .await
-    .expect("the ack lands");
+    let _ = conn
+        .handle_control(ControlMessage::MutationApplied(MutationApplied {
+            client_seq: seqs[0],
+        }))
+        .await
+        .expect("the ack lands");
     assert_eq!(refreshes(&mut steered), 1, "the settled frontier moved");
 
-    conn.handle_control(ControlMessage::MutationReject(MutationReject {
-        client_seq: seqs[1],
-        reason: MutationRejectReason::Unauthorized,
-    }))
-    .await
-    .expect("the refusal lands");
+    let _ = conn
+        .handle_control(ControlMessage::MutationReject(MutationReject {
+            client_seq: seqs[1],
+            reason: MutationRejectReason::Unauthorized,
+        }))
+        .await
+        .expect("the refusal lands");
     assert_eq!(refreshes(&mut steered), 1, "the retraction log grew");
 
-    conn.handle_control(ControlMessage::MutationReject(MutationReject {
-        client_seq: seqs[2],
-        reason: MutationRejectReason::Indeterminate,
-    }))
-    .await
-    .expect("the deferral lands");
+    let _ = conn
+        .handle_control(ControlMessage::MutationReject(MutationReject {
+            client_seq: seqs[2],
+            reason: MutationRejectReason::Indeterminate,
+        }))
+        .await
+        .expect("the deferral lands");
     assert_eq!(refreshes(&mut steered), 0, "a deferral changes no offer");
 }
 
@@ -278,12 +286,13 @@ async fn a_settlement_that_cannot_be_written_fails_and_keeps_the_entry() {
 #[tokio::test]
 async fn a_retirement_whose_log_cannot_be_dropped_keeps_the_writer() {
     let (mut conn, seqs, _steered) = device_replica(2);
-    conn.handle_control(ControlMessage::MutationReject(MutationReject {
-        client_seq: seqs[0],
-        reason: MutationRejectReason::Unauthorized,
-    }))
-    .await
-    .expect("the refusal lands");
+    let _ = conn
+        .handle_control(ControlMessage::MutationReject(MutationReject {
+            client_seq: seqs[0],
+            reason: MutationRejectReason::Unauthorized,
+        }))
+        .await
+        .expect("the refusal lands");
     refuse(&mut conn, "BEFORE DELETE ON _connetto_retraction");
     assert!(conn.retire_device(Carry::Named).is_err());
     assert_eq!(queued(&mut conn), 1, "the device writer keeps its entry");

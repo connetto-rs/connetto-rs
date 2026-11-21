@@ -19,7 +19,7 @@ use connetto_client::{
 
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired, LivePatch, SnapshotBegin,
-    SnapshotEnd, SnapshotPatch, SubscriptionPriority,
+    SnapshotEnd, SnapshotPatch,
 };
 use connetto_core::traits::IncomingFrame;
 use diesel::connection::SimpleConnection;
@@ -239,17 +239,13 @@ async fn connected_shared() -> (ConnettoConnection<Script>, Script) {
     let script = Script::default();
     script.say(support::handshake_ack());
     let schema = SyncSchema::new(
-        connetto_schema::translate_shared::<String, connetto_core::bots::TextIds>(
-            "-- connetto:major 1\nCREATE TABLE vocabulary (id INT PRIMARY KEY, label TEXT NOT NULL); \
-             CREATE TABLE notes (id INT PRIMARY KEY, vocabulary_id INT NOT NULL, \
-              owner TEXT NOT NULL); \
-             ALTER TABLE vocabulary ENABLE ROW LEVEL SECURITY; \
-             ALTER TABLE notes ENABLE ROW LEVEL SECURITY;",
-            "CREATE POLICY vocabulary_read ON vocabulary FOR SELECT USING (id > 0); \
-             CREATE POLICY notes_read ON notes FOR SELECT USING \
-             (owner = current_setting('app.user_id', true));",
-            &["vocabulary"],
-        )
+        connetto_schema::translate_shared::<String, connetto_core::bots::TextIds>(connetto_schema::Documents::new("-- connetto:major 1\nCREATE TABLE vocabulary (id INT PRIMARY KEY, label TEXT NOT NULL); \
+         CREATE TABLE notes (id INT PRIMARY KEY, vocabulary_id INT NOT NULL, \
+          owner TEXT NOT NULL); \
+         ALTER TABLE vocabulary ENABLE ROW LEVEL SECURITY; \
+         ALTER TABLE notes ENABLE ROW LEVEL SECURITY;", "CREATE POLICY vocabulary_read ON vocabulary FOR SELECT USING (id > 0); \
+         CREATE POLICY notes_read ON notes FOR SELECT USING \
+         (owner = current_setting('app.user_id', true));", connetto_test_harness::FIXTURE_ROLES, connetto_test_harness::FIXTURE_READER), &["vocabulary"])
         .expect("translate the shared vocabulary"),
     );
     let conn = ClientBuilder::new(schema, support::Once::new(script.clone()))
@@ -264,7 +260,6 @@ fn send_snapshot(server: &Script, sub_id: &str, payload: Vec<u8>, cursor: u8) {
     server.say(IncomingFrame::Control(ControlMessage::SnapshotBegin(
         SnapshotBegin {
             sub_id: sub_id.to_owned(),
-            priority: SubscriptionPriority::default(),
         },
     )));
     server.say(IncomingFrame::Bulk(BulkMessage::SnapshotPatch(

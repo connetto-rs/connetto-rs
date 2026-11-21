@@ -10,9 +10,10 @@ name: CI
 permissions:
   contents: read
 
+# A main run is never cut short, and a newer merge replaces only the pending main run.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -20,7 +21,10 @@ env:
 
 # Caches are saved only from main, which restores exact keys only, so a
 # tree saved after a Cargo.lock change holds none of the artifacts the
-# older lock left behind. Pull requests also restore the nearest older key.
+# older lock left behind. A main run that fails or is cancelled saves its
+# build output under its key with a -partial- suffix, which a later main run
+# of the same lock restores, so a cold build its timeout cut short resumes.
+# Pull requests also restore the nearest older key.
 # Self-hosted runners skip these steps, since their host-mounted cargo
 # registry and sccache already hold the same work without a download.
 jobs:
@@ -155,6 +159,102 @@ jobs:
             ~/.cargo/git/db
           key: ${{ steps.cache-1.outputs.cache-primary-key }}
 
+  nightly-clippy:
+    # The gate's clippy, on the dated nightly ci/clippy-nightly names, so a
+    # lint that fires only on nightly fails a pull request.
+    name: Clippy root nightly
+    runs-on: *light-runner
+    timeout-minutes: 40
+    env:
+      CONNETTO_DEMO_BUILD_DEVICE_ROOT: /dev/null
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore cargo downloads
+        if: runner.environment == 'github-hosted'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
+
+      - name: Read the pinned nightly
+        id: nightly
+        run: echo "toolchain=$(cat ci/clippy-nightly)" >> "$GITHUB_OUTPUT"
+
+      - name: Install the pinned nightly with clippy
+        uses: $/.github/actions/install-rust
+        with:
+          toolchain: ${{ steps.nightly.outputs.toolchain }}
+          components: clippy
+
+      - name: Install desktop dependencies
+        uses: $/.github/actions/install-desktop-deps
+
+      - name: Run clippy
+        env:
+          TOOLCHAIN: ${{ steps.nightly.outputs.toolchain }}
+        run: cargo "+$TOOLCHAIN" clippy --all-targets --all-features -- -D warnings
+
+  android-clippy:
+    # The gate's clippy for the Android target, on the same dated nightly, over
+    # the crates with Android-only code, which no other job compiles for
+    # Android.
+    name: Clippy android
+    runs-on: *light-runner
+    timeout-minutes: 40
+    env:
+      CONNETTO_DEMO_BUILD_DEVICE_ROOT: /dev/null
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore cargo downloads
+        if: runner.environment == 'github-hosted'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
+
+      - name: Read the pinned nightly
+        id: nightly
+        run: echo "toolchain=$(cat ci/clippy-nightly)" >> "$GITHUB_OUTPUT"
+
+      - name: Install the pinned nightly with clippy and the Android target
+        uses: $/.github/actions/install-rust
+        with:
+          toolchain: ${{ steps.nightly.outputs.toolchain }}
+          components: clippy
+          targets: aarch64-linux-android
+
+      - name: Run clippy for Android
+        env:
+          TOOLCHAIN: ${{ steps.nightly.outputs.toolchain }}
+        run: |
+          ndk="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          tc="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CC_aarch64_linux_android="$tc/aarch64-linux-android29-clang"
+          export AR_aarch64_linux_android="$tc/llvm-ar"
+          export RANLIB_aarch64_linux_android="$tc/llvm-ranlib"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$tc/aarch64-linux-android29-clang"
+          cargo "+$TOOLCHAIN" clippy \
+            --target aarch64-linux-android \
+            --all-features \
+            -p connetto-client \
+            -p connetto-peer-android \
+            -p connetto-auth-session \
+            -- -D warnings
+
   android:
     # R88: the phone build of the demo, built and linked without a
     # device. Its own job because the matrix legs pass their own flags, which
@@ -182,8 +282,14 @@ jobs:
         with:
           targets: aarch64-linux-android
 
+      # An Android build bakes in the addresses it dials, and this one is only
+      # built and linked, so the loopback addresses the emulator proof uses
+      # serve.
       - name: Build the demo for Android
         working-directory: examples/dioxus-demo
+        env:
+          CONNETTO_DEMO_BUILD_WS: ws://127.0.0.1:7777/sync
+          CONNETTO_DEMO_BUILD_AUTH_ORIGIN: http://127.0.0.1:7777
         run: |
           ndk="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
           tc="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
@@ -205,222 +311,6 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: ${{ steps.cache-1.outputs.cache-primary-key }}
-
-  ios:
-    # R88: the phone build of the demo for iOS, built without a
-    # device, for the same reason the Android leg is its own job. It links,
-    # because only the link sees a C object built for another iOS version.
-    name: Build dioxus-demo ios
-    runs-on: macos-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Restore cargo downloads
-        id: cache-1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
-
-      - name: Install stable toolchain with the iOS targets
-        uses: $/.github/actions/install-rust
-        with:
-          targets: aarch64-apple-ios aarch64-apple-ios-sim
-
-      - name: Build the demo for iOS devices and the simulator
-        working-directory: examples/dioxus-demo
-        run: |
-          for target in aarch64-apple-ios aarch64-apple-ios-sim; do
-            cargo +stable build \
-              --target "$target" \
-              --no-default-features \
-              --features mobile
-          done
-
-      - name: Save cargo downloads
-        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: ${{ steps.cache-1.outputs.cache-primary-key }}
-
-  ios-simulator:
-    # R88's proof, walked on an iOS simulator with the Tauri demo. The runner
-    # cannot run Docker, so the backend runs as plain processes and the
-    # simulator build carries an invented team ID, which the simulator does
-    # not check.
-    name: iOS simulator proof
-    runs-on: macos-latest
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Restore cargo downloads
-        id: cache-1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
-
-      - name: Restore native build output
-        id: cache-2
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: target
-          key: t-ios-simulator-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ github.event_name == 'pull_request' && format('t-ios-simulator-{0}-', runner.os) || '' }}
-
-      - name: Restore the demo's build output
-        id: cache-3
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: examples/tauri-leptos-demo/target
-          key: t-ios-simulator-tauri-${{ runner.os }}-${{ hashFiles('examples/tauri-leptos-demo/Cargo.lock') }}
-          restore-keys: ${{ github.event_name == 'pull_request' && format('t-ios-simulator-tauri-{0}-', runner.os) || '' }}
-
-      - name: Install stable toolchain with the simulator target
-        uses: $/.github/actions/install-rust
-        with:
-          targets: aarch64-apple-ios-sim
-
-      - uses: $/.github/actions/install-tauri-tools
-
-      # The proof reads the simulator's pages through ios_webkit_debug_proxy.
-      - name: Install ios_webkit_debug_proxy
-        run: brew install ios-webkit-debug-proxy
-
-      # One release tree, whose dependencies the server and the harness share.
-      - name: Build the server and the proof
-        run: |
-          cargo +stable build --release --all-features -p connetto-server --bin connetto-server
-          cargo +stable build --release -p connetto-test-harness --bin connetto-demo-stack --bin connetto-ios-proof
-
-      - uses: $/.github/actions/start-native-services
-
-      # The proof builds the demo with `cargo tauri ios build` once the stack has minted its device CA.
-      - name: Walk the proof on a simulator
-        env:
-          CONNETTO_SERVER_BIN: ${{ github.workspace }}/target/release/connetto-server
-          CONNETTO_IOS_TEAM_ID: ABCDE12345
-        run: target/release/connetto-demo-stack target/release/connetto-ios-proof --demo tauri
-
-      - uses: actions/upload-artifact@v7
-        if: failure()
-        with:
-          name: ios-proof-evidence
-          path: |
-            target/ios-proof
-            ${{ runner.temp }}/native-services/logs
-          retention-days: 7
-
-      - name: Prune target caches
-        if: always()
-        run: |
-          rm -rf target/release/incremental
-          find examples/tauri-leptos-demo/target -type d -name incremental -prune -exec rm -rf {} +
-
-      - name: Save cargo downloads
-        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: ${{ steps.cache-1.outputs.cache-primary-key }}
-
-      - name: Save native build output
-        if: github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: target
-          key: ${{ steps.cache-2.outputs.cache-primary-key }}
-
-      - name: Save the demo's build output
-        if: github.event_name == 'push' && steps.cache-3.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: examples/tauri-leptos-demo/target
-          key: ${{ steps.cache-3.outputs.cache-primary-key }}
-
-  ios-crate-tests:
-    # The client crates' own tests, run inside an iOS simulator. The runner
-    # cannot run Docker, so each fixture starts a copy of the workflow's
-    # template cluster, beside the workflow's OpenFGA and mock identity
-    # provider. It keeps no target cache, which would not fit beside
-    # main's others under the repository's 10 GB.
-    name: iOS simulator crate tests
-    runs-on: macos-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Restore cargo downloads
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
-
-      - name: Install stable toolchain with the simulator target
-        uses: $/.github/actions/install-rust
-        with:
-          targets: aarch64-apple-ios-sim
-
-      # The crates the iOS demo links, with the features it uses.
-      - name: Build the crates' tests for the simulator
-        run: |
-          while read -r -a crate; do
-            cargo +stable test --no-run --target aarch64-apple-ios-sim -p "${crate[@]}"
-          done < .github/ios-crates.txt
-
-      - uses: $/.github/actions/start-native-services
-
-      - name: Boot a simulator
-        run: |
-          udid=$(xcrun simctl list devices available --json \
-            | jq -r '[.devices[][] | select(.name == "iPhone 17 Pro")][0].udid')
-          xcrun simctl boot "$udid"
-          xcrun simctl bootstatus "$udid" -b
-          echo "SIMULATOR_UDID=$udid" >> "${GITHUB_ENV}"
-
-      # simctl passes the variables prefixed SIMCTL_CHILD_ into the simulator.
-      - name: Run the crates' tests in the simulator
-        env:
-          CARGO_TARGET_AARCH64_APPLE_IOS_SIM_RUNNER: xcrun simctl spawn ${{ env.SIMULATOR_UDID }}
-          SIMCTL_CHILD_CONNETTO_POSTGRES_BIN: ${{ env.CONNETTO_POSTGRES_BIN }}
-          SIMCTL_CHILD_CONNETTO_POSTGRES_TEMPLATE: ${{ env.CONNETTO_POSTGRES_TEMPLATE }}
-          SIMCTL_CHILD_CONNETTO_STACK_OPENFGA_URL: ${{ env.CONNETTO_STACK_OPENFGA_URL }}
-          SIMCTL_CHILD_CONNETTO_STACK_ISSUER: ${{ env.CONNETTO_STACK_ISSUER }}
-          SIMCTL_CHILD_RUST_BACKTRACE: "1"
-        run: |
-          status=0
-          while read -r -a crate; do
-            cargo +stable test --no-fail-fast --target aarch64-apple-ios-sim -p "${crate[@]}" || status=1
-          done < .github/ios-crates.txt
-          exit "$status"
-
-      - uses: actions/upload-artifact@v7
-        if: failure()
-        with:
-          name: ios-crate-test-services
-          path: ${{ runner.temp }}/native-services/logs
-          retention-days: 7
 
   rust-tests:
     name: Rust tests ${{ matrix.name }}
@@ -455,10 +345,8 @@ jobs:
       matrix:
         include:
           - name: server
-            packages: -p connetto-server
-            # The e2e tests spawn both binaries from the test profile's target dir,
-            # and neither cargo test nor nextest builds another package's bin.
-            bins: -p connetto-server -p connetto-client
+            packages: -p connetto-server -p connetto-demo-tools
+            bins: ''
           - name: client
             packages: -p connetto-client
             bins: ''
@@ -474,14 +362,17 @@ jobs:
               -p connetto-schema
               -p connetto-ca
               -p connetto-test-harness
+              -p connetto-demo-stack
               -p connetto-dioxus
               -p connetto-yew
+              -p tauri-plugin-connetto
+              -p connetto-tauri-page
               -p connetto-peer
               -p connetto-exchange
               -p connetto-demo-support
-            # The offline-exchange proof names the server binary, so the rest
+            # The offline-exchange proof names the demo server, so the rest
             # shard compiles it beside its test binaries.
-            bins: -p connetto-server
+            bins: -p connetto-demo-tools
     steps:
       - uses: actions/checkout@v7
 
@@ -504,16 +395,17 @@ jobs:
         with:
           path: target
           key: t-rust-tests-${{ matrix.name }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ github.event_name == 'pull_request' && format('t-rust-tests-{0}-{1}-', matrix.name, runner.os) || '' }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('t-rust-tests-{0}-{1}-', matrix.name, runner.os) || format('t-rust-tests-{0}-{1}-{2}-partial-', matrix.name, runner.os, hashFiles('**/Cargo.lock')) }}
 
       - name: Install stable toolchain
         uses: $/.github/actions/install-rust
 
-      # dbus-daemon backs the fake Secret portal the client suite starts.
-      - name: Install keyring helpers
+      # dbus-daemon backs the fake Secret portal the client suite starts, and
+      # the server links libpq for the drift guard's live catalog reads.
+      - name: Install keyring helpers and libpq
         run: |
           sudo apt-get update
-          sudo apt-get install -y keyutils dbus gnome-keyring libdbus-1-dev pkg-config
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y keyutils dbus gnome-keyring libdbus-1-dev libpq-dev pkg-config
 
       # --all-features turns on connetto-dioxus's desktop feature.
       - name: Install desktop dependencies
@@ -537,8 +429,8 @@ jobs:
         env:
           # The offline-exchange proof reads the binary the build step
           # compiled, so the test does not build a server of its own.
-          CONNETTO_SERVER_BIN: ${{ matrix.name == 'rest' && format('{0}/target/{1}/connetto-server', github.workspace, github.event_name == 'pull_request' && 'testfast' || 'release') || '' }}
-        run: keyctl session -- cargo +stable nextest run --profile native --cargo-profile "$CARGO_TEST_PROFILE" --all-features --test-threads 4 ${{ matrix.packages }}
+          CONNETTO_SERVER_BIN: ${{ matrix.name == 'rest' && format('{0}/target/{1}/demo-server', github.workspace, github.event_name == 'pull_request' && 'testfast' || 'release') || '' }}
+        run: keyctl session -- cargo +stable nextest run --cargo-profile "$CARGO_TEST_PROFILE" --all-features --test-threads 4 ${{ matrix.packages }}
 
       - name: Prune target cache
         if: always()
@@ -565,6 +457,13 @@ jobs:
         with:
           path: target
           key: ${{ steps.cache-2.outputs.cache-primary-key }}
+
+      - name: Save partial rust test output
+        if: (failure() || cancelled()) && runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true' && steps.cache-2.outputs.cache-primary-key != ''
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: target
+          key: ${{ steps.cache-2.outputs.cache-primary-key }}-partial-${{ github.run_id }}
 
   custody-tests:
     # R71's Linux secret-store groups that need a private session bus, root,
@@ -597,15 +496,15 @@ jobs:
         with:
           path: target
           key: t-custody-tests-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ github.event_name == 'pull_request' && format('t-custody-tests-{0}-', runner.os) || '' }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('t-custody-tests-{0}-', runner.os) || format('t-custody-tests-{0}-{1}-partial-', runner.os, hashFiles('**/Cargo.lock')) }}
 
       - name: Install stable toolchain
         uses: $/.github/actions/install-rust
 
-      - name: Install keyring helpers
+      - name: Install keyring helpers and libpq
         run: |
           sudo apt-get update
-          sudo apt-get install -y keyutils dbus gnome-keyring libdbus-1-dev pkg-config
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y keyutils dbus gnome-keyring libdbus-1-dev libpq-dev pkg-config
 
       - uses: taiki-e/install-action@nextest
 
@@ -662,6 +561,13 @@ jobs:
           path: target
           key: ${{ steps.cache-2.outputs.cache-primary-key }}
 
+      - name: Save partial custody test output
+        if: (failure() || cancelled()) && runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true' && steps.cache-2.outputs.cache-primary-key != ''
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: target
+          key: ${{ steps.cache-2.outputs.cache-primary-key }}-partial-${{ github.run_id }}
+
   browser-build:
     name: Browser stack build
     # This job hands its binaries to the shards and the Android proof, so all
@@ -698,7 +604,7 @@ jobs:
         with:
           path: target
           key: t-browser-native-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ github.event_name == 'pull_request' && format('t-browser-native-{0}-', runner.os) || '' }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('t-browser-native-{0}-', runner.os) || format('t-browser-native-{0}-{1}-partial-', runner.os, hashFiles('**/Cargo.lock')) }}
 
       - name: Install stable browser toolchain
         uses: $/.github/actions/install-rust
@@ -706,13 +612,13 @@ jobs:
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libdbus-1-dev pkg-config
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y libdbus-1-dev libpq-dev pkg-config
 
       - name: Build the browser stack
         run: |
           cargo +stable run \
             --profile "$CARGO_TEST_PROFILE" \
-            -p connetto-test-harness \
+            -p connetto-demo-stack \
             --bin connetto-browser-stack \
             -- \
             --build-only browser-bins
@@ -722,7 +628,7 @@ jobs:
         run: |
           cargo +stable build \
             --profile "$CARGO_TEST_PROFILE" \
-            -p connetto-test-harness \
+            -p connetto-demo-stack \
             --bin connetto-demo-stack \
             --bin connetto-android-proof
           mkdir android-bins
@@ -766,6 +672,13 @@ jobs:
           path: target
           key: ${{ steps.cache-2.outputs.cache-primary-key }}
 
+      - name: Save the partial native build output
+        if: (failure() || cancelled()) && runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true' && steps.cache-2.outputs.cache-primary-key != ''
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: target
+          key: ${{ steps.cache-2.outputs.cache-primary-key }}-partial-${{ github.run_id }}
+
   browser-tests:
     name: Browser tests ${{ matrix.shard }}/4
     needs: browser-build
@@ -806,7 +719,7 @@ jobs:
         with:
           path: target-wasm
           key: t-browser-wasm-lines-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ github.event_name == 'pull_request' && format('t-browser-wasm-lines-{0}-', runner.os) || '' }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('t-browser-wasm-lines-{0}-', runner.os) || format('t-browser-wasm-lines-{0}-{1}-partial-', runner.os, hashFiles('**/Cargo.lock')) }}
 
       - uses: $/.github/actions/get-files
         with:
@@ -816,6 +729,11 @@ jobs:
       # Artifacts drop the executable bit.
       - name: Mark the prebuilt binaries executable
         run: chmod +x browser-bins/*
+
+      - name: Install the libpq the prebuilt server links
+        run: |
+          sudo apt-get update
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y libpq5
 
       - name: Install stable browser toolchain with the wasm target
         uses: $/.github/actions/install-rust
@@ -834,7 +752,7 @@ jobs:
 
       - name: Run browser suites
         env:
-          CONNETTO_SERVER_BIN: ${{ github.workspace }}/browser-bins/connetto-server
+          CONNETTO_SERVER_BIN: ${{ github.workspace }}/browser-bins/demo-server
           CONNETTO_TOPOLOGY_BIN: ${{ github.workspace }}/browser-bins/verified-topology
         run: browser-bins/connetto-browser-stack --shard ${{ matrix.shard }}/4
 
@@ -860,6 +778,13 @@ jobs:
         with:
           path: target-wasm
           key: ${{ steps.cache-2.outputs.cache-primary-key }}
+
+      - name: Save partial wasm build output
+        if: (failure() || cancelled()) && runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true' && steps.cache-2.outputs.cache-primary-key != ''
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: target-wasm
+          key: ${{ steps.cache-2.outputs.cache-primary-key }}-partial-${{ github.run_id }}
 
   android-emulator:
     # R88's proof, walked on an emulator with the Tauri demo's APK, so the
@@ -891,7 +816,7 @@ jobs:
         with:
           path: examples/tauri-leptos-demo/target
           key: t-android-emulator-tauri-${{ runner.os }}-${{ hashFiles('examples/tauri-leptos-demo/Cargo.lock') }}
-          restore-keys: ${{ github.event_name == 'pull_request' && format('t-android-emulator-tauri-{0}-', runner.os) || '' }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('t-android-emulator-tauri-{0}-', runner.os) || format('t-android-emulator-tauri-{0}-{1}-partial-', runner.os, hashFiles('examples/tauri-leptos-demo/Cargo.lock')) }}
 
       - uses: $/.github/actions/get-files
         with:
@@ -906,6 +831,11 @@ jobs:
       # Artifacts drop the executable bit.
       - name: Mark the prebuilt binaries executable
         run: chmod +x browser-bins/* android-bins/*
+
+      - name: Install the libpq the prebuilt server links
+        run: |
+          sudo apt-get update
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y libpq5
 
       - name: Install stable toolchain with the emulator's target
         uses: $/.github/actions/install-rust
@@ -936,10 +866,14 @@ jobs:
       # The same command the proof runs without --apk, built before the
       # emulator boots so the emulator's time goes to the proof. Line tables
       # keep a panic's file and line and halve the APK and the cached tree.
+      # The emulator reaches the stack over adb reverse, at the loopback
+      # addresses the build bakes in.
       - name: Build the demo's APK
         working-directory: examples/tauri-leptos-demo/src-tauri
         env:
           CARGO_PROFILE_DEV_DEBUG: line-tables-only
+          CONNETTO_DEMO_BUILD_WS: ws://127.0.0.1:7777/sync
+          CONNETTO_DEMO_BUILD_AUTH_ORIGIN: http://127.0.0.1:7777
         run: cargo tauri android build --debug --apk --target x86_64 --features device-identity
 
       - uses: $/.github/actions/pull-test-images
@@ -960,7 +894,7 @@ jobs:
       # The Keystore gate (R52) needs a secure lock screen, so the run sets a throwaway PIN and types it.
       - name: Walk the proof on the emulator
         env:
-          CONNETTO_SERVER_BIN: ${{ github.workspace }}/browser-bins/connetto-server
+          CONNETTO_SERVER_BIN: ${{ github.workspace }}/browser-bins/demo-server
         run: |
           adb -s emulator-5554 shell locksettings set-pin 2580
           android-bins/connetto-demo-stack android-bins/connetto-android-proof --serial emulator-5554 --unlock-pin 2580 --app tauri --apk examples/tauri-leptos-demo/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
@@ -1002,6 +936,13 @@ jobs:
         with:
           path: examples/tauri-leptos-demo/target
           key: ${{ steps.cache-2.outputs.cache-primary-key }}
+
+      - name: Save the partial demo build output
+        if: (failure() || cancelled()) && runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true' && steps.cache-2.outputs.cache-primary-key != ''
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: examples/tauri-leptos-demo/target
+          key: ${{ steps.cache-2.outputs.cache-primary-key }}-partial-${{ github.run_id }}
 
   file-core-wasm:
     name: File core wasm
@@ -1079,7 +1020,7 @@ jobs:
         with:
           path: examples/webauthn-unlock/target
           key: t-passkey-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ github.event_name == 'pull_request' && format('t-passkey-{0}-', runner.os) || '' }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('t-passkey-{0}-', runner.os) || format('t-passkey-{0}-{1}-partial-', runner.os, hashFiles('**/Cargo.lock')) }}
 
       - name: Install stable browser toolchain with the wasm target
         uses: $/.github/actions/install-rust
@@ -1103,7 +1044,19 @@ jobs:
 
       - name: Run the passkey gate driver
         working-directory: examples/webauthn-unlock
-        run: cargo +stable test --release --test webauthn_unlock
+        run: |
+          set -o pipefail
+          rm -rf target/passkey-gate
+          mkdir -p target/passkey-gate
+          cargo +stable test --release --test webauthn_unlock -- --nocapture 2>&1 | tee target/passkey-gate/test.log
+
+      - name: Upload passkey failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: passkey-gate-diagnostics
+          path: examples/webauthn-unlock/target/passkey-gate
+          retention-days: 7
 
       - name: Prune target cache
         if: always()
@@ -1127,3 +1080,10 @@ jobs:
         with:
           path: examples/webauthn-unlock/target
           key: ${{ steps.cache-2.outputs.cache-primary-key }}
+
+      - name: Save partial passkey build output
+        if: (failure() || cancelled()) && runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true' && steps.cache-2.outputs.cache-primary-key != ''
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: examples/webauthn-unlock/target
+          key: ${{ steps.cache-2.outputs.cache-primary-key }}-partial-${{ github.run_id }}

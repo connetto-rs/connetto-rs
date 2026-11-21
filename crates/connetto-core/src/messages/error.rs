@@ -17,6 +17,13 @@ use crate::schema::Major;
 /// structured log instead.
 pub const SUBSCRIPTION_REFUSED: &str = "subscription refused";
 
+/// The one detail text a subscription carries when its table is refused
+/// because the live schema no longer matches the catalog.
+///
+/// A fixed phrase like [`SUBSCRIPTION_REFUSED`], so it names neither the table
+/// nor the change. The reasons go to the structured log.
+pub const SUBSCRIPTION_REFUSED_SCHEMA: &str = "subscription refused, schema changed";
+
 /// The one detail text a refused content ticket carries.
 ///
 /// An invisible file and an over-budget write read identically here, so a

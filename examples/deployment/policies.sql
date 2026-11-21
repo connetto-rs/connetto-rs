@@ -29,8 +29,34 @@ CREATE POLICY order_lines_p ON order_lines USING (owner_id = current_setting('ap
 -- same way: Postgres splits it with string_to_array, and the replica's
 -- translation turns the whole membership test into a search over the same
 -- string.
+--
+-- A photo posted to a team is visible to every member of the team, the way
+-- the team's notes are, so a member's device in camp can be served it by
+-- another member's. Only its owner writes a photo, and only into a team the
+-- owner belongs to, so a member removed from a team has the photos it posts
+-- there refused.
 ALTER TABLE photos ENABLE ROW LEVEL SECURITY;
-CREATE POLICY photos_p ON photos USING (
+CREATE POLICY photos_read ON photos FOR SELECT USING (
+  owner_id = current_setting('app.user_id', true)
+  OR owner_id = ANY(string_to_array(current_setting('app.subjects', true), ','))
+  OR team_id IN (SELECT team_id FROM team_members WHERE member_id = current_setting('app.user_id', true))
+);
+CREATE POLICY photos_insert ON photos FOR INSERT WITH CHECK (
+  (owner_id = current_setting('app.user_id', true)
+    OR owner_id = ANY(string_to_array(current_setting('app.subjects', true), ',')))
+  AND (team_id IS NULL
+    OR team_id IN (SELECT team_id FROM team_members WHERE member_id = current_setting('app.user_id', true)))
+);
+CREATE POLICY photos_update ON photos FOR UPDATE USING (
+  owner_id = current_setting('app.user_id', true)
+  OR owner_id = ANY(string_to_array(current_setting('app.subjects', true), ','))
+) WITH CHECK (
+  (owner_id = current_setting('app.user_id', true)
+    OR owner_id = ANY(string_to_array(current_setting('app.subjects', true), ',')))
+  AND (team_id IS NULL
+    OR team_id IN (SELECT team_id FROM team_members WHERE member_id = current_setting('app.user_id', true)))
+);
+CREATE POLICY photos_delete ON photos FOR DELETE USING (
   owner_id = current_setting('app.user_id', true)
   OR owner_id = ANY(string_to_array(current_setting('app.subjects', true), ','))
 );
@@ -40,10 +66,27 @@ CREATE POLICY photos_p ON photos USING (
 -- member, and PostgreSQL refuses that loop for a reader the table does not
 -- own. The roster is the demo's shared reference data, and the note rows are
 -- what the membership gates.
+
+-- Every account reads every team row, the shared reference data a membership
+-- names. No policy admits a write, and roles.sql revokes them besides.
+ALTER TABLE teams ENABLE ROW LEVEL SECURITY;
+CREATE POLICY teams_read ON teams FOR SELECT USING (true);
+
 -- The notes of a team settle from the membership rows the replica syncs, so
 -- the write of an author the replica knows only through those rows settles
 -- the same way on every end of the team.
 ALTER TABLE team_notes ENABLE ROW LEVEL SECURITY;
 CREATE POLICY team_notes_p ON team_notes USING (
   team_id IN (SELECT team_id FROM team_members WHERE member_id = current_setting('app.user_id', true))
+);
+
+-- An account reads its own name and the names of everyone sharing a team
+-- with it, read through the membership rows the replica syncs. No subquery
+-- names a column of the row, so PostgreSQL computes each set once per
+-- statement, and the caller is read once as a scalar subquery.
+ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+CREATE POLICY users_read ON users FOR SELECT USING (
+  id = (SELECT current_setting('app.user_id', true))
+  OR id IN (SELECT member_id FROM team_members WHERE team_id IN (
+    SELECT team_id FROM team_members WHERE member_id = (SELECT current_setting('app.user_id', true))))
 );

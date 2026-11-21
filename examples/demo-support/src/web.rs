@@ -51,6 +51,10 @@ pub fn demo_builder() -> WebClientBuilder {
             "SELECT content_id FROM photos WHERE content_state = 'lost'",
             "content_id",
         )
+        .with_content_heal_lost(
+            "SELECT thumb_id FROM photos WHERE thumb_state = 'lost'",
+            "thumb_id",
+        )
 }
 
 /// Ask the page which OIDC provider to use for this boot, falling back to [`AUTH_PROVIDER`] after 200 ms of silence.
@@ -393,6 +397,31 @@ pub fn clear_stored_account() {
     }
 }
 
+/// The `localStorage` entry the login names of this origin's stored accounts
+/// live in.
+pub const STORED_NAMES_KEY: &str = "connetto-demo-stored-names";
+
+/// The login names this origin keeps for its stored accounts, empty when
+/// none were kept or the entry does not decode.
+#[must_use]
+pub fn read_stored_names() -> crate::view::StoredNames {
+    web_sys::window()
+        .and_then(|window| window.local_storage().ok().flatten())
+        .and_then(|storage| storage.get_item(STORED_NAMES_KEY).ok().flatten())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// Keep `names` for the next load.
+pub fn save_stored_names(names: &crate::view::StoredNames) {
+    if let Some(window) = web_sys::window()
+        && let Some(storage) = window.local_storage().ok().flatten()
+        && let Ok(text) = serde_json::to_string(names)
+    {
+        let _ = storage.set_item(STORED_NAMES_KEY, &text);
+    }
+}
+
 /// Reload the page after logout, dropping the remembered account first.
 pub fn reload_page() {
     clear_stored_account();
@@ -561,6 +590,7 @@ pub async fn logout_delete() -> Result<DeleteOutcome, AuthError> {
             match connetto_web::auth::request_logout(true, false).await {
                 Ok(LogoutOutcome::Refused { pending }) => Ok(DeleteOutcome::Refused(pending)),
                 Ok(_) => {
+                    forget_live_stored_name();
                     reload_page();
                     Ok(DeleteOutcome::Reloaded)
                 }
@@ -580,10 +610,37 @@ pub async fn logout_delete() -> Result<DeleteOutcome, AuthError> {
 pub async fn logout_delete_confirmed() -> Result<(), AuthError> {
     match connetto_web::auth::request_logout(true, true).await {
         Ok(_) => {
+            forget_live_stored_name();
             reload_page();
             Ok(())
         }
         Err(err) => Err(err),
+    }
+}
+
+/// Delete a stored account and remove its saved name when teardown starts.
+pub async fn forget_stored_account(account: &str, force: bool) -> crate::view::StoredDeleteOutcome {
+    let outcome = crate::view::StoredDeleteOutcome::from(
+        connetto_web::auth::request_forget_stored(account, force).await,
+    );
+    if matches!(outcome, crate::view::StoredDeleteOutcome::Done(_)) {
+        forget_stored_name(account);
+    }
+    outcome
+}
+
+/// Drop the live account's stored name.
+fn forget_live_stored_name() {
+    if let Some(account) = read_stored_account() {
+        forget_stored_name(&account);
+    }
+}
+
+/// Drop an account's login name from this origin's stored names.
+pub fn forget_stored_name(account: &str) {
+    let mut names = read_stored_names();
+    if names.forget(&crate::account_label(account)) {
+        save_stored_names(&names);
     }
 }
 
@@ -603,6 +660,10 @@ pub async fn boot_with(db_prefix: &'static str, auth_db: &'static str) -> Result
             "SELECT content_id FROM photos WHERE content_state = 'lost'",
             "content_id",
         )
+        .with_content_heal_lost(
+            "SELECT thumb_id FROM photos WHERE thumb_state = 'lost'",
+            "thumb_id",
+        )
         .signed_in(Auth::new(crate::AUTH_BASE, AUTH_PROVIDER))
         .with_redirect_uri(crate::auth_landing())
         .with_auth_db_name(auth_db)
@@ -612,4 +673,49 @@ pub async fn boot_with(db_prefix: &'static str, auth_db: &'static str) -> Result
         .await
         .map(drop)
         .map_err(JsValue::from)
+}
+
+/// Stages a thumbnail before its full photo and the row naming both.
+///
+/// # Errors
+///
+/// Returns the blob read or staging error if either file cannot be stored.
+pub async fn stage_photo(
+    content: &connetto_web::TabContent<BroadcastChannel>,
+    client: &connetto_client::ConnettoClient<connetto_web::MessageTransport<BroadcastChannel>>,
+    blob: &web_sys::Blob,
+    mime: connetto_file_core::MimeClass,
+    identity: &str,
+    team: Option<&str>,
+) -> Result<
+    (connetto_file_core::FileId, rosetta_uuid::Uuid),
+    connetto_web::TabStageError<diesel::result::Error>,
+> {
+    let buffer = wasm_bindgen_futures::JsFuture::from(blob.array_buffer())
+        .await
+        .map_err(|error| connetto_web::TabStageError::Read(format!("{error:?}")))?;
+    let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
+    let thumb_id = if let Some(thumbnail) = crate::make_photo_thumbnail(&bytes) {
+        let parts = js_sys::Array::of1(&js_sys::Uint8Array::from(thumbnail.as_slice()));
+        let thumbnail = web_sys::Blob::new_with_u8_array_sequence(&parts)
+            .map_err(|error| connetto_web::TabStageError::Read(format!("{error:?}")))?;
+        Some(
+            content
+                .stage(
+                    &thumbnail,
+                    connetto_file_core::MimeClass::Jpeg,
+                    client,
+                    |_, _| Ok(()),
+                )
+                .await?
+                .0,
+        )
+    } else {
+        None
+    };
+    content
+        .stage(blob, mime, client, |conn, file_id| {
+            crate::stage_photo_row(conn, file_id, identity, thumb_id, team)
+        })
+        .await
 }

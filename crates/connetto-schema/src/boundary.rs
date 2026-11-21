@@ -513,7 +513,7 @@ fn rebuilt_tables(
         let new_name = decls
             .renamed_tables
             .get(old_name)
-            .map_or_else(|| old_name.as_str(), String::as_str);
+            .map_or(old_name.as_str(), String::as_str);
         let new_table =
             new.shape
                 .tables
@@ -741,7 +741,7 @@ fn validate_declarations(
         let new_name = decls
             .renamed_tables
             .get(table)
-            .map_or_else(|| table.as_str(), String::as_str);
+            .map_or(table.as_str(), String::as_str);
         let Some(new_table) = new.shape.tables.get(new_name) else {
             return Err(declaration_mismatch(
                 path,
@@ -787,7 +787,7 @@ fn kept_table<'a>(
     let new_name = decls
         .renamed_tables
         .get(old_name)
-        .map_or_else(|| old_name, String::as_str);
+        .map_or(old_name, String::as_str);
     let new_table =
         new.shape
             .tables

@@ -329,7 +329,6 @@ fn walk_userset(
 mod tests {
     use super::GrantReach;
     use crate::openfga::Translated;
-    use connetto_core::auth::DEFAULT_USER_SETTING;
     use rls2fga::generator::json_model::Userset;
 
     /// The harness's own cross-table shape, which is what this phase exists
@@ -349,10 +348,14 @@ mod tests {
     );
 
     fn reach(shape: (&str, &str)) -> GrantReach {
-        Translated::of::<String, connetto_core::bots::TextIds>(
-            shape.0,
-            shape.1,
-            DEFAULT_USER_SETTING,
+        Translated::of::<String, crate::defaults::ConnettoDefaults>(
+            connetto_schema::Documents::new(
+                shape.0,
+                shape.1,
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
+            ),
+            true,
         )
         .expect("the shape translates")
         .into_parts()
@@ -365,10 +368,14 @@ mod tests {
     /// to, and the withdrawal then reaches nobody.
     #[test]
     fn a_membership_fact_reaches_the_guarded_table() {
-        let translated = Translated::of::<String, connetto_core::bots::TextIds>(
-            CROSS_TABLE.0,
-            CROSS_TABLE.1,
-            DEFAULT_USER_SETTING,
+        let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
+            connetto_schema::Documents::new(
+                CROSS_TABLE.0,
+                CROSS_TABLE.1,
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
+            ),
+            true,
         )
         .expect("the shape translates");
         // The member relation is the team's leaf relation. Its name comes from

@@ -21,8 +21,17 @@ pub const SCHEMA_SQL: &str = include_str!("../schema.sql");
 /// triggers admit, so a changed policy changes the replica.
 pub const POLICIES_SQL: &str = include_str!("../policies.sql");
 
-/// The roles the deployment grants, the reader role among them.
+/// The roles the deployment creates and their grants on the synced tables,
+/// which the server and every client build read beside the schema and the
+/// policies.
 pub const ROLES_SQL: &str = include_str!("../roles.sql");
+
+/// The role [`ROLES_SQL`] creates and the server logs in and acts as.
+pub const READER_ROLE: &str = "connetto_reader";
+
+/// The reader role's grants on connetto's own bookkeeping tables, applied
+/// after them and read by no translation.
+pub const BOOKKEEPING_SQL: &str = include_str!("../bookkeeping.sql");
 
 /// The file server's deployment contracts, applied beside the roles.
 pub const CONTENT_SQL: &str = include_str!("../content.sql");

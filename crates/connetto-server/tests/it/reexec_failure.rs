@@ -79,6 +79,7 @@ impl WatchedIngest {
     fn spawn<Src>(manager: &Arc<Manager>, mut source: Src) -> Self
     where
         Src: CdcSource<Event = PgChangeEvent, Commit = PgCommit> + 'static,
+        Src::Relation: connetto_server::drift::StreamSignal,
         Src::Error: core::fmt::Display,
     {
         let read_retrying = Arc::new(AtomicBool::new(false));
@@ -146,7 +147,7 @@ impl WatchedIngest {
     }
 
     /// The held event's re-execution answers `value`, then delivery resumes, with nothing ended.
-    async fn assert_resumed_with(self, client: &mut Client, value: &str) {
+    async fn assert_resumed_with(self, client: &mut Client, value: i64) {
         // AggregateUpdate is sent inside the dispatch, DeliveryResumed after it returns.
         let reexec = tokio::time::timeout(Duration::from_secs(10), client.next_control())
             .await
@@ -154,7 +155,7 @@ impl WatchedIngest {
         let ControlMessage::AggregateUpdate(result) = reexec else {
             panic!("expected AggregateUpdate after resume, got {reexec:?}");
         };
-        assert_eq!(result.result_json.as_deref(), Some(value));
+        assert_eq!(super::reexec::integer(&result), value);
         let resumed = tokio::time::timeout(Duration::from_secs(5), client.next_control())
             .await
             .expect("DeliveryResumed within 5 s");
@@ -203,11 +204,12 @@ async fn a_poisoned_computed_read_ends_alone_without_a_retry() {
             computed_client
                 .subscribe("cheapest", "SELECT MIN(n) FROM counts")
                 .await;
+            computed_client.expect_aggregate_columns("cheapest").await;
             let ControlMessage::AggregateUpdate(seeded) = computed_client.next_control().await
             else {
                 panic!("expected aggregate seed");
             };
-            assert_eq!(seeded.result_json.as_deref(), Some("10"));
+            assert_eq!(super::reexec::integer(&seeded), 10);
 
             let mut row_client = connect_to(&manager);
             row_client.handshake_with("reader", "user:reader").await;
@@ -310,10 +312,11 @@ async fn a_transient_read_pause_resumes_delivery_without_ending_anything() {
     client
         .subscribe("smallest", "SELECT MIN(n) FROM counts")
         .await;
+    client.expect_aggregate_columns("smallest").await;
     let ControlMessage::AggregateUpdate(seeded) = client.next_control().await else {
         panic!("expected aggregate seed");
     };
-    assert_eq!(seeded.result_json.as_deref(), Some("10"));
+    assert_eq!(super::reexec::integer(&seeded), 10);
 
     // Process INSERT before holding the pool so the connector can re-execute.
     let mut source = PgSqliteEmuSource::open_in_memory(DDL).expect("open emu source");
@@ -347,7 +350,7 @@ async fn a_transient_read_pause_resumes_delivery_without_ending_anything() {
         .assert_paused_in_place(&mut client, Duration::from_secs(3))
         .await;
     drop(held);
-    ingest.assert_resumed_with(&mut client, "10").await;
+    ingest.assert_resumed_with(&mut client, 10).await;
 }
 
 /// The catalog shape of the gated view below, as the materializer and the emulator see it.
@@ -405,10 +408,11 @@ async fn a_listed_code_raised_for_real_pauses_and_resumes_delivery() {
     client
         .subscribe("smallest", "SELECT MIN(n) FROM gated")
         .await;
+    client.expect_aggregate_columns("smallest").await;
     let ControlMessage::AggregateUpdate(seeded) = client.next_control().await else {
         panic!("expected aggregate seed");
     };
-    assert_eq!(seeded.result_json.as_deref(), Some("10"));
+    assert_eq!(super::reexec::integer(&seeded), 10);
 
     // The emulator builds the DELETE of the seeded extreme, which forces a
     // re-execution, and the event is stamped where Postgres can place it.
@@ -437,32 +441,43 @@ async fn a_listed_code_raised_for_real_pauses_and_resumes_delivery() {
         .await;
     fixture.exec("DELETE FROM gated_fail").await;
     // Postgres still holds the row, so the re-execution answers the same extreme.
-    ingest.assert_resumed_with(&mut client, "10").await;
+    ingest.assert_resumed_with(&mut client, 10).await;
 }
 
 const PAIR_DDL: &str = "CREATE TABLE counts (id INT PRIMARY KEY, n INT, m INT)";
 
 /// A subscribed client that has received its seed.
-async fn seeded(manager: &Arc<Manager>, label: &str, sql: &str, seed: &str) -> Client {
+async fn seeded(
+    manager: &Arc<Manager>,
+    label: &str,
+    sql: &str,
+    seed: connetto_core::messages::SqliteValue,
+) -> Client {
     let mut client = connect_to(manager);
     client.handshake_with(label, &format!("user:{label}")).await;
     client.subscribe(label, sql).await;
+    client.expect_aggregate_columns(label).await;
     let ControlMessage::AggregateUpdate(update) = client.next_control().await else {
         panic!("expected the {label} seed");
     };
-    assert_eq!(update.result_json.as_deref(), Some(seed));
+    assert_eq!(
+        update.change,
+        connetto_core::messages::AggregateChange::Replace {
+            rows: vec![vec![seed]]
+        }
+    );
     client
 }
 
 /// The next aggregate value a client receives within five seconds.
-async fn next_value(client: &mut Client) -> Option<String> {
+async fn next_value(client: &mut Client) -> i64 {
     let control = tokio::time::timeout(Duration::from_secs(5), client.next_control())
         .await
         .expect("an update within 5 s");
     let ControlMessage::AggregateUpdate(update) = control else {
         panic!("expected an aggregate update, got {control:?}");
     };
-    update.result_json
+    super::reexec::integer(&update)
 }
 
 /// Nothing more reaches a client for half a second.
@@ -492,9 +507,27 @@ async fn a_poisoned_read_neither_refolds_the_event_nor_loses_a_sibling_answer() 
         pool.clone(),
         pool,
     );
-    let mut poisoned = seeded(&manager, "poisoned", "SELECT MIN(n) FROM counts", "10").await;
-    let mut healthy = seeded(&manager, "healthy", "SELECT MIN(m) FROM counts", "10").await;
-    let mut counter = seeded(&manager, "counter", "SELECT COUNT(*) FROM counts", "2").await;
+    let mut poisoned = seeded(
+        &manager,
+        "poisoned",
+        "SELECT MIN(n) FROM counts",
+        connetto_core::messages::SqliteValue::Integer(10),
+    )
+    .await;
+    let mut healthy = seeded(
+        &manager,
+        "healthy",
+        "SELECT MIN(m) FROM counts",
+        connetto_core::messages::SqliteValue::Integer(10),
+    )
+    .await;
+    let mut counter = seeded(
+        &manager,
+        "counter",
+        "SELECT COUNT(*) FROM counts",
+        connetto_core::messages::SqliteValue::Integer(2),
+    )
+    .await;
 
     fixture.exec("ALTER TABLE counts DROP COLUMN n").await;
     fixture.exec("DELETE FROM counts WHERE id = 10").await;
@@ -520,9 +553,9 @@ async fn a_poisoned_read_neither_refolds_the_event_nor_loses_a_sibling_answer() 
         panic!("expected the poisoned subscription's refusal");
     };
     assert_eq!(refusal.related_to.as_deref(), Some("poisoned"));
-    assert_eq!(next_value(&mut counter).await.as_deref(), Some("1"));
+    assert_eq!(next_value(&mut counter).await, 1);
     assert_quiet(&mut counter).await;
-    assert_eq!(next_value(&mut healthy).await.as_deref(), Some("20"));
+    assert_eq!(next_value(&mut healthy).await, 20);
     assert_quiet(&mut healthy).await;
 }
 
@@ -554,8 +587,20 @@ async fn a_transient_read_pause_folds_the_held_event_once() {
         fixture.admin().clone(),
         fixture.admin().clone(),
     );
-    let mut smallest = seeded(&manager, "smallest", "SELECT MIN(n) FROM counts", "1").await;
-    let mut counter = seeded(&manager, "counter", "SELECT COUNT(*) FROM counts", "2").await;
+    let mut smallest = seeded(
+        &manager,
+        "smallest",
+        "SELECT MIN(n) FROM counts",
+        connetto_core::messages::SqliteValue::Integer(1),
+    )
+    .await;
+    let mut counter = seeded(
+        &manager,
+        "counter",
+        "SELECT COUNT(*) FROM counts",
+        connetto_core::messages::SqliteValue::Integer(2),
+    )
+    .await;
 
     let mut source = PgSqliteEmuSource::open_in_memory(DDL).expect("open emu source");
     source
@@ -599,20 +644,20 @@ async fn a_transient_read_pause_folds_the_held_event_once() {
     tokio::time::sleep(Duration::from_millis(400)).await;
     drop(held);
 
-    assert_eq!(next_value(&mut smallest).await.as_deref(), Some("10"));
+    assert_eq!(next_value(&mut smallest).await, 10);
     let mut counts = Vec::new();
     loop {
         let control = tokio::time::timeout(Duration::from_secs(5), counter.next_control())
             .await
             .expect("a control within 5 s");
         match control {
-            ControlMessage::AggregateUpdate(update) => counts.push(update.result_json),
+            ControlMessage::AggregateUpdate(update) => counts.push(super::reexec::integer(&update)),
             ControlMessage::DeliveryResumed => break,
             ControlMessage::DeliveryPaused { .. } => {}
             other => panic!("unexpected control {other:?}"),
         }
     }
-    assert_eq!(counts, [Some("1".to_owned())]);
+    assert_eq!(counts, [1]);
     assert_quiet(&mut counter).await;
     ingest.abort();
 }
@@ -691,17 +736,29 @@ async fn a_codeless_computed_read_retries_once_then_refuses_alone() {
         fixture.admin().clone(),
     );
 
-    let mut smallest = seeded(&manager, "smallest", "SELECT MIN(n) FROM mins", "1.0").await;
-    let mut counter = seeded(&manager, "counter", "SELECT COUNT(*) FROM counts", "2").await;
+    let mut smallest = seeded(
+        &manager,
+        "smallest",
+        "SELECT MIN(n) FROM mins",
+        connetto_core::messages::SqliteValue::Real(1.0),
+    )
+    .await;
+    let mut counter = seeded(
+        &manager,
+        "counter",
+        "SELECT COUNT(*) FROM counts",
+        connetto_core::messages::SqliteValue::Integer(2),
+    )
+    .await;
 
-    // n is now real, so the double decode of the re-executed MIN projection fails without a SQLSTATE and is classified Other.
+    // n is now money, a type with no subql value, so decoding the re-executed MIN projection fails without a SQLSTATE and is classified Other.
     {
         let mut conn = reads.get().await.expect("the read connection");
-        // The column narrowing is DDL the diesel DSL cannot express, so raw SQL is the only form.
-        sql_query("ALTER TABLE mins ALTER COLUMN n TYPE real USING n::real")
+        // The column retype is DDL the diesel DSL cannot express, so raw SQL is the only form.
+        sql_query("ALTER TABLE mins ALTER COLUMN n TYPE money USING n::numeric::money")
             .execute(&mut conn)
             .await
-            .expect("narrow the column");
+            .expect("retype the column");
         delete(mins::table.filter(mins::id.eq(1)))
             .execute(&mut conn)
             .await
@@ -787,7 +844,7 @@ async fn a_codeless_computed_read_retries_once_then_refuses_alone() {
         .dispatch_event(&second_delete)
         .await
         .unwrap_or_else(|err| panic!("dispatch failed: {err:?}"));
-    assert_eq!(next_value(&mut counter).await.as_deref(), Some("1"));
+    assert_eq!(next_value(&mut counter).await, 1);
     assert_quiet(&mut counter).await;
     assert_quiet(&mut smallest).await;
 }

@@ -1,169 +1,62 @@
 //! Yew adapter for connetto live queries.
 //!
-//! One hook, [`use_live`], serves both live handle kinds through
-//! [`LiveHandle`]: a row query yields state of `Vec<R>`, a scalar aggregate
-//! state of `Option<V>`, both chosen at compile time by the query's shape
-//! through [`Watchable`]. The subscription is owned by a driver task the hook
-//! aborts on unmount, dropping the handle, which unsubscribes server-side:
-//! connetto's drop-unsubscribe contract composes with the component lifecycle
-//! with no extra wiring.
-//!
-//! Yew's [`spawn_local`] is detached, unlike a
-//! dioxus scope task, so the hook cannot rely on the component dropping the
-//! task. It wraps the driver in [`Abortable`] and returns an effect cleanup
-//! that aborts it, which drops the live handle at its next await point.
-//!
-//! A second hook, [`use_live_fn`], covers boxed (`.into_boxed()`) and
-//! dynamically built row queries: they carry no compile-time aggregation
-//! marker and are not `Clone`, so they cannot ride [`use_live`]. It takes a
-//! query-builder closure instead of a query value and yields the same
-//! `UseLive<Vec<R>>`, sharing the identical abort-on-unmount lifecycle.
+//! [`use_live`] follows a [`LiveSpec`] from a [`LiveSource`] through
+//! [`follow`], and aborts that loop from the effect's cleanup, since Yew's
+//! [`spawn_local`] is detached and an unmount alone would not drop the feed.
 
-use connetto_client::dsl::Watchable;
-use connetto_client::{ConnettoClient, LiveHandle};
-use connetto_core::traits::{MaybeSend, Transport};
-use diesel::SqliteConnection;
-use diesel::query_builder::QueryFragment;
-use diesel::query_dsl::methods::LoadQuery;
-use diesel::sqlite::Sqlite;
+use connetto_client::{LiveSnapshot, LiveSource, LiveSpec, follow};
 use futures_util::future::{AbortHandle, Abortable};
 use yew::platform::spawn_local;
 use yew::prelude::*;
 
-/// A live query bound to a component: the snapshot state and an error slot.
+/// A live query bound to a component, its snapshot and the error that ended it.
 ///
-/// [`value`](Self::value) is the type's `Default` until the first refresh
-/// lands (an empty `Vec` for rows, `None` for a scalar). [`error`](Self::error)
-/// becomes `Some` when subscribing failed or the driving client stopped, and
-/// the snapshot keeps its last value in that case.
-pub struct UseLive<S> {
-    value: UseStateHandle<S>,
+/// [`value`](Self::value) is the type's `Default` until the first snapshot
+/// lands, and keeps its last value once [`error`](Self::error) is set.
+pub struct UseLive<Snapshot> {
+    value: UseStateHandle<Snapshot>,
     error: UseStateHandle<Option<String>>,
 }
 
-impl<S: Clone> UseLive<S> {
+impl<Snapshot: Clone> UseLive<Snapshot> {
     /// The current live snapshot.
     #[must_use]
-    pub fn value(&self) -> S {
+    pub fn value(&self) -> Snapshot {
         (*self.value).clone()
     }
 
-    /// The current error, if the subscription or driving client failed.
+    /// The error that ended the subscription, if one did.
     #[must_use]
     pub fn error(&self) -> Option<String> {
         (*self.error).clone()
     }
 }
 
-/// Subscribe this component to a live query.
+/// Follow `spec` from `source` for as long as this component is mounted.
 ///
-/// The query and client are captured on first render (re-render with a
-/// different query has no effect, remount the component to change it). The
-/// subscription lives exactly as long as the component: unmount aborts the
-/// driver task, drops the handle, and the client's pump sends the unsubscribe.
-///
-/// Works for both shapes through the compile-time dispatch: a row query
-/// produces `UseLive<Vec<R>>` (annotate `R` as with diesel's `load`), a scalar
-/// aggregate produces `UseLive<Option<V>>` with `V` inferred from the query
-/// itself.
+/// Both are captured on first render, so a component remounts to follow
+/// another spec.
 #[hook]
-pub fn use_live<T, Q, R>(
-    client: &ConnettoClient<T>,
-    query: Q,
-) -> UseLive<<Q::Handle as LiveHandle>::Snapshot>
+pub fn use_live<Source, Spec>(source: &Source, spec: Spec) -> UseLive<LiveSnapshot<Spec>>
 where
-    T: Transport + MaybeSend + 'static,
-    T::Error: core::fmt::Display,
-    Q: Watchable<T, R> + 'static,
-    Q::Handle: 'static,
-    <Q::Handle as LiveHandle>::Snapshot: Default + Clone + 'static,
+    Source: LiveSource,
+    Spec: LiveSpec,
+    LiveSnapshot<Spec>: Default + Clone + 'static,
 {
-    let value = use_state(<Q::Handle as LiveHandle>::Snapshot::default);
+    let value = use_state(LiveSnapshot::<Spec>::default);
     let error = use_state(|| None::<String>);
     {
         let value = value.clone();
         let error = error.clone();
-        let client = client.clone();
+        let source = source.clone();
         use_effect_with((), move |()| {
             let (abort, registration) = AbortHandle::new_pair();
-            let driver = async move {
-                match query.live(&client).await {
-                    Ok(mut handle) => {
-                        value.set(handle.snapshot());
-                        loop {
-                            match handle.changed().await {
-                                Ok(()) => value.set(handle.snapshot()),
-                                Err(err) => {
-                                    error.set(Some(err.to_string()));
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    Err(err) => error.set(Some(err.to_string())),
-                }
-            };
-            spawn_local(async move {
-                let _ = Abortable::new(driver, registration).await;
-            });
-            move || abort.abort()
-        });
-    }
-    UseLive { value, error }
-}
-
-/// Subscribe this component to a boxed or dynamically built row query.
-///
-/// The row-query peer of [`use_live`] for a query that cannot carry the
-/// compile-time dispatch marker [`use_live`] needs: a boxed (`.into_boxed()`)
-/// or otherwise dynamically built query, which is also not `Clone`. In place
-/// of a query value it takes `build`, a closure that yields a fresh query
-/// instance on each call, and drives it through
-/// [`ConnettoClient::watch_fn`](connetto_client::ConnettoClient::watch_fn).
-///
-/// `build` is captured on first render and re-invoked for the initial read and
-/// every refresh, so it MUST be pure and stable: each call has to build an
-/// equivalent query with the same SQL, tables, and binds. The subscription
-/// lives exactly as long as the component, unmount aborts the driver task,
-/// drops the handle, and the client's pump sends the unsubscribe.
-///
-/// This is the row path only. A boxed aggregate query has no row answer here,
-/// drive it through
-/// [`watch_value_with`](connetto_client::ConnettoClient::watch_value_with).
-#[hook]
-pub fn use_live_fn<T, F, Q, R>(client: &ConnettoClient<T>, build: F) -> UseLive<Vec<R>>
-where
-    T: Transport + MaybeSend + 'static,
-    T::Error: core::fmt::Display,
-    F: Fn() -> Q + Send + 'static,
-    Q: QueryFragment<Sqlite> + for<'query> LoadQuery<'query, SqliteConnection, R>,
-    R: Clone + PartialEq + Send + Sync + 'static,
-{
-    let value = use_state(Vec::<R>::new);
-    let error = use_state(|| None::<String>);
-    {
-        let value = value.clone();
-        let error = error.clone();
-        let client = client.clone();
-        use_effect_with((), move |()| {
-            let (abort, registration) = AbortHandle::new_pair();
-            let driver = async move {
-                match client.watch_fn(build).await {
-                    Ok(mut handle) => {
-                        value.set(handle.snapshot());
-                        loop {
-                            match handle.changed().await {
-                                Ok(()) => value.set(handle.snapshot()),
-                                Err(err) => {
-                                    error.set(Some(err.to_string()));
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    Err(err) => error.set(Some(err.to_string())),
-                }
-            };
+            let driver = follow(
+                source,
+                spec,
+                move |snapshot| value.set(snapshot),
+                move |failure| error.set(Some(failure.to_string())),
+            );
             spawn_local(async move {
                 let _ = Abortable::new(driver, registration).await;
             });

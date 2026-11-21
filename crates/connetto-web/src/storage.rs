@@ -102,6 +102,13 @@ impl ReplicaStorage {
         }
     }
 
+    /// Whether a database in this backend survives a reload, which only OPFS
+    /// gives.
+    #[must_use]
+    pub const fn is_persistent(&self) -> bool {
+        matches!(self, Self::Opfs(_))
+    }
+
     /// The database URL that opens `name` in this backend.
     ///
     /// Always the codec shim over this backend's VFS, named explicitly, because
@@ -313,6 +320,10 @@ where
         .clear(name)
         .await
         .map_err(|err| WipeError::KeyStore(err.to_string()))?;
+    key_store
+        .clear(&connetto_client::share_keys::share_key_record(name))
+        .await
+        .map_err(|error| WipeError::KeyStore(error.to_string()))?;
     storage
         .delete_db(&tier_db_name(name))
         .map_err(|err| WipeError::Storage(err.to_string()))?;
@@ -406,6 +417,9 @@ pub struct PendingWipe {
     pub replica: String,
     /// Persistent browser content namespace to remove.
     pub content_namespace: Option<String>,
+    /// Account-index row whose deletion must finish before acknowledgement.
+    #[serde(default)]
+    account: Option<String>,
     /// Whether the replica is already gone and only content cleanup remains.
     #[serde(default)]
     replica_deleted: bool,
@@ -421,6 +435,7 @@ impl PendingWipe {
         Self {
             replica: replica.into(),
             content_namespace,
+            account: None,
             replica_deleted: false,
             shared: SharedWipe::Kept,
         }
@@ -431,6 +446,17 @@ impl PendingWipe {
     pub const fn with_shared(mut self, shared: SharedWipe) -> Self {
         self.shared = shared;
         self
+    }
+
+    /// Keep the account-index deletion pending beside the replica wipe.
+    #[must_use]
+    pub fn with_account(mut self, account: impl Into<String>) -> Self {
+        self.account = Some(account.into());
+        self
+    }
+
+    pub(crate) fn account(&self) -> Option<&str> {
+        self.account.as_deref()
     }
 
     pub(crate) const fn replica_deleted(&self) -> bool {
@@ -444,6 +470,7 @@ impl PendingWipe {
     fn after_replica_deleted(&self) -> Self {
         let mut pending = self.clone();
         pending.replica_deleted = true;
+        pending.account = None;
         pending
     }
 }
@@ -656,6 +683,15 @@ mod tests {
     wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
     #[wasm_bindgen_test]
+    fn a_wipe_record_without_an_account_has_no_index_cleanup() {
+        let wipe = super::decode_pending_wipe(
+            r#"{"replica":"old-replica","content_namespace":null}"#.to_owned(),
+        )
+        .unwrap();
+        assert_eq!(wipe.account(), None);
+    }
+
+    #[wasm_bindgen_test]
     async fn acknowledging_an_observed_wipe_preserves_its_replacement() {
         let first = PendingWipe::new(
             "r68-replaced-pending-wipe.sqlite",
@@ -697,7 +733,8 @@ mod tests {
         let wipe = PendingWipe::new(
             "r68-deferred-content-wipe.sqlite",
             Some("r68-deferred-content".to_owned()),
-        );
+        )
+        .with_account("departed-account");
         mark_wipe_pending(&wipe, &PendingWork::default(), false)
             .await
             .expect("mark wipe");
@@ -712,6 +749,7 @@ mod tests {
             .find(|pending| pending.replica == wipe.replica)
             .expect("find deferred cleanup");
         assert!(deferred.replica_deleted());
+        assert_eq!(deferred.account(), None);
         assert_eq!(deferred.content_namespace, wipe.content_namespace);
         acknowledge_pending_wipe(deferred)
             .await

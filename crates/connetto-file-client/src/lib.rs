@@ -13,6 +13,8 @@ mod import;
 pub mod resolve;
 mod retain;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+mod space;
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 mod store;
 mod ticket;
 mod upload;
@@ -24,9 +26,14 @@ pub use browser_store::{BrowserStore, BrowserStoreError};
 pub use client::PeerContent;
 pub use client::{ContentClient, ContentEvent};
 pub use connetto_file_core::{ChunkHash, FileId, FileIdHasher, MimeClass};
+#[cfg(all(
+    feature = "peer",
+    not(all(target_family = "wasm", target_os = "unknown"))
+))]
+pub use content::PeerDeclaration;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub use content::{Content, ContentHandle};
-pub use db::held_content;
+pub use db::content_hooks;
 pub use error::{AttemptOutcome, ContentError, StageCommitError};
 pub use import::ContentImportPlan;
 pub use resolve::{BoxedSource, ChunkStoreSource, LocalContentSource, Resolved, SourceFuture};

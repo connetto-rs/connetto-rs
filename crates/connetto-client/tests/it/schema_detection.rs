@@ -37,6 +37,7 @@ fn fake_server(server_version: Option<SchemaVersion>) -> LoopbackTransport {
                 resume_token: "server".to_owned(),
                 schema_version: server_version,
                 sunset_at_secs: None,
+                courier: false,
                 initial_credits: 64,
                 writer: Some(connetto_core::messages::WriterGrant {
                     number: 1,

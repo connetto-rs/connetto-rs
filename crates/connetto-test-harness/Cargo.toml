@@ -28,9 +28,6 @@ connetto-server = { path = "../connetto-server", features = ["test-seams"] }
 connetto-schema = { workspace = true }
 # The demo stack mints the demo's device certificate authority with the operator tool.
 connetto-ca = { path = "../connetto-ca" }
-# The browser stack's lose-content route finds a file's chunks and deletes them from the store.
-connetto-file-core = { path = "../connetto-file-core" }
-connetto-file-server = { path = "../connetto-file-server" }
 # The linux leg of the two-device peer proof (R76 slice 9b) signs in,
 # enrols and drives its peer link through the same production paths the
 # phone demo drives, in a child process of the proof binary.
@@ -60,16 +57,19 @@ tokio = { workspace = true, features = ["process", "io-std"] }
 # The admin and role pools that reset the fixture and back the write, snapshot,
 # and connector paths.
 diesel = { workspace = true, features = ["postgres_backend"] }
-diesel-async = { version = "0.9", default-features = false, features = [
+diesel-async = { version = "0.10", default-features = false, features = [
   "postgres",
   "bb8",
 ] }
 # Building the mutation changeset a client uploads.
-sqlite-diff-rs = { version = "0.19", default-features = false }
+sqlite-diff-rs = { version = "0.20", default-features = false }
 # Compressing the uploaded changeset, matching the wire format.
 zstd = "0.13"
 # Naming the Postgres dialect when parsing the catalog DDL for the CDC source.
 sqlparser = { version = "0.64", default-features = false }
+# The name PostgreSQL stores for a written role, so a roles document applied
+# twice finds the roles it created.
+sql-traits = { git = "https://github.com/connetto-rs/sql-traits", branch = "main", default-features = false }
 # The fixture owns the services it needs, so a test provisions nothing by hand.
 # `GenericImage` for both Postgres and OpenFGA rather than `testcontainers-modules`:
 # that crate pins testcontainers 0.27, and neither image is served better by a
@@ -88,12 +88,10 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 serde_json = "1"
 # The leg's answers cross the proof's standard streams as JSON.
 serde = { version = "1", features = ["derive"] }
-axum = { workspace = true }
 openidconnect = { version = "4.0.1", default-features = false, features = [
   "reqwest",
   "rustls-tls",
 ] }
-tower-http = { version = "0.6", default-features = false, features = ["cors"] }
 # Diagnostic logging for wedged-test hunts: `Fixture::acquire` installs a
 # stderr subscriber when `CONNETTO_TEST_LOG` is set, so a killed test's
 # captured output names its last state transition.
@@ -103,9 +101,6 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
   "std",
 ] }
 ring = "0.17"
-# Encoding the App Store Connect token and decoding what the API returns,
-# already in the graph through testcontainers.
-base64 = "0.22"
 # Ids for the fixture rows the browser stack seeds.
 uuid = { version = "1", features = ["v4"] }
 # The Android proof drives the demo's WebView over the DevTools protocol.
@@ -118,17 +113,24 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 # The standby switchboard's target and open flows, locked briefly and never
 # across an await. Already in the graph through connetto-server.
 parking_lot = "0.12"
+# The JWT key files `server_fixture::signing_keys` writes, and the stand-in
+# adb the Android proof's offline-recovery tests run.
+tempfile = "3"
 
 [dev-dependencies]
 # The peer exchange proof names a timestamptz value for the order it writes.
 chrono = "0.4"
+# The camp media proof runs a content client over each device's replica.
+connetto-file-client = { path = "../connetto-file-client", features = ["peer"] }
+# The camp media proof builds and stages through the demo's own photo
+# declarations and thumbnail, and encodes the photo it takes.
+connetto-demo-support = { path = "../../examples/demo-support", default-features = false, features = ["native", "peer"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 tokio = { workspace = true, features = ["test-util"] }
 # The smoke test reads a table back through the admin pool with a typed row.
 diesel = { workspace = true, features = ["postgres_backend"] }
 # Building the row a mutation uploads, in the outage proof.
-sqlite-diff-rs = { version = "0.19", default-features = false }
-# A stand-in adb for the Android proof's offline-recovery tests.
-tempfile = "3"
+sqlite-diff-rs = { version = "0.20", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Joining a fresh anonymous session keyring in-process, replacing the external

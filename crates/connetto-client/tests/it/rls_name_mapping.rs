@@ -64,7 +64,11 @@ diesel::define_sql_function! {
 
 fn options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
-        .with_session_variable(SessionVariableMapping::current_setting(
+        .with_deployment(
+            connetto_schema::deployment::<String>(connetto_test_harness::FIXTURE_READER)
+                .expect("the deployment description builds"),
+        )
+        .with_session_variable(SessionVariableMapping::new(
             "app.user_id",
             "current_app_user",
         ))

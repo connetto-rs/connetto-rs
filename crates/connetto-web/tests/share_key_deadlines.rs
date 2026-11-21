@@ -20,8 +20,7 @@ use connetto_core::auth::CapabilitySubject;
 use connetto_core::messages::{
     BulkMessage, ContentTicketGrant, ControlMessage, FullResyncReason, FullResyncRequired,
     Handshake, HandshakeAck, MutationApplied, MutationHeader, MutationPatch, ReplaceShareKeys,
-    ShareKeysReplaced, SnapshotBegin, SnapshotEnd, Subscribe, SubscriptionPriority,
-    SubscriptionSpec, WriterGrant,
+    ShareKeysReplaced, SnapshotBegin, SnapshotEnd, Subscribe, SubscriptionSpec, WriterGrant,
 };
 use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, MaybeSend, ReplicaKeyStore, Transport};
@@ -156,6 +155,7 @@ impl Upstream {
             current_cursor: Cursor::new(Vec::new()),
             schema_version: None,
             sunset_at_secs: None,
+            courier: false,
             initial_credits: 64,
             writer: Some(WriterGrant {
                 number: 1,
@@ -246,6 +246,7 @@ impl Transport for Upstream {
                                     held_schema(if old { 1 } else { 2 }).version(),
                                 ),
                                 sunset_at_secs: None,
+                                courier: false,
                                 initial_credits: 64,
                                 writer: (!old).then_some(WriterGrant {
                                     number: 1,
@@ -601,7 +602,6 @@ async fn an_expired_grant_is_swapped_without_any_request() {
         .unbounded_send(IncomingFrame::Control(ControlMessage::SnapshotBegin(
             SnapshotBegin {
                 sub_id: "wire-0".to_owned(),
-                priority: SubscriptionPriority::default(),
             },
         )))
         .expect("queue begin");
@@ -1719,7 +1719,7 @@ async fn held_major_file_after_expiry(hold_attach: bool) {
     };
     let expires = seconds_now() + 8;
     let worker = ClientBuilder::new(held_schema(2), factory.clone())
-        .with_held_content(connetto_file_client::held_content())
+        .with_content_hooks(connetto_file_client::content_hooks())
         .with_share_keys(vec![(
             mint(expires),
             CapabilitySubject::<String>::new(SKD_SUBJECT),

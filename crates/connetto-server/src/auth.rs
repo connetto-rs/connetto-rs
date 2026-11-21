@@ -372,7 +372,7 @@ mod rls {
         {
             let old = match write {
                 RowWrite::Insert { .. } | RowWrite::Update { .. } => return Ok(Verdict::Allow),
-                RowWrite::UpdateUsing { old } | RowWrite::Delete { old } => old,
+                RowWrite::UpdateUsing { old, .. } | RowWrite::Delete { old, .. } => old,
                 _ => return Ok(Verdict::Deny),
             };
             let Some((table, filter)) = self.locate(old)? else {

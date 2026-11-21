@@ -11,7 +11,6 @@ use connetto_client::{
     SyncStatus,
 };
 use connetto_core::Major;
-use connetto_core::messages::ContentVerb;
 use connetto_core::traits::Transport;
 use connetto_file_core::{
     ChunkHash, ChunkInventory, ChunkStore, EncryptingStore, FileId, Manifest, MaybeSend, MimeClass,
@@ -28,7 +27,7 @@ use crate::import::{
     ContentImportPlan, apply_content_import, prepare_content_import, write_import_chunks,
 };
 use crate::resolve::{BoxedSource, ChunkStoreSource, Resolved};
-use crate::worker::{outbox_manifests, retire, unreadable_chunk_count, write_content_entries};
+use crate::worker::{archived_files, retire, unreadable_chunk_count, write_content_entries};
 use crate::{ticket, upload};
 
 #[cfg(feature = "peer")]
@@ -94,6 +93,26 @@ pub enum ContentEvent {
         /// The file now held locally.
         file_id: FileId,
     },
+    /// The number of linked devices reporting a copy in custody of one of
+    /// this device's unsent files in a replicated column changed (R79
+    /// decision 12).
+    Replicated {
+        /// The file.
+        file_id: FileId,
+        /// How many linked devices other than this one hold it without
+        /// marking it leaving.
+        holders: usize,
+        /// How many linked devices hold it marked leaving, handing their
+        /// copy to another device.
+        leaving: usize,
+    },
+    /// Copies this device holds for others are marked leaving under storage
+    /// pressure and no linked device can take one over, so they stay (R79
+    /// decision 16). Raised again whenever more copies are stranded.
+    CustodyPressed {
+        /// The bytes custody holds.
+        held_bytes: u64,
+    },
     /// The boot integrity pass could not run, so no unsent file was checked
     /// this time. The walk went ahead: a pass that cannot read the outbox
     /// says nothing about the bytes, so refusing to upload on its word would
@@ -140,6 +159,23 @@ pub struct ContentClient<T: Transport, B: ChunkStore + Clone, H: ContentHttp> {
     /// while none runs.
     #[cfg(feature = "peer")]
     peer_orders: parking_lot::Mutex<Option<tokio::sync::mpsc::UnboundedSender<peer::Order>>>,
+    /// The bytes copies held for others may take, `None` for a quarter of
+    /// the free space measured when the media driver starts.
+    #[cfg(feature = "peer")]
+    custody_budget: Option<u64>,
+    /// The free space custody always leaves to the device.
+    #[cfg(feature = "peer")]
+    custody_reserve: u64,
+    /// Signalled when a file enters or leaves custody, so the media driver
+    /// reports the change to its linked peers.
+    #[cfg(feature = "peer")]
+    custody_changed: tokio::sync::Notify,
+    /// The number the media driver gives its next holder report, which only
+    /// grows while the client lives, so a driver started again on a link
+    /// that stayed up never reuses a number its peers acknowledge (R79
+    /// decision 16).
+    #[cfg(feature = "peer")]
+    next_report: core::sync::atomic::AtomicU64,
 }
 
 impl<T, B, H> ContentClient<T, B, H>
@@ -149,6 +185,12 @@ where
     B: ChunkStore + Clone + Sync + MaybeSend + 'static,
     H: ContentHttp,
 {
+    /// Whether this client declares any peer media columns.
+    #[cfg(feature = "peer")]
+    pub(crate) fn has_peer_content(&self) -> bool {
+        !self.peer_content.is_empty()
+    }
+
     /// Attaches file handling to a running client.
     ///
     /// `store` holds the ciphertext and knows nothing of keys: the encrypting
@@ -190,10 +232,19 @@ where
             peer_content: Vec::new(),
             #[cfg(feature = "peer")]
             peer_orders: parking_lot::Mutex::new(None),
+            #[cfg(feature = "peer")]
+            custody_budget: None,
+            #[cfg(feature = "peer")]
+            custody_reserve: peer::CUSTODY_RESERVE,
+            #[cfg(feature = "peer")]
+            custody_changed: tokio::sync::Notify::new(),
+            #[cfg(feature = "peer")]
+            next_report: core::sync::atomic::AtomicU64::new(0),
         })
     }
 
-    /// Exports unsent content and replica data to `sink`.
+    /// Exports unsent content, the copies held in custody for other
+    /// devices' rows with their custody records, and replica data to `sink`.
     ///
     /// The sink is written through as each chunk is read from the store, so
     /// one chunk is in memory at a time. Returns the sink once the archive is
@@ -208,8 +259,8 @@ where
         sink: W,
     ) -> Result<W, ContentError> {
         let _writing = self.content_writes.lock().await;
-        let manifests = self.client.with_conn(outbox_manifests).await??;
-        let declaration = crate::archive::declare_content(&manifests)?;
+        let files = self.client.with_conn(archived_files).await??;
+        let declaration = crate::archive::declare_content(&files)?;
         let export = self
             .client
             .with_conn(|conn| {
@@ -383,6 +434,10 @@ where
                 .map(|((), out)| out)
             })
             .await??;
+        // A staged file of a replicated column is reported held to linked
+        // peers (R79 decision 13).
+        #[cfg(feature = "peer")]
+        self.custody_changed.notify_one();
         Ok((file_id, out))
     }
 
@@ -430,6 +485,15 @@ where
             }
         }
         let _writing = self.content_writes.lock().await;
+        // A retention pass may have evicted the file while this read waited on
+        // the lock, so the manifest is read again under it.
+        let Some(manifest) = self
+            .client
+            .with_conn(|conn| db::load_manifest(conn.conn(), file_id))
+            .await??
+        else {
+            return Ok(None);
+        };
         let outboard = outboard_of(&manifest, &store)
             .await
             .map_err(|err| ContentError::Store(err.to_string()))?;
@@ -587,10 +651,20 @@ where
             .await??;
         let mut sent = 0;
         for file_id in waiting {
-            match self.upload_one(file_id, None).await {
+            // A carried entry the walk listed may have been cancelled since,
+            // so membership and owner are read together as the attempt
+            // starts.
+            let Some(entry) = self
+                .client
+                .with_conn(move |conn| db::sendable_entry(conn.conn(), file_id))
+                .await??
+            else {
+                continue;
+            };
+            match self.upload_one(file_id, None, entry.carried_for).await {
                 Ok(()) => {
                     self.client
-                        .with_conn(|conn| db::dequeue(conn.conn(), file_id))
+                        .with_conn(|conn| db::upload_committed(conn.conn(), file_id))
                         .await??;
                     sent += 1;
                     let _ = self.events.send(ContentEvent::Uploaded { file_id });
@@ -616,14 +690,14 @@ where
                     // identical whichever pass reached the fact first.
                     AttemptOutcome::Lost => match self.unreadable_chunks(file_id).await? {
                         Some(unreadable) => {
-                            let heal = self
+                            let authored = self
                                 .client
-                                .with_conn(move |conn| db::is_heal(conn.conn(), file_id))
+                                .with_conn(move |conn| db::is_authored(conn.conn(), file_id))
                                 .await??;
                             self.client
                                 .with_conn(move |conn| retire(conn.conn(), file_id))
                                 .await??;
-                            if !heal {
+                            if authored {
                                 let _ = self.events.send(ContentEvent::BytesLost {
                                     file_id,
                                     unreadable,
@@ -644,8 +718,15 @@ where
     }
 
     /// One file: a write ticket, then the whole negotiation under it. A file
-    /// held from an older major (R31) asks on that major's drain wire.
-    async fn upload_one(&self, file_id: FileId, held: Option<Major>) -> Result<(), ContentError> {
+    /// held from an older major (R31) asks on that major's drain wire, and a
+    /// carried one names `for_owner`, the account it credits (R79 decision
+    /// 17).
+    async fn upload_one(
+        &self,
+        file_id: FileId,
+        held: Option<Major>,
+        for_owner: Option<String>,
+    ) -> Result<(), ContentError> {
         let (manifest, wire) = match held {
             None => (
                 self.client
@@ -665,7 +746,7 @@ where
         let url = ticket::request(
             &self.client,
             file_id,
-            ContentVerb::Write { declared_len },
+            ticket::TicketAsk::write(declared_len, for_owner),
             wire,
         )
         .await?;
@@ -692,7 +773,7 @@ where
             if self.client.held_files_ready().await? != Some(major) {
                 break;
             }
-            match self.upload_one(file_id, Some(major)).await {
+            match self.upload_one(file_id, Some(major), None).await {
                 Ok(()) => {
                     self.forget_held(major, file_id).await?;
                     self.client.held_file_settled().await?;
@@ -764,7 +845,7 @@ where
         let ticket = ticket::request(
             &self.client,
             file_id,
-            ContentVerb::Read,
+            ticket::TicketAsk::read(),
             ticket::TicketWire::Main,
         )
         .await;
@@ -966,7 +1047,7 @@ where
         let url = ticket::request(
             &self.client,
             file_id,
-            ContentVerb::Read,
+            ticket::TicketAsk::read(),
             ticket::TicketWire::Main,
         )
         .await?;
@@ -984,16 +1065,18 @@ where
             });
         }
         let outboard = self.store_outboard(&outboard).await?;
-        self.commit_cached(&manifest, outboard).await
+        self.commit_cached(&manifest, outboard, None).await
     }
 
     /// Commits a fetched file's manifest and outboard rows in one
-    /// transaction, with no outbox row, which makes the file cache. The
-    /// caller holds `content_writes` from its chunk writes to here.
+    /// transaction, with no outbox row, which makes the file cache, or a copy
+    /// in custody for whom `custody` names. The caller holds
+    /// `content_writes` from its chunk writes to here.
     async fn commit_cached(
         &self,
         manifest: &Manifest,
         outboard: Option<ChunkHash>,
+        custody: Option<&Keeper>,
     ) -> Result<(), ContentError> {
         let file_id = manifest.file_id();
         self.client
@@ -1001,8 +1084,16 @@ where
                 conn.transact_with_bookkeeping(
                     |c| {
                         db::put_manifest(c, manifest)?;
-                        match &outboard {
-                            Some(hash) => db::put_outboard(c, file_id, hash),
+                        if let Some(hash) = &outboard {
+                            db::put_outboard(c, file_id, hash)?;
+                        }
+                        match custody {
+                            Some(keeper) => db::enter_custody(
+                                c,
+                                file_id,
+                                keeper.author.as_deref(),
+                                keeper.owner.as_deref(),
+                            ),
                             None => Ok(()),
                         }
                     },
@@ -1013,6 +1104,15 @@ where
             .map_err(ContentError::Replica)
             .map(|_| ())
     }
+}
+
+/// Whom a copy taken into custody is kept for.
+pub(crate) struct Keeper {
+    /// The key id of the provisional row's author, `None` for a settled
+    /// row whose state column does not read `available` yet.
+    pub(crate) author: Option<Vec<u8>>,
+    /// The account a carried upload credits, `None` when not known.
+    pub(crate) owner: Option<String>,
 }
 
 impl<T, B, H> ContentClient<T, B, H>
@@ -1148,8 +1248,13 @@ where
     /// again, or when a pin names it. With the `peer` feature it also
     /// survives while a row whose peer apply still awaits a verdict names it
     /// in a column [`with_peer_content`](Self::with_peer_content) declared,
-    /// since a file fetched in camp may not be on the server yet. Everything
-    /// else is cache and goes.
+    /// unless the row's author lapsed, and while it is in custody for a
+    /// [`replicate`](PeerContent::replicate)d column, the custody half of the
+    /// pass releasing a copy whose row is gone, whose author lapsed or whose
+    /// state reads `available`, and taking back a cache copy whose state
+    /// reads `lost`. A copy whose row this device saw settle is not released
+    /// for a missing row before the replica first syncs, the state of a
+    /// device restored from an archive. Everything else is cache and goes.
     ///
     /// Then every chunk file the store holds that no surviving manifest names
     /// is deleted. Enumerating the store rather than the hashes an eviction
@@ -1179,28 +1284,41 @@ where
             expect(unused_mut, reason = "only the peer build adds to the kept set")
         )]
         let mut kept = self.pinned().await?;
+        #[cfg(feature = "peer")]
+        let now = peer::custody::unix_now();
         let _writing = self.content_writes.lock().await;
         let (evicted, referenced) = self
             .client
             .with_conn(|conn| {
-                // Read with the eviction under one hold of the connection,
-                // so a peer apply cannot land a provisional row between them.
+                // One hold of the connection, so a peer apply cannot land between the reads and the eviction.
                 #[cfg(feature = "peer")]
-                kept.extend(peer::provisionally_named(conn, &self.peer_content)?);
+                let mut reach = peer::custody::Reach::default();
+                #[cfg(feature = "peer")]
+                kept.extend(peer::provisionally_named(
+                    conn,
+                    &self.peer_content,
+                    &mut reach,
+                )?);
+                #[cfg(feature = "peer")]
+                let named = peer::custody::named(conn, &self.peer_content, &mut reach)?;
+                #[cfg(feature = "peer")]
+                let synced = conn.has_synced();
                 conn.transact_with_bookkeeping(
                     |c| {
+                        #[cfg(feature = "peer")]
+                        peer::custody::pass(c, &self.peer_content, &named, now, synced, &mut kept)?;
                         let evicted = crate::retain::evict_uncovered(c, &kept)?;
                         Ok((evicted, db::referenced_hashes(c)?))
                     },
                     |_| Ok::<(), ContentError>(()),
                 )
-                // The application half writes nothing here: eviction is
-                // entirely connetto's own bookkeeping, and using the same
-                // primitive keeps one transaction shape for every content
-                // write.
                 .map(|(counted, ())| counted)
             })
             .await??;
+        // Besides custody, an upload since the last pass may have taken a file
+        // out of the unsent ones the reports list as held (R79 decision 13).
+        #[cfg(feature = "peer")]
+        self.custody_changed.notify_one();
         self.delete_unreferenced(&referenced).await?;
         Ok(evicted)
     }
@@ -1339,6 +1457,101 @@ mod tests {
         assert!(
             matches!(event, ContentEvent::UploadDeferred { file_id: f, .. } if f == file_id),
             "the driver must attempt the cleared entry and emit UploadDeferred, got {event:?}"
+        );
+    }
+
+    /// The room a device offers is what the budget leaves, never eating into
+    /// the free space the reserve keeps for the device (R79 decision 16).
+    #[cfg(feature = "peer")]
+    #[tokio::test]
+    async fn the_room_is_bounded_by_the_budget_and_by_the_reserve() {
+        const MIB: u64 = 1024 * 1024;
+        let store = connetto_file_core::MemStore::new();
+        let connection = offline("CREATE TABLE photos (id INTEGER PRIMARY KEY)");
+        let (client, pump) = ConnettoClient::with_pump(connection);
+        tokio::spawn(pump);
+        let content = ContentClient::attach(client, store.clone(), [1; 32], ReqwestHttp::default())
+            .await
+            .expect("content attaches");
+
+        store.set_free_bytes(600 * MIB);
+        assert_eq!(
+            content.room(50 * MIB, 10 * MIB),
+            40 * MIB,
+            "the budget binds"
+        );
+        assert_eq!(
+            content.room(1024 * MIB, 0),
+            88 * MIB,
+            "the 512 MiB reserve binds"
+        );
+        store.set_free_bytes(100 * MIB);
+        assert_eq!(
+            content.room(1024 * MIB, 0),
+            0,
+            "free space under the reserve"
+        );
+        let content = content.with_custody_reserve(0);
+        assert_eq!(content.room(1024 * MIB, 0), 100 * MIB);
+        assert_eq!(
+            content.room(10 * MIB, 20 * MIB),
+            0,
+            "a budget lowered below what custody holds"
+        );
+    }
+
+    /// An outboard read that loaded the manifest before a retention pass
+    /// evicted the file answers `None` once the pass releases the content
+    /// lock, rather than hashing the chunks the pass removed.
+    #[tokio::test]
+    async fn an_outboard_read_overtaken_by_the_retention_pass_finds_the_file_gone() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = FsStore::new(dir.path().join("chunks"));
+        let connection = offline("CREATE TABLE photos (id INTEGER PRIMARY KEY)");
+        let (client, pump) = ConnettoClient::with_pump(connection);
+        tokio::spawn(pump);
+        let content = Arc::new(
+            ContentClient::attach(client, store.clone(), [1; 32], ReqwestHttp::default())
+                .await
+                .expect("content attaches"),
+        );
+        let encrypted = EncryptingStore::new(store, &[1u8; 32]);
+        let manifest = process_file(
+            &vec![7u8; 3 * 1024 * 1024 + 17],
+            MimeClass::Jpeg,
+            &encrypted,
+        )
+        .await
+        .expect("the bytes chunk");
+        let file_id = manifest.file_id();
+        content
+            .client
+            .with_conn(|conn| db::put_manifest(conn.conn(), &manifest))
+            .await
+            .expect("gate not locked")
+            .expect("record the manifest");
+
+        // The pass holds the content lock while the read starts, so the read
+        // loads the manifest and then waits on the lock.
+        let pass = content.content_writes.lock().await;
+        let reader = content.clone();
+        let read = tokio::spawn(async move { reader.outboard(file_id).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        content
+            .client
+            .with_conn(move |conn| db::drop_manifest(conn.conn(), file_id))
+            .await
+            .expect("gate not locked")
+            .expect("evict the manifest");
+        std::fs::remove_dir_all(dir.path().join("chunks")).expect("remove the chunks");
+        drop(pass);
+
+        assert_eq!(
+            read.await
+                .expect("the read task")
+                .expect("the read answers"),
+            None,
+            "the evicted file has no outboard"
         );
     }
 }

@@ -7,7 +7,7 @@ use dioxus::prelude::*;
 use dioxus_free_icons::Icon;
 use dioxus_free_icons::icons::fa_solid_icons::FaTags;
 
-use super::ClientSlot;
+use super::{ClientSlot, PaneInfo};
 
 /// The catalogue pane.
 #[component]
@@ -15,12 +15,12 @@ pub fn ProductsPane() -> Element {
     let ClientSlot(client_slot) = use_context::<ClientSlot>();
     let client = client_slot.read().clone().expect("mounted with a client");
 
-    let products_live = use_live::<_, _, support::Product>(&client, support::products_by_name());
+    let products_live = use_live(&client, support::ProductsByName);
     let rows: Vec<support::Product> = products_live.value().read().iter().cloned().collect();
     let rows_error = products_live.error().read().clone();
 
     rsx! {
-        div { class: "pane",
+        div { class: "pane toned tone-catalogue",
             h2 {
                 Icon { icon: FaTags, width: 14, height: 14 }
                 {support::CATALOGUE_HEADING} " "
@@ -47,6 +47,7 @@ pub fn ProductsPane() -> Element {
                     }
                 }
             }
+            PaneInfo { text: support::CATALOGUE_INFO }
         }
     }
 }

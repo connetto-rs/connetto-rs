@@ -122,8 +122,10 @@ fn indexed_without(known: &[String], account: &str) -> Option<Vec<String>> {
 impl RefreshTokenStore for KeyringStore {
     type Error = ClientError;
 
+    /// A token a gated launch left while the gate is now off is deleted
+    /// without a prompt, so the account signs in again.
     fn load<'a>(&'a self, account: &'a str) -> RefreshFuture<'a, Option<String>, ClientError> {
-        Box::pin(self.keyring.read(account))
+        Box::pin(self.keyring.read_token(account))
     }
 
     /// Writes the entry, then records the account in the index so
@@ -660,6 +662,26 @@ impl NativeAuthenticator {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// Every account the refresh store holds a credential for.
+    pub(crate) async fn stored_accounts(&self) -> Result<Vec<String>, ClientError> {
+        self.store.accounts().await
+    }
+
+    /// This authenticator's server and store addressing `account`, so the
+    /// session of a stored account that is not the live one can be revoked.
+    pub(crate) fn for_account(&self, account: String) -> Self {
+        Self {
+            server_base: self.server_base.clone(),
+            login_base: self.login_base.clone(),
+            provider: self.provider.clone(),
+            store: Arc::clone(&self.store),
+            account: std::sync::Mutex::new(Some(account)),
+            opener: Arc::clone(&self.opener),
+            claimed: None,
+            http: self.http.clone(),
+        }
     }
 
     /// Clear the stored credential without asking the server, for a session

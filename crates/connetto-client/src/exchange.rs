@@ -16,7 +16,45 @@ use crate::{ClientError, ConnettoConnection, ExemptWrites, author, majors};
 /// Creates the per-author cursor beside the replica's other bookkeeping.
 pub(crate) const PEER_CURSOR_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_peer_cursor \
      (author BLOB PRIMARY KEY, account TEXT NOT NULL, seq INTEGER NOT NULL, \
-      head BLOB NOT NULL, offer BLOB NOT NULL)";
+      head BLOB NOT NULL, offer BLOB NOT NULL, expires_at INTEGER NOT NULL)";
+
+/// How long past the moment a cursor is stored an author's certificate counts
+/// as live when the receiver never learned its end, the default certificate
+/// lifetime ceiling (R78 decision 42).
+pub(crate) const UNLEARNED_EXPIRY: core::time::Duration = core::time::Duration::from_hours(30 * 24);
+
+/// `at` in whole Unix seconds, the instant the cursor stores, an instant
+/// before the epoch counting as the epoch, long ended.
+pub(crate) fn unix_secs(at: std::time::SystemTime) -> i64 {
+    at.duration_since(std::time::UNIX_EPOCH).map_or(0, |after| {
+        i64::try_from(after.as_secs()).unwrap_or(i64::MAX)
+    })
+}
+
+/// The end an author's certificate counts as having when the receiver never
+/// learned it, [`UNLEARNED_EXPIRY`] past `now`.
+fn unlearned_expiry(now: i64) -> i64 {
+    now.saturating_add(i64::try_from(UNLEARNED_EXPIRY.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// Give a cursor table of an earlier build its `expires_at`, every stored
+/// author's counting [`UNLEARNED_EXPIRY`] from `now` (R78 decision 42).
+///
+/// # Errors
+///
+/// [`ClientError`] when the table cannot be read or altered.
+pub(crate) fn upgrade_cursors(db: &mut SqliteConnection, now: i64) -> Result<(), ClientError> {
+    use diesel::connection::SimpleConnection as _;
+    let columns = crate::peer::columns_of(db, "_connetto_peer_cursor")?;
+    if columns.is_empty() || columns.iter().any(|column| column == "expires_at") {
+        return Ok(());
+    }
+    db.batch_execute(&format!(
+        "ALTER TABLE _connetto_peer_cursor ADD COLUMN expires_at INTEGER NOT NULL DEFAULT {}",
+        unlearned_expiry(now)
+    ))?;
+    Ok(())
+}
 
 diesel::table! {
     /// The last verified sequence and head of each author, with the signed
@@ -32,6 +70,10 @@ diesel::table! {
         head -> Binary,
         /// The author's last verified signed offer, as `MessagePack`.
         offer -> Binary,
+        /// When the author's certificate last seen over a link ends, in Unix
+        /// seconds, which the author's retained entries are kept until (R78
+        /// decisions 17 and 42).
+        expires_at -> BigInt,
     }
 }
 
@@ -113,6 +155,26 @@ pub(crate) fn offer_of(
     Ok(offer)
 }
 
+/// The author's last verified signed offer with the account its cursor
+/// names, the cursor's stored `MessagePack` bytes and the account recorded
+/// at the write, `None` when nothing of the author was ever verified (R78
+/// slice 4).
+///
+/// # Errors
+///
+/// [`ClientError`] when the cursor cannot be read.
+pub(crate) fn offer_and_account(
+    db: &mut SqliteConnection,
+    author: &[u8],
+) -> Result<Option<(Vec<u8>, String)>, ClientError> {
+    let row: Option<(Vec<u8>, String)> = dsl::_connetto_peer_cursor
+        .filter(dsl::author.eq(author))
+        .select((dsl::offer, dsl::account))
+        .first(db)
+        .optional()?;
+    Ok(row)
+}
+
 /// Every stored cursor, author order, the archive's copy of the peer state
 /// (R77 decision 16).
 ///
@@ -129,9 +191,17 @@ pub(crate) fn all_cursors(
         seq: i64,
         head: Vec<u8>,
         offer: Vec<u8>,
+        expires_at: i64,
     }
     let rows: Vec<Row> = dsl::_connetto_peer_cursor
-        .select((dsl::author, dsl::account, dsl::seq, dsl::head, dsl::offer))
+        .select((
+            dsl::author,
+            dsl::account,
+            dsl::seq,
+            dsl::head,
+            dsl::offer,
+            dsl::expires_at,
+        ))
         .order(dsl::author.asc())
         .load(db)?;
     rows.into_iter()
@@ -144,14 +214,53 @@ pub(crate) fn all_cursors(
                 account: row.account,
                 seq: row.seq,
                 offer: row.offer,
+                expires_at: row.expires_at,
             })
         })
         .collect::<Result<Vec<_>, _>>()
 }
 
+/// When, in Unix seconds, `author`'s stored cursor puts its certificate end
+/// [`DEVICE_SKEW`](connetto_core::clock::DEVICE_SKEW) in the past, after
+/// which no courier can deliver its entries (R79 decision 15), `None` for an
+/// author with no cursor, which is not known to lapse.
+///
+/// # Errors
+///
+/// When the cursor cannot be read.
+pub(crate) fn courier_lapse_at(
+    db: &mut SqliteConnection,
+    author: &[u8],
+) -> Result<Option<i64>, ClientError> {
+    let expires_at: Option<i64> = dsl::_connetto_peer_cursor
+        .filter(dsl::author.eq(author))
+        .select(dsl::expires_at)
+        .first(db)
+        .optional()?;
+    let skew = i64::try_from(connetto_core::clock::DEVICE_SKEW.as_secs()).unwrap_or(i64::MAX);
+    Ok(expires_at.map(|end| end.saturating_add(skew)))
+}
+
+/// Whether `author`'s certificate lapsed by [`courier_lapse_at`], by the
+/// wall clock the replica keeps its times in.
+///
+/// # Errors
+///
+/// When the cursor or the clock cannot be read.
+pub(crate) fn courier_lapsed(
+    db: &mut SqliteConnection,
+    author: &[u8],
+) -> Result<bool, ClientError> {
+    let Some(lapse_at) = courier_lapse_at(db, author)? else {
+        return Ok(false);
+    };
+    Ok(lapse_at <= crate::clock::now_secs(db)?)
+}
+
 /// Store or replace `author`'s cursor with `cursor` and its verified `offer`
 /// (R77 decision 16), the archive's import writing it where the receiver held
-/// none.
+/// none, its certificate end `expires_at` where the receiver held no cursor
+/// (R78 decision 20).
 ///
 /// # Errors
 ///
@@ -163,6 +272,7 @@ pub(crate) fn upsert_cursor(
     account: &str,
     cursor: &Frontier,
     offer: &[u8],
+    expires_at: i64,
 ) -> Result<(), ClientError> {
     let seq = stored_seq(cursor.seq)?;
     diesel::insert_into(dsl::_connetto_peer_cursor)
@@ -172,6 +282,7 @@ pub(crate) fn upsert_cursor(
             dsl::seq.eq(seq),
             dsl::head.eq(cursor.head.as_slice()),
             dsl::offer.eq(offer),
+            dsl::expires_at.eq(expires_at),
         ))
         .on_conflict(dsl::author)
         .do_update()
@@ -182,6 +293,28 @@ pub(crate) fn upsert_cursor(
             dsl::offer.eq(offer),
         ))
         .execute(db)?;
+    Ok(())
+}
+
+/// Keep the later of `author`'s stored certificate end and `expires_at`, the
+/// end an archive carries for it (R78 held-row table). An author the
+/// receiver holds no cursor of is left alone.
+///
+/// # Errors
+///
+/// [`ClientError`] when the cursor cannot be written.
+pub(crate) fn keep_later_expiry(
+    db: &mut SqliteConnection,
+    author: &[u8],
+    expires_at: i64,
+) -> Result<(), ClientError> {
+    diesel::update(
+        dsl::_connetto_peer_cursor
+            .filter(dsl::author.eq(author))
+            .filter(dsl::expires_at.lt(expires_at)),
+    )
+    .set(dsl::expires_at.eq(expires_at))
+    .execute(db)?;
     Ok(())
 }
 
@@ -352,8 +485,10 @@ where
 
     /// Take `author`'s verified offer (R77), which retracts each entry its log
     /// names, adjudicates the stored entries at or below its settled
-    /// frontier, then keeps the offer with `cursor`. Each step is idempotent,
-    /// so a crash between them replays at the author's next offer.
+    /// frontier, then keeps the offer with `cursor` and `expires_at`, the end
+    /// of the certificate the link proved in Unix seconds (R78 decision 17).
+    /// Each step is idempotent, so a crash between them replays at the
+    /// author's next offer.
     ///
     /// # Errors
     ///
@@ -364,6 +499,7 @@ where
         author: &PeerAuthor,
         offer: &SignedOffer,
         cursor: &Frontier,
+        expires_at: i64,
     ) -> Result<(), ClientError> {
         for retraction in &offer.offer.retractions {
             self.retract_peer_entry(author, retraction)?;
@@ -381,6 +517,7 @@ where
                 dsl::seq.eq(seq),
                 dsl::head.eq(cursor.head.as_slice()),
                 dsl::offer.eq(&encoded),
+                dsl::expires_at.eq(expires_at),
             ))
             .on_conflict(dsl::author)
             .do_update()
@@ -389,16 +526,42 @@ where
                 dsl::seq.eq(seq),
                 dsl::head.eq(cursor.head.as_slice()),
                 dsl::offer.eq(&encoded),
+                dsl::expires_at.eq(expires_at),
             ))
             .execute(&mut self.db)?;
-        Ok(())
+        crate::peer::prune_retained(&mut self.db)?;
+        self.settle_pruned_marks()?;
+        self.courier_offer_stood(&author.key_id)
+    }
+
+    /// Move `author`'s certificate end to `expires_at`, in Unix seconds, as a
+    /// link renewing it reports, so its retained entries are kept until the
+    /// renewed certificate ends (R78 decision 17). An author the receiver
+    /// holds no cursor of has nothing retained to move.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the cursor cannot be written or the retained
+    /// entries cannot be pruned.
+    pub(crate) fn renew_peer_expiry(
+        &mut self,
+        author: &[u8],
+        expires_at: i64,
+    ) -> Result<(), ClientError> {
+        let _exempt = ExemptWrites::raise(&self.write_flags);
+        diesel::update(dsl::_connetto_peer_cursor.filter(dsl::author.eq(author)))
+            .set(dsl::expires_at.eq(expires_at))
+            .execute(&mut self.db)?;
+        crate::peer::prune_retained(&mut self.db)?;
+        self.settle_pruned_marks()
     }
 
     /// Take `author`'s entry `row` with the cursor at it (R77 state table,
-    /// rows applied, refused and at another build). `body` applies as the
-    /// author with the cursor in the same transaction, a refusal keeps the
-    /// cursor alone, and an entry of another build, `body` `None`, moves the
-    /// cursor alone.
+    /// R78 held-row table). `body` applies as the author with the cursor in
+    /// the same transaction, a policy refusal keeps the body courier-only and
+    /// an entry of another build, `body` `None`, keeps the row digest-only,
+    /// each with the cursor in the same transaction. A body its row does not
+    /// digest moves the cursor alone.
     ///
     /// # Errors
     ///
@@ -410,14 +573,28 @@ where
         body: Option<&[u8]>,
         cursor: &Frontier,
     ) -> Result<(), ClientError> {
-        if let Some(body) = body
-            && let crate::peer::PeerApplyOutcome::Applied { .. } =
-                self.apply_peer_entry_at(author, row, body, Some(cursor))?
+        let Some(body) = body else {
+            let result = self.hold_peer_entry(
+                author,
+                row,
+                crate::peer::HeldState::DigestOnly,
+                None,
+                Some(cursor),
+            );
+            if result.is_ok() {
+                self.courier_offer_stood(&author.key_id)?;
+            }
+            return result;
+        };
+        if let crate::peer::PeerApplyOutcome::Refused {
+            cause: crate::peer::PeerRefusal::DigestMismatch,
+            ..
+        } = self.apply_peer_entry_at(author, row, body, Some(cursor))?
         {
-            return Ok(());
+            let _exempt = ExemptWrites::raise(&self.write_flags);
+            store_cursor(&mut self.db, &author.key_id, cursor)?;
         }
-        let _exempt = ExemptWrites::raise(&self.write_flags);
-        store_cursor(&mut self.db, &author.key_id, cursor)
+        self.courier_offer_stood(&author.key_id)
     }
 }
 

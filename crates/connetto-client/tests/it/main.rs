@@ -29,6 +29,10 @@ mod column_subset;
 
 mod changed_signal;
 
+mod courier_audit;
+
+mod courier_notice;
+
 mod coverage_resync;
 
 mod encrypted_replica;
@@ -54,6 +58,10 @@ mod holdings;
 mod key_requirement;
 
 mod live_dispatch;
+
+mod live_source;
+
+mod live_wire;
 
 #[cfg(all(feature = "native-auth", target_os = "linux"))]
 mod linux_custody;
@@ -82,6 +90,15 @@ mod outbox;
 mod outbox_push;
 #[cfg(feature = "peer")]
 mod peer_media;
+
+#[cfg(feature = "peer")]
+mod courier_client;
+
+#[cfg(feature = "peer")]
+mod courier_dial;
+
+#[cfg(feature = "peer")]
+mod courier_hold;
 
 #[cfg(feature = "peer")]
 mod peer_apply;
@@ -157,6 +174,9 @@ mod tier_majors;
 mod truncate_resync;
 
 mod two_majors;
+
+#[cfg(feature = "native-auth")]
+mod unsynced_live;
 
 mod uuid_rls_default;
 

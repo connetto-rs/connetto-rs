@@ -1,0 +1,5 @@
+"$schema" = "schemas/schema.json"
+
+[default]
+description = "Lets the webview follow the live specs the application registered: subscribe, stop and acknowledge."
+permissions = ["allow-subscribe", "allow-stop", "allow-ack"]

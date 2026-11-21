@@ -73,6 +73,12 @@ pub enum CertificateError {
     /// This device's key was revoked, so it and its certificate are deleted.
     #[error("this device's key was revoked")]
     Revoked,
+    /// The deployment's application refused the enrolment or the revocation.
+    #[error("the application refused: {reason}")]
+    ApplicationRefused {
+        /// The application's reason, as it gave it.
+        reason: String,
+    },
     /// The server refused for another reason.
     #[error("the server refused the certificate: {0:?}")]
     Refused(EnrolRefusal),
@@ -184,13 +190,23 @@ pub(crate) trait Link: Clone + Send + Sync + 'static {
         &self,
         author: Vec<u8>,
     ) -> impl Future<Output = Result<Frontier, ClientError>> + Send;
-    /// Take `author`'s verified offer with `cursor` (R77).
+    /// Take `author`'s verified offer with `cursor` (R77), its certificate
+    /// ending at `expires_at` (R78 decision 17).
     #[cfg(feature = "peer")]
     fn adopt(
         &self,
         author: PeerAuthor,
         offer: SignedOffer,
         cursor: Frontier,
+        expires_at: std::time::SystemTime,
+    ) -> impl Future<Output = Result<(), ClientError>> + Send;
+    /// Move `author`'s certificate end to `expires_at`, a renewal its link
+    /// reported (R78 decision 17).
+    #[cfg(feature = "peer")]
+    fn renew(
+        &self,
+        author: Vec<u8>,
+        expires_at: std::time::SystemTime,
     ) -> impl Future<Output = Result<(), ClientError>> + Send;
     /// Take `author`'s entry `row`, applying `body` when it crosses, with
     /// the cursor at it (R77).
@@ -255,6 +271,13 @@ pub(crate) enum Command {
     /// changed, so linked peers get a fresh offer (R77).
     #[cfg(feature = "peer")]
     OfferChanged,
+    /// The device's peer links came to stand `on`, the live links closing
+    /// with the client's close when they go off (R77 slice 8).
+    #[cfg(feature = "peer")]
+    SetPeerLinks {
+        /// The standing the links came to.
+        on: bool,
+    },
 }
 
 /// The peer node the task drives, the listener address it binds and the
@@ -575,6 +598,7 @@ impl EnrolHandle {
             Standing::Fresh | Standing::Aging => match self.peer.link(addr).await {
                 Ok(peer) => Ok(peer),
                 Err(LinkError::NotServing) => Err(PeerError::NoIdentity),
+                Err(LinkError::LinksOff) => Err(PeerError::LinksOff),
                 Err(err) => Err(PeerError::Link(err)),
             },
         }
@@ -593,39 +617,6 @@ impl EnrolHandle {
             Ok(Err(_)) => Err(HotspotError::Failed),
             Err(_) => Err(HotspotError::TimedOut),
         }
-    }
-
-    /// Host this device's personal hotspot under its typed details, its
-    /// beacon's outcome beside the offer, within the machines' bounds (R76
-    /// decision 26).
-    #[cfg(feature = "peer")]
-    pub(crate) async fn host_personal_hotspot(
-        &self,
-        ssid: &str,
-        passphrase: &str,
-    ) -> Result<crate::bluetooth::Hosted, HotspotError> {
-        let (reply, answer) = oneshot::channel();
-        self.bluetooth
-            .send(crate::bluetooth::Command::PersonalHost {
-                ssid: ssid.to_owned(),
-                passphrase: passphrase.to_owned(),
-                caller: reply,
-            })
-            .map_err(|_| HotspotError::Failed)?;
-        match tokio::time::timeout(HOST_BOUND + PROMPT_BOUND + MARGIN, answer).await {
-            Ok(Ok(hosted)) => hosted,
-            Ok(Err(_)) => Err(HotspotError::Failed),
-            Err(_) => Err(HotspotError::TimedOut),
-        }
-    }
-
-    /// The personal hotspot's landing bound, started when an exchange
-    /// hands the offer out (R76 decision 26).
-    #[cfg(feature = "peer")]
-    pub(crate) fn personal_offer_handed_out(&self) {
-        let _ = self
-            .hotspot
-            .send(crate::hotspot::Command::PersonalOfferHandedOut);
     }
 
     /// Stop hosting, or cancel the pending request (R76).
@@ -745,6 +736,29 @@ impl EnrolHandle {
             .send(crate::bluetooth::Command::SetPrompt(prompt));
     }
 
+    /// The device's peer links standing, at run time, the live links closing
+    /// with the client's close when they go off and the found peers dialing
+    /// at once when they come back (R77 slice 8). The node takes the standing
+    /// before the call returns, so [`Self::peer_links_on`] answers it at once
+    /// and the node refuses new links from then on, and the run closes the
+    /// live links and steers the discovery after. A standing already held
+    /// changes nothing.
+    #[cfg(feature = "peer")]
+    pub(crate) fn set_peer_links(&self, on: bool) {
+        if self.peer.peer_links_on() == on {
+            return;
+        }
+        self.peer.set_peer_links(on);
+        let _ = self.commands.send(Command::SetPeerLinks { on });
+        let _ = self.hotspot.send(crate::hotspot::Command::Links { on });
+    }
+
+    /// Whether the device's peer links stand, at run time (R77 slice 8).
+    #[cfg(feature = "peer")]
+    pub(crate) fn peer_links_on(&self) -> bool {
+        self.peer.peer_links_on()
+    }
+
     /// The fingerprint the device serves, once it serves (R76).
     #[cfg(feature = "peer")]
     pub(crate) fn peer_serving_fingerprint(&self) -> Option<connetto_peer::Fingerprint> {
@@ -797,6 +811,9 @@ impl From<Failed> for CertificateError {
                 ceiling: Duration::from_secs(ceiling_secs),
             },
             Failed::Refused(EnrolRefusal::Revoked) => Self::Revoked,
+            Failed::Refused(EnrolRefusal::Refused { reason }) => {
+                Self::ApplicationRefused { reason }
+            }
             Failed::Refused(reason) => Self::Refused(reason),
             Failed::Device(err) => Self::Device(err),
         }
@@ -1372,6 +1389,19 @@ impl<L: Link> Run<L> {
         self.peer.stop(reason);
     }
 
+    /// The run's half of the device's peer links coming to stand `on`, the
+    /// node having taken the standing in the handle. Off closes every live
+    /// link with the client's close, and the discovery follows either way.
+    /// The standing lasts across a renewal's re-serve on the same node
+    /// (R77 slice 8).
+    #[cfg(feature = "peer")]
+    fn set_peer_links(&mut self, on: bool) {
+        if !on {
+            self.peer.close_links(CloseReason::Closed);
+        }
+        self.discovery.set_peer_links(on);
+    }
+
     /// Act on a live connection as the certificate's standing says
     /// (lifecycle rows "Connected and signed in", "Half-life crossed" and
     /// "Wall clock changes, or the hourly look"). The hourly look never
@@ -1549,6 +1579,8 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
                 }
                 #[cfg(feature = "peer")]
                 Some(Command::OfferChanged) => run.offer_changed().await,
+                #[cfg(feature = "peer")]
+                Some(Command::SetPeerLinks { on }) => run.set_peer_links(on),
                 None => steering = false,
             },
             Some(lists) = run.enroller.lists.recv() => {
@@ -1562,13 +1594,25 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
                 if let Some(event) = peer {
                     run.discovery.on_node_event(&event);
                     match event {
-                        PeerEvent::Linked { peer, public_key, bot_list } => {
+                        PeerEvent::Linked { peer, link, public_key, bot_list, expires_at } => {
                             let _ = run.enroller.media.forward(crate::media::MediaEvent::Linked {
                                 peer: peer.clone(),
+                                link,
                                 bot_list: bot_list.clone(),
                             });
-                            run.peer_linked(peer.clone(), public_key, bot_list).await;
+                            run.peer_linked(peer.clone(), public_key, bot_list, expires_at).await;
                             run.link.emit(ClientEvent::PeerLinked { peer });
+                        }
+                        PeerEvent::LinkReplaced { peer, link, public_key, bot_list, expires_at } => {
+                            let _ = run.enroller.media.forward(crate::media::MediaEvent::Linked {
+                                peer: peer.clone(),
+                                link,
+                                bot_list: bot_list.clone(),
+                            });
+                            run.peer_relink(&peer, public_key, bot_list, expires_at).await;
+                        }
+                        PeerEvent::Renewed { peer, expires_at } => {
+                            run.peer_renewed(&peer, expires_at).await;
                         }
                         PeerEvent::Unlinked { peer, reason } => {
                             let _ = run
@@ -1587,8 +1631,8 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
                         PeerEvent::Exchange { peer, message } => {
                             run.peer_message(&peer, message).await;
                         }
-                        PeerEvent::Media { peer, message } => {
-                            run.media_message(peer, message).await;
+                        PeerEvent::Media { peer, link, message } => {
+                            run.media_message(peer, link, message).await;
                         }
                     }
                 }
@@ -1630,19 +1674,30 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
 impl<L: Link> Run<L> {
     /// Hand a media frame to the live port, or answer a request `Refused`
     /// when none lives, as a holder answers for a file it lacks (R79).
-    async fn media_message(&self, peer: DeviceIdentity, message: connetto_exchange::media::Media) {
-        let Err(crate::media::MediaEvent::Message { peer, message }) = self
+    async fn media_message(
+        &self,
+        peer: DeviceIdentity,
+        link: u64,
+        message: connetto_exchange::media::Media,
+    ) {
+        let Err(crate::media::MediaEvent::Message {
+            peer,
+            link,
+            message,
+        }) = self
             .enroller
             .media
-            .forward(crate::media::MediaEvent::Message { peer, message })
+            .forward(crate::media::MediaEvent::Message {
+                peer,
+                link,
+                message,
+            })
         else {
             return;
         };
-        if message.ask().is_some() {
-            let refused = connetto_exchange::media::Media::Refused {
-                request_id: message.request_id(),
-            };
-            if let Err(err) = self.peer.send_media(&peer, refused).await {
+        if let (Some(_), Some(request_id)) = (message.ask(), message.request_id()) {
+            let refused = connetto_exchange::media::Media::Refused { request_id };
+            if let Err(err) = self.peer.send_media(&peer, link, refused).await {
                 tracing::debug!(error = %err, "a media refusal did not reach its peer");
             }
         }

@@ -1,10 +1,8 @@
-//! The bundled Kotlin module and btleplug's Java, the prompt for their
-//! permissions, and the virtual machine btleplug's jni takes.
+//! The bundled Kotlin module and btleplug's Java, and the virtual machine
+//! btleplug's jni takes.
 
 use manganis::android::with_activity;
-use manganis::jni::JNIEnv;
 use manganis::jni::errors::Error as JniError;
-use manganis::jni::objects::{JClass, JValue};
 
 // Declared for `dx`, which builds and bundles the Kotlin module this names.
 #[manganis::ffi("android")]
@@ -13,91 +11,13 @@ extern "Kotlin" {
     pub type BluetoothPlugin;
 }
 
-/// The plugins' classes, reached through the application's class loader,
-/// since a thread Dioxus attached to the VM cannot find app classes with
-/// `FindClass`.
-const HOTSPOT_PLUGIN: &str = "dev.connetto.peer.HotspotPlugin";
-const BLUETOOTH_PLUGIN: &str = "dev.connetto.peer.BluetoothPlugin";
-
-/// Ask the operating system for the peer link's permissions, from the plugin
-/// standing behind the Activity (R76).
-pub fn request_peer_permissions() {
-    let _ = with_activity(|env, activity| {
-        let class = plugin(env, HOTSPOT_PLUGIN).ok()?;
-        env.call_static_method(
-            class,
-            "requestPermissions",
-            "(Landroid/app/Activity;)V",
-            &[JValue::Object(activity)],
-        )
-        .ok()?;
-        Some(())
-    });
-}
-
-/// A bundled plugin's class, loaded on the Activity's class loader.
-fn plugin<'local>(env: &mut JNIEnv<'local>, name: &str) -> Result<JClass<'local>, JniError> {
-    let application = env
-        .call_static_method(
-            "android/app/ActivityThread",
-            "currentApplication",
-            "()Landroid/app/Application;",
-            &[],
-        )?
-        .l()?;
-    let class_loader = env
-        .call_method(
-            &application,
-            "getClassLoader",
-            "()Ljava/lang/ClassLoader;",
-            &[],
-        )?
-        .l()?;
-    let name = env.new_string(name)?;
-    let class = env
-        .call_method(
-            &class_loader,
-            "loadClass",
-            "(Ljava/lang/String;)Ljava/lang/Class;",
-            &[JValue::Object(&name)],
-        )?
-        .l()?;
-    Ok(JClass::from(class))
-}
-
-/// Start the platform's action that brings Bluetooth to `Ready`, the
-/// permission prompt or the enable dialog, from the application's Activity
-/// (R76 decision 21), answering whether it started.
-///
-/// # Errors
-///
-/// [`VmError::NoActivity`] before the application's Activity stands, and
-/// [`VmError::Jni`] when the plugin's call fails.
-pub fn start_bluetooth_prompt() -> Result<bool, VmError> {
-    with_activity(|env, activity| {
-        Some((|| {
-            let class = plugin(env, BLUETOOTH_PLUGIN)?;
-            let code = env
-                .call_static_method(
-                    class,
-                    "prompt",
-                    "(Landroid/app/Activity;)I",
-                    &[JValue::Object(activity)],
-                )?
-                .i()?;
-            Ok::<_, JniError>(code == 0)
-        })())
-    })
-    .ok_or(VmError::NoActivity)?
-    .map_err(VmError::from)
-}
-
 /// Why btleplug's virtual machine is not at hand.
 #[derive(Debug, thiserror::Error)]
 pub enum VmError {
-    /// The process shows no Activity, so its virtual machine is unknown yet.
-    #[error("no Activity stands, so the virtual machine is unknown")]
-    NoActivity,
+    /// The host registered no Android context yet, so the virtual machine
+    /// is unknown.
+    #[error("no Android context is registered, so the virtual machine is unknown")]
+    NoContext,
     /// The virtual machine refused a call.
     #[error("the virtual machine refused: {0}")]
     Jni(#[from] JniError),
@@ -108,12 +28,12 @@ pub enum VmError {
 ///
 /// # Errors
 ///
-/// [`VmError::NoActivity`] before the application's Activity stands, and
+/// [`VmError::NoContext`] before the host registers its Android context, and
 /// [`VmError::Jni`] when the virtual machine refuses the lookup.
 pub fn java_vm() -> Result<jni::JavaVM, VmError> {
     let raw =
         with_activity(|env, _activity| Some(env.get_java_vm().map(|vm| vm.get_java_vm_pointer())))
-            .ok_or(VmError::NoActivity)??;
+            .ok_or(VmError::NoContext)??;
     #[expect(
         unsafe_code,
         reason = "jni 0.22 learns the running virtual machine only through from_raw"

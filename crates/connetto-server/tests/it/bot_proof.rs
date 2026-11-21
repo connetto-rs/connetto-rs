@@ -108,10 +108,14 @@ async fn shipped_executor(
     Translator,
 ) {
     let (channel, store) = fixture.fga_store().await;
-    let translated = Translated::of::<String, connetto_core::bots::TextIds>(
-        PG_DDL,
-        NO_POLICIES,
-        connetto_core::auth::DEFAULT_USER_SETTING,
+    let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
+        connetto_schema::Documents::new(
+            PG_DDL,
+            NO_POLICIES,
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
+        true,
     )
     .expect("the fixture's policies are one rls2fga classifies");
     let mut setup = OpenFgaServiceClient::new(channel.clone());
@@ -123,9 +127,9 @@ async fn shipped_executor(
         translated.shapes_arc(),
         setup,
         store.clone(),
+        model.model(),
     )
-    .expect("the index carries what the questions need")
-    .authorization_model_id(model.id().to_owned());
+    .expect("the index carries what the questions need");
     translated
         .load_into(&FactSource::owner(fixture.admin().clone()), &loader)
         .await
@@ -136,9 +140,9 @@ async fn shipped_executor(
         Arc::clone(&shapes),
         OpenFgaServiceClient::new(Counted::new(channel)),
         store,
+        model.model(),
     )
-    .expect("the index carries what the questions need")
-    .authorization_model_id(model.id().to_owned());
+    .expect("the index carries what the questions need");
     let fga = FgaAuth::new(Arc::clone(&shapes), delegate, naming);
     let upkeep = fga.upkeep(
         reach,
@@ -181,13 +185,13 @@ async fn stack(fixture: &Fixture) -> (Server, Pool<AsyncPgConnection>) {
         .await;
     provision_cap_policies(fixture.admin(), PG_DDL, NO_POLICIES).await;
     let reader = pool_for(&with_user(fixture.admin_url(), READER, READER)).await;
-    let engine_ddl = connetto_schema::with_registry::<connetto_core::bots::TextIds>(PG_DDL);
+    let engine_ddl = connetto_test_harness::engine_ddl(PG_DDL);
     let (fga, upkeep, translator) = shipped_executor(fixture).await;
     let auth = HarnessAuth::fga(fga, upkeep);
     let snapshot = PgSnapshotSource::from_ddl(reader.clone(), &engine_ddl)
         .expect("snapshot source")
         .with_publication(PUBLICATION);
-    let config = ServerConfig::new(engine_ddl.clone(), fixture.admin_url())
+    let config = ServerConfig::new(PG_DDL, fixture.admin_url())
         .with_writable(RuntimeWritableCatalog::builder().writable("t").build())
         .with_translation(translator, None)
         .with_content_signer(OkSigner)

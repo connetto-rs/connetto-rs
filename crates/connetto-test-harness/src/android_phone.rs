@@ -11,6 +11,7 @@ use anyhow::{Result, anyhow, bail};
 use tokio::process::Command;
 use tokio::time::{Instant, sleep, timeout};
 
+pub mod live;
 mod steps;
 
 pub use steps::{
@@ -99,14 +100,14 @@ async fn bounded_status(
     }
 }
 
-/// The demo the proof deploys on the phone, `dioxus` (the default) or `tauri`
-/// (`examples/tauri-leptos-demo`).
+/// The demo the proof deploys on the phone, `tauri` (the default) or `dioxus`
+/// (`examples/dioxus-demo`).
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum Demo {
-    /// The Dioxus demo, the default.
-    #[default]
+    /// The Dioxus demo.
     Dioxus,
-    /// The Tauri demo.
+    /// The Tauri demo, the default.
+    #[default]
     Tauri,
 }
 

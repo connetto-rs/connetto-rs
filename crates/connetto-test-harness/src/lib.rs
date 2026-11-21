@@ -18,9 +18,11 @@ use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::CallerMappings;
 use connetto_server::openfga::{Counted, FgaAuth, StoreUpkeep};
 use connetto_server::{
-    InMemoryOplog, LoopbackTransport, ManagerBuilder, Materializer, NoSigner, OidcProviderConfig,
-    PgReadConnector, PgSnapshotSource, ReconnectEvent, ReconnectPolicy, RequestGuard, RlsAuth,
-    RlsAuthError, RuntimeWritableCatalog, SessionConfig, SessionManager, loopback, pg_write_target,
+    AuthConfig, AuthHooks, AuthService, DbAuthStore, DefaultAuthHooks, InMemoryOplog,
+    LoopbackTransport, ManagerBuilder, Materializer, NoSigner, OAuthEndpoints, OAuthProviderConfig,
+    OidcProviderConfig, PgReadConnector, PgSnapshotSource, ReconnectEvent, ReconnectPolicy,
+    RefreshLifetimes, RequestGuard, RlsAuth, RlsAuthError, RuntimeWritableCatalog, SessionConfig,
+    SessionManager, TokenAuthority, loopback, pg_write_target,
 };
 use diesel::sql_query;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -34,10 +36,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::Postgres;
 use subql::visibility::openfga::OpenFgaError;
 use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
-use subql::{
-    ParserDB, PgChangeEvent, PgCommitPosition, PgLsn, PgStreamingCdcSource, PgStreamingConfig,
-    PgXid,
-};
+use subql::{PgChangeEvent, PgCommitPosition, PgLsn, PgStreamingConfig, PgXid};
 use testcontainers::core::logs::LogFrame;
 use testcontainers::core::wait::HttpWaitStrategy;
 use testcontainers::core::{CmdWaitFor, ExecCommand, IntoContainerPort, WaitFor};
@@ -60,15 +59,37 @@ pub mod peer_proof;
 pub mod relay;
 pub mod roster;
 pub mod router;
+pub mod server_fixture;
 pub mod stack;
 pub mod standby;
 pub mod star;
+pub mod wire_tables;
 
+mod container_slot;
+pub use container_slot::{CONTAINER_SLOTS, ContainerSlot, container_slot};
 mod native;
 use native::NativeCluster;
 pub use native::{POSTGRES_BIN_VAR, POSTGRES_TEMPLATE_VAR};
 
 pub use roster::{RosterAuth, WITHHELD_ID};
+
+/// The reader role the fixture deployments read and write as.
+pub const FIXTURE_READER: &str = "app_reader";
+
+/// The roles document a fixture deployment's translations read, creating
+/// [`FIXTURE_READER`] and granting it every table the fixture's documents
+/// declare, the grants the replica translation holds each table to.
+pub const FIXTURE_ROLES: &str = "CREATE ROLE app_reader LOGIN;\n\
+     GRANT USAGE ON SCHEMA public TO app_reader;\n\
+     GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_reader;";
+
+diesel::table! {
+    /// The cluster's roles, read to skip a role a roles document creates twice.
+    pg_roles (rolname) {
+        /// The role's name.
+        rolname -> Text,
+    }
+}
 
 /// One proof step's line, which the proofs' summaries read off the log.
 pub fn step(name: &str) {
@@ -88,6 +109,13 @@ pub use connetto_server::defaults::ConnettoDefaults;
 pub const SLOT: &str = "connetto_slot";
 /// The publication the slot follows. Matches the server binary default.
 pub const PUBLICATION: &str = "connetto_pub";
+/// The dump a restore reads, the globals and the whole database, taken
+/// while the server runs into the [`Fixture::shell`]'s `DUMP_DIR`.
+const DUMP: &str = "pg_dumpall --globals-only -f \"$DUMP_DIR/globals.sql\" && \
+                    pg_dump -Fc -d postgres -f \"$DUMP_DIR/db.dump\"";
+/// The dump restored over the cluster it came from, the slot dropped by the
+/// caller and recreated with the publication checked after.
+const RESTORE_INTO_SAME: &str = "pg_restore --clean --if-exists -d postgres \"$DUMP_DIR/db.dump\"";
 
 /// The secret the harness client issues every number writer under, so a test
 /// presents its number again with [`number_writer`].
@@ -614,7 +642,46 @@ impl MockOauth {
         .with_client_secret(Some(MOCK_OAUTH_CLIENT_SECRET.to_owned()))
     }
 
-    /// Environment variables consumed by `connetto-server`.
+    /// The provider's user endpoint, which answers the claims of the access
+    /// token it is shown, the login form's own claims among them.
+    #[must_use]
+    pub fn user_url(&self) -> String {
+        format!("{}/userinfo", self.issuer)
+    }
+
+    /// Build connetto's plain OAuth 2.0 configuration for this provider, which
+    /// ignores the ID token the provider also returns and reads the user from
+    /// `user_url` at `subject_pointer`, labelled `issuer_label`. The provider
+    /// refuses an authorize request without the `openid` scope, so it is the
+    /// one scope requested.
+    #[must_use]
+    pub fn oauth_config(
+        &self,
+        name: &str,
+        issuer_label: &str,
+        redirect_url: &str,
+        user_url: String,
+        subject_pointer: &str,
+    ) -> OAuthProviderConfig {
+        OAuthProviderConfig::new(
+            name,
+            MOCK_OAUTH_CLIENT_ID,
+            issuer_label,
+            redirect_url,
+            OAuthEndpoints {
+                authorize_url: format!("{}/authorize", self.issuer),
+                token_url: format!("{}/token", self.issuer),
+                user_url,
+            },
+            subject_pointer,
+        )
+        .with_client_secret(Some(MOCK_OAUTH_CLIENT_SECRET.to_owned()))
+        .with_scopes(["openid"])
+        .with_email_pointer("/email")
+        .with_name_pointer("/name")
+    }
+
+    /// Environment variables consumed by `demo-server`.
     #[must_use]
     pub fn env_pairs(&self, name: &str, redirect_url: &str) -> Vec<(String, String)> {
         let prefix = env_prefix(name);
@@ -730,11 +797,19 @@ pub const WRITERS_DDL: &str = "DO $$ BEGIN \
      writer BIGINT NOT NULL, \
      first_seq BIGINT NOT NULL, \
      bound_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
-     PRIMARY KEY (session_id, writer))";
+     PRIMARY KEY (session_id, writer)); \
+    CREATE TABLE IF NOT EXISTS _connetto_courier_notices \
+    (id BIGSERIAL PRIMARY KEY, \
+     user_id TEXT NOT NULL, \
+     courier_user_id TEXT NOT NULL, \
+     device_key BYTEA NOT NULL, \
+     seq BIGINT NOT NULL, \
+     outcome TEXT NOT NULL)";
 
 /// Create the reference settle-path enum and writer tables if missing, as
 /// admin. A restricted writer role needs `SELECT, INSERT, UPDATE, DELETE` on
-/// all three tables, granted separately.
+/// all four tables and `USAGE` on the notices table's id sequence, granted
+/// separately.
 pub async fn provision_writers(pool: &Pool<AsyncPgConnection>) {
     exec(pool, WRITERS_DDL).await;
 }
@@ -743,31 +818,7 @@ pub async fn provision_writers(pool: &Pool<AsyncPgConnection>) {
 /// (R105 decision 5), matching `docs/architecture/08-authorization.md` and the
 /// default schema's audit member, created only where missing. It names the
 /// settle-path enum, so [`WRITERS_DDL`] runs first.
-pub const AUDIT_DDL: &str = "DO $$ BEGIN \
-    CREATE TYPE connetto_auth_op AS ENUM (\
-    'logged_in', 'logged_out', 'session_revoked', 'token_replayed', \
-    'ended_by_owner', 'ended_all', 'ended_others', 'ended_by_ban', \
-    'capability_minted', 'permission_change', 'model_change', \
-    'banned', 'ban_lifted', 'write_forked', 'write_redelivered', \
-    'data_downloaded', 'data_erased'); \
-    EXCEPTION WHEN duplicate_object THEN NULL; END $$; \
-    CREATE TABLE IF NOT EXISTS auth_events \
-    (at TIMESTAMPTZ NOT NULL DEFAULT now(), \
-     session UUID, \
-     user_id TEXT, \
-     op connetto_auth_op NOT NULL, \
-     table_name TEXT, \
-     pk UUID, \
-     subject TEXT, \
-     writer BIGINT, \
-     seq BIGINT, \
-     path connetto_settle_path, \
-     other_path connetto_settle_path, \
-     provider TEXT, \
-     issuer TEXT, \
-     query_list_hash TEXT, \
-     archive_bytes BIGINT, \
-     acted_by TEXT)";
+pub const AUDIT_DDL: &str = connetto_server::connetto_audit_ddl!(provision, "TEXT", "UUID");
 
 /// Create the reference audit enum and table if missing, as admin.
 pub async fn provision_audit(pool: &Pool<AsyncPgConnection>) {
@@ -894,9 +945,10 @@ pub async fn provision_oplog(pool: &Pool<AsyncPgConnection>) {
 
 /// Set up the publication, slot, and oplog table for logical replication.
 ///
-/// The publication carries `tables` and connetto's bot registry tables, which
-/// every deployment's publication must carry as well, since the registry is
-/// synced like the deployment's own tables.
+/// The publication carries `tables`, connetto's bot registry tables, and the
+/// three bookkeeping tables the server settles writes into, since the
+/// deployment's publication must carry all of them and preflight refuses to
+/// boot while the publication lacks one (R77 decision 11).
 ///
 /// # Panics
 ///
@@ -904,10 +956,35 @@ pub async fn provision_oplog(pool: &Pool<AsyncPgConnection>) {
 pub async fn start_replication_on(pool: &Pool<AsyncPgConnection>, tables: &[&str]) {
     drop_slot(pool).await;
     exec(pool, &format!("DROP PUBLICATION IF EXISTS {PUBLICATION}")).await;
+    // The enrolment base table must exist for the publication to name it,
+    // created idempotently so a test that provisions it with its own typed
+    // DDL beside is unaffected.
+    exec(
+        pool,
+        "CREATE TABLE IF NOT EXISTS connetto_device_enrolments \
+         (key_id BYTEA PRIMARY KEY, user_id TEXT NOT NULL, session_id UUID NOT NULL, \
+          enrolled_at TIMESTAMPTZ NOT NULL, last_seen TIMESTAMPTZ NOT NULL, \
+          revoked_at TIMESTAMPTZ, public_key BYTEA NOT NULL, attestation TEXT NOT NULL, \
+          bot_list TEXT)",
+    )
+    .await;
+    provision_writers(pool).await;
     let mut published: Vec<&str> = tables.to_vec();
     for registry in connetto_core::bots::REGISTRY_TABLES {
         if !published.contains(registry) {
             published.push(registry);
+        }
+    }
+    for table in connetto_schema::BOOKKEEPING_TABLES {
+        if !published.contains(table) {
+            published.push(table);
+        }
+    }
+    for table in <connetto_server::defaults::ConnettoAudit as
+        connetto_server::audit::ConnettoAuditSchema>::TABLES
+    {
+        if !published.contains(table) {
+            published.push(table);
         }
     }
     for table in &published {
@@ -951,10 +1028,14 @@ pub struct Fixture {
 
 /// What keeps a fixture's Postgres alive.
 enum Cluster {
-    /// A container, the target of [`Fixture::shell`].
-    Container(Box<ContainerAsync<GenericImage>>),
-    /// A cluster started as plain processes, see [`native::POSTGRES_BIN_VAR`].
-    Native { _guard: NativeCluster },
+    /// A container, the target of [`Fixture::shell`] inside it, dropped before the slot that admitted it.
+    Container {
+        container: Box<ContainerAsync<GenericImage>>,
+        _slot: ContainerSlot,
+    },
+    /// A cluster started as plain processes, see [`native::POSTGRES_BIN_VAR`],
+    /// the target of [`Fixture::shell`] with its own programs.
+    Native { cluster: NativeCluster },
     /// A cluster something else started and keeps running.
     Running,
 }
@@ -1041,6 +1122,7 @@ impl Fixture {
             );
             return Self::on_native(&programs, shared_counter_scope, exclusive_counter_scope).await;
         }
+        let slot = container_slot().await.expect("a container slot");
         sweep_abandoned_containers();
         let mut image = GenericImage::new(POSTGRES_IMAGE, POSTGRES_TAG)
             .with_exposed_port(POSTGRES_PORT.tcp())
@@ -1073,7 +1155,10 @@ impl Fixture {
         let admin_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
         Self::provisioned(
             admin_url,
-            Cluster::Container(Box::new(postgres)),
+            Cluster::Container {
+                container: Box::new(postgres),
+                _slot: slot,
+            },
             spare_url,
             OnceCell::new(),
             shared_counter_scope,
@@ -1091,7 +1176,7 @@ impl Fixture {
         let cluster = NativeCluster::start(&programs.bin, &programs.template).await;
         Self::provisioned(
             cluster.admin_url(),
-            Cluster::Native { _guard: cluster },
+            Cluster::Native { cluster },
             None,
             OnceCell::new(),
             shared_counter_scope,
@@ -1126,35 +1211,89 @@ impl Fixture {
         }
     }
 
-    /// Run a `bash` script inside the container as the `postgres` user and
-    /// return its standard output.
+    /// Run a `bash` script against the fixture's own cluster and return its
+    /// standard output, inside the container as the `postgres` user, or for a
+    /// native cluster with the programs beside its `pg_ctl` and `PGHOST`,
+    /// `PGPORT` and `PGUSER` naming it. `DUMP_DIR` names a directory only this
+    /// cluster uses, `/tmp` inside the container.
     ///
     /// # Panics
     ///
     /// Panics when the fixture runs over a cluster it did not start, when the
-    /// exec cannot start, or when the script exits nonzero, printing the
-    /// script's standard error.
+    /// script cannot start, or when it exits nonzero, printing the script's
+    /// standard error.
     pub async fn shell(&self, script: &str) -> String {
-        let Cluster::Container(postgres) = &self.postgres else {
-            panic!("a shell needs the fixture's own container");
+        let (code, stdout, stderr) = match &self.postgres {
+            Cluster::Container {
+                container: postgres,
+                ..
+            } => {
+                let exported = format!("export DUMP_DIR=/tmp\n{script}");
+                let mut run = postgres
+                    .exec(
+                        ExecCommand::new([
+                            "gosu", "postgres", "bash", "-euo", "pipefail", "-c", &exported,
+                        ])
+                        .with_cmd_ready_condition(CmdWaitFor::exit()),
+                    )
+                    .await
+                    .unwrap_or_else(|err| panic!("starting `{script}` in the container: {err}"));
+                let stdout = run.stdout_to_vec().await.expect("read the script's stdout");
+                let stderr = run.stderr_to_vec().await.expect("read the script's stderr");
+                let code = run.exit_code().await.expect("read the script's exit code");
+                (code, stdout, stderr)
+            }
+            Cluster::Native { cluster } => {
+                let output =
+                    cluster.shell(script).output().await.unwrap_or_else(|err| {
+                        panic!("starting `{script}` beside the cluster: {err}")
+                    });
+                (
+                    output.status.code().map(i64::from),
+                    output.stdout,
+                    output.stderr,
+                )
+            }
+            Cluster::Running => panic!("a shell needs a cluster the fixture started"),
         };
-        let mut run = postgres
-            .exec(
-                ExecCommand::new(["gosu", "postgres", "bash", "-euo", "pipefail", "-c", script])
-                    .with_cmd_ready_condition(CmdWaitFor::exit()),
-            )
-            .await
-            .unwrap_or_else(|err| panic!("starting `{script}` in the container: {err}"));
-        let stdout = run.stdout_to_vec().await.expect("read the script's stdout");
-        let stderr = run.stderr_to_vec().await.expect("read the script's stderr");
-        let code = run.exit_code().await.expect("read the script's exit code");
         assert_eq!(
             code,
             Some(0),
-            "`{script}` failed in the container: {}",
+            "`{script}` failed on the fixture's cluster: {}",
             String::from_utf8_lossy(&stderr)
         );
         String::from_utf8(stdout).expect("the script printed UTF-8")
+    }
+
+    /// Take the deployment's backup, the globals and a custom dump of the
+    /// whole database, while the server runs.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::shell`].
+    pub async fn dump_backup(&self) -> String {
+        self.shell(DUMP).await
+    }
+
+    /// Restore the backup [`Self::dump_backup`] took over the cluster it came
+    /// from, dropping the slot first and recreating it with the publication
+    /// checked, as an operator restores same-cluster.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::shell`].
+    pub async fn restore_same_cluster(&self) {
+        self.shell(&format!(
+            "psql -d postgres -q -c \"SELECT pg_drop_replication_slot('{SLOT}')\""
+        ))
+        .await;
+        self.shell(RESTORE_INTO_SAME).await;
+        self
+            .shell(&format!(
+                "psql -d postgres -q -c \"SELECT pg_create_logical_replication_slot('{SLOT}', 'pgoutput')\" \
+                 -c \"SELECT 1 FROM pg_publication WHERE pubname = '{PUBLICATION}'\""
+            ))
+            .await;
     }
 
     /// The admin conninfo of the second cluster a restorable fixture's test starts on port 5433.
@@ -1248,22 +1387,137 @@ impl Fixture {
         }
     }
 
+    /// Apply a deployment's roles document as admin, skipping a `CREATE
+    /// ROLE` whose role the cluster already holds.
+    ///
+    /// A role is cluster-wide while each fixture holds one database, so a
+    /// second provision on one cluster meets the roles the first created.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the document does not parse, when the admin connection is
+    /// unavailable, or when a statement fails.
+    pub async fn setup_roles(&self, roles: &str) {
+        use diesel::{ExpressionMethods as _, QueryDsl as _};
+        let statements = sqlparser::parser::Parser::parse_sql(&PostgreSqlDialect {}, roles)
+            .expect("the roles document parses");
+        let mut conn = self.admin.get().await.expect("admin connection");
+        for statement in statements {
+            if let sqlparser::ast::Statement::CreateRole(create) = &statement {
+                let mut held = false;
+                for name in &create.names {
+                    let Some(ident) = name.0.last().and_then(|part| part.as_ident()) else {
+                        panic!("role name {name} is no identifier");
+                    };
+                    let stored = sql_traits::utils::identifier_resolution::stored_ident_name(ident)
+                        .into_owned();
+                    held |= diesel::select(diesel::dsl::exists(
+                        pg_roles::table.filter(pg_roles::rolname.eq(stored)),
+                    ))
+                    .get_result::<bool>(&mut *conn)
+                    .await
+                    .expect("read the cluster's roles");
+                }
+                if held {
+                    continue;
+                }
+            }
+            conn.batch_execute(&statement.to_string())
+                .await
+                .unwrap_or_else(|err| panic!("apply {statement}: {err}"));
+        }
+    }
+
     /// Create the database auth store's tables in the reference shape
     /// (`11-authentication.md`), for a server run with `CONNETTO_AUTH=database`.
     pub async fn provision_auth_tables(&self) {
-        self.setup(&[
+        self.provision_auth_tables_over("TEXT").await;
+    }
+
+    /// Create the auth tables in the reference shape with `user_id` of the
+    /// Postgres type `user_id_type`, for a schema whose `Id` maps to it.
+    pub async fn provision_auth_tables_over(&self, user_id_type: &str) {
+        let sessions = format!(
             "CREATE TABLE connetto_sessions (\
-             session_id UUID PRIMARY KEY, user_id TEXT NOT NULL, \
+             session_id UUID PRIMARY KEY, user_id {user_id_type} NOT NULL, \
              current_refresh_hash BYTEA NOT NULL, idle_deadline TIMESTAMPTZ NOT NULL, \
              absolute_deadline TIMESTAMPTZ NOT NULL, revoked BOOLEAN NOT NULL DEFAULT FALSE, \
              created_at TIMESTAMPTZ NOT NULL, refreshed_at TIMESTAMPTZ, \
-             provider TEXT NOT NULL, issuer TEXT NOT NULL)",
+             provider TEXT NOT NULL, issuer TEXT NOT NULL)"
+        );
+        self.setup(&[
+            sessions.as_str(),
             "CREATE TABLE connetto_provider_tokens (\
              session_id UUID PRIMARY KEY REFERENCES connetto_sessions (session_id) ON DELETE CASCADE, \
              issuer TEXT NOT NULL, access_token TEXT NOT NULL, refresh_token TEXT, \
              expires_at TIMESTAMPTZ)",
         ])
         .await;
+    }
+
+    /// Create the auth tables and build the database auth store over them in
+    /// the default schema, enforcing `lifetimes` and resolving identity to a
+    /// deterministic UUID v5 string over `(issuer, subject)`.
+    pub async fn auth_store(
+        &self,
+        lifetimes: RefreshLifetimes,
+    ) -> Arc<DbAuthStore<ConnettoDefaults>> {
+        self.auth_store_with(lifetimes, Arc::new(DefaultAuthHooks))
+            .await
+    }
+
+    /// [`auth_store`](Self::auth_store) running `hooks` at each auth event.
+    pub async fn auth_store_with(
+        &self,
+        lifetimes: RefreshLifetimes,
+        hooks: Arc<dyn AuthHooks<ConnettoDefaults>>,
+    ) -> Arc<DbAuthStore<ConnettoDefaults>> {
+        self.provision_auth_tables().await;
+        Arc::new(DbAuthStore::new(self.admin.clone(), lifetimes, hooks))
+    }
+
+    /// Create the auth and enrolment tables and an auth service over them
+    /// running `hooks`, the service a device enrolment's transactions join.
+    ///
+    /// # Panics
+    ///
+    /// When a table cannot be created or the token keypair cannot be
+    /// generated.
+    pub async fn enrolment_auth(
+        &self,
+        hooks: Arc<dyn AuthHooks<ConnettoDefaults>>,
+    ) -> Arc<AuthService<ConnettoDefaults>> {
+        let config = AuthConfig::default();
+        let store = self
+            .auth_store_with(config.refresh_lifetimes(), hooks)
+            .await;
+        stack::provision_enrolment_tables(self).await;
+        Arc::new(AuthService::new(
+            Arc::new(TokenAuthority::generate(&config).expect("generate the token keypair")),
+            store,
+            Arc::new(RequestGuard::default()),
+        ))
+    }
+
+    /// Record `session` as a live session of `user`, the session a device
+    /// enrolling during it names, without a sign-in.
+    pub async fn live_session(&self, user: &str, session: connetto_core::SessionId) {
+        self.exec(&format!(
+            "INSERT INTO connetto_sessions (session_id, user_id, current_refresh_hash, \
+             idle_deadline, absolute_deadline, created_at, provider, issuer) \
+             VALUES ('{session}', '{user}', '\\x00', now() + interval '1 day', \
+             now() + interval '30 days', now(), 'test', 'https://issuer.example')",
+            session = session.as_uuid(),
+            user = user.replace('\'', "''"),
+        ))
+        .await;
+    }
+
+    /// Fail every later statement of the auth store, the way a database
+    /// outage does, by moving its sessions table out of reach.
+    pub async fn break_auth_store(&self) {
+        self.exec("ALTER TABLE connetto_sessions RENAME TO connetto_sessions_unreachable")
+            .await;
     }
 
     /// Put each published table in full previous-image mode, then create the publication, slot and oplog table.
@@ -1509,6 +1763,7 @@ trait SignerInner: Send + Sync {
         caller: &'a connetto_core::auth::ContentCaller,
         file_id: [u8; 32],
         verb: ContentVerb,
+        carry: Option<&'a connetto_core::auth::ContentCarry>,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<String, BoxSignerError>> + Send + 'a>>;
 }
 
@@ -1523,10 +1778,11 @@ where
         caller: &'a connetto_core::auth::ContentCaller,
         file_id: [u8; 32],
         verb: ContentVerb,
+        carry: Option<&'a connetto_core::auth::ContentCarry>,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<String, BoxSignerError>> + Send + 'a>> {
         Box::pin(async move {
             self.0
-                .mint(caller, file_id, verb)
+                .mint(caller, file_id, verb, carry)
                 .await
                 .map_err(|e| BoxSignerError(format!("{e}")))
         })
@@ -1562,10 +1818,16 @@ impl ContentTicketSigner for BoxSigner {
         caller: &connetto_core::auth::ContentCaller,
         file_id: [u8; 32],
         verb: ContentVerb,
+        carry: Option<&connetto_core::auth::ContentCarry>,
     ) -> impl Future<Output = Result<String, Self::Error>> + MaybeSend {
         let inner = Arc::clone(&self.0);
         let caller = caller.clone();
-        async move { inner.mint_boxed(&caller, file_id, verb).await }
+        let carry = carry.cloned();
+        async move {
+            inner
+                .mint_boxed(&caller, file_id, verb, carry.as_ref())
+                .await
+        }
     }
 }
 
@@ -1612,6 +1874,8 @@ pub struct ServerConfig {
     replication_tables: Vec<String>,
     /// The signer the session loop calls when a client requests a content ticket.
     signer: BoxSigner,
+    /// How often the drift guard re-reads every table's live shape.
+    drift_reconciliation: Duration,
 }
 
 impl ServerConfig {
@@ -1629,6 +1893,7 @@ impl ServerConfig {
             caller: None,
             replication_tables: Vec::new(),
             signer: BoxSigner::noop(),
+            drift_reconciliation: Duration::from_secs(60),
         }
     }
 
@@ -1678,6 +1943,14 @@ impl ServerConfig {
     #[must_use]
     pub fn with_replication(mut self, tables: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.replication_tables = tables.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// How often the drift guard re-reads every table's live shape, so a test
+    /// can see a change no row has carried yet without waiting a minute.
+    #[must_use]
+    pub fn with_drift_reconciliation(mut self, every: Duration) -> Self {
+        self.drift_reconciliation = every;
         self
     }
 
@@ -1770,6 +2043,12 @@ impl Server {
     }
 }
 
+/// The default deployment's complete server catalog.
+#[must_use]
+pub fn engine_ddl(pg_ddl: &str) -> String {
+    connetto_server::schema::engine_ddl::<ConnettoDefaults>(pg_ddl, true)
+}
+
 /// Wire a harness server: build the materializer, write target, and re-execution
 /// connector, then spawn the CDC ingest loop.
 ///
@@ -1803,20 +2082,23 @@ pub async fn spawn_server(
         caller,
         replication_tables,
         signer,
+        drift_reconciliation,
     } = config;
     if !replication_tables.is_empty() {
         let admin_pool = pool_for(&admin_url).await;
         let table_refs: Vec<&str> = replication_tables.iter().map(String::as_str).collect();
         start_replication_on(&admin_pool, &table_refs).await;
     }
-    // The materializer alone reads the policies beside `pg_ddl`, because a folded read rule reads the policy text the engine holds.
+    // The materializer alone reads the policies beside the engine catalog, because a folded read rule reads the policy text the engine holds.
     let upkeep = auth.upkeep();
     let engine_connector = PgReadConnector::with_session_setup(connector_pool.clone());
+    let base_ddl = engine_ddl(&pg_ddl);
     let materializer_ddl = match policies {
-        Some(policies) => std::borrow::Cow::Owned(format!("{pg_ddl}\n{policies}")),
-        None => std::borrow::Cow::Borrowed(&pg_ddl),
+        Some(policies) => std::borrow::Cow::Owned(format!("{base_ddl}\n{policies}")),
+        None => std::borrow::Cow::Borrowed(&base_ddl),
     };
     let mut materializer_builder = Materializer::builder(&materializer_ddl)
+        .with_audit_schema::<connetto_server::defaults::ConnettoAudit>()
         .with_write_catalog(writable)
         .with_read_connector(engine_connector);
     if let Some(translator) = translator {
@@ -1827,15 +2109,16 @@ pub async fn spawn_server(
     }
     let materializer = materializer_builder.build().expect("build materializer");
     let write =
-        pg_write_target::<ConnettoDefaults>(write_pool, &pg_ddl).expect("build write target");
+        pg_write_target::<ConnettoDefaults>(write_pool, &base_ddl).expect("build write target");
     let withdrawal_pool = connector_pool.clone();
     let connector = PgReadConnector::with_session_setup(connector_pool);
     // The harness is test-only, so the stand-in authority reads the subject out of the grant string.
     let authority: Arc<dyn connetto_core::traits::HandshakeAuthority> =
         Arc::new(connetto_core::test_support::TestGrantChecker);
-    // Move-out withdrawals read on the admin pool, keys only (R27 decision 6).
+    // Move-out withdrawals read on the admin pool, keys only (R27 decision 6),
+    // against the same catalog the materializer classifies.
     let withdrawals =
-        PgSnapshotSource::from_ddl(withdrawal_pool, &pg_ddl).expect("build withdrawal source");
+        PgSnapshotSource::from_ddl(withdrawal_pool, &base_ddl).expect("build withdrawal source");
     let mut manager_builder =
         ManagerBuilder::new(materializer, snapshot, auth, authority, connector, write)
             .with_guard(guard)
@@ -1850,9 +2133,10 @@ pub async fn spawn_server(
     let restarts = Arc::new(AtomicU64::new(0));
     let ingest = spawn_ingest_task(
         admin_url,
-        pg_ddl,
+        &pg_ddl,
         Arc::clone(&manager),
         Arc::clone(&restarts),
+        drift_reconciliation,
     );
 
     Server {
@@ -1864,21 +2148,34 @@ pub async fn spawn_server(
 /// Spawn the CDC ingest loop that drives `manager` from the replication stream.
 fn spawn_ingest_task(
     admin_url: String,
-    pg_ddl: String,
+    pg_ddl: &str,
     manager: Arc<HarnessManager>,
     restarts: Arc<AtomicU64>,
+    drift_reconciliation: Duration,
 ) -> JoinHandle<()> {
+    let catalog_ddl = engine_ddl(pg_ddl);
     tokio::spawn(async move {
         let connect = |resume: connetto_server::ResumePoint| {
-            let (url, ddl) = (admin_url.clone(), pg_ddl.clone());
+            let (url, ddl, manager) =
+                (admin_url.clone(), catalog_ddl.clone(), Arc::clone(&manager));
             async move {
-                let catalog = ParserDB::parse::<PostgreSqlDialect>(&ddl)
-                    .map_err(|err| format!("parsing catalog DDL: {err:?}"))?;
-                let config = PgStreamingConfig::new(url, SLOT.to_owned(), PUBLICATION.to_owned())
-                    .start(resume.get());
-                PgStreamingCdcSource::connect(config, catalog)
+                let config =
+                    PgStreamingConfig::new(url.clone(), SLOT.to_owned(), PUBLICATION.to_owned())
+                        .start(resume.get());
+                let source = connetto_server::drift::connect_guarded(
+                    config,
+                    &ddl,
+                    &url,
+                    PUBLICATION,
+                    drift_reconciliation,
+                )
+                .await
+                .map_err(|err| err.to_string())?;
+                manager
+                    .watch_guard(source.refusals())
                     .await
-                    .map_err(|err| format!("opening CDC stream: {err}"))
+                    .map_err(|err| format!("settling earlier refusals: {err}"))?;
+                Ok::<_, String>(source)
             }
         };
         let _ = manager
@@ -1889,6 +2186,12 @@ fn spawn_ingest_task(
                 }
                 if let ReconnectEvent::AuthRetrying { error, .. } = &event {
                     eprintln!("the harness change feed holds an event the authorization path refused: {error}");
+                }
+                if let ReconnectEvent::ReadRetrying { error, .. } = &event {
+                    eprintln!("the harness change feed holds an event the re-execution read refused: {error}");
+                }
+                if let ReconnectEvent::GaveUp { attempts, error } = &event {
+                    eprintln!("the harness change feed gave up after {attempts} attempts: {error}");
                 }
             })
             .await;
@@ -1905,6 +2208,9 @@ pub struct Client {
     /// commit, and an assertion about what was delivered has to weigh that
     /// patch rather than never meet it.
     live_backlog: VecDeque<LivePatch>,
+    /// The schema major every handshake declares, the capture major of the
+    /// entries the connection settles.
+    schema_major: Option<connetto_core::Major>,
 }
 
 impl Client {
@@ -1916,7 +2222,19 @@ impl Client {
         Self {
             transport,
             live_backlog: VecDeque::new(),
+            schema_major: None,
         }
+    }
+
+    /// Declare `major` in every handshake this client sends, the capture
+    /// major of the entries the connection settles.
+    // Out of line, since rustc otherwise copies so small a function into each
+    // calling crate of a non-incremental build, where coverage never counts it.
+    #[must_use]
+    #[inline(never)]
+    pub fn declaring(mut self, major: connetto_core::Major) -> Self {
+        self.schema_major = Some(major);
+        self
     }
 
     /// Send the handshake as `client_id` and wait for its ack. The client id
@@ -1958,6 +2276,7 @@ impl Client {
         let mut handshake = Handshake::new(PROTOCOL_VERSION, client_id)
             .with_grants(grants.iter().map(|grant| Grant::new(*grant)))
             .with_writer(writer);
+        handshake.schema_major = self.schema_major;
         if let Some(token) = resume_token {
             handshake = handshake.with_resume_token(token);
         }
@@ -2011,6 +2330,7 @@ impl Client {
         let mut handshake = Handshake::new(PROTOCOL_VERSION, client_id)
             .with_grant(Grant::new(grant))
             .with_cursor(cursor);
+        handshake.schema_major = self.schema_major;
         if let Some(subjects) = cursor_subjects {
             handshake = handshake.with_cursor_subjects(subjects.iter().copied());
         }
@@ -2039,6 +2359,7 @@ impl Client {
         let mut handshake = Handshake::new(PROTOCOL_VERSION, client_id)
             .with_grants(grants.iter().map(|grant| Grant::new(*grant)))
             .with_writer(writer);
+        handshake.schema_major = self.schema_major;
         if let Some(token) = resume_token {
             handshake = handshake.with_resume_token(token);
         }
@@ -2214,6 +2535,46 @@ impl Client {
             )))
             .await
             .expect("send mutation patch");
+    }
+
+    /// Open a courier range (R78), its bodies to follow.
+    ///
+    /// # Panics
+    ///
+    /// Panics when sending the `CourierRange` frame fails on the transport.
+    pub async fn courier_range(&mut self, range: connetto_core::messages::CourierRange) {
+        self.transport
+            .send_control(ControlMessage::CourierRange(range))
+            .await
+            .expect("send courier range");
+    }
+
+    /// Send one body of the open courier range.
+    ///
+    /// # Panics
+    ///
+    /// Panics when sending the `CourierBody` frame fails on the transport.
+    pub async fn courier_body(&mut self, body: connetto_core::messages::CourierBody) {
+        self.transport
+            .send_bulk(BulkMessage::CourierBody(body))
+            .await
+            .expect("send courier body");
+    }
+
+    /// Ack the courier notice frame a connection received (R78).
+    ///
+    /// # Panics
+    ///
+    /// Panics when sending the `CourierNoticeAck` frame fails on the transport.
+    pub async fn courier_notice_ack(&mut self, notice_id: &str) {
+        self.transport
+            .send_control(ControlMessage::CourierNoticeAck(
+                connetto_core::messages::CourierNoticeAck {
+                    notice_id: notice_id.to_owned(),
+                },
+            ))
+            .await
+            .expect("send courier notice ack");
     }
 
     /// Prove the connection's device key with a signature over the
@@ -2406,6 +2767,24 @@ impl Client {
                 other => panic!("expected snapshot patch or end, got {other:?}"),
             }
         }
+    }
+
+    /// Read a computed subscription's column declaration, the first frame the
+    /// server sends at its registration.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the next control frame is not an `AggregateColumns` for `sub_id`, or when the transport returns a receive error.
+    pub async fn expect_aggregate_columns(
+        &mut self,
+        sub_id: &str,
+    ) -> connetto_core::messages::AggregateColumns {
+        let frame = self.next_control().await;
+        let ControlMessage::AggregateColumns(columns) = frame else {
+            panic!("expected aggregate columns, got {frame:?}");
+        };
+        assert_eq!(columns.sub_id, sub_id, "columns for the wrong subscription");
+        columns
     }
 
     /// Wait for a live patch to arrive, skipping any interleaved control frames

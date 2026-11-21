@@ -11,15 +11,21 @@ mod negotiation;
 mod offline_photo;
 mod outboards;
 #[cfg(feature = "peer")]
+mod peer_custody;
+#[cfg(feature = "peer")]
 mod peer_fetch;
 #[cfg(feature = "peer")]
 mod peer_holder;
+#[cfg(feature = "peer")]
+mod peer_placement;
 #[cfg(feature = "peer")]
 mod peer_prefetch;
 #[cfg(feature = "peer")]
 mod peer_retention;
 #[cfg(feature = "peer")]
 mod peer_support;
+#[cfg(feature = "peer")]
+mod peer_upload;
 mod photo_fixture;
 mod resolving;
 mod retention;
@@ -27,3 +33,4 @@ mod staging;
 mod store;
 mod support;
 mod transport;
+mod unsynced_files;

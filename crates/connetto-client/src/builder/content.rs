@@ -7,7 +7,7 @@ use connetto_core::Transport;
 use connetto_core::traits::MaybeSend;
 
 use crate::ClientError;
-use crate::HeldContent;
+use crate::ContentHooks;
 use crate::live::ConnettoClient;
 
 /// Where the content store sits, the builder's answer for a build.
@@ -39,8 +39,19 @@ pub trait AttachContent<T: Transport> {
         place: ContentPlace,
     ) -> impl Future<Output = Result<Self::Handle, ClientError>> + MaybeSend;
 
-    /// What a rebuild holds of an older major's unsent files (R31).
-    fn held_content() -> HeldContent {
-        HeldContent::NONE
+    /// The media driver for `handle`, `None` when it declares no peer content
+    /// or `take_port` finds the port taken. `take_port` runs only for declared content.
+    #[cfg(feature = "peer")]
+    fn media_driver(
+        _handle: &Self::Handle,
+        _take_port: impl FnOnce() -> Option<crate::media::MediaPort>,
+    ) -> Option<std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>> {
+        None
+    }
+
+    /// The content layer's hooks for its unsent files, which a rebuild holds
+    /// (R31) and the unsynced snapshot lists.
+    fn content_hooks() -> ContentHooks {
+        ContentHooks::NONE
     }
 }

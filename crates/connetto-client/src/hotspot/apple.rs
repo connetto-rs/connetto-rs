@@ -2,24 +2,16 @@
 //!
 //! The join side asks the platform to join the offered network, the Network
 //! Extension's on iOS and `CoreWLAN`'s on the Mac, and reads the joined
-//! network's address, subnet and gateway from the system. The host side
-//! stands on the user's own Personal Hotspot, which the app can only
-//! describe, never start, and the Mac refuses it, since it never hosts
-//! (R76 decision 1).
+//! network's address, subnet and gateway from the system. Apple devices
+//! only join, so the host side stands refused (R77 decision 23).
 
 use parking_lot::RwLock;
 
 use connetto_peer_apple as apple;
-#[cfg(target_os = "ios")]
-use connetto_peer_apple::Idiom;
 
 use super::{
     HostStatus, HotspotBackend, HotspotError, HotspotOffer, HotspotSecurity, JoinError, JoinStatus,
 };
-
-/// The personal hotspot's lane, the platform's bridge for it.
-#[cfg(target_os = "ios")]
-const PERSONAL_LANE: &str = "bridge100";
 
 /// The permission a Mac's join names when Location Services access is
 /// missing (R76 slice 9c).
@@ -28,8 +20,6 @@ const LOCATION_PERMISSION: &str = "Location Services";
 
 /// The Apple hotspot backend, over `connetto-peer-apple` (R76).
 pub(crate) struct AppleHotspotBackend {
-    /// The typed personal offer, where the device stands one.
-    personal: RwLock<Option<(String, String)>>,
     /// The SSID the join side last asked for, for its release.
     joined_ssid: RwLock<Option<String>>,
     /// The join side has stood available once.
@@ -65,7 +55,6 @@ impl AppleHotspotBackend {
     /// The backend's new.
     pub(crate) fn new() -> Self {
         Self {
-            personal: RwLock::new(None),
             joined_ssid: RwLock::new(None),
             was_available: RwLock::new(false),
             before: RwLock::new(None),
@@ -92,36 +81,15 @@ fn join_refusal(error: &apple::Error) -> JoinError {
     }
 }
 
-/// Whether the personal hotspot's network has landed.
-fn personal_landed() -> bool {
-    // The Mac's bridge100 is its virtualisation bridge, and the Mac never
-    // hosts, so the landed read stands false there (R76 decision 1).
-    #[cfg(target_os = "macos")]
-    {
-        false
-    }
-    #[cfg(target_os = "ios")]
-    if_addrs::get_if_addrs().is_ok_and(|interfaces| {
-        interfaces.iter().any(|interface| {
-            interface.name == PERSONAL_LANE && matches!(interface.addr, if_addrs::IfAddr::V4(_))
-        })
-    })
-}
-
 impl HotspotBackend for AppleHotspotBackend {
     fn request_host(&self) -> Result<(), HotspotError> {
-        // The app cannot start the platform's hotspot, so the request stands
-        // refused (R76 decision 26).
+        // Apple devices only join (R77 decision 23).
         Err(HotspotError::Unsupported)
     }
 
-    fn stop_host(&self) {
-        *self.personal.write() = None;
-    }
+    fn stop_host(&self) {}
 
     fn host_status(&self) -> HostStatus {
-        // The personal offer stands on the user's own hotspot, which the
-        // machine's landing bound confirms through `personal_landed`.
         HostStatus::Pending
     }
 
@@ -202,25 +170,5 @@ impl HotspotBackend for AppleHotspotBackend {
             }
             _ => JoinStatus::Pending,
         }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn request_personal_host(&self, _ssid: &str, _passphrase: &str) -> Result<(), HotspotError> {
-        // The Mac never hosts (R76 decision 1).
-        Err(HotspotError::Unsupported)
-    }
-    #[cfg(target_os = "ios")]
-    fn request_personal_host(&self, ssid: &str, passphrase: &str) -> Result<(), HotspotError> {
-        // Only a phone hosts a Personal Hotspot, so anything but a phone
-        // stands refused (R76 decision 27).
-        if apple::device_idiom() != Idiom::Phone {
-            return Err(HotspotError::Incompatible);
-        }
-        *self.personal.write() = Some((ssid.to_owned(), passphrase.to_owned()));
-        Ok(())
-    }
-
-    fn personal_landed(&self) -> bool {
-        personal_landed()
     }
 }

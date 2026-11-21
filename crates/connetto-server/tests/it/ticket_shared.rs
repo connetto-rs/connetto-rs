@@ -6,13 +6,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use connetto_core::PROTOCOL_VERSION;
-use connetto_core::auth::ContentCaller;
 use connetto_core::auth::DEFAULT_USER_SETTING;
+use connetto_core::auth::{ContentCaller, ContentCarry};
 use connetto_core::messages::{
     ContentTicketRequest, ContentVerb, ControlMessage, Grant, Handshake,
 };
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{ContentTicketSigner, IncomingFrame, Transport};
+use connetto_core::traits::{GrantCheckFuture, HandleError, HandshakeAuthority};
+use connetto_core::{LivenessFuture, LivenessUnknown, SessionId, SessionLiveness};
 use connetto_server::{
     AbuseConfig, InMemoryOplog, LoopbackTransport, ManagerBuilder, Materializer, NoConnector,
     PageSpec, RequestGuard, SessionError, SessionManager, SnapshotEstimate, SnapshotPage,
@@ -75,7 +77,7 @@ impl SnapshotSource for NeverSnapshot {
     async fn estimate(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &connetto_core::Principal,
     ) -> Result<SnapshotEstimate, Self::Error> {
         Ok(SnapshotEstimate {
@@ -91,7 +93,7 @@ impl SnapshotSource for NeverSnapshot {
     async fn snapshot_page(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &connetto_core::Principal,
         _page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {
@@ -129,6 +131,7 @@ impl ContentTicketSigner for OkSigner {
         caller: &ContentCaller,
         file_id: [u8; 32],
         _verb: ContentVerb,
+        _carry: Option<&ContentCarry>,
     ) -> impl Future<Output = Result<String, Self::Error>> + Send {
         let url = format!(
             "https://cdn.example.com/files/{:02x}/{}",
@@ -150,11 +153,38 @@ impl ContentTicketSigner for RecordingSigner {
         caller: &ContentCaller,
         file_id: [u8; 32],
         _verb: ContentVerb,
+        _carry: Option<&ContentCarry>,
     ) -> impl Future<Output = Result<String, Self::Error>> + Send {
         self.0
             .lock()
             .expect("the recording signer's mutex is never poisoned")
             .push(caller.clone());
+        let url = format!(
+            "https://cdn.example.com/files/{:02x}/{}",
+            file_id[0],
+            rendered(caller)
+        );
+        async move { Ok(url) }
+    }
+}
+
+/// A signer that records the carry of every ticket it was asked to mint.
+pub(crate) struct CarrySigner(pub(crate) Arc<std::sync::Mutex<Vec<Option<ContentCarry>>>>);
+
+impl ContentTicketSigner for CarrySigner {
+    type Error = Infallible;
+
+    fn mint(
+        &self,
+        caller: &ContentCaller,
+        file_id: [u8; 32],
+        _verb: ContentVerb,
+        carry: Option<&ContentCarry>,
+    ) -> impl Future<Output = Result<String, Self::Error>> + Send {
+        self.0
+            .lock()
+            .expect("the carry signer's mutex is never poisoned")
+            .push(carry.cloned());
         let url = format!(
             "https://cdn.example.com/files/{:02x}/{}",
             file_id[0],
@@ -175,6 +205,7 @@ impl ContentTicketSigner for BrokenSigner {
         _caller: &ContentCaller,
         _file_id: [u8; 32],
         _verb: ContentVerb,
+        _carry: Option<&ContentCarry>,
     ) -> impl Future<Output = Result<String, Self::Error>> + Send {
         core::future::ready(Err("key not loaded".to_owned()))
     }
@@ -202,6 +233,7 @@ impl ContentTicketSigner for FlakyFirstSigner {
         caller: &ContentCaller,
         file_id: [u8; 32],
         _verb: ContentVerb,
+        _carry: Option<&ContentCarry>,
     ) -> impl Future<Output = Result<String, Self::Error>> + Send {
         let prev = self.calls.fetch_add(1, Ordering::Relaxed);
         if prev == 0 {
@@ -265,6 +297,30 @@ pub(crate) async fn setup_reader_admitting(
 /// [`setup_reader_admitting`] under [`ADMITS_ALICE`].
 pub(crate) async fn setup_reader(fixture: &Fixture) -> Pool<AsyncPgConnection> {
     setup_reader_admitting(fixture, ADMITS_ALICE).await
+}
+
+/// [`setup_reader_admitting`] under `predicate`, with a
+/// `connetto_file_owner` answering `owner`, an SQL expression over the
+/// argument `file_id`, as the caller's own rights read it.
+pub(crate) async fn setup_reader_with_owner(
+    fixture: &Fixture,
+    predicate: &str,
+    owner: &str,
+) -> Pool<AsyncPgConnection> {
+    let pool = setup_reader_admitting(fixture, predicate).await;
+    let owner_fn = format!(
+        "CREATE OR REPLACE FUNCTION connetto_file_owner(file_id bytea) \
+         RETURNS text LANGUAGE sql SECURITY INVOKER SET search_path = public AS $$ \
+             SELECT {owner} \
+         $$"
+    );
+    fixture
+        .setup(&[
+            owner_fn.as_str(),
+            "GRANT EXECUTE ON FUNCTION connetto_file_owner(bytea) TO app_reader",
+        ])
+        .await;
+    pool
 }
 
 /// Install the test-fixture schema for the reader-permit saturation test.
@@ -350,11 +406,23 @@ pub(crate) async fn request_ticket(
     file_id: [u8; 32],
     verb: ContentVerb,
 ) -> ControlMessage {
+    request_ticket_for(client, request_id, file_id, verb, None).await
+}
+
+/// [`request_ticket`] for a write the caller carries for `for_owner`.
+pub(crate) async fn request_ticket_for(
+    client: &mut LoopbackTransport,
+    request_id: &str,
+    file_id: [u8; 32],
+    verb: ContentVerb,
+    for_owner: Option<&str>,
+) -> ControlMessage {
     client
         .send_control(ControlMessage::ContentTicketRequest(ContentTicketRequest {
             request_id: request_id.to_owned(),
             file_id,
             verb,
+            for_owner: for_owner.map(ToOwned::to_owned),
         }))
         .await
         .expect("send ticket request");
@@ -393,13 +461,35 @@ pub(crate) fn build_manager_named_setting<
     signer: S,
     user_setting: &str,
 ) -> Arc<TicketManager<S>> {
+    build_manager_answering(
+        reader_pool,
+        roster,
+        guard,
+        signer,
+        user_setting,
+        Arc::new(TestGrantChecker),
+    )
+}
+
+/// [`build_manager_named_setting`] whose grants and session liveness
+/// `authority` answers.
+pub(crate) fn build_manager_answering<
+    S: ContentTicketSigner + core::marker::Send + core::marker::Sync + 'static,
+>(
+    reader_pool: Pool<AsyncPgConnection>,
+    roster: RosterAuth,
+    guard: Arc<RequestGuard<String>>,
+    signer: S,
+    user_setting: &str,
+    authority: Arc<dyn HandshakeAuthority>,
+) -> Arc<TicketManager<S>> {
     ManagerBuilder::new(
         Materializer::builder(PG_DDL)
             .build()
             .expect("build materializer"),
         NeverSnapshot,
         roster,
-        Arc::new(TestGrantChecker),
+        authority,
         NoConnector,
         pg_write_target::<ConnettoDefaults>(reader_pool, PG_DDL)
             .expect("build write target")
@@ -408,6 +498,41 @@ pub(crate) fn build_manager_named_setting<
     .with_guard(guard)
     .with_signer(signer)
     .build()
+}
+
+/// [`TestGrantChecker`]'s grants, with every login session it is asked about
+/// answered by `live`: `Ok(false)` for a session that ended, `Err` for a
+/// store that cannot answer. Every question is counted.
+pub(crate) struct AnsweringAuthority {
+    pub(crate) live: Result<bool, LivenessUnknown>,
+    pub(crate) asked: Arc<std::sync::Mutex<usize>>,
+}
+
+impl SessionLiveness for AnsweringAuthority {
+    fn session_is_live(&self, _session_id: SessionId) -> LivenessFuture<'_> {
+        *self
+            .asked
+            .lock()
+            .expect("the question counter's mutex is never poisoned") += 1;
+        Box::pin(core::future::ready(self.live.clone()))
+    }
+}
+
+/// The checker [`AnsweringAuthority`] delegates its grants and handles to.
+static CHECKER: TestGrantChecker = TestGrantChecker;
+
+impl HandshakeAuthority for AnsweringAuthority {
+    fn check_grant<'a>(&'a self, grant: &'a Grant) -> GrantCheckFuture<'a> {
+        CHECKER.check_grant(grant)
+    }
+
+    fn mint_handle(&self, session_id: SessionId) -> Result<String, HandleError> {
+        CHECKER.mint_handle(session_id)
+    }
+
+    fn read_handle(&self, blob: &str) -> Result<SessionId, HandleError> {
+        CHECKER.read_handle(blob)
+    }
 }
 
 /// Build a session manager whose guard the caller chooses.
@@ -515,6 +640,7 @@ pub(crate) async fn send_ticket_request(
             request_id: request_id.to_owned(),
             file_id,
             verb,
+            for_owner: None,
         }))
         .await
         .expect("send ticket request");

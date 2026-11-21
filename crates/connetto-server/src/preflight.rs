@@ -49,15 +49,7 @@ pub enum Artifact<'a> {
     /// already streams, so its refusal names the tables to fix rather than
     /// offering to have one provisioned.
     ///
-    /// **Scoped to the publication rather than the database, and that is
-    /// decision 2 of R6.** subql ships the database-wide audit
-    /// (`REPLICA_IDENTITY_AUDIT_SQL`), which also reports connetto's own
-    /// bookkeeping tables: the watermark, the sessions, the provider tokens,
-    /// the audit log, the ban list and the change log all sit in the same
-    /// database, none of them is replicated, and setting the property on them
-    /// would mean nothing. What connetto needs the previous row image for is
-    /// the change stream, so the tables the change stream carries are exactly
-    /// the tables that must have it.
+    /// Audit and bookkeeping tables carried by the publication need the same previous images.
     PreviousImages {
         /// The publication whose tables must all record their previous image.
         publication: &'a str,
@@ -112,7 +104,9 @@ enum Found {
     MissingColumn { table: String, column: String },
     /// The table is there, and row-level security filters it for the
     /// connecting role.
-    Filtered,
+    Filtered(String),
+    /// The connecting role lacks schema usage or table read permission.
+    ReadDenied(String),
 }
 
 impl Artifact<'_> {
@@ -169,8 +163,17 @@ impl Artifact<'_> {
             Self::PublishedTable { publication, table } => {
                 let present: bool = diesel::select(diesel::dsl::exists(
                     pg_publication_tables::table
+                        .inner_join(
+                            pg_namespace::table
+                                .on(pg_namespace::nspname.eq(pg_publication_tables::schemaname)),
+                        )
+                        .inner_join(
+                            pg_class::table.on(pg_class::relnamespace
+                                .eq(pg_namespace::oid)
+                                .and(pg_class::relname.eq(pg_publication_tables::tablename))),
+                        )
                         .filter(pg_publication_tables::pubname.eq(publication))
-                        .filter(pg_publication_tables::tablename.eq(table)),
+                        .filter(pg_class::oid.nullable().eq(to_regclass(table))),
                 ))
                 .get_result(conn)
                 .await?;
@@ -263,21 +266,31 @@ impl Artifact<'_> {
                 });
             }
             Self::ReadInFull(table) => {
-                // `row_security_active` is Postgres's own answer for the
-                // current role, so ownership through membership, `FORCE ROW
-                // LEVEL SECURITY`, superusers and `BYPASSRLS` are all weighed
-                // as a read would weigh them. A catalog function the DSL does
-                // not model, so a statement of its own.
-                let filtered: Vec<Filtered> = sql_query(
-                    "SELECT to_regclass($1) IS NOT NULL AS present, \
-                     COALESCE(row_security_active(to_regclass($1)), false) AS filtered",
-                )
-                .bind::<Text, _>(table)
-                .load(conn)
-                .await?;
-                return Ok(match filtered.into_iter().next() {
-                    Some(Filtered { present: false, .. }) | None => Found::Absent,
-                    Some(Filtered { filtered: true, .. }) => Found::Filtered,
+                // Diesel has no constructor for the `CURRENT_USER` value expression.
+                let role = diesel::dsl::sql::<Text>("CURRENT_USER::text");
+                let access = pg_class::table
+                    .filter(pg_class::oid.nullable().eq(to_regclass(table)))
+                    .select((
+                        row_security_active(pg_class::oid),
+                        has_table_privilege(pg_class::oid, "SELECT")
+                            .and(has_schema_privilege(pg_class::relnamespace, "USAGE")),
+                        role,
+                    ))
+                    .get_result::<ReadAccess>(conn)
+                    .await
+                    .optional()?;
+                return Ok(match access {
+                    None => Found::Absent,
+                    Some(ReadAccess {
+                        readable: false,
+                        role,
+                        ..
+                    }) => Found::ReadDenied(role),
+                    Some(ReadAccess {
+                        filtered: true,
+                        role,
+                        ..
+                    }) => Found::Filtered(role),
                     Some(_) => Found::Fit,
                 });
             }
@@ -303,17 +316,59 @@ impl Artifact<'_> {
 }
 
 diesel::table! {
-    /// The catalog view naming which tables a publication carries.
-    ///
-    /// A view rather than a table, and read-only, so only the two columns this
-    /// check reads are modelled. `pubname` is the key diesel needs and is not
-    /// unique here, which costs nothing: nothing loads a row, only `EXISTS`.
+    /// The publication's expanded table membership.
     pg_publication_tables (pubname) {
         /// The publication's name.
         pubname -> Text,
         /// One table it carries, unqualified.
         tablename -> Text,
+        /// The table's schema.
+        schemaname -> Text,
     }
+}
+
+diesel::table! {
+    /// Database relation identities.
+    pg_class (oid) {
+        /// Relation identity.
+        oid -> Oid,
+        /// Stored relation name.
+        relname -> Text,
+        /// Namespace identity.
+        relnamespace -> Oid,
+    }
+}
+
+diesel::table! {
+    /// Database namespace identities.
+    pg_namespace (oid) {
+        /// Namespace identity.
+        oid -> Oid,
+        /// Stored namespace name.
+        nspname -> Text,
+    }
+}
+
+diesel::allow_tables_to_appear_in_same_query!(pg_publication_tables, pg_class, pg_namespace,);
+
+diesel::define_sql_function! {
+    /// Resolve a relation through the connecting role's search path.
+    fn to_regclass(name: Text) -> diesel::sql_types::Nullable<diesel::sql_types::Oid>;
+}
+
+diesel::define_sql_function! {
+    /// Whether row-level security filters the connecting role.
+    fn row_security_active(relation: diesel::sql_types::Oid) -> Bool;
+}
+
+diesel::define_sql_function! {
+    /// Whether the connecting role holds a table privilege.
+    fn has_table_privilege(relation: diesel::sql_types::Oid, privilege: Text) -> Bool;
+}
+
+diesel::define_sql_function! {
+    /// Whether the connecting role holds a schema privilege.
+    fn has_schema_privilege(schema: diesel::sql_types::Oid, privilege: Text) -> Bool;
 }
 
 /// Why the server refused to start.
@@ -392,21 +447,21 @@ pub enum PreflightError {
         /// The column connetto reads from it.
         column: String,
     },
-    /// Row-level security filters the connecting role on a table that role
-    /// must read in full.
-    ///
-    /// Its own variant because the fix is the role the pool connects as or
-    /// the table's setting, not anything missing.
-    #[error(
-        "row-level security filters the owner pool's role on table {table}, so the \
-         authorization facts and the rows withdrawn from callers would be read short \
-         and lost without an error. Connect the owner pool as the table's owner on a \
-         table without FORCE ROW LEVEL SECURITY, or as a superuser or a role with \
-         BYPASSRLS, before the server will start"
-    )]
-    OwnerFiltered {
+    /// Row-level security filters a role that must read the table in full.
+    #[error("row-level security filters role {role} on table {table}, which must be read in full")]
+    ReadFiltered {
         /// The table the role cannot read in full.
         table: String,
+        /// The connecting database role.
+        role: String,
+    },
+    /// The connecting role cannot select from the table.
+    #[error("role {role} requires SELECT and schema USAGE for table {table}")]
+    ReadDenied {
+        /// The table the role cannot read.
+        table: String,
+        /// The connecting database role.
+        role: String,
     },
 }
 
@@ -451,14 +506,12 @@ struct Named {
     name: String,
 }
 
-/// Whether a table is present and row-level security filters it for the
-/// connecting role.
-#[derive(QueryableByName)]
-struct Filtered {
-    #[diesel(sql_type = Bool)]
-    present: bool,
-    #[diesel(sql_type = Bool)]
+/// The connecting role's effective read access to a relation.
+#[derive(Queryable)]
+struct ReadAccess {
     filtered: bool,
+    readable: bool,
+    role: String,
 }
 
 /// Refuse unless every artifact is there and fit to serve, naming the first
@@ -475,8 +528,9 @@ struct Filtered {
 /// connetto reads, [`PreflightError::Uncapped`] naming the synced table the
 /// cap rules leave out, [`PreflightError::PreviousImage`] naming the
 /// replicated tables that cannot report an old row,
-/// [`PreflightError::OwnerFiltered`] naming a table row-level security filters
+/// [`PreflightError::ReadFiltered`] naming a table row-level security filters
 /// for the connecting role,
+/// [`PreflightError::ReadDenied`] naming a table the connecting role cannot select,
 /// [`PreflightError::Probe`] when the check could not be answered, and
 /// [`PreflightError::Pool`] when no connection was available.
 pub async fn require(
@@ -519,9 +573,16 @@ pub async fn require(
             Found::MissingColumn { table, column } => {
                 return Err(PreflightError::MissingColumn { table, column });
             }
-            Found::Filtered => {
-                return Err(PreflightError::OwnerFiltered {
+            Found::Filtered(role) => {
+                return Err(PreflightError::ReadFiltered {
                     table: artifact.name().to_owned(),
+                    role,
+                });
+            }
+            Found::ReadDenied(role) => {
+                return Err(PreflightError::ReadDenied {
+                    table: artifact.name().to_owned(),
+                    role,
                 });
             }
         }

@@ -22,8 +22,10 @@ use diesel_async::RunQueryDsl as _;
 use diesel_async::pooled_connection::bb8::Pool;
 use tokio::net::{TcpListener, TcpStream};
 
-use super::e2e::{PG_SERIAL, exec, mint_tokens, reset_fixture};
-use super::lifecycle::{admin_pool, builder_over, next_control, served_major, wait_ready};
+use super::lifecycle::{admin_pool, builder_over, next_control, wait_ready};
+use connetto_test_harness::server_fixture::{
+    PG_SERIAL, exec, mint_tokens, reset_fixture, served_major,
+};
 
 /// A deployment stamping every inserted order with the writer and sequence
 /// the write bound, the way decision 6 leaves finding rows to the deployment.
@@ -69,7 +71,9 @@ async fn served(fixture: &Fixture) -> Served {
         change_stream,
         handle,
         ..
-    } = builder.build().await.expect("the deployment assembles");
+    } = Box::pin(builder.build())
+        .await
+        .expect("the deployment assembles");
     let stream = tokio::spawn(async move {
         let _ = change_stream.await;
     });

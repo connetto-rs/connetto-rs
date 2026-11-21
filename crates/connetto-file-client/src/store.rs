@@ -4,7 +4,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use connetto_file_core::{ChunkHash, ChunkInventory, ChunkStore};
+use connetto_file_core::{ChunkHash, ChunkInventory, ChunkStore, FreeSpace};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 
@@ -162,6 +162,12 @@ impl ChunkInventory for FsStore {
             }
         }
         Ok(hashes)
+    }
+}
+
+impl FreeSpace for FsStore {
+    fn free_bytes(&self) -> io::Result<u64> {
+        crate::space::free_bytes(&self.inner.root)
     }
 }
 

@@ -389,15 +389,17 @@ async fn live_key_changes_reconcile_overlapping_subscriptions_without_redial() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
     let fixture = connetto_test_harness::Fixture::acquire().await;
     let server = keyed_share_fixture(&fixture).await;
-    let conn = ClientBuilder::new(
+    let mut conn = ClientBuilder::new(
         super::support::bundle(
             "CREATE TABLE papers (id INTEGER PRIMARY KEY, owner TEXT NOT NULL);",
         ),
-        super::support::Once::new(server.attach()),
+        super::support::NeverDial::<LoopbackTransport>::default(),
     )
-    .connect_driven()
-    .await
-    .expect("connect anonymously");
+    .open_driven()
+    .expect("open replica");
+    conn.attach(server.attach())
+        .await
+        .expect("connect anonymously");
     let (client, pump) = ConnettoClient::with_pump(conn);
     let pump = tokio::spawn(pump);
     let mut first = client

@@ -8,6 +8,10 @@ mod cap_policies;
 
 mod catchup_cost;
 
+mod courier_offer;
+
+mod courier_restore;
+
 mod demo;
 
 mod fanout_counters;
@@ -27,9 +31,15 @@ mod parity;
 
 mod peer_exchange;
 
+mod peer_media;
+
+mod peer_loss;
+
 mod provisional_adjudication;
 
 mod read_rule_fold;
+
+mod roles_document;
 
 mod session_handle;
 

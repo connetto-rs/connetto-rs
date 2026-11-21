@@ -79,10 +79,12 @@ diesel::table! {
 /// The translated bundle the builds present.
 pub fn bundle() -> SyncSchema {
     SyncSchema::new(
-        connetto_schema::translate::<String, TextIds>(
+        connetto_schema::translate::<String, TextIds>(connetto_schema::Documents::new(
             DEMO_DEPLOYMENT.schema,
             DEMO_DEPLOYMENT.policies,
-        )
+            DEMO_DEPLOYMENT.roles,
+            DEMO_DEPLOYMENT.reader_role,
+        ))
         .expect("the deployment translates"),
     )
 }
@@ -121,6 +123,27 @@ pub async fn connect_client(
     .expect("connects")
 }
 
+/// Connects a durable client with the given content piece.
+pub async fn connect_client_with_content<C: connetto_client::AttachContent<NativeTransport>>(
+    addr: SocketAddr,
+    sign_in: KeyringAuth,
+    dir: &Path,
+    root: &[u8],
+    peer_listener: SocketAddr,
+    content: C,
+) -> NativeClient<NativeTransport, C::Handle> {
+    connetto_client::NativeClientBuilder::new(format!("ws://{addr}/sync"), bundle())
+        .with_content(content)
+        .signed_in(sign_in)
+        .durable(dir)
+        .with_deployment_roots(vec![root.to_owned()])
+        .with_peer_listener(peer_listener)
+        .with_peer_autolink(false)
+        .connect()
+        .await
+        .expect("connects with content")
+}
+
 /// Connect, declare the watches, and close, remembering the subscriptions in
 /// the durable store. The next build of the same replica re-announces them on
 /// its attach, so the server resnapshots the tables then, on the handshake.
@@ -147,16 +170,16 @@ pub async fn next_event(
 
 /// Poll `device_certificate` until it holds a certificate, bounded by
 /// `deadline`.
-pub async fn wait_for_certificate(
-    client: &NativeClient<NativeTransport>,
+pub async fn wait_for_certificate<C>(
+    client: &NativeClient<NativeTransport, C>,
     deadline: Duration,
 ) -> Option<DeviceCertificate> {
     native_client::wait_for_certificate(client, deadline).await
 }
 
 /// Poll the device's peer listener until it answers, bounded by `deadline`.
-pub async fn wait_peer_address(
-    client: &NativeClient<NativeTransport>,
+pub async fn wait_peer_address<C>(
+    client: &NativeClient<NativeTransport, C>,
     deadline: Duration,
 ) -> Option<SocketAddr> {
     let until = Instant::now() + deadline;
@@ -170,7 +193,7 @@ pub async fn wait_peer_address(
 }
 
 /// The replica's `team_notes` bodies in order, the view answering the read.
-pub async fn note_bodies(client: &NativeClient<NativeTransport>) -> Vec<String> {
+pub async fn note_bodies<C>(client: &NativeClient<NativeTransport, C>) -> Vec<String> {
     client
         .client()
         .with_conn(|conn| {
@@ -185,7 +208,7 @@ pub async fn note_bodies(client: &NativeClient<NativeTransport>) -> Vec<String> 
 }
 
 /// The replica's orders owners in order, the view answering the read.
-pub async fn orders_owners(client: &NativeClient<NativeTransport>) -> Vec<String> {
+pub async fn orders_owners<C>(client: &NativeClient<NativeTransport, C>) -> Vec<String> {
     client
         .client()
         .with_conn(|conn| {
@@ -200,7 +223,7 @@ pub async fn orders_owners(client: &NativeClient<NativeTransport>) -> Vec<String
 }
 
 /// The replica's membership rows in order.
-pub async fn roster(client: &NativeClient<NativeTransport>) -> Vec<(String, String)> {
+pub async fn roster<C>(client: &NativeClient<NativeTransport, C>) -> Vec<(String, String)> {
     client
         .client()
         .with_conn(|conn| {
@@ -228,7 +251,7 @@ pub struct Watches {
 /// Declare the roster and notes watches on the client's shared session, the
 /// subscriptions remembered in the durable store so a later build of the same
 /// replica re-announces them within the grace.
-pub async fn watch_tables(client: &NativeClient<NativeTransport>) -> Watches {
+pub async fn watch_tables<C>(client: &NativeClient<NativeTransport, C>) -> Watches {
     let roster = client
         .client()
         .watch(
@@ -252,8 +275,8 @@ pub async fn watch_tables(client: &NativeClient<NativeTransport>) -> Watches {
 
 /// Poll the replica's membership rows until they hold exactly `expected`,
 /// in any order, bounded by `deadline`.
-pub async fn wait_roster(
-    client: &NativeClient<NativeTransport>,
+pub async fn wait_roster<C>(
+    client: &NativeClient<NativeTransport, C>,
     expected: &[(String, String)],
 ) -> bool {
     let mut expected = expected.to_vec();
@@ -269,13 +292,13 @@ pub async fn wait_roster(
 }
 
 /// Poll `unsynced` until it holds nothing, bounded by `BOUND`.
-pub async fn wait_unsynced_empty(client: &NativeClient<NativeTransport>) -> bool {
+pub async fn wait_unsynced_empty<C>(client: &NativeClient<NativeTransport, C>) -> bool {
     native_client::wait_unsynced_empty(client, BOUND).await
 }
 
 /// Alice's note of `team` with `body`.
-pub async fn write_note(
-    client: &NativeClient<NativeTransport>,
+pub async fn write_note<C>(
+    client: &NativeClient<NativeTransport, C>,
     team: &str,
     author: &str,
     body: &str,
@@ -296,8 +319,8 @@ pub async fn write_note(
         .expect("the write is captured");
 }
 
-pub async fn read_note_id(
-    client: &NativeClient<NativeTransport>,
+pub async fn read_note_id<C>(
+    client: &NativeClient<NativeTransport, C>,
     team: &str,
     body: &str,
 ) -> Vec<u8> {
@@ -358,9 +381,9 @@ pub async fn hear_applies(
 /// The server's refusal of the removed team's note on alice's stream, the
 /// refusal naming the note, her queue settling and the note rolled back on
 /// her replica behind it.
-pub async fn expect_removed_note_refusal(
+pub async fn expect_removed_note_refusal<C>(
     events: &mut tokio::sync::broadcast::Receiver<ClientEvent>,
-    alice: &NativeClient<NativeTransport>,
+    alice: &NativeClient<NativeTransport, C>,
     remaining: &[(String, String)],
     bodies: &[String],
 ) {
@@ -404,7 +427,7 @@ pub async fn expect_removed_note_refusal(
 }
 
 /// Alice's one-line order of `quantity` items, owned by her server-minted id.
-pub async fn write_order(client: &NativeClient<NativeTransport>, owner: &str, quantity: i64) {
+pub async fn write_order<C>(client: &NativeClient<NativeTransport, C>, owner: &str, quantity: i64) {
     client
         .client()
         .with_conn(|conn| {
@@ -424,7 +447,7 @@ pub async fn write_order(client: &NativeClient<NativeTransport>, owner: &str, qu
 
 /// The sign-in's user id, polled until the session records it, bounded by
 /// `deadline`.
-pub async fn wait_session(client: &NativeClient<NativeTransport>) -> String {
+pub async fn wait_session<C>(client: &NativeClient<NativeTransport, C>) -> String {
     let until = Instant::now() + BOUND;
     loop {
         if let Some(session) = client.session() {
@@ -438,9 +461,12 @@ pub async fn wait_session(client: &NativeClient<NativeTransport>) -> String {
     }
 }
 
-/// Insert the two-account roster the membership rows hold, under the
-/// server-minted ids the policies compare.
+/// Insert the two teams and the two-account roster the membership rows hold,
+/// under the server-minted ids the policies compare.
 pub async fn seed_roster(fixture: &connetto_test_harness::Fixture, alice: &str, bob: &str) {
+    fixture
+        .exec("INSERT INTO teams (id) VALUES ('T1'), ('T2')")
+        .await;
     for row in [("T1", alice), ("T1", bob), ("T2", alice), ("T2", bob)] {
         fixture
             .exec(&format!(

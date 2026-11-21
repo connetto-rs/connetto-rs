@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use connetto_core::auth::{DEFAULT_USER_SETTING, Principal};
+use connetto_core::auth::Principal;
 use connetto_core::messages::{
     BulkMessage, ControlMessage, Grant, Handshake, Subscribe, SubscriptionSpec,
 };
@@ -57,7 +57,7 @@ impl SnapshotSource for EmptySnapshot {
     async fn estimate(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &Principal,
     ) -> Result<SnapshotEstimate, Self::Error> {
         Ok(SnapshotEstimate {
@@ -73,7 +73,7 @@ impl SnapshotSource for EmptySnapshot {
     async fn snapshot_page(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _auth: &Principal,
         _page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {
@@ -157,13 +157,19 @@ async fn connected_clients(
         tokio::task::JoinHandle<Result<(), SessionError>>,
     )>,
 ) {
-    let translated =
-        connetto_server::openfga::Translated::of::<String, connetto_core::bots::TextIds>(
+    let translated = connetto_server::openfga::Translated::of::<
+        String,
+        connetto_server::defaults::ConnettoDefaults,
+    >(
+        connetto_schema::Documents::new(
             PG_DDL,
             POLICIES,
-            DEFAULT_USER_SETTING,
-        )
-        .expect("the policy translates");
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
+        true,
+    )
+    .expect("the policy translates");
     let (_, translator, _) = translated.into_parts();
     let materializer = Materializer::builder(&format!("{PG_DDL}\n{POLICIES}"))
         .with_write_catalog(RuntimeWritableCatalog::default())

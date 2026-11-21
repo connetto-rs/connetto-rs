@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use connetto_core::messages::{BulkMessage, ControlMessage, MutationHeader, MutationPatch};
 use connetto_core::traits::Transport;
-use connetto_server::{IdentityResolver, ResolveFuture, VerifiedClaims};
+use connetto_server::{AuthHooks, HookFuture, VerifiedClaims};
 use connetto_test_harness::{Fixture, RowValue, insert_changeset, isolated_session_keyring};
 use diesel::QueryDsl;
 use diesel_async::AsyncPgConnection;
@@ -17,8 +17,8 @@ use diesel_async::RunQueryDsl as _;
 use diesel_async::pooled_connection::bb8::Pool;
 use tokio::net::TcpListener;
 
-use super::e2e::{PG_SERIAL, exec, mint_tokens, reset_fixture};
 use super::lifecycle::{admin_pool, builder_over, live_session, next_control, wait_ready};
+use connetto_test_harness::server_fixture::{PG_SERIAL, exec, mint_tokens, reset_fixture};
 
 /// The deployment's schema, every default member over a `Uuid` id but the
 /// writers, which live in tables of its own.
@@ -33,6 +33,7 @@ mod app {
         pub struct UuidDefaults;
         id: uuid::Uuid => diesel::sql_types::Uuid,
         audit_row_key: uuid::Uuid => diesel::sql_types::Uuid,
+        audit_ddl: connetto_server::connetto_audit_ddl!("UUID", "UUID"),
     }
 
     diesel::table! {
@@ -69,6 +70,17 @@ mod app {
         }
     }
 
+    diesel::table! {
+        app_courier_notices (id) {
+            id -> BigInt,
+            user_id -> Uuid,
+            courier_user_id -> Uuid,
+            device_key -> Bytea,
+            seq -> BigInt,
+            outcome -> Text,
+        }
+    }
+
     diesel::joinable!(app_session_writers -> app_writers (writer));
     diesel::allow_tables_to_appear_in_same_query!(app_session_writers, app_writers);
 
@@ -88,7 +100,7 @@ mod app {
     type SettledRangeTuple = (i64, Vec<u8>, Vec<u8>, String, SettlePath);
 
     /// The deployment's own writer tables and the reader's grant on them.
-    pub const WRITERS_DDL: [&str; 5] = [
+    pub const WRITERS_DDL: [&str; 6] = [
         "CREATE TABLE app_writers (\
          writer BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY, \
          user_id UUID, session_id UUID, device_key BYTEA UNIQUE, \
@@ -104,16 +116,23 @@ mod app {
         "CREATE TABLE app_session_writers (\
          session_id UUID NOT NULL, writer BIGINT NOT NULL, first_seq BIGINT NOT NULL, \
          bound_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (session_id, writer))",
-        "GRANT SELECT, INSERT, UPDATE, DELETE ON app_writers, app_settled, app_session_writers \
-         TO app_reader",
+        "CREATE TABLE app_courier_notices (\
+         id BIGSERIAL PRIMARY KEY, user_id UUID NOT NULL, courier_user_id UUID NOT NULL, \
+         device_key BYTEA NOT NULL, seq BIGINT NOT NULL, outcome TEXT NOT NULL)",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON app_writers, app_settled, \
+         app_session_writers, app_courier_notices TO app_reader",
     ];
 
     pub struct AppWriters;
 
     impl ConnettoWriterSchema for AppWriters {
         type Id = uuid::Uuid;
-        const TABLES: &'static [&'static str] =
-            &["app_writers", "app_settled", "app_session_writers"];
+        const TABLES: &'static [&'static str] = &[
+            "app_writers",
+            "app_settled",
+            "app_session_writers",
+            "app_courier_notices",
+        ];
 
         fn issue(
             conn: &mut AsyncPgConnection,
@@ -553,6 +572,69 @@ mod app {
                     .collect())
             })
         }
+
+        fn courier_notice_insert<'c>(
+            conn: &'c mut AsyncPgConnection,
+            user_id: &'c Self::Id,
+            courier_user_id: &'c Self::Id,
+            device_key: &'c [u8],
+            seq: i64,
+            outcome: &'c str,
+        ) -> Statement<'c, ()> {
+            Box::pin(async move {
+                use diesel::ExpressionMethods as _;
+                use diesel_async::RunQueryDsl as _;
+                diesel::insert_into(app_courier_notices::table)
+                    .values((
+                        app_courier_notices::user_id.eq(user_id),
+                        app_courier_notices::courier_user_id.eq(courier_user_id),
+                        app_courier_notices::device_key.eq(device_key.to_vec()),
+                        app_courier_notices::seq.eq(seq),
+                        app_courier_notices::outcome.eq(outcome),
+                    ))
+                    .execute(&mut *conn)
+                    .await
+                    .map(drop)
+            })
+        }
+
+        fn courier_notices<'c>(
+            conn: &'c mut AsyncPgConnection,
+            user_id: &'c Self::Id,
+        ) -> Statement<'c, Vec<(i64, Self::Id, Vec<u8>, i64, String)>> {
+            Box::pin(async move {
+                use diesel::{ExpressionMethods, QueryDsl};
+                use diesel_async::RunQueryDsl as _;
+                let rows: Vec<(i64, uuid::Uuid, Vec<u8>, i64, String)> = app_courier_notices::table
+                    .filter(app_courier_notices::user_id.eq(user_id))
+                    .order(app_courier_notices::id.asc())
+                    .select((
+                        app_courier_notices::id,
+                        app_courier_notices::courier_user_id,
+                        app_courier_notices::device_key,
+                        app_courier_notices::seq,
+                        app_courier_notices::outcome,
+                    ))
+                    .load(&mut *conn)
+                    .await?;
+                Ok(rows)
+            })
+        }
+
+        fn courier_notices_delete(
+            conn: &mut AsyncPgConnection,
+            ids: Vec<i64>,
+        ) -> Statement<'_, i64> {
+            Box::pin(async move {
+                use diesel::ExpressionMethods as _;
+                use diesel_async::RunQueryDsl as _;
+                diesel::delete(app_courier_notices::table)
+                    .filter(app_courier_notices::id.eq_any(ids))
+                    .execute(&mut *conn)
+                    .await
+                    .map(|affected| i64::try_from(affected).unwrap_or(i64::MAX))
+            })
+        }
     }
 
     pub struct AppSchema;
@@ -572,13 +654,15 @@ mod app {
 /// A fixed namespace for the deployment's `(issuer, subject)` to `Uuid` map.
 const NS: uuid::Uuid = uuid::Uuid::from_u128(0x7c1e_0a52_93d4_4b8f_a6e1_5d2c_0f9b_3e47);
 
-/// The deployment's resolver, a deterministic `Uuid` per verified identity.
-struct UuidResolver;
+/// The deployment's hooks, a deterministic `Uuid` per verified identity.
+struct UuidHooks;
 
-impl IdentityResolver for UuidResolver {
-    type Id = uuid::Uuid;
-
-    fn resolve<'a>(&'a self, claims: &'a VerifiedClaims) -> ResolveFuture<'a, uuid::Uuid> {
+impl AuthHooks<app::AppSchema> for UuidHooks {
+    fn user_for<'a>(
+        &'a self,
+        _transaction: &'a mut AsyncPgConnection,
+        claims: &'a VerifiedClaims,
+    ) -> HookFuture<'a, uuid::Uuid> {
         let id = uuid::Uuid::new_v5(
             &NS,
             format!("{}|{}", claims.issuer, claims.subject).as_bytes(),
@@ -621,9 +705,10 @@ async fn a_deployment_schema_of_its_own_serves_through_the_builder() {
     let fixture = Fixture::acquire().await;
     let pool = admin_pool(&fixture).await;
     reset_fixture(&pool, &fixture).await;
+    // The default bookkeeping tables stand beside the deployment's own
+    // writer tables, since the publication must carry the settled table the
+    // pending verdicts push on (R77 decision 11).
     for stmt in [
-        "DROP TABLE _connetto_settled",
-        "DROP TABLE _connetto_writers",
         "CREATE TABLE connetto_sessions (\
          session_id UUID PRIMARY KEY, user_id UUID NOT NULL, \
          current_refresh_hash BYTEA NOT NULL, idle_deadline TIMESTAMPTZ NOT NULL, \
@@ -634,6 +719,9 @@ async fn a_deployment_schema_of_its_own_serves_through_the_builder() {
          session_id UUID PRIMARY KEY REFERENCES connetto_sessions (session_id) ON DELETE CASCADE, \
          issuer TEXT NOT NULL, access_token TEXT NOT NULL, refresh_token TEXT, \
          expires_at TIMESTAMPTZ)",
+        "ALTER TABLE auth_events \
+         ALTER COLUMN user_id TYPE UUID USING user_id::uuid, \
+         ALTER COLUMN courier_user_id TYPE UUID USING courier_user_id::uuid",
         "DROP TABLE connetto_installation_optional_tables",
         "DROP TABLE connetto_installations",
         "DROP TABLE connetto_bot_lists",
@@ -653,7 +741,7 @@ async fn a_deployment_schema_of_its_own_serves_through_the_builder() {
     let (builder, _idp, _keys) = builder_over(&fixture, port).await;
     let base = format!("http://127.0.0.1:{port}");
     let parts = builder
-        .deployment_schema::<app::AppSchema>(Arc::new(UuidResolver))
+        .deployment_schema::<app::AppSchema>(Arc::new(UuidHooks))
         .build()
         .await
         .expect("the deployment's own schema assembles");

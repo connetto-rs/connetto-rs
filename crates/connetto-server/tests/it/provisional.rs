@@ -66,7 +66,7 @@ impl SnapshotSource for NoSnapshot {
     async fn estimate(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &Principal,
     ) -> Result<SnapshotEstimate, Self::Error> {
         Ok(SnapshotEstimate {
@@ -82,7 +82,7 @@ impl SnapshotSource for NoSnapshot {
     async fn snapshot_page(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _auth: &Principal,
         _page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {
@@ -254,7 +254,7 @@ impl Enrolments {
 fn manager(
     pool: &Pool<AsyncPgConnection>,
     guard: Arc<RequestGuard<String>>,
-    enrolment: Option<DeviceEnrolment<String>>,
+    enrolment: Option<DeviceEnrolment<ConnettoDefaults>>,
 ) -> Arc<SessionManager<NoSnapshot, RosterAuth, ConnettoDefaults>> {
     let manager = ManagerBuilder::new(
         Materializer::builder(PG_DDL)
@@ -321,11 +321,11 @@ async fn a_ruling_answers_every_row_of_the_verdict_table() {
         AbuseConfig::default(),
     ));
     let live = SystemTime::now() + Duration::from_hours(24);
-    let enrol = Enrolments::new();
+    let enrol = Enrolments::new(&fixture).await;
     let (alice, alice_id) = enrol.enrol_key("alice", live).await;
     let (carol, carol_id) = enrol.enrol_key("carol", live).await;
     let (dave, dave_id) = enrol.enrol_key("dave", live).await;
-    enrol.revoke(carol_id);
+    enrol.revoke(carol_id).await;
     let manager = manager(fixture.admin(), guard, Some(enrol.installable()));
 
     // alice binds her device writer and settles one applied entry, sequence 1.
@@ -455,6 +455,36 @@ async fn a_ruling_answers_every_row_of_the_verdict_table() {
     assert_eq!(verdicts.request_id, "p3");
     assert_eq!(verdicts.verdicts, vec![(1, Verdict::Pending)]);
 
+    // An author whose every write was acknowledged signs no newest, and the
+    // ask about a sequence its settled frontier covers is ruled all the same
+    // (R78 decision 52).
+    let reply = ask_provisional(
+        &mut recv,
+        ProvisionalStatus {
+            request_id: "p4".to_owned(),
+            author: dave_id,
+            offer: dave.signed_offer_bytes(&Offer {
+                builds: vec![(
+                    Major::new(1).expect("a positive major"),
+                    SchemaVersion::from_hash(vec![1; 32]),
+                )],
+                settled: Some(Frontier {
+                    seq: 1,
+                    head: [1; 32],
+                }),
+                newest: None,
+                retractions: Vec::new(),
+            }),
+            seqs: vec![1],
+        },
+    )
+    .await;
+    let ControlMessage::ProvisionalVerdicts(verdicts) = reply else {
+        panic!("expected the ruling for a settled-only offer, got {reply:?}");
+    };
+    assert_eq!(verdicts.request_id, "p4");
+    assert_eq!(verdicts.verdicts, vec![(1, Verdict::Pending)]);
+
     let _ = recv.close().await;
     server.await.expect("join bob").expect("session ok");
 }
@@ -470,7 +500,7 @@ async fn an_overbound_or_forged_ask_is_refused() {
         AbuseConfig::default(),
     ));
     let live = SystemTime::now() + Duration::from_hours(24);
-    let enrol = Enrolments::new();
+    let enrol = Enrolments::new(&fixture).await;
     let (x1, x1_id) = enrol.enrol_key("x1", live).await;
     let (x2, x2_id) = enrol.enrol_key("x2", live).await;
     let (x3, x3_id) = enrol.enrol_key("x3", live).await;
@@ -585,6 +615,49 @@ async fn an_overbound_or_forged_ask_is_refused() {
     server.await.expect("join bob").expect("session ok");
 }
 
+/// Settled records that cannot be read fail the ask and end the session,
+/// rather than ruling a recordless sequence below the frontier settled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_record_table_fails_the_ask() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    let live = SystemTime::now() + Duration::from_hours(24);
+    let enrol = Enrolments::new(&fixture).await;
+    let (x1, x1_id) = enrol.enrol_key("x1", live).await;
+    let manager = manager(fixture.admin(), guard, Some(enrol.installable()));
+    insert_writer_row(fixture.admin(), "x1", x1_id, 2).await;
+    fixture
+        .setup(&["DROP TABLE _connetto_settled CASCADE"])
+        .await;
+
+    let (server_transport, mut recv) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    super::ticket_shared::do_handshake_with(&mut recv, "pv-recv", &["user:bob"]).await;
+    recv.send_control(ControlMessage::ProvisionalStatus(ProvisionalStatus {
+        request_id: "s1".to_owned(),
+        author: x1_id,
+        offer: x1.signed_offer(Some(Frontier {
+            seq: 2,
+            head: [2; 32],
+        })),
+        seqs: vec![1],
+    }))
+    .await
+    .expect("send the ask");
+    let error = server
+        .await
+        .expect("join bob")
+        .expect_err("the session ends on the failed read");
+    assert!(
+        matches!(error, connetto_server::SessionError::WriteTarget(_)),
+        "got {error:?}"
+    );
+}
+
 /// A follow-up ask for the same author on the same session gets its own
 /// ruling, the way the receiver's next chunk is answered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -596,7 +669,7 @@ async fn a_follow_up_ask_for_the_same_author_gets_its_own_verdicts() {
         AbuseConfig::default(),
     ));
     let live = SystemTime::now() + Duration::from_hours(24);
-    let enrol = Enrolments::new();
+    let enrol = Enrolments::new(&fixture).await;
     let (x1, x1_id) = enrol.enrol_key("x1", live).await;
     let manager = manager(fixture.admin(), guard, Some(enrol.installable()));
 
@@ -657,7 +730,7 @@ async fn a_prune_keeps_the_refusals_while_the_writer_row_stands() {
         AbuseConfig::default(),
     ));
     let live = SystemTime::now() + Duration::from_hours(24);
-    let enrol = Enrolments::new();
+    let enrol = Enrolments::new(&fixture).await;
     let (alice, alice_id) = enrol.enrol_key("alice", live).await;
     let manager = manager(fixture.admin(), guard, Some(enrol.installable()));
     let admin = fixture.admin();
@@ -749,7 +822,7 @@ async fn a_prune_keeps_the_refusals_while_the_writer_row_stands() {
     .await;
     set_frontier(admin, device_writer, 3).await;
 
-    enrol.revoke(alice_id);
+    enrol.revoke(alice_id).await;
     let pruned = manager.sweep_writer_rows().await.expect("sweep the rows");
     assert_eq!(pruned, 1, "the sweep pruned the dead device writer");
 

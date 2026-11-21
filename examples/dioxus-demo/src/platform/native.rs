@@ -25,6 +25,17 @@ use crate::ui::*;
 const DEFAULT_WS: &str = "ws://127.0.0.1:7777/sync";
 const DEFAULT_AUTH_ORIGIN: &str = "http://127.0.0.1:7777";
 const KEYRING_SERVICE: &str = "connetto-dioxus-demo";
+/// The keyring service the demo stores its secrets under, a separate name in
+/// an unattended build so a replica key or refresh token a gated earlier run
+/// left in the keychain, which survives a reinstall, cannot meet the
+/// unattended build and prompt.
+fn keyring_service() -> &'static str {
+    if cfg!(feature = "unattended") {
+        "connetto-dioxus-demo-unattended"
+    } else {
+        KEYRING_SERVICE
+    }
+}
 /// The login redirect on a phone, whose scheme is the app's bundle identifier
 /// (`Dioxus.toml`), the scheme the bundled redirect activity claims on Android
 /// and the authentication session catches on iOS.
@@ -243,6 +254,18 @@ impl Restart {
     }
 }
 
+/// Reads this device's stored account names.
+pub(crate) fn read_badge_names() -> support::view::StoredNames {
+    support::native::read_stored_names(&data_dir())
+}
+
+/// Persists the signed-in account's name.
+pub(crate) fn save_badge_names(names: &support::view::StoredNames) {
+    if let Err(error) = support::native::write_stored_names(&data_dir(), names) {
+        tracing::warn!(%error, "could not store account names");
+    }
+}
+
 /// The native entry: renders the shared page at once and runs the connection
 /// behind it, parking the loopback login URL instead of opening a browser.
 /// Android calls `main` from the activity's start, so nothing there may wait
@@ -291,7 +314,7 @@ pub fn Shell() -> Element {
     {
         let mut stored = stored_account;
         spawn(async move {
-            let store = connetto_client::KeyringStore::new(KEYRING_SERVICE);
+            let store = connetto_client::KeyringStore::new(keyring_service());
             if let Ok(Some(_)) = store.load(connetto_client::IDENTITY_RECORD).await {
                 stored.set(true);
             }
@@ -427,11 +450,29 @@ pub fn Shell() -> Element {
             None
         }
     };
+    let teams_panel: Option<Element> = {
+        #[cfg(feature = "peer")]
+        {
+            parts
+                .read()
+                .clone()
+                .map(|p| rsx! { TeamNotesPanel { parts: p } })
+        }
+        #[cfg(not(feature = "peer"))]
+        {
+            None
+        }
+    };
     rsx! {
         if let Some(sp) = parts.read().clone() {
             Session { key: "{session}", parts: sp }
         }
-        Page { ready: ready, restoring: restoring, peer: peer_panel }
+        Page {
+            ready: ready,
+            restoring: restoring,
+            peer: peer_panel,
+            teams: teams_panel,
+        }
     }
 }
 
@@ -456,7 +497,7 @@ fn Session(parts: SessionParts) -> Element {
     let StorageLine(mut storage_line) = use_context::<StorageLine>();
 
     use_away_input(&client);
-    let orders_rows = use_live::<_, _, support::Order>(&client, support::orders_newest_first());
+    let orders_rows = use_live(&client, support::OrdersNewestFirst);
     let event_rx = client.events();
     use_hook(move || {
         spawn(async move {
@@ -566,7 +607,7 @@ async fn setup(
     let sign_in = platform_sign_in(
         Auth::new(auth_origin.clone(), support::native::AUTH_PROVIDER)
             .with_account(account)
-            .keyring(KEYRING_SERVICE)
+            .keyring(keyring_service())
             .with_browser_opener({
                 let parked = parked.clone();
                 Arc::new(move |url: &str| {
@@ -594,7 +635,7 @@ async fn setup(
     let (connected, pump) = support::native::connect(
         server,
         auth_origin,
-        KEYRING_SERVICE,
+        keyring_service(),
         &data_dir(),
         &roots,
         sign_in,

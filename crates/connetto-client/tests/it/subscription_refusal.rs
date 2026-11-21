@@ -10,8 +10,8 @@ use std::time::Duration;
 use connetto_client::{ClientBuilder, LiveQuery};
 use connetto_core::Cursor;
 use connetto_core::messages::{
-    BulkMessage, ControlMessage, HandshakeAck, NonFatalError, SUBSCRIPTION_REFUSED, SnapshotBegin,
-    SnapshotEnd, SnapshotPatch, SubscriptionPriority, WriterGrant,
+    BulkMessage, ControlMessage, HandshakeAck, NonFatalError, SUBSCRIPTION_REFUSED,
+    SUBSCRIPTION_REFUSED_SCHEMA, SnapshotBegin, SnapshotEnd, SnapshotPatch, WriterGrant,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{LoopbackTransport, loopback};
@@ -48,6 +48,9 @@ struct Photo {
 enum Answer {
     /// The one fixed refusal phrase, and no snapshot.
     Refuse,
+    /// The fixed phrase of a table the server refused for a schema change,
+    /// and no snapshot.
+    RefuseSchema,
     /// A non-fatal error naming the subscription with another detail, then
     /// the snapshot.
     OtherError,
@@ -91,6 +94,7 @@ fn scripted_server(answers: Vec<Answer>) -> LoopbackTransport {
                 current_cursor: Cursor::new(Vec::new()),
                 schema_version: None,
                 sunset_at_secs: None,
+                courier: false,
                 initial_credits: 64,
                 writer: Some(WriterGrant {
                     number: 1,
@@ -112,6 +116,7 @@ fn scripted_server(answers: Vec<Answer>) -> LoopbackTransport {
             tokio::time::sleep(Duration::from_millis(100)).await;
             let detail = match answer {
                 Answer::Refuse | Answer::RefuseThenServe => Some(SUBSCRIPTION_REFUSED),
+                Answer::RefuseSchema => Some(SUBSCRIPTION_REFUSED_SCHEMA),
                 Answer::OtherError => Some("the server is busy"),
                 Answer::Serve => None,
             };
@@ -124,14 +129,13 @@ fn scripted_server(answers: Vec<Answer>) -> LoopbackTransport {
                     .await;
             }
             match answer {
-                Answer::Refuse => continue,
+                Answer::Refuse | Answer::RefuseSchema => continue,
                 Answer::RefuseThenServe => tokio::time::sleep(Duration::from_millis(100)).await,
                 Answer::OtherError | Answer::Serve => {}
             }
             let _ = server
                 .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
                     sub_id: sub_id.clone(),
-                    priority: SubscriptionPriority::default(),
                 }))
                 .await;
             let _ = server
@@ -192,6 +196,23 @@ async fn a_refused_subscription_reaches_the_live_handle_error() {
         .expect("a standing refusal answers without waiting")
         .expect_err("the refusal stands");
     assert_eq!(again.to_string(), "subscription refused");
+}
+
+/// A subscription refused because its table's schema changed ends the live
+/// handle's wait as any other refusal does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_schema_refusal_reaches_the_live_handle_error() {
+    let client = client_over(vec![Answer::RefuseSchema]).await;
+    let mut photos: LiveQuery<Photo> = client
+        .watch(photos::table.order_by(photos::id))
+        .await
+        .expect("watch");
+
+    let err = tokio::time::timeout(BOUND, photos.changed())
+        .await
+        .expect("the refusal must end the wait")
+        .expect_err("the server refused the subscription");
+    assert_eq!(err.to_string(), "subscription refused");
 }
 
 /// A refusal wakes every waiting handle, and one the server did not refuse

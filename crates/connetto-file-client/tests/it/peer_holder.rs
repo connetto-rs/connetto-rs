@@ -14,15 +14,20 @@ use tokio::sync::mpsc;
 use crate::peer_support::{Devices, beside, declared, hand_over, name_file, port, replica, stage};
 use crate::retention::pseudorandom;
 
-/// The replies to `request` from `holder`, up to the last one, bounded.
-async fn ask(
+/// The replies to `request` from `holder`, up to the last one, bounded, the
+/// holder's custody reports left out.
+pub(crate) async fn ask(
     requester: &Node,
     events: &mut mpsc::UnboundedReceiver<PeerEvent>,
     holder: &DeviceIdentity,
     request: Media,
 ) -> Vec<Media> {
     requester
-        .send_media(holder, request)
+        .send_media(
+            holder,
+            crate::peer_support::link_to(requester, holder),
+            request,
+        )
         .await
         .expect("the request queues");
     let mut replies = Vec::new();
@@ -34,6 +39,9 @@ async fn ask(
         let PeerEvent::Media { message, .. } = event else {
             continue;
         };
+        if message.request_id().is_none() {
+            continue;
+        }
         let done = match &message {
             Media::Manifest { last, .. } | Media::Piece { last, .. } => *last,
             _ => true,
@@ -161,7 +169,7 @@ async fn a_refused_requester_and_an_absent_file_get_the_same_answer() {
                 len: 100,
             },
         ] {
-            let request_id = request.request_id();
+            let request_id = request.request_id().expect("a request carries its id");
             assert_eq!(
                 ask(&carl, &mut carl_events, &holder, request).await,
                 vec![Media::Refused { request_id }],
@@ -271,6 +279,7 @@ async fn a_stream_whose_link_falls_stops_and_the_holder_serves_on() {
         leaving
             .send_media(
                 &holder,
+                crate::peer_support::link_to(&leaving, &holder),
                 Media::Fetch {
                     request_id: 1,
                     file_id: *file_id.as_bytes(),
@@ -285,7 +294,7 @@ async fn a_stream_whose_link_falls_stops_and_the_holder_serves_on() {
                 .await
                 .expect("a piece within the bound")
                 .expect("the requester lives");
-            if matches!(event, PeerEvent::Media { .. }) {
+            if matches!(event, PeerEvent::Media { ref message, .. } if message.request_id().is_some()) {
                 break;
             }
         }
@@ -336,7 +345,7 @@ async fn a_file_a_readable_row_names_but_the_holder_lacks_is_refused() {
                 len: 100,
             },
         ] {
-            let request_id = request.request_id();
+            let request_id = request.request_id().expect("a request carries its id");
             assert_eq!(
                 ask(&anna, &mut anna_events, &holder, request).await,
                 vec![Media::Refused { request_id }],
@@ -397,4 +406,106 @@ async fn a_declaration_naming_a_column_the_replica_lacks_is_refused() {
             "{refused:?}"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fragmented_manifest_names_its_owner_only_on_the_last_run() {
+    use diesel::prelude::*;
+
+    diesel::table! {
+        /// The file's ordered chunks.
+        _connetto_content_chunks (file_id, ordinal) {
+            /// The file identity.
+            file_id -> Binary,
+            /// The chunk position.
+            ordinal -> Integer,
+            /// The chunk identity.
+            hash -> Binary,
+            /// The plaintext length.
+            len -> BigInt,
+        }
+    }
+    diesel::table! {
+        /// The copies held for other accounts.
+        _connetto_content_custody (file_id) {
+            /// The file identity.
+            file_id -> Binary,
+            /// The credited account.
+            owner -> Nullable<Text>,
+            /// The custody state.
+            state -> Text,
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (client, content) =
+        crate::peer_support::declare_replicated(replica(dir.path(), None).await).await;
+    let chunk = stage(&content, 1, "anna", b"x").await;
+    let bytes = vec![b'x'; connetto_exchange::MAX_MANIFEST_ROWS + 1];
+    let file_id = stage(&content, 2, "anna", &bytes).await;
+    client
+        .with_conn(|conn| {
+            conn.conn()
+                .transaction::<_, diesel::result::Error, _>(|db| {
+                    diesel::delete(_connetto_content_chunks::table)
+                        .filter(_connetto_content_chunks::file_id.eq(file_id.as_bytes().as_slice()))
+                        .execute(db)?;
+                    for ordinal in 0..=connetto_exchange::MAX_MANIFEST_ROWS {
+                        diesel::insert_into(_connetto_content_chunks::table)
+                            .values((
+                                _connetto_content_chunks::file_id.eq(file_id.as_bytes().as_slice()),
+                                _connetto_content_chunks::ordinal
+                                    .eq(i32::try_from(ordinal).expect("ordinal fits")),
+                                _connetto_content_chunks::hash.eq(chunk.as_bytes().as_slice()),
+                                _connetto_content_chunks::len.eq(1_i64),
+                            ))
+                            .execute(db)?;
+                    }
+                    diesel::insert_into(_connetto_content_custody::table)
+                        .values((
+                            _connetto_content_custody::file_id.eq(file_id.as_bytes().as_slice()),
+                            _connetto_content_custody::owner.eq("anna"),
+                            _connetto_content_custody::state.eq("held"),
+                        ))
+                        .execute(db)
+                })
+        })
+        .await
+        .expect("the replica is open")
+        .expect("store a valid fragmented manifest");
+    assert_eq!(
+        content.bytes(file_id).await.expect("read the file"),
+        Some(bytes)
+    );
+
+    let devices = Devices::new();
+    let (node, addr, events) = devices.node(&devices.device("r77", 2));
+    let (reader, _, mut replies) = devices.node(&devices.device("anna", 3));
+    let holder = reader.link(addr).await.expect("link the reader");
+    beside(&content, port(node, events), async {
+        let runs = ask(
+            &reader,
+            &mut replies,
+            &holder,
+            Media::Want {
+                request_id: 1,
+                file_id: *file_id.as_bytes(),
+            },
+        )
+        .await;
+        assert_eq!(runs.len(), 2);
+        assert!(
+            matches!(&runs[0], Media::Manifest { last: false, owner: None, chunks, .. }
+            if chunks.len() == connetto_exchange::MAX_MANIFEST_ROWS)
+        );
+        assert!(
+            matches!(&runs[1], Media::Manifest { last: true, owner: Some(owner), chunks, .. }
+            if owner == "anna" && chunks.len() == 1)
+        );
+        assert_eq!(
+            manifest_rows(&runs),
+            vec![(*chunk.as_bytes(), 1); connetto_exchange::MAX_MANIFEST_ROWS + 1]
+        );
+    })
+    .await;
 }

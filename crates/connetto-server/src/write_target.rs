@@ -19,9 +19,12 @@ use core::marker::PhantomData;
 /// admin's. `set_config` threads that identity in just before the call, inside
 /// the same transaction so the setting stays in scope.
 mod visibility {
-    use diesel::sql_types::{Array, Bytea};
+    use diesel::sql_types::{Array, Bytea, Nullable, Text};
     diesel::define_sql_function! {
         fn connetto_visible_files(file_ids: Array<Bytea>) -> Array<Bytea>;
+    }
+    diesel::define_sql_function! {
+        fn connetto_file_owner(file_id: Bytea) -> Nullable<Text>;
     }
 }
 
@@ -30,10 +33,12 @@ use connetto_core::messages::{ConflictRow, WriterSecret};
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::ParserDB;
-use subql::patchset::{PgAdapter, apply_diffset_bytes_async_with_catalog};
+use subql::patchset::{ApplyError, PgAdapter, apply_diffset_bytes_async_with_catalog};
+use subql::{NoRefusals, ParserDB};
 
+use crate::audit::ConnettoAuditSchema;
 use crate::capability::CallerBinding;
+use crate::catalog_shapes::CatalogShapes;
 use crate::schema::ConnettoSchema;
 use crate::writer_schema::{
     ConnettoWriterSchema, SettlePath, SettledOutcome, SettledRow, WriterRow, writer_secret_hash,
@@ -72,6 +77,9 @@ pub(crate) enum WriteOutcome {
 pub(crate) struct Settlement {
     pub(crate) row: SettledRow,
     pub(crate) forked: bool,
+    /// Whether this call won the sequence, `false` when a standing record
+    /// answered it.
+    pub(crate) fresh: bool,
 }
 
 /// A failure while committing a mutation.
@@ -124,6 +132,22 @@ fn seq_storage(client_seq: u64) -> Result<i64, WriteError> {
         .map_err(|_| WriteError::Backend("client sequence overflows storage".to_owned()))
 }
 
+/// A settle's provenance original in the storage types, the writer, the
+/// sequence, the entry hash and the predecessor.
+type StoredOriginal = (i64, i64, [u8; 32], [u8; 32]);
+
+/// A settle's provenance original, or `None` when the entry is its own
+/// original or its sequence overflows storage.
+fn original_of<Id>(settle: &SettleSpec<Id>) -> Result<Option<StoredOriginal>, WriteError> {
+    settle
+        .original
+        .filter(|(writer, seq, _, _)| *writer != settle.writer || *seq != settle.seq)
+        .map(|(writer, seq, hash, previous)| {
+            seq_storage(seq).map(|seq| (writer, seq, hash, previous))
+        })
+        .transpose()
+}
+
 /// Build the conflict outcome for a stale op.
 fn conflict_outcome(conflict: &PlannedConflict, row: Option<ServerRow>) -> WriteOutcome {
     WriteOutcome::Conflict {
@@ -142,8 +166,22 @@ fn conflict_outcome(conflict: &PlannedConflict, row: Option<ServerRow>) -> Write
     }
 }
 
+/// The accounts a couriered entry settles between, what the settle
+/// transaction's notice row names and the `write_couriered` audit row reads
+/// (R78 decisions 10 and 37).
+pub(crate) struct CourierSettle<Id> {
+    /// The courier's account.
+    pub user_id: Id,
+    /// The courier's session, the audit row's `session` column.
+    pub session: connetto_core::SessionId,
+    /// The author's account.
+    pub author: Id,
+    /// The author's device key, the writer the entry settles under.
+    pub device_key: Vec<u8>,
+}
+
 /// One entry's settle instruction, what `commit` records once it applies.
-pub(crate) struct SettleSpec {
+pub(crate) struct SettleSpec<Id> {
     /// The writer the entry settles under.
     pub writer: i64,
     /// The entry's sequence for that writer.
@@ -156,6 +194,9 @@ pub(crate) struct SettleSpec {
     pub path: SettlePath,
     /// The original writer, sequence, entry hash and predecessor for shared settlement.
     pub original: Option<(i64, u64, [u8; 32], [u8; 32])>,
+    /// The courier range that settles the entry, absent for the direct and
+    /// restore paths.
+    pub courier: Option<CourierSettle<Id>>,
 }
 
 /// A Postgres write target that applies under the caller's RLS context.
@@ -167,6 +208,9 @@ pub(crate) struct SettleSpec {
 pub struct PgWriteTarget<D> {
     pool: Pool<AsyncPgConnection>,
     catalog: ParserDB,
+    /// Every catalog table's columns, which a settled conflict's re-read
+    /// projects.
+    shapes: CatalogShapes,
     /// The setting a policy reads the caller's identity from.
     user_setting: std::sync::Arc<str>,
     /// The deployment's writer schema, carried only in the type system so
@@ -179,17 +223,21 @@ pub struct PgWriteTarget<D> {
 ///
 /// # Errors
 ///
-/// [`MaterializerError::Catalog`] when the DDL does not parse.
+/// [`MaterializerError::Catalog`] when the DDL does not parse or cannot name
+/// a table's columns.
 pub fn pg_write_target<D: ConnettoSchema>(
     pool: Pool<AsyncPgConnection>,
     pg_ddl: &str,
 ) -> Result<PgWriteTarget<D>, MaterializerError> {
     let catalog = ParserDB::parse::<PostgreSqlDialect>(pg_ddl)
         .map_err(|err| MaterializerError::Catalog(format!("{err:?}")))?;
+    let shapes =
+        CatalogShapes::of(&catalog).map_err(|err| MaterializerError::Catalog(err.to_string()))?;
     Ok(PgWriteTarget {
         user_setting: connetto_core::auth::DEFAULT_USER_SETTING.into(),
         pool,
         catalog,
+        shapes,
         _writers: PhantomData,
     })
 }
@@ -209,6 +257,37 @@ impl From<diesel::result::Error> for CommitError {
     fn from(err: diesel::result::Error) -> Self {
         Self::Db(err)
     }
+}
+
+impl From<ApplyError> for CommitError {
+    fn from(err: ApplyError) -> Self {
+        match err {
+            ApplyError::Diesel(err) => Self::Db(err),
+            refused => Self::Probe(MaterializerError::Refused(refused)),
+        }
+    }
+}
+
+/// Apply an upload's diffset bytes on `conn`, counting the rows it changed.
+///
+/// No drift guard refuses tables on this path, so the view refuses none.
+async fn apply_upload(
+    catalog: &ParserDB,
+    bytes: &[u8],
+    conn: &mut AsyncPgConnection,
+) -> Result<usize, CommitError> {
+    let adapter = PgAdapter::new(catalog)
+        .map_err(|e| CommitError::Probe(MaterializerError::Catalog(e.to_string())))?;
+    Ok(
+        apply_diffset_bytes_async_with_catalog::<subql::backend::Postgres, _, _, _, _, _>(
+            catalog,
+            bytes,
+            &NoRefusals,
+            conn,
+            &adapter,
+        )
+        .await?,
+    )
 }
 
 /// Whether Postgres refused a statement with `42501` (`insufficient_privilege`).
@@ -287,6 +366,19 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
             .map_err(WriteError::from)
     }
 
+    /// Read committed courier receipts visible to the authenticated viewer.
+    pub(crate) async fn courier_audit_receipts(
+        &self,
+        viewer: &D::Id,
+        writer: i64,
+        sequences: &[i64],
+    ) -> Result<Vec<i64>, WriteError> {
+        let mut conn = self.pool.get().await.map_err(pool_failure)?;
+        D::Audit::courier_receipts(&mut conn, viewer, writer, sequences)
+            .await
+            .map_err(WriteError::from)
+    }
+
     /// The first bind or first provenance of a device writer, absent when the
     /// row stood already.
     pub(crate) async fn insert_device_writer(
@@ -354,7 +446,8 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
     }
 
     /// The current row a re-answered settled conflict reads fresh, under the
-    /// caller's RLS context on the reader pool.
+    /// caller's RLS context on the reader pool. A table this deployment's
+    /// catalog no longer declares is refused before a connection is taken.
     pub(crate) async fn settled_conflict_row<Key: CapabilityKey>(
         &self,
         caller: &Principal<D::Id, Key>,
@@ -363,6 +456,10 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
         pk_columns: &[String],
         pk_values: &[crate::writer_schema::StoredValue],
     ) -> Result<Option<ServerRow>, WriteError> {
+        let select_list = self
+            .shapes
+            .select_list_named(&self.catalog, table)
+            .map_err(|err| WriteError::Backend(err.to_string()))?;
         let mut conn = self.pool.get().await.map_err(pool_failure)?;
         CallerBinding::of(caller, std::sync::Arc::clone(&self.user_setting))
             .apply(&mut conn)
@@ -370,6 +467,7 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
             .map_err(WriteError::from)?;
         crate::materializer::read_settled_conflict_row(
             &mut conn,
+            select_list,
             table,
             version_column,
             pk_columns,
@@ -439,16 +537,10 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
         caller: &Principal<D::Id, Key>,
         plan: &WritePlan,
         payload_zstd: &[u8],
-        settle: &SettleSpec,
+        settle: &SettleSpec<D::Id>,
     ) -> Result<WriteOutcome, WriteError> {
         let seq = seq_storage(settle.seq)?;
-        let original = settle
-            .original
-            .filter(|(writer, seq, _, _)| *writer != settle.writer || *seq != settle.seq)
-            .map(|(writer, seq, hash, previous)| {
-                seq_storage(seq).map(|seq| (writer, seq, hash, previous))
-            })
-            .transpose()?;
+        let original = original_of(settle)?;
         let bytes = crate::materializer::decompress(payload_zstd)
             .map_err(|err| WriteError::Backend(format!("decompress: {err}")))?;
         let mut conn = self.pool.get().await.map_err(pool_failure)?;
@@ -475,6 +567,7 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
                     return Ok(WriteOutcome::Settled(Settlement {
                         forked: row.entry_hash != settle.entry_hash,
                         row,
+                        fresh: false,
                     }));
                 }
                 if let Some(row) = Self::reserve_original(c, original, &applied).await? {
@@ -482,10 +575,15 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
                         diesel::result::Error::DeserializationError(Box::new(err))
                     })?;
                     D::Writers::settle_outcome(c, settle.writer, seq, text).await?;
+                    Self::courier_notice(c, settle, seq, text).await?;
                     if !D::Writers::advance(c, settle.writer, seq, &settle.entry_hash).await? {
                         return Err(CommitError::Frontier);
                     }
-                    return Ok(WriteOutcome::Settled(Settlement { row, forked: false }));
+                    return Ok(WriteOutcome::Settled(Settlement {
+                        row,
+                        forked: false,
+                        fresh: true,
+                    }));
                 }
                 binding.apply(c).await?;
                 crate::capability::bind_writer::<D::Writers>(c, settle.writer, seq).await?;
@@ -513,20 +611,19 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
                             D::Writers::settle_outcome(c, writer, oseq, &text).await?;
                         }
                         Self::advance_original(c, original).await?;
+                        Self::courier_notice(c, settle, seq, &text).await?;
                         if !D::Writers::advance(c, settle.writer, seq, &settle.entry_hash).await? {
                             return Err(CommitError::Frontier);
                         }
                         return Ok(conflict_outcome(conflict, row));
                     }
                 }
-                let adapter = PgAdapter::new(catalog)
-                    .map_err(|e| CommitError::Probe(MaterializerError::Catalog(e.to_string())))?;
-                let affected =
-                    apply_diffset_bytes_async_with_catalog(catalog, &bytes, c, &adapter).await?;
+                let affected = apply_upload(catalog, &bytes, c).await?;
                 if affected < expected {
                     return Err(CommitError::Denied);
                 }
                 Self::advance_original(c, original).await?;
+                Self::courier_notice(c, settle, seq, &applied).await?;
                 if !D::Writers::advance(c, settle.writer, seq, &settle.entry_hash).await? {
                     return Err(CommitError::Frontier);
                 }
@@ -576,10 +673,34 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
         Ok(())
     }
 
+    /// The notice row of a couriered entry, written beside the settle it
+    /// names in the same transaction, a no-op for the direct and restore
+    /// paths.
+    async fn courier_notice(
+        conn: &mut AsyncPgConnection,
+        settle: &SettleSpec<D::Id>,
+        seq: i64,
+        outcome: &str,
+    ) -> Result<(), CommitError> {
+        let Some(courier) = settle.courier.as_ref() else {
+            return Ok(());
+        };
+        D::Writers::courier_notice_insert(
+            conn,
+            &courier.author,
+            &courier.user_id,
+            &courier.device_key,
+            seq,
+            outcome,
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Settles a terminal outcome and returns the first-seen record.
     pub(crate) async fn settle_refusal(
         &self,
-        settle: &SettleSpec,
+        settle: &SettleSpec<D::Id>,
         outcome: &SettledOutcome,
     ) -> Result<Settlement, WriteError> {
         let seq = seq_storage(settle.seq)?;
@@ -610,15 +731,22 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
                 return Ok(Settlement {
                     forked: row.entry_hash != settle.entry_hash,
                     row,
+                    fresh: false,
                 });
             }
             let result = if let Some(row) = Self::reserve_original(c, original, &text).await? {
                 let stored = std::str::from_utf8(&row.outcome)
                     .map_err(|err| diesel::result::Error::DeserializationError(Box::new(err)))?;
                 D::Writers::settle_outcome(c, settle.writer, seq, stored).await?;
-                Settlement { row, forked: false }
+                Self::courier_notice(c, settle, seq, stored).await?;
+                Settlement {
+                    row,
+                    forked: false,
+                    fresh: true,
+                }
             } else {
                 Self::advance_original(c, original).await?;
+                Self::courier_notice(c, settle, seq, &text).await?;
                 Settlement {
                     row: SettledRow {
                         entry_hash: settle.entry_hash.to_vec(),
@@ -627,6 +755,7 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
                         path: settle.path,
                     },
                     forked: false,
+                    fresh: true,
                 }
             };
             if !D::Writers::advance(c, settle.writer, seq, &settle.entry_hash).await? {
@@ -636,6 +765,29 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
         })
         .await
         .map_err(commit_failure)
+    }
+
+    /// The account's courier notice rows, in the order they settled, each
+    /// with the id its ack's delete takes and the courier's account as the
+    /// database's text.
+    pub(crate) async fn courier_notices(
+        &self,
+        user_id: &D::Id,
+    ) -> Result<Vec<(i64, D::Id, Vec<u8>, i64, String)>, WriteError> {
+        let mut conn = self.pool.get().await.map_err(pool_failure)?;
+        D::Writers::courier_notices(&mut conn, user_id)
+            .await
+            .map_err(WriteError::from)
+    }
+
+    /// Delete the notice rows an acked frame carried, whatever still stands,
+    /// so a second session's ack of the same ids deletes nothing.
+    pub(crate) async fn delete_courier_notices(&self, ids: Vec<i64>) -> Result<(), WriteError> {
+        let mut conn = self.pool.get().await.map_err(pool_failure)?;
+        D::Writers::courier_notices_delete(&mut conn, ids)
+            .await
+            .map(|_| ())
+            .map_err(WriteError::from)
     }
 
     /// Whether `caller` may see `file_id` per the deployment's
@@ -668,6 +820,31 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
         .await
         .map_err(WriteError::from)
     }
+
+    /// The account the deployment's `connetto_file_owner` answers for
+    /// `file_id` as `caller`'s own rights read it, `None` when it answers
+    /// nobody (R79 decision 17).
+    ///
+    /// Bound and pooled as [`Self::file_visible_to_caller`] is, so the
+    /// function, `SECURITY INVOKER`, never names the owner of a row the
+    /// caller cannot read.
+    pub(crate) async fn file_owner_for_caller<Key: CapabilityKey>(
+        &self,
+        file_id: [u8; 32],
+        caller: &Principal<D::Id, Key>,
+    ) -> Result<Option<String>, WriteError> {
+        use visibility::connetto_file_owner;
+        let binding = CallerBinding::of(caller, std::sync::Arc::clone(&self.user_setting));
+        let mut conn = self.pool.get().await.map_err(pool_failure)?;
+        conn.transaction::<Option<String>, diesel::result::Error, _>(async move |c| {
+            binding.apply(c).await?;
+            diesel::select(connetto_file_owner(file_id.to_vec()))
+                .get_result(c)
+                .await
+        })
+        .await
+        .map_err(WriteError::from)
+    }
 }
 
 /// The write error a failed commit transaction reports.
@@ -693,9 +870,54 @@ fn commit_failure(err: CommitError) -> WriteError {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommitError, MaterializerError, WriteError, commit_failure};
+    use super::{CommitError, MaterializerError, WriteError, commit_failure, pg_write_target};
+    use crate::catalog_shapes::{unconnected_pool, unresolvable_key_column, unresolvable_key_ddl};
+    use crate::defaults::ConnettoDefaults;
     use crate::reexec::coded_error;
+    use crate::writer_schema::StoredValue;
+    use connetto_core::SessionId;
+    use connetto_core::auth::Principal;
     use diesel::result::{DatabaseErrorKind, Error};
+
+    #[tokio::test]
+    async fn a_catalog_with_an_unresolvable_key_refuses_the_write_target() {
+        let refusal =
+            pg_write_target::<ConnettoDefaults>(unconnected_pool(), &unresolvable_key_ddl())
+                .err()
+                .map(|err| err.to_string());
+        assert_eq!(
+            refusal,
+            Some(MaterializerError::Catalog(unresolvable_key_column()).to_string())
+        );
+    }
+
+    /// A settled conflict stored under an earlier deployment can name a table
+    /// this deployment's catalog no longer declares. Its re-read is refused as
+    /// the schema mismatch, before the reader pool is asked for a connection.
+    #[tokio::test]
+    async fn a_settled_conflict_on_an_undeclared_table_is_refused_before_reading() {
+        let target = pg_write_target::<ConnettoDefaults>(
+            unconnected_pool(),
+            "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT);",
+        )
+        .expect("the catalog loads");
+        let caller =
+            Principal::<String, String>::unidentified(SessionId::from_uuid(uuid::Uuid::nil()));
+        let result = target
+            .settled_conflict_row(
+                &caller,
+                "gone",
+                "edited_at",
+                &["id".to_owned()],
+                &[StoredValue::Integer(1)],
+            )
+            .await;
+        let expected = MaterializerError::SchemaMismatch("gone".to_owned()).to_string();
+        assert!(
+            matches!(&result, Err(WriteError::Backend(message)) if *message == expected),
+            "{result:?}"
+        );
+    }
 
     fn db_error(kind: DatabaseErrorKind, message: &str) -> Error {
         Error::DatabaseError(kind, Box::new(message.to_owned()))

@@ -259,37 +259,69 @@ impl<Id, Key> Principal<Id, Key> {
     }
 }
 
-/// The caller a content ticket carries: the identity, the capability
-/// subjects it holds, and the bot list a login bound on the run.
+/// What a write ticket carries when its caller uploads another account's
+/// file (R79 decision 17): the account the manifest is recorded for. The carry
+/// is audited under the session the ticket's [`ContentCaller`] names, which a
+/// carry always has, since only a login may carry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentCarry {
+    /// The account the deployment's `connetto_file_owner` answered for the
+    /// file, which the manifest records as its uploader.
+    pub owner: String,
+}
+
+impl ContentCarry {
+    /// The key the carried upload is recorded and metered under, the owner's
+    /// own, as [`ContentCaller::storage_key`] renders an identity.
+    #[must_use]
+    pub fn storage_key(&self) -> String {
+        identity_key(&self.owner)
+    }
+}
+
+/// The key an identity owns rows and meters under.
+fn identity_key(identity: &str) -> String {
+    format!("user:{identity}")
+}
+
+/// The caller a content ticket carries: the identity, the login session, the
+/// capability subjects it holds, and the bot list a login bound on the run.
 ///
-/// All three travel so the file server binds what the mint bound, and an
-/// unheld value stays unheld rather than becoming `""`, which would be a
-/// real identity a policy could match. The subjects ride as the list they
-/// are, because a commit is attributed to each of them and only the binding
-/// needs them joined, under the separator that deployment's key type chose.
-/// The bot list rides as the value the connection binds, the wildcard for a
-/// caller holding no login.
+/// All travel so the file server binds what the mint bound, and an unheld
+/// value stays unheld rather than becoming `""`, which would be a real
+/// identity a policy could match. The subjects ride as the list they are,
+/// because a commit is attributed to each of them and only the binding needs
+/// them joined, under the separator that deployment's key type chose. The bot
+/// list rides as the value the connection binds, the wildcard for a caller
+/// holding no login. The session is the login's, which the file server asks
+/// [`crate::SessionLiveness`] about on every request, and absent for a caller
+/// holding no login, whose ticket ends only at its expiry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentCaller {
     identity: Option<String>,
+    session: Option<SessionId>,
     subjects: Vec<String>,
     bot_list: String,
 }
 
 impl ContentCaller {
-    /// Name all three values.
+    /// Name every value.
     ///
-    /// `bot_list` is the value the caller's connection binds into
-    /// [`crate::schema::BOT_LIST_SETTING`], the wildcard for a caller holding
-    /// no login, so the ticket and the connection hold the caller to one list.
+    /// `session` is the session of the login the identity came from, `None`
+    /// for a caller holding no login. `bot_list` is the value the caller's
+    /// connection binds into [`crate::schema::BOT_LIST_SETTING`], the wildcard
+    /// for a caller holding no login, so the ticket and the connection hold
+    /// the caller to one list.
     #[must_use]
     pub fn new(
         identity: Option<String>,
+        session: Option<SessionId>,
         subjects: impl IntoIterator<Item = String>,
         bot_list: String,
     ) -> Self {
         Self {
             identity,
+            session,
             subjects: subjects.into_iter().collect(),
             bot_list,
         }
@@ -299,6 +331,12 @@ impl ContentCaller {
     #[must_use]
     pub fn identity(&self) -> Option<&str> {
         self.identity.as_deref()
+    }
+
+    /// The login's session, `None` for a caller holding no login.
+    #[must_use]
+    pub const fn session(&self) -> Option<SessionId> {
+        self.session
     }
 
     /// The capability subjects the caller holds, sorted and without repeats,
@@ -361,12 +399,10 @@ impl ContentCaller {
     /// A caller holding neither half has no key, so it owns nothing.
     #[must_use]
     pub fn storage_key(&self, separator: char) -> Option<String> {
-        self.identity()
-            .map(|identity| format!("user:{identity}"))
-            .or_else(|| {
-                self.packed_subjects(separator)
-                    .map(|subjects| format!("keys:{subjects}"))
-            })
+        self.identity().map(identity_key).or_else(|| {
+            self.packed_subjects(separator)
+                .map(|subjects| format!("keys:{subjects}"))
+        })
     }
 }
 
@@ -374,6 +410,7 @@ impl Default for ContentCaller {
     fn default() -> Self {
         Self {
             identity: None,
+            session: None,
             subjects: Vec::new(),
             bot_list: crate::BOT_LIST_WILDCARD.to_owned(),
         }
@@ -604,10 +641,12 @@ mod tests {
     fn a_key_spelled_like_a_pair_owns_its_own_rows() {
         let one_key = ContentCaller::new(
             None,
+            None,
             ["a,b".to_owned()],
             crate::BOT_LIST_WILDCARD.to_owned(),
         );
         let two_keys = ContentCaller::new(
+            None,
             None,
             ["a".to_owned(), "b".to_owned()],
             crate::BOT_LIST_WILDCARD.to_owned(),

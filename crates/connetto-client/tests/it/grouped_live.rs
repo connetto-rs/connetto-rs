@@ -87,16 +87,12 @@ async fn connect(
     client_id: &str,
     dir: &std::path::Path,
 ) -> ConnettoConnection<WebSocketTransport<TcpStream>> {
-    let stream = TcpStream::connect(addr).await.expect("connect");
-    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
-        .await
-        .expect("ws connect");
     let credential =
         super::support::held_grant(Grant::new(format!("user:token#{client_id}")), "token");
     let store = super::support::key_store(&credential).await;
-    ClientBuilder::new(
+    let mut conn = ClientBuilder::new(
         super::support::bundle(SQLITE_DDL),
-        super::support::Once::new(transport),
+        super::support::NeverDial::<WebSocketTransport<TcpStream>>::default(),
     )
     .signed_in(credential)
     .durable(
@@ -104,13 +100,24 @@ async fn connect(
         store,
         MemoryRefreshStore::default(),
     )
-    .connect_driven()
+    .open_driven()
     .await
-    .expect("client connect")
+    .expect("open replica");
+    let stream = TcpStream::connect(addr).await.expect("connect");
+    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
+        .await
+        .expect("ws connect");
+    conn.attach(transport).await.expect("client connect");
+    conn
 }
 
 /// The typed grouped query every test watches: one count per status.
-fn by_status() -> impl diesel::query_builder::QueryFragment<diesel::sqlite::Sqlite> {
+fn by_status() -> impl diesel::query_builder::Query<
+    SqlType = (
+        diesel::sql_types::Nullable<diesel::sql_types::Text>,
+        diesel::sql_types::BigInt,
+    ),
+> + diesel::query_builder::QueryFragment<diesel::sqlite::Sqlite> {
     orders::table
         .group_by(orders::status)
         .select((orders::status, diesel::dsl::count_star()))
@@ -314,9 +321,9 @@ async fn a_restart_reads_the_last_synced_map_from_the_resting_table() {
     pump.await.expect("second pump ends");
 }
 
-/// One answer row of the top-orders window, decoded from the whole answer's
-/// object by column name.
-#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+/// One answer row of the top-orders window, loaded through diesel from the
+/// window's `(id, status)` columns in select order.
+#[derive(Debug, Clone, PartialEq, diesel::Queryable)]
 struct TopOrder {
     id: i64,
     status: Option<String>,

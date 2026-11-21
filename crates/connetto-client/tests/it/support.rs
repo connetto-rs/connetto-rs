@@ -21,6 +21,7 @@ use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, MaybeSend, ReplicaKeyStore, Transport};
 use connetto_server::openfga::{GrantMove, StoreUpkeep, UpkeepError};
 use parking_lot::Mutex;
+use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 use tokio::sync::oneshot;
 
 /// A gate mechanism that stays locked and asks a prompt the test holds.
@@ -187,6 +188,23 @@ impl<T: Transport + MaybeSend + 'static> TransportFactory for Once<T> {
     }
 }
 
+/// Compressed one-row `orders (id, label)` patchset bytes, the snapshot the
+/// scripted servers serve.
+#[must_use]
+pub fn labelled_order_payload(id: i64) -> Vec<u8> {
+    let insert = Insert::<_, String, Vec<u8>>::from(SimpleTable::new(
+        "orders",
+        &[("id", ""), ("label", "")],
+        &[0],
+    ))
+    .set(0, Value::Integer(id))
+    .expect("set id")
+    .set(1, Value::Text("seed".to_owned()))
+    .expect("set label");
+    let patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new().insert(insert);
+    zstd::encode_all(patchset.build().as_slice(), 3).expect("compress payload")
+}
+
 /// The refusal a dialer that never reaches a server hands back.
 #[derive(Debug, thiserror::Error)]
 #[error("no server is reachable")]
@@ -332,6 +350,8 @@ pub struct Script {
     frames: std::sync::Arc<parking_lot::Mutex<std::collections::VecDeque<IncomingFrame>>>,
     sent: std::sync::Arc<parking_lot::Mutex<Vec<ControlMessage>>>,
     closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Woken at every control frame the client sends.
+    sent_wake: std::sync::Arc<tokio::sync::Notify>,
 }
 
 /// The scripted socket after a close.
@@ -363,6 +383,24 @@ impl Script {
         self.sent.lock().iter().filter_map(pick).collect()
     }
 
+    /// The `count`th sent control frame `pick` selects, awaited on the
+    /// client's sends.
+    pub async fn until_sent<T>(
+        &self,
+        count: usize,
+        mut pick: impl FnMut(&ControlMessage) -> Option<T>,
+    ) -> T {
+        loop {
+            let woken = self.sent_wake.notified();
+            let mut woken = std::pin::pin!(woken);
+            woken.as_mut().enable();
+            if let Some(found) = self.sent(&mut pick).into_iter().nth(count - 1) {
+                return found;
+            }
+            woken.await;
+        }
+    }
+
     /// The share-key replacements the client sent.
     pub fn replacements(&self) -> Vec<connetto_core::messages::ReplaceShareKeys> {
         self.sent(|message| match message {
@@ -380,6 +418,7 @@ impl Transport for Script {
         message: ControlMessage,
     ) -> impl Future<Output = Result<(), Self::Error>> {
         self.sent.lock().push(message);
+        self.sent_wake.notify_waiters();
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
             std::future::ready(Err(Gone::Closed))
         } else {
@@ -427,6 +466,7 @@ pub fn handshake_ack() -> IncomingFrame {
             current_cursor: connetto_core::Cursor::from(Vec::new()),
             schema_version: None,
             sunset_at_secs: None,
+            courier: false,
             initial_credits: 64,
             writer: Some(connetto_core::messages::WriterGrant {
                 number: 1,

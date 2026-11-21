@@ -10,7 +10,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use connetto_core::messages::{BulkMessage, ControlMessage, FatalErrorReason};
+use connetto_core::messages::{
+    AggregateChange, BulkMessage, ControlMessage, FatalErrorReason, SqliteValue,
+};
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
@@ -31,6 +33,10 @@ fn manager(fixture: &Fixture) -> Arc<Manager> {
 }
 
 fn manager_with_session(fixture: &Fixture, session: SessionConfig) -> Arc<Manager> {
+    manager_with_ddl(fixture, session, PG_DDL)
+}
+
+fn manager_with_ddl(fixture: &Fixture, session: SessionConfig, ddl: &str) -> Arc<Manager> {
     let guard = Arc::new(RequestGuard::new(
         ThrottleConfig::default()
             .with_identified(TierLimits::identified().with_read_timeout(Duration::from_secs(30))),
@@ -38,17 +44,17 @@ fn manager_with_session(fixture: &Fixture, session: SessionConfig) -> Arc<Manage
     ));
     let pool = fixture.admin().clone();
     ManagerBuilder::new(
-        Materializer::builder(PG_DDL)
+        Materializer::builder(ddl)
             .with_write_catalog(RuntimeWritableCatalog::default())
             .with_read_connector(PgReadConnector::with_session_setup(pool.clone()))
             .build()
             .expect("build materializer"),
-        PgSnapshotSource::from_ddl(pool.clone(), PG_DDL).expect("snapshot source"),
+        PgSnapshotSource::from_ddl(pool.clone(), ddl).expect("snapshot source"),
         // A grouped count is global, so the policy never sees it.
         RosterAuth::granting_nobody(),
         Arc::new(TestGrantChecker),
         PgReadConnector::with_session_setup(pool.clone()),
-        pg_write_target::<ConnettoDefaults>(pool, PG_DDL).expect("build write target"),
+        pg_write_target::<ConnettoDefaults>(pool, ddl).expect("build write target"),
     )
     .with_guard(guard)
     .with_session(session)
@@ -121,11 +127,20 @@ async fn a_grouped_subscription_delivers_per_group_deltas_with_the_key_populated
         )
         .await;
 
+    let columns = client.expect_aggregate_columns("by-status").await;
+    assert_eq!(columns.columns.len(), 2);
     // The one seeded group arrives as a keyed upsert.
     let seed = take_aggregates(&mut client, "by-status", 1).await.remove(0);
-    assert!(!seed.is_full_result, "a grouped seed is a keyed upsert");
-    let open_key = seed.group_key.expect("a grouped seed carries its key");
-    assert_eq!(seed.result_json.as_deref(), Some("2"));
+    let AggregateChange::Upsert { key: open_key, row } = seed.change else {
+        panic!("expected keyed seed");
+    };
+    assert_eq!(
+        row,
+        vec![
+            SqliteValue::Text("open".to_owned()),
+            SqliteValue::Integer(2)
+        ]
+    );
 
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
     apply(
@@ -137,12 +152,15 @@ async fn a_grouped_subscription_delivers_per_group_deltas_with_the_key_populated
     .await;
     let grew = take_aggregates(&mut client, "by-status", 1).await.remove(0);
     assert_eq!(
-        grew.group_key.as_deref(),
-        Some(open_key.as_slice()),
-        "the delta addresses its group by the seed's own key"
+        grew.change,
+        AggregateChange::Upsert {
+            key: open_key.clone(),
+            row: vec![
+                SqliteValue::Text("open".to_owned()),
+                SqliteValue::Integer(3)
+            ],
+        }
     );
-    assert_eq!(grew.result_json.as_deref(), Some("3"));
-    assert!(!grew.is_full_result, "a grouped delta is an upsert");
 
     // A group born on the change stream appears under a new key, and
     // emptying it again is a keyed removal.
@@ -154,10 +172,17 @@ async fn a_grouped_subscription_delivers_per_group_deltas_with_the_key_populated
     )
     .await;
     let born = take_aggregates(&mut client, "by-status", 1).await.remove(0);
-    let done_key = born.group_key.clone().expect("a new group carries its key");
-    assert_ne!(done_key.as_slice(), open_key.as_slice());
-    assert_eq!(born.result_json.as_deref(), Some("1"));
-    assert!(!born.is_full_result);
+    let AggregateChange::Upsert { key: done_key, row } = born.change else {
+        panic!("expected keyed birth");
+    };
+    assert_ne!(done_key, open_key);
+    assert_eq!(
+        row,
+        vec![
+            SqliteValue::Text("done".to_owned()),
+            SqliteValue::Integer(1)
+        ]
+    );
     apply(
         &fixture,
         &mut source,
@@ -166,13 +191,7 @@ async fn a_grouped_subscription_delivers_per_group_deltas_with_the_key_populated
     )
     .await;
     let removed = take_aggregates(&mut client, "by-status", 1).await.remove(0);
-    assert_eq!(
-        removed.group_key.as_deref(),
-        Some(done_key.as_slice()),
-        "the removal addresses the emptied group"
-    );
-    assert_eq!(removed.result_json, None, "an emptied group is a removal");
-    assert!(!removed.is_full_result);
+    assert_eq!(removed.change, AggregateChange::Remove { key: done_key });
 }
 
 /// The R82 done-when, second half: a seed past the group budget demotes at
@@ -203,26 +222,16 @@ async fn a_demoted_subscription_answers_whole_and_logs_the_transition() {
                 )
                 .await;
 
+            let columns = client.expect_aggregate_columns("by-status").await;
+            assert_eq!(columns.columns.len(), 2);
             // The demoted first answer is one whole row-shaped frame, not keyed
             // upserts: the fold is gone, the whole re-read is the tier now.
             let whole = take_aggregates(&mut client, "by-status", 1).await.remove(0);
-            assert!(
-                whole.is_full_result,
-                "a demoted subscription answers with full results"
-            );
-            assert_eq!(whole.group_key, None, "a whole answer addresses no group");
-            let rows: serde_json::Value = serde_json::from_str(
-                whole
-                    .result_json
-                    .as_deref()
-                    .expect("a whole answer has a body"),
-            )
-            .expect("the whole answer is JSON rows");
-            assert_eq!(
-                rows.as_array().map(Vec::len),
-                Some(1025),
-                "every group is in the whole answer"
-            );
+            let AggregateChange::Replace { rows } = whole.change else {
+                panic!("expected whole answer");
+            };
+            assert_eq!(rows.len(), 1025, "every group is in the whole answer");
+            assert!(rows.iter().all(|row| matches!(row.as_slice(), [SqliteValue::Text(_), SqliteValue::Integer(1)])));
 
             let named = logs
                 .lines()
@@ -299,6 +308,7 @@ async fn a_blocked_reader_of_aggregates_is_closed_at_its_send_budget() {
             "SELECT status, COUNT(*) FROM orders GROUP BY status",
         )
         .await;
+    client.expect_aggregate_columns("by-status").await;
     take_aggregates(&mut client, "by-status", 1).await;
 
     gate.send(false).expect("shut the gate");
@@ -331,4 +341,98 @@ async fn a_blocked_reader_of_aggregates_is_closed_at_its_send_budget() {
         "the budget held back updates, {delivered} of {CHANGES} delivered"
     );
     let _ = served.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn binary_groups_keep_their_cells_and_distinct_keys_on_the_wire() {
+    for (column_type, values, expected) in [
+        (
+            "UUID",
+            "'00010203-0405-0607-0809-0a0b0c0d0e0f'",
+            vec![(0_u8..16).collect::<Vec<_>>()],
+        ),
+        (
+            "BYTEA",
+            "'\\x80'), (2, '\\x81'",
+            vec![vec![0x80], vec![0x81]],
+        ),
+    ] {
+        let fixture = Fixture::acquire().await;
+        fixture.exec("DROP TABLE IF EXISTS orders CASCADE").await;
+        let ddl = format!("CREATE TABLE orders (id INT PRIMARY KEY, category {column_type});");
+        fixture.exec(&ddl).await;
+        fixture
+            .exec(&format!("INSERT INTO orders VALUES (1, {values})"))
+            .await;
+        let manager = manager_with_ddl(&fixture, SessionConfig::default(), &ddl);
+        let mut client = connect(&manager);
+        client.handshake_with("binary", "user:binary").await;
+        client
+            .subscribe(
+                "groups",
+                "SELECT category, COUNT(*) FROM orders GROUP BY category",
+            )
+            .await;
+        let columns = client.expect_aggregate_columns("groups").await;
+        assert_eq!(columns.columns.len(), 2);
+        assert_eq!(
+            columns.columns[0],
+            connetto_core::messages::ColumnType::Blob
+        );
+        let answers = take_aggregates(&mut client, "groups", expected.len()).await;
+        let mut keys = Vec::new();
+        let mut actual = Vec::new();
+        for answer in answers {
+            let AggregateChange::Upsert { key, row } = answer.change else {
+                panic!("expected keyed binary group");
+            };
+            assert!(!keys.contains(&key));
+            keys.push(key);
+            let [SqliteValue::Blob(bytes), SqliteValue::Integer(1)] = row.as_slice() else {
+                panic!("expected binary group and count");
+            };
+            actual.push(bytes.clone());
+        }
+        actual.sort();
+        assert_eq!(actual, expected);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_grouped_answer_declares_columns_before_a_group_is_born() {
+    let fixture = Fixture::acquire().await;
+    fixture.exec("DROP TABLE IF EXISTS orders CASCADE").await;
+    fixture.exec(PG_DDL).await;
+    let manager = manager(&fixture);
+    let mut client = connect(&manager);
+    client.handshake_with("empty", "user:empty").await;
+    client
+        .subscribe(
+            "groups",
+            "SELECT status, COUNT(*) FROM orders GROUP BY status",
+        )
+        .await;
+    let columns = client.expect_aggregate_columns("groups").await;
+    assert_eq!(columns.columns.len(), 2);
+    assert_eq!(
+        columns.columns[0],
+        connetto_core::messages::ColumnType::Text
+    );
+    assert!(matches!(client.barrier(41).await, ControlMessage::Pong(pong) if pong.nonce == 41));
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("source");
+    apply(
+        &fixture,
+        &mut source,
+        &manager,
+        "INSERT INTO orders VALUES (1, 'new')",
+    )
+    .await;
+    let update = take_aggregates(&mut client, "groups", 1).await.remove(0);
+    let AggregateChange::Upsert { row, .. } = update.change else {
+        panic!("expected new group");
+    };
+    assert_eq!(
+        row,
+        vec![SqliteValue::Text("new".to_owned()), SqliteValue::Integer(1)]
+    );
 }

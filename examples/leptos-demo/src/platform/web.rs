@@ -1,6 +1,7 @@
 //! The web platform. It boots the dedicated DB worker, attaches the tab
 //! behind the leader election, and keeps the view signal current from the
-//! live queries, the client events and the worker's broadcasts.
+//! client events and the worker's broadcasts. The panes follow their live
+//! queries on the tab's client themselves.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -8,9 +9,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use base64::Engine;
-use connetto_client::{
-    AccountChoice, Auth, ClientEvent, ConnettoClient, Custody, LiveHandle, NoGate, Watchable,
-};
+use connetto_client::{AccountChoice, Auth, ClientEvent, ConnettoClient, Custody, NoGate};
 use connetto_demo_support as support;
 use connetto_demo_support::web as glue;
 use connetto_file_core::{FileId, MimeClass};
@@ -27,18 +26,14 @@ use web_sys::{
     BlobPropertyBag, FileSystemFileHandle, FileSystemWritableFileStream, SaveFilePickerOptions,
 };
 
-use connetto_demo_support::view::{
-    AccountEntry, Action, LogoutState, NoteRow, OrderRow, PhotoRow, Session, View,
-};
+use connetto_demo_support::view::{AccountEntry, Action, LogoutState, Session, TeamView, View};
 
 /// The tab-to-worker transport the window's client rides.
 pub type Transport = MessageTransport<web_sys::BroadcastChannel>;
 /// The window's client over the tab-to-worker transport.
 pub type Client = ConnettoClient<Transport>;
-
-/// The photo display sources' fetch key, the rows' identity and state with
-/// the generation the fetch button bumps.
-type PhotoSrcKey = (Vec<(Uuid, String)>, u64);
+/// The live source the panes follow their queries through, the tab's client.
+pub type Source = Client;
 
 /// Boot the connetto DB tier in the worker context with the demo config.
 ///
@@ -129,15 +124,6 @@ struct PageHolds {
     answer: Rc<Cell<Option<glue::AccountAnswer>>>,
     custody: Rc<Cell<Option<Custody>>>,
     gate: Rc<Cell<&'static str>>,
-    thumb_refresh: Rc<Cell<u64>>,
-    thumb_last_key: Rc<RefCell<Option<PhotoSrcKey>>>,
-    /// The covered rows the footprint was last read at, `None` before the first.
-    covered: Cell<Option<usize>>,
-    covered_orders: Rc<Cell<usize>>,
-    covered_notes: Rc<Cell<usize>>,
-    covered_photos: Rc<Cell<usize>>,
-    /// The newest orders row's key, the remove button's target.
-    newest_order: Cell<Option<Uuid>>,
     _provider: glue::ProviderListener,
     _login: glue::LoginUrlListener,
     _boot_session: glue::BootSessionListener,
@@ -153,6 +139,9 @@ struct Platform {
 thread_local! {
     /// The page's platform, set once by [`run_page`].
     static PLATFORM: RefCell<Option<Platform>> = const { RefCell::new(None) };
+    /// The account whose own name the page follows, so a second trigger for
+    /// the same live account starts no second feed.
+    static NAMED: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 /// Serve one user control. A control sent before [`run_page`] set the
@@ -230,7 +219,7 @@ fn boot_page() -> RwSignal<View> {
     if let Some(stored) = glue::read_stored_account() {
         view.update(|v| {
             v.session = Session::Restoring;
-            v.stored_account = Some(AccountEntry::new(stored));
+            v.stored_account = Some(AccountEntry::new(stored, &glue::read_stored_names()));
         });
     }
 
@@ -255,6 +244,7 @@ fn boot_page() -> RwSignal<View> {
             if view.with_untracked(logging_out) {
                 return;
             }
+            let live = uid.clone();
             view.update(|v| {
                 if let Some(uid) = uid {
                     v.identity = Some(uid);
@@ -262,7 +252,7 @@ fn boot_page() -> RwSignal<View> {
                 match account {
                     Some(account) => {
                         glue::save_stored_account(&account);
-                        let entry = AccountEntry::new(account);
+                        let entry = AccountEntry::new(account, &glue::read_stored_names());
                         v.account = Some(entry.clone());
                         v.stored_account = Some(entry);
                     }
@@ -270,6 +260,11 @@ fn boot_page() -> RwSignal<View> {
                 }
                 v.session = Session::SignedIn;
             });
+            if let (Some(account), Some(client)) = (live, source()) {
+                follow_own_name(view, client, account);
+            }
+            // A signed-in session stands the team panel.
+            stand_team(view);
             if let Some(secs) = expires_at {
                 latest.set(Some(secs));
                 let view = view;
@@ -290,8 +285,12 @@ fn boot_page() -> RwSignal<View> {
         serve_account_choice(move |accounts| {
             let answer_cell = Rc::clone(&answer_cell);
             async move {
+                let names = glue::read_stored_names();
                 view.update(|v| {
-                    v.known_accounts = accounts.iter().cloned().map(AccountEntry::new).collect();
+                    v.known_accounts = accounts
+                        .iter()
+                        .map(|key| AccountEntry::new(key.clone(), &names))
+                        .collect();
                 });
                 // A signed-in page ignores the question, but the worker still
                 // needs an answer to proceed with its boot.
@@ -304,8 +303,12 @@ fn boot_page() -> RwSignal<View> {
                     &accounts,
                     || {
                         view.update(|v| {
-                            v.picking =
-                                Some(accounts.iter().cloned().map(AccountEntry::new).collect());
+                            v.picking = Some(
+                                accounts
+                                    .iter()
+                                    .map(|key| AccountEntry::new(key.clone(), &names))
+                                    .collect(),
+                            );
                             v.session = Session::PickingAccount;
                         });
                     },
@@ -324,13 +327,6 @@ fn boot_page() -> RwSignal<View> {
         answer,
         custody,
         gate,
-        thumb_refresh: Rc::new(Cell::new(0)),
-        thumb_last_key: Rc::new(RefCell::new(None)),
-        covered: Cell::new(None),
-        covered_orders: Rc::new(Cell::new(0)),
-        covered_notes: Rc::new(Cell::new(0)),
-        covered_photos: Rc::new(Cell::new(0)),
-        newest_order: Cell::new(None),
         _provider: glue::ProviderListener::new(),
         _login: login_listener,
         _boot_session: boot_session_listener,
@@ -345,20 +341,19 @@ fn boot_page() -> RwSignal<View> {
                         holds.custody.set(Some(level));
                         set_header_lines(&holds, &view);
                     }
+                    reseed_refused_lost(&boot.content, &view).await;
+                    let client = boot.client.clone();
+                    // The panes mount on the attach below and take the client
+                    // from the boot, so it stands first.
+                    *holds.boot.borrow_mut() = Some(boot);
                     view.update(|v| {
                         v.attached = true;
                         v.status = "connected".to_owned();
                     });
-                    reseed_refused_lost(&boot.content, &view).await;
-                    let client = boot.client.clone();
-                    let content = Rc::clone(&boot.content);
-                    *holds.boot.borrow_mut() = Some(boot);
-                    spawn_orders(&holds, &view, client.clone());
-                    spawn_count(&view, client.clone());
-                    spawn_grouped(&view, client.clone());
-                    spawn_notes(&holds, &view, client.clone());
-                    spawn_photos(&holds, &view, client.clone(), content);
-                    spawn_products(&view, client.clone());
+                    stand_team(view);
+                    if let Some(account) = view.with_untracked(|v| v.identity.clone()) {
+                        follow_own_name(view, client.clone(), account);
+                    }
                     refresh_storage(&view, &client);
                     let mut events = client.events();
                     while let Ok(event) = events.recv().await {
@@ -437,47 +432,7 @@ async fn reseed_refused_lost(
     });
 }
 
-/// The replica's page footprint, refreshed whenever the covered rows move.
-fn refresh_footprint(holds: &Rc<PageHolds>, view: &RwSignal<View>, client: &Client) {
-    let covered =
-        holds.covered_orders.get() + holds.covered_notes.get() + holds.covered_photos.get();
-    if holds.covered.get() == Some(covered) {
-        return;
-    }
-    holds.covered.set(Some(covered));
-    let view = *view;
-    let client = client.clone();
-    spawn_local(async move {
-        let (pages, free) = support::replica_footprint(&client).await;
-        view.update(|v| {
-            v.pages = pages;
-            v.free_pages = free;
-            v.covered_rows = covered;
-        });
-    });
-}
-
-/// The shared catalogue rows, by name, the pane's list subscription.
-fn spawn_products(view: &RwSignal<View>, client: Client) {
-    let view = *view;
-    spawn_local(async move {
-        let Ok(mut handle) = support::products_by_name().live(&client).await else {
-            return;
-        };
-        let mut rows: Vec<support::Product> = handle.snapshot();
-        loop {
-            view.update(|v| v.products = support::product_rows(&rows));
-            refresh_storage(&view, &client);
-            if handle.changed().await.is_err() {
-                break;
-            }
-            rows = handle.snapshot();
-        }
-    });
-}
-
-/// The storage line the header shows, refreshed wherever the footprint
-/// moves.
+/// The storage line the header shows.
 fn refresh_storage(view: &RwSignal<View>, client: &Client) {
     let view = *view;
     let client = client.clone();
@@ -487,157 +442,81 @@ fn refresh_storage(view: &RwSignal<View>, client: &Client) {
     });
 }
 
-/// The orders rows, newest first, the pane's list subscription.
-fn spawn_orders(holds: &Rc<PageHolds>, view: &RwSignal<View>, client: Client) {
-    let holds = Rc::clone(holds);
-    let view = *view;
+/// Follow `account`'s own `users` row on the tab's client, naming it in the
+/// view and in this origin's stored names, so Switch to names it once it is
+/// not live. The feed ends at an account switch, and the next account's
+/// session starts its own.
+fn follow_own_name(view: RwSignal<View>, client: Client, account: String) {
+    let fresh = NAMED.with(|named| {
+        let mut named = named.borrow_mut();
+        let fresh = named.as_deref() != Some(account.as_str());
+        if fresh {
+            *named = Some(account.clone());
+        }
+        fresh
+    });
+    if !fresh {
+        return;
+    }
     spawn_local(async move {
-        let Ok(mut handle) = support::orders_newest_first().live(&client).await else {
-            return;
-        };
-        let mut rows: Vec<support::Order> = handle.snapshot();
-        loop {
-            holds.newest_order.set(rows.first().map(|row| row.id));
-            holds.covered_orders.set(rows.len());
-            view.update(|v| {
-                v.orders = rows
-                    .iter()
-                    .map(|row| OrderRow {
-                        id: row.id.to_string(),
-                        quantity: row.quantity,
-                    })
-                    .collect();
+        support::follow_own_name(
+            client,
+            account.clone(),
+            |name| {
+                let mut names = glue::read_stored_names();
+                if names.remember(&account, name) {
+                    glue::save_stored_names(&names);
+                    view.update(|v| v.name_account(&account, name));
+                }
+            },
+            |_| {},
+        )
+        .await;
+        NAMED.with(|named| {
+            let mut named = named.borrow_mut();
+            if named.as_deref() == Some(account.as_str()) {
+                *named = None;
+            }
+        });
+    });
+}
+
+/// Stand the team panel while the session is signed in and no sign-out owns
+/// the page. A sign-out or an account switch takes it down.
+fn stand_team(view: RwSignal<View>) {
+    view.update(|v| {
+        if v.session == Session::SignedIn && !logging_out(v) && v.team.is_none() {
+            v.team = Some(TeamView {
+                outcome: "idle".to_owned(),
+                peer: false,
+                ..Default::default()
             });
-            refresh_footprint(&holds, &view, &client);
-            refresh_storage(&view, &client);
-            if handle.changed().await.is_err() {
-                break;
-            }
-            rows = handle.snapshot();
         }
     });
 }
 
-/// The server's `COUNT(*)` for the orders table.
-fn spawn_count(view: &RwSignal<View>, client: Client) {
-    let view = *view;
-    spawn_local(async move {
-        let Ok(mut handle) = support::orders_count().live(&client).await else {
-            return;
-        };
-        let mut value: Option<i64> = handle.snapshot();
-        loop {
-            view.update(|v| v.server_count = value);
-            if handle.changed().await.is_err() {
-                break;
-            }
-            value = handle.snapshot();
-        }
-    });
+/// The tab's client, which the panes follow their live queries on, once the
+/// tab attached.
+#[must_use]
+pub fn source() -> Option<Client> {
+    PLATFORM.with(|cell| cell.borrow().as_ref().and_then(Platform::client))
 }
 
-/// The server's `COUNT(*)` grouped by the orders' quantity.
-fn spawn_grouped(view: &RwSignal<View>, client: Client) {
-    let view = *view;
-    spawn_local(async move {
-        let Ok(mut handle) = support::orders_counts_by_quantity().live(&client).await else {
-            return;
-        };
-        let mut counts: HashMap<i64, i64> = handle.snapshot();
-        loop {
-            view.update(|v| v.grouped = support::grouped_label(&counts));
-            if handle.changed().await.is_err() {
-                break;
-            }
-            counts = handle.snapshot();
-        }
-    });
+/// Each photo's display source by row id, a server URL once the server says
+/// the row's content is available and a local `data:` URL before that,
+/// empty before the tab attached.
+pub async fn photo_sources(rows: Vec<support::Photo>) -> HashMap<String, String> {
+    let content = PLATFORM.with(|cell| cell.borrow().as_ref().and_then(Platform::content));
+    match content {
+        Some(content) => photo_thumbs(&content, &rows).await,
+        None => HashMap::new(),
+    }
 }
 
-/// The device-private notes rows.
-fn spawn_notes(holds: &Rc<PageHolds>, view: &RwSignal<View>, client: Client) {
-    let holds = Rc::clone(holds);
-    let view = *view;
-    spawn_local(async move {
-        let Ok(mut handle) = support::notes_rows().live(&client).await else {
-            return;
-        };
-        let mut rows: Vec<support::Note> = handle.snapshot();
-        loop {
-            holds.covered_notes.set(rows.len());
-            view.update(|v| {
-                v.notes = rows
-                    .iter()
-                    .map(|row| NoteRow {
-                        id: row.id.to_string(),
-                        body: row.body.clone(),
-                    })
-                    .collect();
-            });
-            refresh_footprint(&holds, &view, &client);
-            refresh_storage(&view, &client);
-            if handle.changed().await.is_err() {
-                break;
-            }
-            rows = handle.snapshot();
-        }
-    });
-}
-
-/// The photos rows and each row's display source.
-fn spawn_photos(
-    holds: &Rc<PageHolds>,
-    view: &RwSignal<View>,
-    client: Client,
-    content: Rc<TabContent<web_sys::BroadcastChannel>>,
-) {
-    let holds = Rc::clone(holds);
-    let view = *view;
-    spawn_local(async move {
-        let Ok(mut handle) = support::photos_rows().live(&client).await else {
-            return;
-        };
-        let mut rows: Vec<support::Photo> = handle.snapshot();
-        loop {
-            holds.covered_photos.set(rows.len());
-            view.update(|v| {
-                v.photos = rows
-                    .iter()
-                    .map(|row| PhotoRow {
-                        id: row.id.to_string(),
-                        state: support::photo_state(row.content_state.as_deref()).to_owned(),
-                    })
-                    .collect();
-            });
-            refresh_footprint(&holds, &view, &client);
-            refresh_storage(&view, &client);
-            // The display sources refetch on a row's id or content state
-            // change and when the fetch button restores bytes, so a stale
-            // ticket never wedges the panel.
-            let key: PhotoSrcKey = (
-                rows.iter()
-                    .map(|row| (row.id, row.content_state.clone().unwrap_or_default()))
-                    .collect(),
-                holds.thumb_refresh.get(),
-            );
-            if holds.thumb_last_key.borrow().as_ref() != Some(&key) {
-                *holds.thumb_last_key.borrow_mut() = Some(key);
-                // The fetch task needs its own rows, and the loop keeps
-                // mutating its copy until the next change.
-                let fetched = rows.clone();
-                let content = Rc::clone(&content);
-                let view = view;
-                spawn_local(async move {
-                    let srcs = photo_thumbs(&content, &fetched).await;
-                    view.update(|v| v.photo_thumbs = srcs);
-                });
-            }
-            if handle.changed().await.is_err() {
-                break;
-            }
-            rows = handle.snapshot();
-        }
-    });
+/// The account each still-provisional team note came from, by note id,
+/// which no note has in a browser, since the browser carries no peer link.
+pub async fn team_note_accounts(_ids: Vec<String>) -> HashMap<String, String> {
+    HashMap::new()
 }
 
 /// Each photo's display source, a server URL once the server says the row's
@@ -748,6 +627,9 @@ impl Platform {
 
     /// Serve one user control, answering with the same calls the Yew demo makes.
     fn act(self, action: Action) {
+        if self.view.with_untracked(View::stored_delete_working) {
+            return;
+        }
         match action {
             Action::SignIn => self.sign_in(),
             // The browser has no native gate to unlock and no backend writer,
@@ -760,12 +642,21 @@ impl Platform {
             Action::LogOutKeep => self.logout_keep(),
             Action::LogOutDelete => self.logout_delete(),
             Action::ConfirmDelete | Action::ForceDelete => self.delete_confirmed(),
-            Action::CancelLogout => self.view.update(|v| {
-                v.logout = LogoutState::Idle;
-                v.refused_pending = None;
-            }),
+            Action::DeleteStoredAccount { account, force } => {
+                self.delete_stored_account(account, force)
+            }
+            Action::CancelStoredDelete => self.view.update(|view| view.stored_delete = None),
+            Action::CancelLogout => {
+                self.view.update(|v| {
+                    v.logout = LogoutState::Idle;
+                    v.refused_pending = None;
+                });
+                // An abandoned sign-out keeps the session, which stands the
+                // panel again.
+                stand_team(self.view);
+            }
             Action::AddOrder => self.add_order(),
-            Action::RemoveNewest => self.remove_newest(),
+            Action::RemoveOrder { id } => self.remove_order(&id),
             Action::StagePhoto { name, bytes } => self.stage_photo(name, bytes),
             Action::Pin => self.pin(),
             Action::Unpin => self.unpin(),
@@ -775,8 +666,21 @@ impl Platform {
             Action::AcknowledgeLost => self.acknowledge_lost(),
             Action::SaveNote { body } => self.save_note(body),
             Action::FreeUpSpace => self.free_up_space(),
+            Action::RereadStorage => self.reread_storage(),
             Action::Export => self.export(),
             Action::Import { bytes, .. } => self.import(bytes),
+            Action::AddTeamNote { team, body } => self.add_team_note(team, body),
+            // The web's view carries no peer link, so the nearby pane's
+            // controls and the team pane's tidy pass have nothing to act on.
+            Action::EnableBluetooth
+            | Action::HostHotspot
+            | Action::StopHotspot
+            | Action::JoinHotspot { .. }
+            | Action::JoinPayload { .. }
+            | Action::JoinNearby
+            | Action::LeaveHotspot
+            | Action::SetPeerLinks { .. }
+            | Action::TidyTeam => {}
         }
     }
 
@@ -832,6 +736,7 @@ impl Platform {
             v.identity = None;
             v.account = None;
             v.session = Session::Connecting;
+            v.team = None;
         });
         let view = self.view;
         match account {
@@ -886,7 +791,10 @@ impl Platform {
             return;
         }
         let view = self.view;
-        view.update(|v| v.logout = LogoutState::Working);
+        view.update(|v| {
+            v.logout = LogoutState::Working;
+            v.team = None;
+        });
         spawn_local(async move {
             if let Err(err) = glue::logout_keep().await {
                 view.update(|v| v.logout = LogoutState::Error(err.to_string()));
@@ -899,7 +807,10 @@ impl Platform {
             return;
         }
         let view = self.view;
-        view.update(|v| v.logout = LogoutState::Working);
+        view.update(|v| {
+            v.logout = LogoutState::Working;
+            v.team = None;
+        });
         spawn_local(async move {
             match glue::logout_delete().await {
                 Ok(glue::DeleteOutcome::Confirm(pending)) => {
@@ -933,11 +844,33 @@ impl Platform {
         view.update(|v| {
             v.logout = LogoutState::Working;
             v.refused_pending = None;
+            v.team = None;
         });
         spawn_local(async move {
             if let Err(err) = glue::logout_delete_confirmed().await {
                 view.update(|v| v.logout = LogoutState::Error(err.to_string()));
             }
+        });
+    }
+
+    /// Delete an account whose replica the worker has closed.
+    fn delete_stored_account(&self, account: String, force: bool) {
+        use support::view::{StoredDelete, StoredDeleteState};
+        if self.view.with_untracked(|view| {
+            view.stored_delete_working() || matches!(view.logout, LogoutState::Working)
+        }) {
+            return;
+        }
+        let view = self.view;
+        view.update(|view| {
+            view.stored_delete = Some(StoredDelete {
+                account: account.clone(),
+                state: StoredDeleteState::Working,
+            })
+        });
+        spawn_local(async move {
+            let outcome = glue::forget_stored_account(&account, force).await;
+            view.update(|view| view.finish_stored_delete(&account, outcome));
         });
     }
 
@@ -962,14 +895,12 @@ impl Platform {
         });
     }
 
-    fn remove_newest(&self) {
-        let v = self.view.read_untracked();
-        if v.session != Session::SignedIn || logging_out(&v) {
+    /// Remove the order row `id` names, ignoring one that names no row id.
+    fn remove_order(&self, id: &str) {
+        if !self.page_ok() {
             return;
         }
-        let newest = self.holds.newest_order.get();
-        drop(v);
-        let Some(id) = newest else {
+        let Ok(id) = id.parse::<Uuid>() else {
             return;
         };
         let Some(client) = self.client() else {
@@ -994,6 +925,46 @@ impl Platform {
             match support::save_note(&client, &body).await {
                 Ok(_) => view.update(|v| v.notes_saved += 1),
                 Err(err) => tracing::error!(error = %err, "note save failed"),
+            }
+        });
+    }
+
+    /// Write one note into `team`, answering with the pane's outcome line.
+    fn add_team_note(&self, team: String, body: String) {
+        let v = self.view.read_untracked();
+        if v.session != Session::SignedIn || logging_out(&v) {
+            return;
+        }
+        let author = v.identity.clone().unwrap_or_default();
+        drop(v);
+        if author.is_empty() || team.is_empty() {
+            return;
+        }
+        let Some(client) = self.client() else {
+            return;
+        };
+        let view = self.view;
+        spawn_local(async move {
+            let body = body.trim();
+            if body.is_empty() {
+                view.update(|v| {
+                    if let Some(panel) = v.team.as_mut() {
+                        panel.outcome = "the note needs some text".to_owned();
+                    }
+                });
+                return;
+            }
+            match support::add_team_note(&client, &team, &author, body).await {
+                Ok(_) => view.update(|v| {
+                    if let Some(panel) = v.team.as_mut() {
+                        panel.outcome = "note added".to_owned();
+                    }
+                }),
+                Err(err) => view.update(|v| {
+                    if let Some(panel) = v.team.as_mut() {
+                        panel.outcome = format!("note add failed: {err}");
+                    }
+                }),
             }
         });
     }
@@ -1080,14 +1051,15 @@ impl Platform {
             return;
         };
         let view = self.view;
-        let holds = Rc::clone(&self.holds);
         spawn_local(async move {
             let line = content
                 .fetch_pinned()
                 .await
                 .map_or_else(support::fetch_failed, |ids| support::fetch_ok(ids.len()));
-            holds.thumb_refresh.set(holds.thumb_refresh.get() + 1);
-            view.update(|v| v.content_line = Some(line));
+            view.update(|v| {
+                v.pinned_fetches += 1;
+                v.content_line = Some(line);
+            });
         });
     }
 
@@ -1184,6 +1156,23 @@ impl Platform {
         });
     }
 
+    /// Read the replica mirror's footprint and the storage line again.
+    fn reread_storage(&self) {
+        let Some(client) = self.client() else {
+            return;
+        };
+        let view = self.view;
+        spawn_local(async move {
+            let (pages, free) = support::replica_footprint(&client).await;
+            let storage = support::storage_line(&client).await;
+            view.update(|v| {
+                v.pages = pages;
+                v.free_pages = free;
+                v.storage = storage;
+            });
+        });
+    }
+
     /// Export the archive, through the save picker where the browser has it
     /// and a download link otherwise. A dismissed picker leaves the view
     /// unchanged.
@@ -1221,12 +1210,7 @@ async fn stage_picked(
     mime: MimeClass,
     identity: &str,
 ) -> String {
-    match content
-        .stage(blob, mime, client, move |conn, file_id| {
-            support::stage_photo_row(conn, file_id, identity)
-        })
-        .await
-    {
+    match support::web::stage_photo(content, client, blob, mime, identity, None).await {
         Ok(_) => {
             // Push the staged mutation up now, as the browser builds always have.
             client.replay_pending().await.ok();

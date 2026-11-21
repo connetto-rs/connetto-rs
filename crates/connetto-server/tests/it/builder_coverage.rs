@@ -8,6 +8,7 @@
 //! the binary translates its environment, so the proof goes through the one
 //! construction path.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use connetto_core::PROTOCOL_VERSION;
@@ -23,12 +24,11 @@ use connetto_server::builder::{
     ServerBuilder, ServerParts, ServerSchema, StoreSpec, TokenKeys,
 };
 use connetto_server::device_cert::DeviceCertConfig;
-use connetto_server::openfga::SetupError;
 use connetto_server::portability::DataRequester;
 use connetto_server::{
-    AbuseLimits, AuthConfig, ConnectionLimits, OidcProviderConfig, OplogConfig, PersonLimits,
-    PreflightError, ReaderReserve, ReconnectPolicy, RuntimeWritableCatalog, SessionConfig,
-    ThrottleConfig, TierLimits, WebSocketTransport,
+    AbuseLimits, AuthConfig, ConnectionLimits, OAuthEndpoints, OAuthProvider, OAuthProviderConfig,
+    OidcProviderConfig, OplogConfig, PersonLimits, PreflightError, ReaderReserve, ReconnectPolicy,
+    RuntimeWritableCatalog, SessionConfig, ThrottleConfig, TierLimits, WebSocketTransport,
 };
 use connetto_test_harness::{
     Fixture, MOCK_OAUTH_CLIENT_ID, MOCK_OAUTH_CLIENT_SECRET, MOCK_OAUTH_PROVIDER, MockOauth,
@@ -49,15 +49,14 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tracing::Instrument;
 
-use super::e2e::{
-    NO_POLICIES, OWNED_PG_DDL, OWNED_POLICIES, PG_DDL, PG_SERIAL, audit_ops, exec, mint_token,
-    mint_tokens, reset_fixture, signing_keys, token_body, with_user_url,
-};
 use super::lifecycle::{
-    BOUND, admin_pool, builder_over, live_session, live_session_as, next_control, served_major,
-    wait_ready,
+    BOUND, admin_pool, builder_over, live_session, live_session_as, next_control, wait_ready,
 };
 use super::logging::{record_logged, with_capture};
+use connetto_test_harness::server_fixture::{
+    NO_POLICIES, OWNED_PG_DDL, OWNED_POLICIES, PG_DDL, PG_SERIAL, audit_ops, exec, mint_token,
+    mint_tokens, reset_fixture, served_major, signing_keys, token_body, with_user_url,
+};
 
 /// The one-table schema the refusal tests hand the builder, with the major
 /// line the build's translation reads from it.
@@ -101,13 +100,6 @@ diesel::table! {
 }
 
 connetto_file_server::connetto_file_tables!();
-
-/// A catalog read the DSL cannot name, one column per field.
-#[derive(QueryableByName)]
-struct WalLsn {
-    #[diesel(sql_type = diesel::sql_types::BigInt)]
-    lsn: i64,
-}
 
 /// The slot's confirmed position, null until a stream confirms one.
 #[derive(QueryableByName)]
@@ -162,7 +154,12 @@ fn builder_schema(
     );
     ServerBuilder::new(
         Database::new(url, reader),
-        ServerSchema::new(pg_ddl.to_owned(), pg_policies.to_owned()),
+        ServerSchema::new(
+            pg_ddl.to_owned(),
+            pg_policies.to_owned(),
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
         token,
         OpenFga::new(fga.0.to_owned(), fga.1.to_owned()),
     )
@@ -183,6 +180,7 @@ async fn seed_owned_rls(pool: &Pool<AsyncPgConnection>, user_id: &str) {
         OWNED_PG_DDL,
         "GRANT USAGE ON SCHEMA public TO app_reader",
         "GRANT SELECT ON owned TO app_reader",
+        "GRANT SELECT ON auth_events TO app_reader",
         "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled, \
          _connetto_session_writers TO app_reader",
     ] {
@@ -202,12 +200,9 @@ async fn seed_owned_rls(pool: &Pool<AsyncPgConnection>, user_id: &str) {
     provision_cap_policies(pool, OWNED_PG_DDL, OWNED_POLICIES).await;
 }
 
-/// The count an aggregate answer carries, which the client reads only as a
-/// bare number.
+/// The integer in a scalar aggregate answer.
 fn count_of(update: &AggregateUpdate) -> i64 {
-    let body = update.result_json.as_deref().expect("an answer has a body");
-    body.parse()
-        .unwrap_or_else(|_| panic!("a count answers as a bare number, got {body}"))
+    super::reexec::integer(update)
 }
 
 /// The next aggregate answer for `sub_id`.
@@ -230,6 +225,10 @@ async fn first_count(client: &mut WebSocketTransport<TcpStream>, sub_id: &str, q
         }))
         .await
         .expect("send the subscription");
+    assert!(matches!(
+        next_control(client).await,
+        ControlMessage::AggregateColumns(_)
+    ));
     count_of(&next_update(client, sub_id).await)
 }
 
@@ -1087,42 +1086,12 @@ async fn the_oplog_config_bounds_the_reconnect_log() {
     let builder = builder.oplog_config(OplogConfig::new().with_max_entries(2));
 
     let parts = builder.build().await.expect("the deployment assembles");
+    let mut commits = parts.handle.ingested_commits();
     let stream = tokio::spawn(parts.change_stream);
 
     // Five changes, one commit each. The log may hold two of them.
-    let mut last: i64 = 0;
     for id in 101..=105 {
-        exec(
-            &pool,
-            &format!("INSERT INTO orders VALUES ({id}, 1.0, 1, 'new')"),
-        )
-        .await;
-        let mut conn = pool.get().await.expect("a connection");
-        let row: Vec<WalLsn> = diesel::sql_query(
-            "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0'::pg_lsn)::bigint AS lsn",
-        )
-        .load(&mut *conn)
-        .await
-        .expect("read the write-ahead position");
-        last = row[0].lsn;
-    }
-
-    let deadline = Instant::now() + BOUND;
-    loop {
-        let mut conn = pool.get().await.expect("a connection");
-        let end: Option<i64> = connetto_oplog_commit::table
-            .select(connetto_oplog_commit::end_lsn)
-            .first(&mut *conn)
-            .await
-            .ok();
-        if end.is_some_and(|end| end >= last) {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the stream never ingested the last commit"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        insert_ingested_order(&pool, &mut commits, id).await;
     }
     let mut conn = pool.get().await.expect("a connection");
     let kept: i64 = connetto_oplog::table
@@ -1425,6 +1394,7 @@ async fn seed_no_rls_orders(pool: &Pool<AsyncPgConnection>) {
         PG_DDL,
         "GRANT USAGE ON SCHEMA public TO app_reader",
         "GRANT SELECT ON orders TO app_reader",
+        "GRANT SELECT ON auth_events TO app_reader",
         "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled, \
          _connetto_session_writers TO app_reader",
     ] {
@@ -1660,6 +1630,44 @@ async fn a_restored_cluster_revokes_every_login_session_at_boot() {
     handle.shutdown().await;
 }
 
+/// Insert an order and await its transaction's ingestion.
+async fn insert_ingested_order(
+    pool: &Pool<AsyncPgConnection>,
+    commits: &mut tokio::sync::broadcast::Receiver<subql::PgCommit>,
+    id: i32,
+) {
+    use connetto_test_harness::server_fixture::orders;
+
+    let xid: i64 = {
+        let mut conn = pool.get().await.expect("a connection");
+        // The `xid` cast discards the epoch to match logical replication.
+        diesel::insert_into(orders::table)
+            .values((
+                orders::id.eq(id),
+                orders::price.eq(1.0),
+                orders::quantity.eq(1),
+                orders::status.eq("new"),
+            ))
+            .returning(diesel::dsl::sql::<diesel::sql_types::BigInt>(
+                "pg_current_xact_id()::xid::text::bigint",
+            ))
+            .get_result(&mut *conn)
+            .await
+            .expect("insert the correlated transaction")
+    };
+    let xid = u32::try_from(xid).expect("a logical replication transaction id");
+    tokio::time::timeout(BOUND, async {
+        loop {
+            let commit = commits.recv().await.expect("ingestion notification");
+            if commit.position().xid().0 == xid {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("transaction {xid} was not ingested"));
+}
+
 /// A slot recreated past the reconnect log's last commit is a gap the boot
 /// must settle: the log is trimmed to the resume point, the boundary commit
 /// is recorded at the slot's position, and the gap is logged for the
@@ -1679,43 +1687,33 @@ async fn a_slot_recreated_past_the_log_trims_the_log_at_boot() {
     let port = listener.local_addr().expect("local address").port();
     let (builder, _idp, _keys) = builder_over(&fixture, port).await;
     let parts = builder.build().await.expect("the first boot assembles");
+    let mut commits = parts.handle.ingested_commits();
     let stream = tokio::spawn(parts.change_stream);
 
-    // Three ingested commits, then the log's last commit position.
-    let mut last: i64 = 0;
     for id in 101..=103 {
-        exec(
-            &pool,
-            &format!("INSERT INTO orders VALUES ({id}, 1.0, 1, 'new')"),
-        )
-        .await;
-        let mut conn = pool.get().await.expect("a connection");
-        let row: Vec<WalLsn> = diesel::sql_query(
-            "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0'::pg_lsn)::bigint AS lsn",
-        )
-        .load(&mut *conn)
-        .await
-        .expect("read the write-ahead position");
-        last = row[0].lsn;
-    }
-    let deadline = Instant::now() + BOUND;
-    loop {
-        let mut conn = pool.get().await.expect("a connection");
-        let end: Option<i64> = connetto_oplog_commit::table
-            .select(connetto_oplog_commit::end_lsn)
-            .first(&mut *conn)
-            .await
-            .ok();
-        if end.is_some_and(|end| end >= last) {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the stream never ingested the last commit"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        insert_ingested_order(&pool, &mut commits, id).await;
     }
     stream.abort();
+    tokio::time::timeout(BOUND, async {
+        assert!(
+            stream
+                .await
+                .expect_err("ingestion was aborted")
+                .is_cancelled()
+        );
+        parts.handle.shutdown().await;
+    })
+    .await
+    .expect("ingestion shutdown");
+    let last: i64 = {
+        let mut conn = pool.get().await.expect("a connection");
+        connetto_oplog_commit::table
+            .select(diesel::dsl::max(connetto_oplog_commit::end_lsn))
+            .first::<Option<i64>>(&mut *conn)
+            .await
+            .expect("read the last ingested commit")
+            .expect("the observed commits are recorded")
+    };
 
     // The slot is recreated at the write-ahead head, past the ingested
     // commits, so the boot's check finds the gap.
@@ -1939,41 +1937,6 @@ async fn build_owned_with(policies: &str) -> (Result<ServerParts, BuildError>, (
     (built, store_contents(channel, &store).await)
 }
 
-/// A policy scoped to a role refuses the build naming the policy, its table
-/// and the role, before the authorization store holds a model or a fact.
-#[tokio::test]
-async fn a_role_scoped_policy_refuses_before_the_authorization_store() {
-    let _keyring = isolated_session_keyring();
-    let _serial = PG_SERIAL.lock().await;
-    let policies = format!(
-        "{OWNED_POLICIES}\nCREATE ROLE support_staff;\n\
-         CREATE POLICY owned_staff ON owned FOR SELECT TO support_staff USING (true);"
-    );
-    let (built, contents) = build_owned_with(&policies).await;
-    let err = refused(built, "a role-scoped policy refuses");
-    match &err {
-        BuildError::Authorization(SetupError::RoleScopedPolicy {
-            policy,
-            table,
-            roles,
-        }) => {
-            assert_eq!(policy, "owned_staff");
-            assert_eq!(table, "owned");
-            assert_eq!(roles, "support_staff");
-        }
-        other => panic!("the build answered {other:?}"),
-    }
-    assert!(
-        !err.to_string().contains("with_session_user_role"),
-        "the refusal names nothing a deployment author cannot act on: {err}"
-    );
-    assert_eq!(
-        contents,
-        (0, 0),
-        "the refused build wrote nothing to the store"
-    );
-}
-
 /// A policy only the replica translation refuses, a read policy reading its
 /// own table, refuses the build before the authorization store holds a model
 /// or a fact.
@@ -1998,29 +1961,161 @@ async fn a_replica_refusal_comes_before_the_authorization_store() {
     );
 }
 
-/// No identity provider is configured, so no client can log in, and the build
-/// says so before it touches a pool.
-#[tokio::test]
-async fn no_providers_refuses_the_build_before_anything_runs() {
+/// A builder over a database and an authorization endpoint nothing listens
+/// on, for a refusal the build makes before it reaches either.
+fn unreachable_builder() -> ServerBuilder {
     let keys = TempDir::new().expect("a key dir");
     let (private, public) = signing_keys(&keys);
     let token = TokenKeys::from_pem(
         std::fs::read(&private).expect("read the private half"),
         std::fs::read(&public).expect("read the public half"),
     );
-    let builder = ServerBuilder::new(
+    ServerBuilder::new(
         Database::new(
             "postgres://connetto:connetto@127.0.0.1:1/connetto",
             "postgres://connetto:connetto@127.0.0.1:1/connetto",
         ),
-        ServerSchema::new(T_DDL, ""),
+        ServerSchema::new(
+            T_DDL,
+            "",
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
         token,
         OpenFga::new("http://127.0.0.1:1", "store"),
+    )
+}
+
+/// No identity provider is configured, so no client can log in, and the build
+/// says so before it touches a pool.
+#[tokio::test]
+async fn no_providers_refuses_the_build_before_anything_runs() {
+    let err = refused(
+        unreachable_builder().build().await,
+        "no provider is a refusal",
     );
-    let err = refused(builder.build().await, "no provider is a refusal");
     assert!(
         matches!(err, BuildError::NoProviders),
         "the refusal names the absence: {err}"
+    );
+}
+
+/// A provider the deployment built itself shares the one namespace with the
+/// discovered ones, so a name both carry refuses the build, naming it, before
+/// anything runs.
+#[tokio::test]
+async fn a_provider_name_given_twice_refuses_the_build() {
+    let github = OAuthProvider::new(OAuthProviderConfig::github(
+        "dev",
+        "github-client",
+        "https://app.example/auth/callback",
+    ))
+    .expect("build the GitHub provider");
+    let builder = unreachable_builder()
+        .oidc_providers(vec![OidcProvider::Generic(OidcProviderConfig::new(
+            "dev",
+            "oidc-client",
+            "https://idp.example",
+            "https://app.example/auth/callback",
+        ))])
+        .identity_provider(Arc::new(github));
+    let err = refused(builder.build().await, "a shared name is a refusal");
+    assert!(
+        matches!(&err, BuildError::DuplicateProvider { name } if name == "dev"),
+        "the refusal names the shared name: {err}"
+    );
+}
+
+/// A provider the deployment built that names an issuer another provider
+/// verifies would key its users onto that provider's, so the build refuses
+/// it, for an OIDC issuer exact or any Microsoft tenant's, and for two
+/// GitHub apps that share GitHub's label.
+#[tokio::test]
+async fn a_built_provider_naming_a_claimed_issuer_refuses_the_build() {
+    let impostor = |issuer: &str| {
+        OAuthProvider::new(OAuthProviderConfig::new(
+            "impostor",
+            "client",
+            issuer,
+            "https://app.example/auth/callback",
+            OAuthEndpoints {
+                authorize_url: "https://idp.example/authorize".to_owned(),
+                token_url: "https://idp.example/token".to_owned(),
+                user_url: "https://idp.example/user".to_owned(),
+            },
+            "/id",
+        ))
+        .expect("build the provider")
+    };
+    let oidc = |preset: fn(OidcProviderConfig) -> OidcProvider| {
+        preset(OidcProviderConfig::new(
+            "oidc",
+            "oidc-client",
+            "https://idp.example",
+            "https://app.example/auth/callback",
+        ))
+    };
+    for (discovered, issuer) in [
+        (oidc(OidcProvider::Google), "https://accounts.google.com"),
+        (
+            oidc(OidcProvider::Microsoft),
+            "https://login.microsoftonline.com/some-tenant/v2.0",
+        ),
+        (oidc(OidcProvider::Generic), "https://idp.example"),
+    ] {
+        let builder = unreachable_builder()
+            .oidc_providers(vec![discovered])
+            .identity_provider(Arc::new(impostor(issuer)));
+        let err = refused(builder.build().await, "a claimed issuer is a refusal");
+        assert!(
+            matches!(&err, BuildError::ClaimedIssuer { name, issuer: named } if name == "impostor" && named == issuer),
+            "the refusal names the provider and the issuer: {err}"
+        );
+    }
+
+    let github = |name: &str| {
+        OAuthProvider::new(OAuthProviderConfig::github(
+            name,
+            "github-client",
+            "https://app.example/auth/callback",
+        ))
+        .expect("build the GitHub provider")
+    };
+    let builder = unreachable_builder()
+        .identity_provider(Arc::new(github("web")))
+        .identity_provider(Arc::new(github("native")));
+    let err = refused(builder.build().await, "a shared label is a refusal");
+    assert!(
+        matches!(&err, BuildError::ClaimedIssuer { name, issuer } if name == "native" && issuer == "https://github.com"),
+        "the refusal names the later provider and the label: {err}"
+    );
+}
+
+/// An OIDC provider whose issuer answers no discovery document refuses the
+/// build rather than assemble a deployment nobody can log in through.
+#[tokio::test]
+async fn an_undiscoverable_oidc_provider_refuses_the_build() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+
+    let (builder, _idp, _keys) = builder_over(&fixture, 1).await;
+    let builder = builder.oidc_providers(vec![OidcProvider::Generic(OidcProviderConfig::new(
+        "unreachable",
+        "client",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1/auth/callback",
+    ))]);
+    let err = refused(
+        builder.build().await,
+        "an undiscoverable provider is a refusal",
+    );
+    assert!(
+        matches!(&err, BuildError::Providers(_)),
+        "the refusal is the provider set's: {err}"
     );
 }
 
@@ -2041,7 +2136,12 @@ async fn a_zero_pool_or_an_overrun_reserve_refuses_before_anything_starts() {
                 "postgres://connetto:connetto@127.0.0.1:1/connetto",
                 "postgres://connetto:connetto@127.0.0.1:1/connetto",
             ),
-            ServerSchema::new(T_DDL, ""),
+            ServerSchema::new(
+                T_DDL,
+                "",
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
+            ),
             token,
             OpenFga::new("http://127.0.0.1:1", "store"),
         )
@@ -2226,12 +2326,14 @@ async fn a_missing_schema_table_refuses_naming_it() {
         "{bans}"
     );
     let (_, _, issuer) = super::enrolment::rooted_issuer();
+    // The publication setup creates the enrolment base table, so the first
+    // enrolment table the build names is the certificate one (R77 decision 11).
     let devices = Box::pin(missing(&fixture, move |builder| {
         builder.device_identity(Some(DeviceCertConfig::new(issuer)))
     }))
     .await;
     assert!(
-        devices.starts_with("table connetto_device_enrolments does not exist"),
+        devices.starts_with("table connetto_device_certificates does not exist"),
         "{devices}"
     );
 
@@ -2270,9 +2372,71 @@ async fn a_missing_schema_table_refuses_naming_it() {
     );
 }
 
-/// A build refusal that lands after the slot-lag watcher and the content
-/// sweep started stops both: the slot goes and the watcher never warns, and
-/// the chunk the sweep would have reclaimed stays in place.
+#[tokio::test]
+async fn an_audit_table_outside_the_publication_refuses_startup() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+    exec(
+        &pool,
+        &format!("ALTER PUBLICATION {PUBLICATION} DROP TABLE auth_events"),
+    )
+    .await;
+    let (builder, _idp, _keys) = builder_over(&fixture, 0).await;
+    match refused(builder.build().await, "audit changes must be published") {
+        BuildError::Preflight(PreflightError::Missing { noun, name }) => {
+            assert_eq!(noun, "replicated table");
+            assert_eq!(name, "auth_events");
+        }
+        other => panic!("unexpected startup result {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_audit_reader_without_select_refuses_startup() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+    exec(&pool, "REVOKE SELECT ON auth_events FROM app_reader").await;
+    let (builder, _idp, _keys) = builder_over(&fixture, 0).await;
+    match refused(builder.build().await, "the audit reader requires SELECT") {
+        BuildError::Preflight(PreflightError::ReadDenied { table, role }) => {
+            assert_eq!(table, "auth_events");
+            assert_eq!(role, "app_reader");
+        }
+        other => panic!("unexpected startup result {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_audit_reader_filtered_by_row_security_refuses_startup() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+    exec(&pool, "ALTER TABLE auth_events ENABLE ROW LEVEL SECURITY").await;
+    let (builder, _idp, _keys) = builder_over(&fixture, 0).await;
+    match refused(
+        builder.build().await,
+        "the audit reader must see every receipt",
+    ) {
+        BuildError::Preflight(PreflightError::ReadFiltered { table, role }) => {
+            assert_eq!(table, "auth_events");
+            assert_eq!(role, "app_reader");
+        }
+        other => panic!("unexpected startup result {other:?}"),
+    }
+}
+
+/// A refused build finishes its background loops before returning.
 #[tokio::test]
 async fn a_build_refusal_stops_the_background_loops_it_started() {
     let _keyring = isolated_session_keyring();
@@ -2283,24 +2447,7 @@ async fn a_build_refusal_stops_the_background_loops_it_started() {
     fixture.provision_auth_tables().await;
     apply_content_deployment(&pool).await;
 
-    // A chunk the sweep would reclaim on its next pass.
     let dir = TempDir::new().expect("a store directory");
-    let hash = "cd".repeat(32);
-    let planted = dir.path().join(&hash[..2]).join(&hash[2..4]).join(&hash);
-    tokio::fs::create_dir_all(planted.parent().expect("the chunk parents"))
-        .await
-        .expect("make the chunk parents");
-    tokio::fs::write(&planted, b"the reclaimable chunk")
-        .await
-        .expect("plant the chunk");
-    exec(
-        &pool,
-        &format!(
-            "INSERT INTO _cfs_chunk_registry (chunk_hash, state) \
-             VALUES (decode('{hash}', 'hex'), 'deleting')"
-        ),
-    )
-    .await;
 
     let idp = MockOauth::start().await;
     let (_channel, store) = fixture.fga_store().await;
@@ -2349,12 +2496,24 @@ async fn a_build_refusal_stops_the_background_loops_it_started() {
         }
         other => panic!("the build answered {other:?}"),
     }
+    let hash = "cd".repeat(32);
+    let planted = dir.path().join(&hash[..2]).join(&hash[2..4]).join(&hash);
+    tokio::fs::create_dir_all(planted.parent().expect("the chunk parents"))
+        .await
+        .expect("make the chunk parents");
+    tokio::fs::write(&planted, b"the reclaimable chunk")
+        .await
+        .expect("plant the chunk");
+    exec(
+        &pool,
+        &format!(
+            "INSERT INTO _cfs_chunk_registry (chunk_hash, state) \
+             VALUES (decode('{hash}', 'hex'), 'deleting')"
+        ),
+    )
+    .await;
 
-    // The loops the refusal outlived are stopped: the slot goes and the
-    // watcher never warns, and the chunk the sweep would have reclaimed
-    // stays in place.
     drop_slot(&pool).await;
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
     assert!(
         !record_logged("replication slot is gone", "slot", SLOT),
         "the slot-lag watcher kept running after the refusal"
@@ -2365,10 +2524,7 @@ async fn a_build_refusal_stops_the_background_loops_it_started() {
     );
 }
 
-/// The slot-lag watcher and the content sweep are owned by the handle's
-/// clones: dropping the last one stops both, so the slot goes and the
-/// watcher never warns, and the chunk the sweep would have reclaimed stays
-/// in place.
+/// The last handle's completion observer waits for its background loops.
 #[tokio::test]
 async fn dropping_the_last_handle_stops_the_background_loops() {
     let _keyring = isolated_session_keyring();
@@ -2416,8 +2572,12 @@ async fn dropping_the_last_handle_stops_the_background_loops() {
     .content(Some(settings));
     let parts = builder.build().await.expect("the deployment assembles");
 
-    // A chunk the sweep would reclaim on its next pass, planted while the
-    // loops run and just before the last handle goes.
+    let completion = parts.handle.background_completion();
+    drop(parts);
+    tokio::time::timeout(Duration::from_secs(10), completion.wait())
+        .await
+        .expect("the background loops finish");
+
     let hash = "cd".repeat(32);
     let planted = dir.path().join(&hash[..2]).join(&hash[2..4]).join(&hash);
     tokio::fs::create_dir_all(planted.parent().expect("the chunk parents"))
@@ -2434,9 +2594,7 @@ async fn dropping_the_last_handle_stops_the_background_loops() {
         ),
     )
     .await;
-    drop(parts);
     drop_slot(&pool).await;
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
     assert!(
         !record_logged("replication slot is gone", "slot", SLOT),
         "the slot-lag watcher outlived the last handle"
@@ -3025,7 +3183,7 @@ async fn a_sweep_tick_reclaims_a_chunk_marked_deleting() {
     parts.handle.shutdown().await;
 }
 
-/// The photo table and the two contract functions a configured deployment
+/// The photo table and the three contract functions a configured deployment
 /// applies, from a clean slate.
 pub(super) async fn apply_content_deployment(pool: &Pool<AsyncPgConnection>) {
     const DEPLOYMENT_SQL: &[&str] = &[
@@ -3040,6 +3198,8 @@ pub(super) async fn apply_content_deployment(pool: &Pool<AsyncPgConnection>) {
          LANGUAGE plpgsql SECURITY DEFINER SET search_path TO '' \
          AS $$ BEGIN UPDATE public.photos SET content_state = p_new_state \
          WHERE content_id = p_file_id; RETURN p_file_id; END; $$",
+        "CREATE OR REPLACE FUNCTION connetto_file_owner(p_file_id BYTEA) RETURNS TEXT \
+         LANGUAGE sql SECURITY INVOKER SET search_path TO '' AS $$ SELECT NULL::text $$",
     ];
     for stmt in [
         "DROP TABLE IF EXISTS photos CASCADE",
@@ -3049,6 +3209,7 @@ pub(super) async fn apply_content_deployment(pool: &Pool<AsyncPgConnection>) {
         "DROP TABLE IF EXISTS _cfs_traffic CASCADE",
         "DROP FUNCTION IF EXISTS connetto_visible_files(BYTEA[])",
         "DROP FUNCTION IF EXISTS connetto_set_content_state(BYTEA, TEXT, TEXT)",
+        "DROP FUNCTION IF EXISTS connetto_file_owner(BYTEA)",
     ] {
         exec(pool, stmt).await;
     }

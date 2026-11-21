@@ -9,7 +9,7 @@ A catalogue of every component the system has, by area, so nothing that must exi
 | `ControlMessage` and `BulkMessage` | The two wire enums, one per plane. Control carries the typed frames, bulk carries the Zstd-compressed payloads. [`connetto_core::messages::ControlMessage`] and [`connetto_core::messages::BulkMessage`], shared by both sides |
 | `MutationHeader` and `MutationPatch` | A client-originated write, split across the two planes. The control frame carries the writer, the sequence and the provenance, the bulk frame the compressed patchset |
 | `ChangeRecord` | The server-side record of one committed change. The table, the primary-key bytes, the row event, and the patch built once for the consumers, in [`connetto_server::oplog::ChangeRecord`] |
-| `SubscriptionSpec` | How a client declares what it wants. The predicate, its parameters, the subscription id, and a delivery priority |
+| `SubscriptionSpec` | How a client declares what it wants. The query and its bound parameters, sent under a client-chosen subscription id |
 | `SchemaVersion` | The hash of the translated schema bundle. The server advertises it in the handshake and the client compares it with the one its build baked |
 | Core traits | [`connetto_core::traits::Transport`] and [`connetto_core::traits::Store`] (the local SQLite), the seams the rest of the system plugs into, beside the credential and key storage traits in the same module. Authorization is not one of them. Visibility goes through `subql`'s seam |
 
@@ -122,7 +122,7 @@ Planned in [R99](../../plans/master-implementation-plan.md#r99-bot-login-and-lif
 | Piece | Description |
 |---|---|
 | Worker isolation | All sync logic runs in a dedicated `Worker` spawned by the Web Locks election winner, and the main thread is never blocked. OPFS sync access handles exist only inside a dedicated worker, so a `SharedWorker` was never an option |
-| Browser storage backend | Local SQLite runs in OPFS (Origin Private File System) or an IndexedDB fallback |
+| Browser storage backend | Local SQLite runs in OPFS (Origin Private File System), or in memory for the session where the browser refuses OPFS |
 | Transport adapter | WebSocket in the browser context, the same `Transport` trait as native |
 | File storage adapter | Content chunks stored in OPFS or the browser cache, with no direct filesystem access |
 | Common interface boundary | Native and WASM clients expose the same public API, so application code is portable. Android is supported both in the browser and as a native app, and the topology is in [09](09-wasm.md) |
@@ -135,10 +135,13 @@ One Cargo workspace holds the crates, and each publishes independently so a down
 |---|---|
 | `connetto-core` | The wire types, the framing and codec, and the traits every side agrees on. Both `connetto-server` and `connetto-client` depend on it, and neither depends on the other |
 | `connetto-schema` | The build step that translates a deployment's Postgres sources into the bundle the client and server share |
-| `connetto-server` | The server library and binary. Sessions, CDC ingest, the materializer, the auth stack, the mutation handler, and the server builder |
+| `connetto-server` | The server library. Sessions, CDC ingest, the materializer, the auth stack, the mutation handler, and the server builder |
 | `connetto-client` | The native client. The Diesel connection, its builder, the background sync, the live queries, and the archives |
 | `connetto-dioxus` | The Dioxus hooks that bind live queries to component scope |
 | `connetto-yew` | The same hooks for Yew, with the abort-on-unmount lifecycle suited to Yew's task model |
+| `connetto-leptos` | The same `use_live` hook for Leptos, ending with its reactive owner, and `keyed` rows that keep a row's DOM node across a change |
+| `connetto-tauri-page` | The live source a Tauri webview hands the hooks, reaching the client in the native core over Tauri's IPC |
+| `tauri-plugin-connetto` | The Tauri plugin that runs the live queries an application registers and streams their answers to the webview, one unacknowledged message per subscription |
 | `connetto-test-harness` | The in-process CDC-loop test harness over a real Postgres, and the browser stack runner. Test infrastructure, not a shipped component |
 | `connetto-file-core` | The chunking, the identity, the per-chunk encryption, and the `ChunkStore` and `ChunkInventory` seams. Builds for wasm |
 | `connetto-file-server` | The chunk storage on a filesystem or an object store, the two-phase upload, the ranged serving, the sweep, and the content-ticket minting |
@@ -153,6 +156,7 @@ One Cargo workspace holds the crates, and each publishes independently so a down
 | `connetto-architecture` | The architecture chapters as rustdoc, so the docs build checks every symbol a chapter cites |
 | `examples/deployment` | The deployment the browser demos share, and the build-time translation behind them |
 | `examples/demo-support` | The schema rows, wording and browser pieces the browser demos share |
+| `examples/demo-tools` | The demo's executables over the libraries, the sync server and client, the schema, certificate authority and identity provider tools, and the custody probe |
 
 Planned in [R103](../../plans/master-implementation-plan.md#r103-the-bot-runtime-and-template), the bot runtime and template, and in [R104](../../plans/master-implementation-plan.md#r104-the-demos-for-apps-and-bots) the two demo bots built from it.
 

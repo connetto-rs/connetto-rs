@@ -20,7 +20,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use super::{BluetoothError, CentralBackend, CentralEvent, HostId};
+use super::{BluetoothError, CentralBackend, CentralEvent, HostId, PowerReport};
 
 /// The bound btleplug's thread gets to prepare and find its adapter.
 const START_BOUND: Duration = Duration::from_secs(10);
@@ -38,6 +38,15 @@ enum Command {
 
 /// The events btleplug's thread reports, drained by the machine.
 type Queue = Arc<Mutex<Vec<CentralEvent>>>;
+
+/// btleplug's radio standing as power, `None` for its unknown standing.
+fn powered(state: &btleplug::api::CentralState) -> Option<bool> {
+    match state {
+        btleplug::api::CentralState::PoweredOn => Some(true),
+        btleplug::api::CentralState::PoweredOff => Some(false),
+        btleplug::api::CentralState::Unknown => None,
+    }
+}
 
 /// Why btleplug's central does not start.
 #[derive(Debug, thiserror::Error)]
@@ -71,13 +80,14 @@ pub(crate) struct BtleplugCentral {
 }
 
 impl BtleplugCentral {
-    /// Start btleplug's thread, answering once it found its adapter.
+    /// Start btleplug's thread, answering once it found its adapter, the
+    /// radio's power reported to `power` where it stands.
     ///
     /// # Errors
     ///
     /// [`CentralError`] when the thread cannot be prepared, btleplug finds no
     /// adapter, or the thread does not answer within its bound.
-    pub(crate) async fn start() -> Result<Self, CentralError> {
+    pub(crate) async fn start(power: Option<PowerReport>) -> Result<Self, CentralError> {
         let (commands, receiver) = mpsc::unbounded_channel();
         let events: Queue = Arc::new(Mutex::new(Vec::new()));
         let (started, answer) = tokio::sync::oneshot::channel();
@@ -106,7 +116,7 @@ impl BtleplugCentral {
                         }
                     };
                     let _ = started.send(Ok(()));
-                    drive(adapter, receiver, queue).await;
+                    drive(adapter, receiver, queue, power).await;
                 });
             })
             .map_err(|err| CentralError::Thread(err.to_string()))?;
@@ -194,7 +204,12 @@ fn prepare_thread() -> Result<(), CentralError> {
 
 /// The thread's loop: the machine's commands against btleplug, and
 /// btleplug's events back to the machine, until the client drops its end.
-async fn drive(adapter: Adapter, mut commands: mpsc::UnboundedReceiver<Command>, queue: Queue) {
+async fn drive(
+    adapter: Adapter,
+    mut commands: mpsc::UnboundedReceiver<Command>,
+    queue: Queue,
+    power: Option<PowerReport>,
+) {
     let mut bt_events = match adapter.events().await {
         Ok(events) => events,
         Err(err) => {
@@ -202,6 +217,12 @@ async fn drive(adapter: Adapter, mut commands: mpsc::UnboundedReceiver<Command>,
             return;
         }
     };
+    if let Some(power) = &power {
+        match adapter.adapter_state().await {
+            Ok(state) => power(powered(&state)),
+            Err(err) => tracing::warn!(%err, "btleplug's adapter state could not be read"),
+        }
+    }
     let mut hosts = Hosts::default();
     let mut links: HashMap<HostId, mpsc::UnboundedSender<Vec<u8>>> = HashMap::new();
     loop {
@@ -211,7 +232,7 @@ async fn drive(adapter: Adapter, mut commands: mpsc::UnboundedReceiver<Command>,
                 match command {
                     Command::StartScan => {
                         // The Apple side scans only connetto's service
-                        // (R76 decision 25), Android and Linux scan wide.
+                        // (R76 decision 18), Android and Linux scan wide.
                         #[cfg(any(target_os = "ios", target_os = "macos"))]
                         let filter = ScanFilter {
                             services: vec![Uuid::from_bytes(SERVICE_UUID)],
@@ -260,14 +281,12 @@ async fn drive(adapter: Adapter, mut commands: mpsc::UnboundedReceiver<Command>,
                 match event {
                     BtEvent::ServiceDataAdvertisement { id, service_data } => {
                         if let Some(data) = service_data.get(&Uuid::from_bytes(SERVICE_UUID)) {
-                            report_seen(&adapter, &mut hosts, &queue, id, Some(data.clone())).await;
+                            report_seen(&adapter, &mut hosts, &queue, id, data.clone()).await;
                         }
                     }
-                    // The advert carries connetto's UUID alone, the
-                    // iPhone's beacon (R76 decision 25).
-                    BtEvent::ServicesAdvertisement { id, services } => {
-                        if services.contains(&Uuid::from_bytes(SERVICE_UUID)) {
-                            report_seen(&adapter, &mut hosts, &queue, id, None).await;
+                    BtEvent::StateUpdate(state) => {
+                        if let Some(power) = &power {
+                            power(powered(&state));
                         }
                     }
                     BtEvent::DeviceDisconnected(id) => {
@@ -283,14 +302,14 @@ async fn drive(adapter: Adapter, mut commands: mpsc::UnboundedReceiver<Command>,
     let _ = adapter.stop_scan().await;
 }
 
-/// Report a peripheral advertising connetto's service as seen, with its
-/// signal where the platform reports one.
+/// Report a peripheral advertising connetto's service data as seen, with
+/// its signal where the platform reports one.
 async fn report_seen(
     adapter: &Adapter,
     hosts: &mut Hosts,
     queue: &Queue,
     id: PeripheralId,
-    service_data: Option<Vec<u8>>,
+    service_data: Vec<u8>,
 ) {
     let rssi = rssi_of(adapter, &id).await;
     let host = hosts.host(id);

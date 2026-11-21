@@ -18,7 +18,7 @@ use std::time::Duration;
 use connetto_core::messages::FullResyncReason;
 use connetto_server::{PgSnapshotSource, RlsAuth, RuntimeWritableCatalog};
 use connetto_test_harness::{
-    Fixture, HarnessAuth, ServerConfig, pool_for, spawn_server, with_user,
+    Fixture, HarnessAuth, ServerConfig, engine_ddl, pool_for, spawn_server, with_user,
 };
 
 const PG_DDL: &str = "CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT, body TEXT);";
@@ -58,9 +58,13 @@ async fn provision(fixture: &Fixture) {
 /// A server over that fixture, reading as the restricted role.
 async fn spawn(fixture: &Fixture) -> connetto_test_harness::Server {
     let writer_pool = pool_for(&with_user(fixture.admin_url(), "app_writer", "app_writer")).await;
-    let snapshot =
-        PgSnapshotSource::from_ddl(writer_pool.clone(), PG_DDL).expect("snapshot source");
-    let auth = HarnessAuth::rls(RlsAuth::from_ddl(writer_pool.clone(), PG_DDL).expect("rls auth"));
+    // The one catalog the server parts read, the way the harness appends it
+    // inside `spawn_server` (R77 decision 11).
+    let snapshot = PgSnapshotSource::from_ddl(writer_pool.clone(), &engine_ddl(PG_DDL))
+        .expect("snapshot source");
+    let auth = HarnessAuth::rls(
+        RlsAuth::from_ddl(writer_pool.clone(), &engine_ddl(PG_DDL)).expect("rls auth"),
+    );
     spawn_server(
         ServerConfig::new(PG_DDL, fixture.admin_url())
             .with_policies(POLICIES)

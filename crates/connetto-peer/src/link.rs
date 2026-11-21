@@ -222,6 +222,7 @@ async fn on_frame<S: AsyncRead + AsyncWrite + Unpin>(
         Ok(Some(PeerFrame::Media(message))) => {
             emit_from(state, key, seq, last_seen, |peer| PeerEvent::Media {
                 peer,
+                link: seq,
                 message,
             });
             None
@@ -363,6 +364,15 @@ fn renew(
             .peer_fingerprints
             .lock()
             .insert(key, crate::fingerprint::Fingerprint::of(leaf));
+        // The device keeps the peer's retained entries until the renewed
+        // certificate's end (R78 decision 17).
+        state
+            .events
+            .send(PeerEvent::Renewed {
+                peer: slot.peer.clone(),
+                expires_at: certificate.not_after(),
+            })
+            .ok();
     }
     Ok(())
 }

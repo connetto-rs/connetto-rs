@@ -3,7 +3,8 @@
 //! A replacement answer alone never publishes durable coverage, a known empty
 //! checkpoint stays distinct from unknown, a change back to the starting set
 //! still replaces, every open delivery keeps coverage unknown until it ends,
-//! a replay fence is what lets coverage publish after a declaration, and a
+//! the replica reading as synced only once coverage publishes, a replay
+//! fence is what lets coverage publish after a declaration, and a
 //! rate-limited replacement arms the server's delay without losing the
 //! accepted set.
 
@@ -16,9 +17,9 @@ use connetto_client::{ClientBuilder, ClientEvent, ConnettoClient, ConnettoConnec
 use connetto_core::Cursor;
 use connetto_core::auth::CapabilitySubject;
 use connetto_core::messages::{
-    AggregateUpdate, ControlMessage, FullResyncReason, FullResyncRequired, Handshake, HandshakeAck,
-    Pong, RateLimited, ReplaceShareKeys, ShareKeysReplaced, SnapshotBegin, SnapshotEnd,
-    WriterGrant,
+    AggregateChange, AggregateColumns, AggregateUpdate, ColumnType, ControlMessage,
+    FullResyncReason, FullResyncRequired, Handshake, HandshakeAck, Pong, RateLimited,
+    ReplaceShareKeys, ShareKeysReplaced, SnapshotBegin, SnapshotEnd, SqliteValue, WriterGrant,
 };
 use connetto_core::traits::{IncomingFrame, Transport as _};
 use diesel::prelude::*;
@@ -66,7 +67,6 @@ fn resnapshot(sub_id: &str) -> IncomingFrame {
 fn snapshot_begin(sub_id: &str) -> IncomingFrame {
     IncomingFrame::Control(ControlMessage::SnapshotBegin(SnapshotBegin {
         sub_id: sub_id.to_owned(),
-        priority: connetto_core::messages::SubscriptionPriority::default(),
     }))
 }
 
@@ -446,6 +446,20 @@ async fn coverage_waits_for_every_owed_resend() {
     assert_eq!(coverage(&mut conn), Some(known(&["a"])));
 }
 
+#[tokio::test]
+async fn an_application_ping_reports_a_failed_send() {
+    let (mut conn, script) = client(Vec::new()).await;
+    script.hang_up();
+
+    let error = conn.ping(42).await.expect_err("the socket is gone");
+    assert!(
+        matches!(&error, connetto_client::ClientError::Transport(detail)
+            if detail == "the scripted socket is gone"),
+        "{error}"
+    );
+    assert_eq!(script.pings(), vec![42]);
+}
+
 /// A computed declaration rests its bootstrap behind an ordered fence, and
 /// the matching Pong is what lets coverage publish.
 #[tokio::test]
@@ -460,16 +474,7 @@ async fn a_computed_declaration_is_fenced_before_publication() {
         .expect("declare the computed subscription");
 
     // The synchronous bootstrap arrives, and the fence goes with it.
-    script.say(IncomingFrame::Control(ControlMessage::AggregateUpdate(
-        AggregateUpdate {
-            sub_id: "agg".to_owned(),
-            group_key: None,
-            group_values_json: None,
-            result_json: Some("3".to_owned()),
-            is_full_result: true,
-        },
-    )));
-    pump(&mut conn, Duration::from_secs(5)).await;
+    bootstrap_aggregate(&mut conn, &script).await;
     let nonce = script.pings().first().copied().expect("the fence is sent");
     assert!(matches!(
         conn.ping(nonce).await,
@@ -768,14 +773,31 @@ async fn offline_changes_present_only_the_accepted_set_on_the_next_handshake() {
     assert_eq!(coverage(&mut conn), Some(known(&["b"])));
 }
 
+/// The declared columns of the `agg` count, sent at its registration.
+fn aggregate_columns() -> IncomingFrame {
+    IncomingFrame::Control(ControlMessage::AggregateColumns(AggregateColumns {
+        sub_id: "agg".to_owned(),
+        columns: vec![ColumnType::Integer],
+    }))
+}
+
+/// The `agg` count's first answer.
 fn aggregate_bootstrap() -> IncomingFrame {
     IncomingFrame::Control(ControlMessage::AggregateUpdate(AggregateUpdate {
         sub_id: "agg".to_owned(),
-        group_key: None,
-        group_values_json: None,
-        result_json: Some("3".to_owned()),
-        is_full_result: true,
+        change: AggregateChange::Replace {
+            rows: vec![vec![SqliteValue::Integer(3)]],
+        },
     }))
+}
+
+/// Deliver the `agg` count's registration, its columns then its first
+/// answer, one pump step each.
+async fn bootstrap_aggregate(conn: &mut ConnettoConnection<Script>, script: &Script) {
+    script.say(aggregate_columns());
+    script.say(aggregate_bootstrap());
+    pump(conn, Duration::from_secs(5)).await;
+    pump(conn, Duration::from_secs(5)).await;
 }
 
 #[tokio::test]
@@ -800,8 +822,7 @@ async fn a_replacement_answer_does_not_settle_a_later_computed_declaration() {
     )));
     pump(&mut conn, Duration::from_secs(5)).await;
     assert_eq!(coverage(&mut conn), None);
-    script.say(aggregate_bootstrap());
-    pump(&mut conn, Duration::from_secs(5)).await;
+    bootstrap_aggregate(&mut conn, &script).await;
     assert_eq!(coverage(&mut conn), None);
     script.say(pong(nonce));
     pump(&mut conn, Duration::from_secs(5)).await;
@@ -864,8 +885,7 @@ async fn an_elapsed_retry_waits_for_the_declaration_fence_without_spinning() {
     conn.subscribe("agg", "SELECT COUNT(*) FROM notes")
         .await
         .expect("subscribe computed");
-    script.say(aggregate_bootstrap());
-    pump(&mut conn, Duration::from_secs(5)).await;
+    bootstrap_aggregate(&mut conn, &script).await;
     let nonce = *script.pings().last().expect("declaration fence");
     tokio::time::sleep(
         conn.share_key_timer().expect("retry timer").wait() + Duration::from_millis(20),
@@ -1113,6 +1133,7 @@ async fn the_pump_closes_the_wire_on_an_unanswered_expiry_deadline() {
                 current_cursor: Cursor::new(Vec::new()),
                 schema_version: Some(schema().version()),
                 sunset_at_secs: None,
+                courier: false,
                 initial_credits: 64,
                 writer: Some(WriterGrant {
                     number: 7,
@@ -1161,4 +1182,32 @@ async fn the_pump_closes_the_wire_on_an_unanswered_expiry_deadline() {
         .await
         .expect("the pump terminates")
         .expect("the pump does not panic");
+}
+
+/// A sibling's snapshot ending first stamps a resume cursor, and the replica
+/// still reads as not synced while another initial snapshot owes its rows, so
+/// a row missing from it is undelivered rather than gone (R79 decision 18).
+#[tokio::test]
+async fn a_replica_reads_as_synced_only_once_every_initial_snapshot_ends() {
+    let (mut conn, script) = client(vec![(mint(None), "a".to_owned())]).await;
+    for sub_id in ["s1", "s2"] {
+        conn.subscribe(sub_id, "SELECT * FROM notes")
+            .await
+            .expect("declare the row subscription");
+    }
+    for frame in [
+        snapshot_begin("s1"),
+        snapshot_begin("s2"),
+        snapshot_end("s2"),
+    ] {
+        script.say(frame);
+        pump(&mut conn, Duration::from_secs(5)).await;
+    }
+    assert!(
+        !conn.has_synced(),
+        "s1's snapshot is still open, so its rows are not yet delivered"
+    );
+    script.say(snapshot_end("s1"));
+    pump(&mut conn, Duration::from_secs(5)).await;
+    assert!(conn.has_synced(), "every initial snapshot ended");
 }

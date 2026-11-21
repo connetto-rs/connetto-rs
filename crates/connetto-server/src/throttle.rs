@@ -216,6 +216,8 @@ pub struct ThrottleConfig {
     content_bytes_window: Duration,
     mutation_bytes_per_identity: u64,
     mutation_bytes_window: Duration,
+    courier_bytes_per_identity: u64,
+    courier_bytes_window: Duration,
 }
 
 /// How many distinct keys one signal tracks before it starts evicting.
@@ -256,6 +258,11 @@ impl Default for ThrottleConfig {
             content_bytes_window: MINUTE,
             mutation_bytes_per_identity: DEFAULT_MUTATION_BYTES,
             mutation_bytes_window: MINUTE,
+            // The courier bucket takes the mutation default, so an operator who
+            // sizes one sizes both, and a fresh deployment meters a relay like an
+            // upload.
+            courier_bytes_per_identity: DEFAULT_MUTATION_BYTES,
+            courier_bytes_window: MINUTE,
         }
     }
 }
@@ -356,6 +363,20 @@ impl ThrottleConfig {
     ) -> Self {
         self.mutation_bytes_per_identity = max_bytes;
         self.mutation_bytes_window = window;
+        self
+    }
+
+    /// How many bytes of couriered body one courier may relay per window, a
+    /// bucket of its own so a teammate's backlog never starves the courier's
+    /// own writes (R78 decision 11).
+    ///
+    /// Zero means unlimited. A body past the budget stops the range with a
+    /// wait, and one larger than the whole bucket is answered
+    /// `NotCouriered`, since it can never fit.
+    #[must_use]
+    pub const fn with_courier_bytes(mut self, max_bytes: u64, window: Duration) -> Self {
+        self.courier_bytes_per_identity = max_bytes;
+        self.courier_bytes_window = window;
         self
     }
 
@@ -964,17 +985,22 @@ impl AuthThrottle {
     }
 }
 
-/// The per-identity byte meters: upload bandwidth and mutation patch bytes.
+/// The per-identity byte meters: upload bandwidth, mutation patch bytes and
+/// couriered body bytes.
 ///
 /// Charges each ticket request its declared size, so minting many tickets
-/// cannot authorize unlimited upload, and each mutation its compressed patch,
-/// so a write flood is counted rather than only absorbed by the reader share.
-/// In memory only, because this bounds abuse rather than accounting for usage.
+/// cannot authorize unlimited upload, each mutation its compressed patch, so
+/// a write flood is counted rather than only absorbed by the reader share,
+/// and each courier body its compressed bytes, so a relay flood draws on the
+/// courier's own bucket rather than the courier's writes (R78 decision 11).
+/// In memory only, because this bounds abuse rather than accounting for
+/// usage.
 #[derive(Debug)]
 pub(crate) struct ByteThrottle {
     config: ThrottleConfig,
     per_identity: ByteCounters<String>,
     mutations: ByteCounters<String>,
+    couriers: ByteCounters<String>,
 }
 
 impl ByteThrottle {
@@ -984,6 +1010,7 @@ impl ByteThrottle {
             config: *config,
             per_identity: ByteCounters::new(),
             mutations: ByteCounters::new(),
+            couriers: ByteCounters::new(),
         }
     }
 
@@ -1029,6 +1056,33 @@ impl ByteThrottle {
         };
         self.mutations
             .allow(&identity.to_owned(), policy, patch_len, Instant::now())
+    }
+
+    /// The courier byte limit, or `None` when unlimited. A body larger than
+    /// this can never fit the bucket, so it is answered `NotCouriered`
+    /// rather than deferred (R78 decision 36).
+    #[must_use]
+    pub fn courier_limit(&self) -> Option<u64> {
+        (self.config.courier_bytes_per_identity != 0)
+            .then_some(self.config.courier_bytes_per_identity)
+    }
+
+    /// Whether `identity` may relay `len` more bytes of couriered body now,
+    /// or how long until it may.
+    ///
+    /// Zero configured means unlimited.
+    pub fn allow_courier_bytes(&self, identity: &str, len: u64) -> Result<(), Duration> {
+        if self.config.courier_bytes_per_identity == 0 {
+            return Ok(());
+        }
+        let policy = BytePolicy {
+            limit_bytes: self.config.courier_bytes_per_identity,
+            window: self.config.courier_bytes_window,
+            retain: self.config.courier_bytes_window,
+            cap: self.config.max_tracked,
+        };
+        self.couriers
+            .allow(&identity.to_owned(), policy, len, Instant::now())
     }
 }
 

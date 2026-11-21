@@ -3,6 +3,33 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- The Keystore unlock prompt (R52), as Dioxus.toml's biometrics permission writes it. -->
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+    <!-- The peer link's hotspot hosting and joining, behind the
+         `NEARBY_WIFI_DEVICES` flag that keeps the hotspot from being a
+         location source. -->
+    <uses-permission
+        android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:usesPermissionFlags="neverForLocation" />
+    <!-- The peer link's mDNS discovery. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- The hotspot's standing and the joined network's. -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <!-- The peer link's Bluetooth beacon and exchange, the scan kept from
+         being a location source. The legacy permissions stand on the
+         platforms that still grant them at install. -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH"
+        android:maxSdkVersion="30" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_ADMIN"
+        android:maxSdkVersion="30" />
 
     <!-- AndroidTV support -->
     <uses-feature android:name="android.software.leanback" android:required="false" />

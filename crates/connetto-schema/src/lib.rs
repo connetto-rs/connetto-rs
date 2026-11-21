@@ -27,11 +27,10 @@
 //! current major holds no export, when that export is stale, or when its
 //! majors hold a gap.
 //!
-//! The `connetto-schema export-tier` command, the crate's binary
-//! `connetto-schema`, writes that current export instead. It translates the
+//! [`export_tier`] writes that current export instead. It translates the
 //! tier over the major the schema source declares and writes that major's
 //! `<N>.sql` alone, so it never rewrites the exports of the majors below
-//! the current one. With `--check` it writes nothing and fails instead when
+//! the current one. In `check` mode it writes nothing and fails instead when
 //! the current export is missing or stale, the gate a CI run adds to keep a
 //! history fresh.
 
@@ -55,8 +54,10 @@ use diesel::{Connection, SqliteConnection};
 use pg2sqlite::manifest::WrapperKind;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
 use pg2sqlite::script::{FreshFiles, Script};
+use sql_traits::errors::DeploymentError;
+use sql_traits::prelude::{Deployment, SessionSetting, SetPacking, SettingValue};
 use sqlparser::ast::{
-    AlterTable, AlterTableOperation, ColumnDef, ColumnOption, CreateTable, CreateView,
+    AlterTable, AlterTableOperation, ColumnDef, ColumnOption, CreateTable, CreateView, DataType,
     ObjectNamePart, Statement, TableConstraint,
 };
 use sqlparser::dialect::PostgreSqlDialect;
@@ -86,6 +87,9 @@ pub enum SchemaError {
     /// A source document does not parse, or the translation fails.
     #[error("the Postgres sources do not translate: {0}")]
     Translate(String),
+    /// The deployment description the translators read cannot be built.
+    #[error("the deployment description does not hold: {0}")]
+    Deployment(#[from] DeploymentError),
     /// SQLite refuses the translated DDL of the named tier.
     #[error("SQLite refuses the translated {tier} DDL: {detail}")]
     Sqlite {
@@ -104,7 +108,7 @@ pub enum SchemaError {
         dir: std::path::PathBuf,
     },
     /// The tier history holds no export for the build's own major.
-    #[error("the tier history holds no export for major {major}, run `connetto-schema export-tier --schema <schema> --tier <tier> --dir {dir}`", dir = .dir.display())]
+    #[error("the tier history holds no export for major {major}, write it with `connetto_schema::export_tier` into {dir}", dir = .dir.display())]
     MissingExport {
         /// The major the export is missing for.
         major: u32,
@@ -115,7 +119,7 @@ pub enum SchemaError {
     },
     /// The tier history's export for the build's major differs from the
     /// translation the build just computed.
-    #[error("the export {path} for major {major} is stale against the current sources, run `connetto-schema export-tier` over them", path = .path.display())]
+    #[error("the export {path} for major {major} is stale against the current sources, rewrite it with `connetto_schema::export_tier`", path = .path.display())]
     StaleExport {
         /// The major the export is stale for.
         major: u32,
@@ -314,6 +318,101 @@ pub fn with_registry<Id: BotRegistryIdSql>(schema_sql: &str) -> String {
     out
 }
 
+/// Append the bookkeeping tables to a schema document the way [`with_registry`]
+/// appends the bot registry, the writer and settled records always and the
+/// device enrolment only with device identity (R77 decision 11).
+///
+/// A publication row for a table outside the catalog wedges the change stream,
+/// so the server's catalog carries them, and the deployment adds them to its
+/// publication with `REPLICA IDENTITY FULL`, which preflight already requires
+/// of every published table. The enrolment table stands only with device
+/// identity, so a deployment without it would otherwise carry the table in the
+/// catalog and be refused at preflight, where the read-in-full probe finds it
+/// absent.
+///
+/// The shapes match the reference DDL the test harness provisions, the writer
+/// tables' and the enrolment base table's. The `user_id` column follows the
+/// deployment's id type `Id` the way the registry's id columns do, so the
+/// catalog decodes a non-text deployment's writer and enrolment rows as the
+/// deployment stores them. The settle-path enum is declared with the labels
+/// the server decodes, so the drift guard compares the live enum against them.
+#[must_use]
+pub fn with_bookkeeping<Id: BotRegistryIdSql>(schema_sql: &str, devices: bool) -> String {
+    let mut out = schema_sql.trim_end().to_owned();
+    if !out.ends_with(';') {
+        out.push(';');
+    }
+    out.push('\n');
+    out.push_str(&bookkeeping_ddl::<Id>());
+    if devices {
+        out.push_str(";\n");
+        out.push_str(&enrolment_ddl::<Id>());
+    }
+    // The enrolment and settled statements carry no terminator of their own,
+    // so end the document with one; a caller that appends a policy document
+    // after this needs the boundary.
+    if !out.ends_with(';') {
+        out.push(';');
+    }
+    out
+}
+
+/// The settle-path enum, then the writer and settled tables' DDL over the
+/// deployment's id type `Id`, `;`-terminated, the tables that stand with or
+/// without device identity.
+#[must_use]
+pub fn bookkeeping_ddl<Id: BotRegistryIdSql>() -> String {
+    format!(
+        "CREATE TYPE connetto_settle_path AS ENUM ('direct', 'restore', 'courier'); \
+         CREATE TABLE _connetto_writers \
+         (writer BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY, \
+          user_id {}, \
+          session_id UUID, \
+          device_key BYTEA UNIQUE, \
+          frontier BIGINT NOT NULL DEFAULT 0, \
+          head BYTEA, \
+          retired_at TIMESTAMPTZ, \
+          secret_hash BYTEA); \
+         CREATE TABLE _connetto_settled \
+         (writer BIGINT NOT NULL, \
+          seq BIGINT NOT NULL, \
+          entry_hash BYTEA NOT NULL, \
+          previous_hash BYTEA NOT NULL, \
+          outcome TEXT NOT NULL, \
+          path connetto_settle_path NOT NULL, \
+          settled_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
+          PRIMARY KEY (writer, seq))",
+        Id::ID_SQL_TYPE
+    )
+}
+
+/// The device enrolment table's DDL over the deployment's id type `Id`,
+/// present only with device identity.
+#[must_use]
+pub fn enrolment_ddl<Id: BotRegistryIdSql>() -> String {
+    format!(
+        "CREATE TABLE connetto_device_enrolments \
+         (key_id BYTEA PRIMARY KEY, \
+          user_id {} NOT NULL, \
+          session_id UUID NOT NULL, \
+          enrolled_at TIMESTAMPTZ NOT NULL, \
+          last_seen TIMESTAMPTZ NOT NULL, \
+          revoked_at TIMESTAMPTZ, \
+          public_key BYTEA NOT NULL, \
+          attestation TEXT NOT NULL, \
+          bot_list TEXT)",
+        Id::ID_SQL_TYPE
+    )
+}
+
+/// The bookkeeping tables' names, in the order [`bookkeeping_ddl`] creates
+/// them.
+pub const BOOKKEEPING_TABLES: &[&str] = &[
+    "_connetto_writers",
+    "_connetto_settled",
+    "connetto_device_enrolments",
+];
+
 /// The listed tables, as the schema declares them, that a device may store
 /// once for every account.
 ///
@@ -348,34 +447,128 @@ pub fn shared_tables<Id: BotRegistryIdSql>(
     Ok(shared)
 }
 
-/// Translate the two Postgres source documents with connetto's fixed options
+/// The deployment description both translators read, built once here: the
+/// reader role the server logs in as and acts as, and the three session
+/// settings connetto binds on every request.
+///
+/// The server binds every setting on every request, a half the caller does
+/// not hold taking [`connetto_core::auth::absent_marker`], so each is declared
+/// always set. The caller's identity is declared text, since an anonymous
+/// caller binds the marker, which no other type would read.
+///
+/// # Errors
+///
+/// [`SchemaError::Deployment`] when the description cannot hold, which only a
+/// capability key whose setting name collides with another setting reaches.
+pub fn deployment<K: CapabilityKey>(reader_role: &str) -> Result<Deployment, SchemaError> {
+    let set = |separator: char| SettingValue::Set {
+        element: DataType::Text,
+        packing: SetPacking::Delimited(separator.to_string()),
+    };
+    Ok(Deployment::new(
+        reader_role,
+        [reader_role],
+        [
+            SessionSetting::value(
+                connetto_core::auth::DEFAULT_USER_SETTING,
+                SettingValue::Caller(DataType::Text),
+            )?,
+            SessionSetting::value(K::SETTING, set(K::SEPARATOR))?,
+            SessionSetting::value(BOT_LIST_SETTING, set(BOT_LIST_SEPARATOR))?,
+        ],
+    )?)
+}
+
+/// A deployment's three Postgres source documents and the role connetto
+/// reads and writes as, which the roles document creates.
+///
+/// The roles document holds the deployment's `CREATE ROLE` statements and
+/// its grants on the tables the schema declares, and both translators read
+/// it beside the other two. connetto's own bookkeeping tables are granted to
+/// the reader role in a document of their own, which no translator reads.
+#[derive(Debug, Clone, Copy)]
+pub struct Documents<'a> {
+    schema: &'a str,
+    policies: &'a str,
+    roles: &'a str,
+    reader_role: &'a str,
+}
+
+impl<'a> Documents<'a> {
+    /// The schema, the policies and the roles documents, and the reader role
+    /// the roles document creates.
+    #[must_use]
+    pub const fn new(
+        schema: &'a str,
+        policies: &'a str,
+        roles: &'a str,
+        reader_role: &'a str,
+    ) -> Self {
+        Self {
+            schema,
+            policies,
+            roles,
+            reader_role,
+        }
+    }
+
+    /// The schema document.
+    #[must_use]
+    pub const fn schema(&self) -> &'a str {
+        self.schema
+    }
+
+    /// The policies document.
+    #[must_use]
+    pub const fn policies(&self) -> &'a str {
+        self.policies
+    }
+
+    /// The roles document.
+    #[must_use]
+    pub const fn roles(&self) -> &'a str {
+        self.roles
+    }
+
+    /// The role connetto logs in and acts as.
+    #[must_use]
+    pub const fn reader_role(&self) -> &'a str {
+        self.reader_role
+    }
+}
+
+/// Translate a deployment's source documents with connetto's fixed options
 /// and return the bundle they produce.
 ///
 /// The options are connetto's, not the caller's. They fix the `uuidv4` representation
 /// and function, the `rls_audit` table, the `connetto_write_exempt` function,
-/// and the caller, subjects and bot-list mappings built from the core
-/// constants. `K` names the capability key type, which fixes the subjects
-/// setting and separator the mapping holds. The documents are translated in
-/// the order schema, policies and the [`cap_policies`] the pair generates, so
-/// the replica holds the cap its Postgres source holds. The schema reaches the
-/// replica translation without its references, which the server alone
-/// enforces, while the bundle keeps the source as written. The replica DDL is
-/// applied to a throwaway in-memory database first, so a translation SQLite
-/// refuses is an error here rather than a boot-time failure on the client.
+/// the caller, subjects and bot-list mappings built from the core constants,
+/// and the [`deployment`] description. `K` names the capability key type,
+/// which fixes the subjects setting and separator the deployment declares.
+/// The documents are translated in the order a migration applies them,
+/// schema, roles, policies, then the [`cap_policies`] the schema and policies
+/// generate, so the replica holds the cap its Postgres source holds. The
+/// replica is translated as the reader
+/// role, so its policies and grants are the ones PostgreSQL applies to the
+/// reader. The schema reaches the replica translation without its
+/// references, which the server alone enforces, while the bundle keeps the
+/// source as written. The replica DDL is applied to a throwaway in-memory
+/// database first, so a translation SQLite refuses is an error here rather
+/// than a boot-time failure on the client.
 ///
 /// # Errors
 ///
 /// [`SchemaError::Translate`] when a source does not parse or the translation
-/// fails, [`SchemaError::Major`] when the schema source does not declare its
+/// fails, a roles document that never creates the reader role among them,
+/// [`SchemaError::Major`] when the schema source does not declare its
 /// major, and [`SchemaError::Sqlite`] when the replica DDL is not accepted.
 pub fn translate<K: CapabilityKey, Id: BotRegistryIdSql>(
-    schema_sql: &str,
-    policies_sql: &str,
+    documents: Documents<'_>,
 ) -> Result<SchemaBundle, SchemaError> {
-    translated::<K, Id>(schema_sql, policies_sql, &[])
+    translated::<K, Id>(documents, &[])
 }
 
-/// Translate the two Postgres source documents with connetto's fixed options,
+/// Translate a deployment's source documents with connetto's fixed options,
 /// placing the validated `shared` tables in a separate `connetto_shared` store.
 ///
 /// As [`translate`], but first checks `shared` under [`shared_tables`] and
@@ -390,29 +583,32 @@ pub fn translate<K: CapabilityKey, Id: BotRegistryIdSql>(
 /// As [`translate`], plus [`SchemaError::SharedTableUndeclared`] when the
 /// list names a table the schema does not declare.
 pub fn translate_shared<K: CapabilityKey, Id: BotRegistryIdSql>(
-    schema_sql: &str,
-    policies_sql: &str,
+    documents: Documents<'_>,
     shared: &[&str],
 ) -> Result<SchemaBundle, SchemaError> {
-    let shared = shared_tables::<Id>(schema_sql, shared)?;
-    translated::<K, Id>(schema_sql, policies_sql, &shared)
+    let shared = shared_tables::<Id>(documents.schema, shared)?;
+    translated::<K, Id>(documents, &shared)
 }
 
 /// The shared step behind [`translate`] and [`translate_shared`]: translate
 /// the synced tier, and when `shared` is non-empty compile its layout.
 fn translated<K: CapabilityKey, Id: BotRegistryIdSql>(
-    schema_sql: &str,
-    policies_sql: &str,
+    documents: Documents<'_>,
     shared: &[String],
 ) -> Result<SchemaBundle, SchemaError> {
-    let schema_sql = with_registry::<Id>(schema_sql);
-    let options = options::<K>();
-    let mut translator = parsed_documents(&without_references(&schema_sql)?, policies_sql)?;
+    let schema_sql = with_registry::<Id>(documents.schema);
+    let policies_sql = documents.policies;
+    let options = replica_options::<K>(documents.reader_role)?;
+    let mut translator = parsed_documents(&without_references(&schema_sql)?, "")?;
     let cap = cap_policies_inner(&schema_sql, policies_sql)?;
-    if !cap.is_empty() {
-        translator = translator
-            .sql(&cap)
-            .map_err(|err| SchemaError::Translate(err.to_string()))?;
+    // In the order a migration applies them: a role exists before a policy
+    // names it, and a grant follows the tables it names.
+    for document in [documents.roles, policies_sql, cap.as_str()] {
+        if !document.trim().is_empty() {
+            translator = translator
+                .sql(document)
+                .map_err(|err| SchemaError::Translate(err.to_string()))?;
+        }
     }
     let report = translator
         .translate_with_report(&options)
@@ -629,7 +825,7 @@ pub struct ExportOutcome {
 ///
 /// As [`translate`], plus [`SchemaError::MissingExport`] and
 /// [`SchemaError::StaleExport`] in `check` mode for the current export.
-pub fn export_tier<K: CapabilityKey, Id: BotRegistryIdSql>(
+pub fn export_tier(
     schema: &Path,
     tier: &Path,
     dir: &Path,
@@ -638,7 +834,7 @@ pub fn export_tier<K: CapabilityKey, Id: BotRegistryIdSql>(
     let schema_sql = std::fs::read_to_string(schema)?;
     let tier_sql = std::fs::read_to_string(tier)?;
     let major = connetto_core::Major::declared_in(&schema_sql)?;
-    let tier_ddl = translate_tier::<K>(&tier_sql)?;
+    let tier_ddl = translate_tier(&tier_sql)?;
     let path = dir.join(format!("{major}.sql"));
     let existing = match std::fs::read_to_string(&path) {
         Ok(existing) => Some(existing),
@@ -673,8 +869,8 @@ pub fn export_tier<K: CapabilityKey, Id: BotRegistryIdSql>(
 /// # Errors
 ///
 /// As [`translate`], with [`SchemaError::Sqlite`] for the local tier.
-fn translate_tier<K: CapabilityKey>(tier_sql: &str) -> Result<String, SchemaError> {
-    let options = options::<K>();
+fn translate_tier(tier_sql: &str) -> Result<String, SchemaError> {
+    let options = options();
     let tier = parsed_documents(tier_sql, "")?;
     let report = tier
         .translate_with_report(&options)
@@ -711,7 +907,8 @@ fn rerun_history(dir: &Path) -> Result<(), SchemaError> {
 
 /// The build-script entry point.
 ///
-/// Reads the two Postgres source documents, translates the synced tier and,
+/// Reads the three Postgres source documents, translates the synced tier as
+/// `reader_role` and,
 /// when a [`TierSource`] is given, the deployment's own local tier as a
 /// separate reference universe and the tier history its exports hold,
 /// validates both DDLs against a throwaway SQLite database, checks `shared`
@@ -745,39 +942,55 @@ fn rerun_history(dir: &Path) -> Result<(), SchemaError> {
 pub fn emit<K: CapabilityKey, Id: BotRegistryIdSql>(
     schema: &Path,
     policies: &Path,
+    roles: &Path,
+    reader_role: &str,
     tier: Option<&TierSource>,
     shared: &[&str],
 ) -> Result<(), SchemaError> {
     let out_dir = std::env::var("OUT_DIR").map_err(|_| SchemaError::MissingOutDir)?;
-    emit_to::<K, Id>(schema, policies, tier, shared, Path::new(&out_dir))
+    emit_to::<K, Id>(
+        [schema, policies, roles],
+        reader_role,
+        tier,
+        shared,
+        Path::new(&out_dir),
+    )
 }
 
 /// The body of [`emit`], its output directory supplied, so a test can run
-/// the step without a build script.
+/// the step without a build script. `sources` are the schema, policies and
+/// roles documents, in that order.
 ///
 /// # Errors
 ///
 /// As [`emit`], minus [`SchemaError::MissingOutDir`].
 pub(crate) fn emit_to<K: CapabilityKey, Id: BotRegistryIdSql>(
-    schema: &Path,
-    policies: &Path,
+    sources: [&Path; 3],
+    reader_role: &str,
     tier: Option<&TierSource>,
     shared: &[&str],
     out_dir: &Path,
 ) -> Result<(), SchemaError> {
-    println!("cargo::rerun-if-changed={}", schema.display());
-    println!("cargo::rerun-if-changed={}", policies.display());
+    for source in sources {
+        println!("cargo::rerun-if-changed={}", source.display());
+    }
     if let Some(tier) = tier {
         println!("cargo::rerun-if-changed={}", tier.source().display());
         rerun_history(tier.history())?;
     }
-    let schema_sql = std::fs::read_to_string(schema)?;
-    let policies_sql = std::fs::read_to_string(policies)?;
+    let [schema_sql, policies_sql, roles_sql] = [
+        std::fs::read_to_string(sources[0])?,
+        std::fs::read_to_string(sources[1])?,
+        std::fs::read_to_string(sources[2])?,
+    ];
     let cap = cap_policies::<Id>(&schema_sql, &policies_sql)?;
-    let mut bundle = translate_shared::<K, Id>(&schema_sql, &policies_sql, shared)?;
+    let mut bundle = translate_shared::<K, Id>(
+        Documents::new(&schema_sql, &policies_sql, &roles_sql, reader_role),
+        shared,
+    )?;
     if let Some(tier) = tier {
         let tier_sql = std::fs::read_to_string(tier.source())?;
-        let tier_ddl = translate_tier::<K>(&tier_sql)?;
+        let tier_ddl = translate_tier(&tier_sql)?;
         let history = boundary::tier_history(tier.history(), bundle.major(), &tier_ddl)?;
         bundle = bundle
             .with_local_tier(tier_ddl)
@@ -788,25 +1001,57 @@ pub(crate) fn emit_to<K: CapabilityKey, Id: BotRegistryIdSql>(
     Ok(())
 }
 
-/// The one fixed option set the deployment's documents translate under.
-fn options<K: CapabilityKey>() -> Pg2SqliteOptions {
+/// The fixed option set every document translates under: the `uuidv4`
+/// representation and function, the `rls_audit` table and the
+/// `connetto_write_exempt` function.
+fn options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_function_name(UUID_FUNCTION)
-        .with_session_variable(SessionVariableMapping::current_setting(
+        .with_rls_audit_table_name(AUDIT_TABLE.to_string())
+        .with_write_exemption_function(WRITE_EXEMPTION_FUNCTION)
+}
+
+/// The pg2sqlite options the synced tier translates under: the
+/// [`query_options`], and the reader role as the role the replica acts as.
+///
+/// Acting as the reader settles every policy's `TO` clause the way PostgreSQL
+/// settles it for connetto's callers, and holds each table to the reader's
+/// grants: a table the reader cannot read stays out of the replica, and one it
+/// can only read is read-only there.
+///
+/// # Errors
+///
+/// As [`deployment`].
+pub fn replica_options<K: CapabilityKey>(
+    reader_role: &str,
+) -> Result<Pg2SqliteOptions, SchemaError> {
+    Ok(query_options::<K>(reader_role)?.with_acting_role(reader_role))
+}
+
+/// The pg2sqlite options a client's query reverse translates under on the
+/// server: the fixed set, the [`deployment`] declaring what each session
+/// setting holds, and the replica function answering each setting, so a
+/// replica function reads back as the setting the build translated it from.
+///
+/// They name no acting role. The server runs the translated query as the
+/// reader role, so PostgreSQL holds it to that role's grants and policies.
+///
+/// # Errors
+///
+/// As [`deployment`].
+pub fn query_options<K: CapabilityKey>(reader_role: &str) -> Result<Pg2SqliteOptions, SchemaError> {
+    Ok(options()
+        .with_deployment(deployment::<K>(reader_role)?)
+        .with_session_variable(SessionVariableMapping::new(
             connetto_core::auth::DEFAULT_USER_SETTING,
             CALLER_FUNCTION,
         ))
-        .with_session_variable(
-            SessionVariableMapping::current_setting(K::SETTING, SUBJECTS_FUNCTION)
-                .holding_set(K::SEPARATOR),
-        )
-        .with_session_variable(
-            SessionVariableMapping::current_setting(BOT_LIST_SETTING, BOT_LIST_FUNCTION)
-                .holding_set(BOT_LIST_SEPARATOR),
-        )
-        .with_rls_audit_table_name(AUDIT_TABLE.to_string())
-        .with_write_exemption_function(WRITE_EXEMPTION_FUNCTION)
+        .with_session_variable(SessionVariableMapping::new(K::SETTING, SUBJECTS_FUNCTION))
+        .with_session_variable(SessionVariableMapping::new(
+            BOT_LIST_SETTING,
+            BOT_LIST_FUNCTION,
+        )))
 }
 
 /// Parse the documents into one translator, in the given order.
@@ -1294,8 +1539,9 @@ mod tests {
         let policies = "ALTER TABLE items ENABLE ROW LEVEL SECURITY;\n\
                         CREATE POLICY items_p ON items FOR ALL USING \
                         (owner = current_setting('app.user_id', true));";
-        let bundle = translate::<String, connetto_core::bots::TextIds>(&schema, policies)
-            .expect("translates");
+        let bundle =
+            translate::<String, connetto_core::bots::TextIds>(documents(&schema, policies))
+                .expect("translates");
         assert!(
             bundle.replica_ddl().contains("current_bot_list"),
             "the replica DDL names the bot list function: {}",
@@ -1324,15 +1570,67 @@ mod tests {
         }
     }
 
+    /// A policy for the reader role holds on the replica, and a policy for a
+    /// role outside connetto is left out of it instead of refusing the build.
+    #[test]
+    fn a_reader_policy_holds_and_an_outside_role_policy_is_left_out() {
+        let schema = majored(
+            "CREATE TABLE notes (id INT PRIMARY KEY, word_id INT NOT NULL, \
+             owner_id TEXT NOT NULL, body TEXT);",
+        );
+        let policies = "ALTER TABLE notes ENABLE ROW LEVEL SECURITY; \
+                        CREATE POLICY notes_reader ON notes FOR ALL TO app_reader \
+                          USING (owner_id = current_setting('app.user_id', true)); \
+                        CREATE POLICY notes_staff ON notes FOR ALL TO support_staff \
+                          USING (true);";
+        let roles = format!("{ROLES}\nCREATE ROLE support_staff;");
+        let bundle = translate::<String, connetto_core::bots::TextIds>(Documents::new(
+            &schema, policies, &roles, READER,
+        ))
+        .expect("a policy for a role outside connetto refuses nothing");
+        let mut conn = SqliteConnection::establish(":memory:").expect("open the replica");
+        conn.batch_execute(bundle.replica_ddl())
+            .expect("apply the replica DDL");
+        register_replica_functions(&mut conn, "alice", "*");
+        for (id, owner) in [(1, "alice"), (2, "bob")] {
+            diesel::insert_into(notes::table)
+                .values((
+                    notes::id.eq(id),
+                    notes::word_id.eq(0),
+                    notes::owner_id.eq(owner),
+                    notes::body.eq("b"),
+                ))
+                .execute(&mut conn)
+                .expect("seed a row");
+        }
+        let visible: Vec<i32> = notes::table
+            .select(notes::id)
+            .order(notes::id)
+            .load(&mut conn)
+            .expect("read the view");
+        assert_eq!(
+            visible,
+            [1],
+            "the reader's policy admits alice's row alone, and support_staff's \
+             policy admitting every row does not reach the replica"
+        );
+    }
+
     /// The derivation and the database agree on the views over the
     /// deployment's own schema and policies.
     #[test]
     fn the_derived_views_are_the_views_sqlite_builds() {
-        let options = options::<String>();
+        let options = replica_options::<String>(connetto_demo_deployment::READER_ROLE)
+            .expect("the demo deployment's description holds");
         let translator = parsed_documents(
             connetto_demo_deployment::SCHEMA_SQL,
             connetto_demo_deployment::POLICIES_SQL,
         )
+        .and_then(|translator| {
+            translator
+                .sql(connetto_demo_deployment::ROLES_SQL)
+                .map_err(|err| SchemaError::Translate(err.to_string()))
+        })
         .expect("parse the deployment documents");
         let report = translator
             .translate_with_report(&options)
@@ -1499,8 +1797,10 @@ mod tests {
     #[test]
     fn a_caller_dependent_table_is_shareable() {
         let bundle = translate_shared::<String, connetto_core::bots::TextIds>(
-            &format!("-- connetto:major 1\n{SHARING_SCHEMA}"),
-            &sharing_policies(),
+            documents(
+                &format!("-- connetto:major 1\n{SHARING_SCHEMA}"),
+                &sharing_policies(),
+            ),
             &["notes", "papers", "tags"],
         )
         .expect("every caller-dependent table translates shared");
@@ -1533,29 +1833,42 @@ mod tests {
                        CREATE TABLE notes (id INT PRIMARY KEY, folder_id INT NOT NULL, \
                          code TEXT, label TEXT DEFAULT 'x' CHECK (label <> '')); \
                        CREATE TABLE pins (id INT PRIMARY KEY, note_id INT);";
-        let bundle = translate::<String, connetto_core::bots::TextIds>(&majored(with), "")
-            .expect("translates with references");
-        let plain = translate::<String, connetto_core::bots::TextIds>(&majored(without), "")
-            .expect("translates without references");
+        let bundle =
+            translate::<String, connetto_core::bots::TextIds>(documents(&majored(with), ""))
+                .expect("translates with references");
+        let plain =
+            translate::<String, connetto_core::bots::TextIds>(documents(&majored(without), ""))
+                .expect("translates without references");
         assert_eq!(bundle.replica_ddl(), plain.replica_ddl());
         assert!(bundle.schema_source().contains("REFERENCES folders(id)"));
         assert!(bundle.schema_source().contains("REFERENCES notes(id)"));
     }
 
+    /// The reader role every test deployment declares.
+    const READER: &str = "app_reader";
+
+    /// The roles document every test deployment carries, creating [`READER`]
+    /// and granting it every table.
+    const ROLES: &str = "CREATE ROLE app_reader LOGIN;\n\
+         GRANT USAGE ON SCHEMA public TO app_reader;\n\
+         GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_reader;";
+
+    /// `schema` and `policies` with [`ROLES`] and [`READER`].
+    fn documents<'a>(schema: &'a str, policies: &'a str) -> Documents<'a> {
+        Documents::new(schema, policies, ROLES, READER)
+    }
+
     /// The source documents a build step reads, the schema source declaring
-    /// `major`, written under `dir`. The last result is the DDL the same
-    /// tier source translates to now.
+    /// `major`, written under `dir`: the schema, policies and roles documents,
+    /// then the tier source. The last result is the DDL the same tier source
+    /// translates to now.
     fn emit_inputs(
         dir: &std::path::Path,
         major: u32,
-    ) -> (
-        std::path::PathBuf,
-        std::path::PathBuf,
-        std::path::PathBuf,
-        String,
-    ) {
+    ) -> ([std::path::PathBuf; 3], std::path::PathBuf, String) {
         let schema = dir.join("schema.sql");
         let policies = dir.join("policies.sql");
+        let roles = dir.join("roles.sql");
         let tier = dir.join("tier.sql");
         let schema_sql = format!(
             "{} {major}\nCREATE TABLE orders (id INT PRIMARY KEY, label TEXT);",
@@ -1566,13 +1879,18 @@ mod tests {
         let tier_sql = "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT);";
         std::fs::write(&schema, schema_sql).expect("the schema source writes");
         std::fs::write(&policies, policies_sql).expect("the policies source writes");
+        std::fs::write(&roles, ROLES).expect("the roles source writes");
         std::fs::write(&tier, tier_sql).expect("the tier source writes");
         (
-            schema,
-            policies,
+            [schema, policies, roles],
             tier,
-            translate_tier::<String>(tier_sql).expect("the tier translates"),
+            translate_tier(tier_sql).expect("the tier translates"),
         )
+    }
+
+    /// The source paths [`emit_inputs`] wrote, borrowed for [`emit_to`].
+    fn paths(sources: &[std::path::PathBuf; 3]) -> [&std::path::Path; 3] {
+        sources.each_ref().map(std::path::PathBuf::as_path)
     }
 
     /// A build without a tier writes the bundle file and attaches no
@@ -1580,10 +1898,10 @@ mod tests {
     #[test]
     fn emit_without_a_tier_attaches_no_history() {
         let dir = tempfile::tempdir().expect("a scratch directory");
-        let (schema, policies, _, _) = emit_inputs(dir.path(), 1);
+        let (sources, _, _) = emit_inputs(dir.path(), 1);
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).expect("the output directory writes");
-        emit_to::<String, TextIds>(&schema, &policies, None, &[], &out).expect("emits");
+        emit_to::<String, TextIds>(paths(&sources), READER, None, &[], &out).expect("emits");
         let rendered =
             std::fs::read_to_string(out.join("connetto-schema.rs")).expect("the bundle file");
         assert!(
@@ -1605,14 +1923,14 @@ mod tests {
     #[test]
     fn emit_with_a_fresh_history_attaches_it() {
         let dir = tempfile::tempdir().expect("a scratch directory");
-        let (schema, policies, tier, tier_ddl) = emit_inputs(dir.path(), 1);
+        let (sources, tier, tier_ddl) = emit_inputs(dir.path(), 1);
         let history = dir.path().join("tier_history");
         std::fs::create_dir_all(&history).expect("the history directory writes");
         std::fs::write(history.join("1.sql"), tier_ddl).expect("the current export writes");
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).expect("the output directory writes");
         let source = TierSource::new(&tier, &history);
-        emit_to::<String, TextIds>(&schema, &policies, Some(&source), &[], &out)
+        emit_to::<String, TextIds>(paths(&sources), READER, Some(&source), &[], &out)
             .expect("emits with the history");
         let rendered =
             std::fs::read_to_string(out.join("connetto-schema.rs")).expect("the bundle file");
@@ -1633,11 +1951,11 @@ mod tests {
     #[test]
     fn emit_refuses_a_missing_history_directory() {
         let dir = tempfile::tempdir().expect("a scratch directory");
-        let (schema, policies, tier, _) = emit_inputs(dir.path(), 1);
+        let (sources, tier, _) = emit_inputs(dir.path(), 1);
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).expect("the output directory writes");
         let source = TierSource::new(&tier, dir.path().join("absent"));
-        let err = emit_to::<String, TextIds>(&schema, &policies, Some(&source), &[], &out)
+        let err = emit_to::<String, TextIds>(paths(&sources), READER, Some(&source), &[], &out)
             .expect_err("an absent history directory refuses");
         match err {
             SchemaError::MissingHistoryDir { dir: reported } => {
@@ -1652,7 +1970,7 @@ mod tests {
     #[test]
     fn emit_refuses_a_stale_current_export() {
         let dir = tempfile::tempdir().expect("a scratch directory");
-        let (schema, policies, tier, _) = emit_inputs(dir.path(), 1);
+        let (sources, tier, _) = emit_inputs(dir.path(), 1);
         let history = dir.path().join("tier_history");
         std::fs::create_dir_all(&history).expect("the history directory writes");
         std::fs::write(
@@ -1663,7 +1981,7 @@ mod tests {
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).expect("the output directory writes");
         let source = TierSource::new(&tier, &history);
-        let err = emit_to::<String, TextIds>(&schema, &policies, Some(&source), &[], &out)
+        let err = emit_to::<String, TextIds>(paths(&sources), READER, Some(&source), &[], &out)
             .expect_err("a stale export refuses");
         match err {
             SchemaError::StaleExport { major, path, .. } => {
@@ -1678,13 +1996,13 @@ mod tests {
     #[test]
     fn emit_refuses_a_missing_current_export() {
         let dir = tempfile::tempdir().expect("a scratch directory");
-        let (schema, policies, tier, _) = emit_inputs(dir.path(), 1);
+        let (sources, tier, _) = emit_inputs(dir.path(), 1);
         let history = dir.path().join("tier_history");
         std::fs::create_dir_all(&history).expect("the history directory writes");
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).expect("the output directory writes");
         let source = TierSource::new(&tier, &history);
-        let err = emit_to::<String, TextIds>(&schema, &policies, Some(&source), &[], &out)
+        let err = emit_to::<String, TextIds>(paths(&sources), READER, Some(&source), &[], &out)
             .expect_err("a missing export refuses");
         match err {
             SchemaError::MissingExport { major, path, .. } => {
@@ -1700,7 +2018,7 @@ mod tests {
     #[test]
     fn emit_refuses_a_gap_between_exports() {
         let dir = tempfile::tempdir().expect("a scratch directory");
-        let (schema, policies, tier, tier_ddl) = emit_inputs(dir.path(), 3);
+        let (sources, tier, tier_ddl) = emit_inputs(dir.path(), 3);
         let history = dir.path().join("tier_history");
         std::fs::create_dir_all(&history).expect("the history directory writes");
         std::fs::write(history.join("1.sql"), tier_ddl.clone()).expect("the first export writes");
@@ -1708,7 +2026,7 @@ mod tests {
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).expect("the output directory writes");
         let source = TierSource::new(&tier, &history);
-        let err = emit_to::<String, TextIds>(&schema, &policies, Some(&source), &[], &out)
+        let err = emit_to::<String, TextIds>(paths(&sources), READER, Some(&source), &[], &out)
             .expect_err("a gap refuses");
         match err {
             SchemaError::HistoryGap { dir, missing, .. } => {
@@ -1724,7 +2042,7 @@ mod tests {
     #[test]
     fn export_tier_writes_the_current_major_and_keeps_the_older_ones() {
         let dir = tempfile::tempdir().expect("a scratch directory");
-        let (schema, _policies, tier, tier_ddl) = emit_inputs(dir.path(), 2);
+        let ([schema, ..], tier, tier_ddl) = emit_inputs(dir.path(), 2);
         let history = dir.path().join("tier_history");
         std::fs::create_dir_all(&history).expect("the history directory writes");
         std::fs::write(
@@ -1732,8 +2050,8 @@ mod tests {
             "an export the command never rewrites",
         )
         .expect("the older export writes");
-        let outcome = export_tier::<String, TextIds>(&schema, &tier, &history, false)
-            .expect("writes the current export");
+        let outcome =
+            export_tier(&schema, &tier, &history, false).expect("writes the current export");
         assert_eq!(outcome.path, history.join("2.sql"));
         assert_eq!(
             std::fs::read_to_string(&outcome.path).expect("the export"),
@@ -1750,22 +2068,22 @@ mod tests {
     #[test]
     fn export_tier_check_mode_reports_a_missing_or_stale_export() {
         let dir = tempfile::tempdir().expect("a scratch directory");
-        let (schema, _policies, tier, tier_ddl) = emit_inputs(dir.path(), 1);
+        let ([schema, ..], tier, tier_ddl) = emit_inputs(dir.path(), 1);
         let history = dir.path().join("tier_history");
         std::fs::create_dir_all(&history).expect("the history directory writes");
         std::fs::write(history.join("1.sql"), tier_ddl).expect("the export writes");
-        let fresh = export_tier::<String, TextIds>(&schema, &tier, &history, true)
-            .expect("a fresh export checks clean");
+        let fresh =
+            export_tier(&schema, &tier, &history, true).expect("a fresh export checks clean");
         assert_eq!(fresh.path, history.join("1.sql"));
         std::fs::write(history.join("1.sql"), "a drifted export").expect("the drift writes");
-        let err = export_tier::<String, TextIds>(&schema, &tier, &history, true)
+        let err = export_tier(&schema, &tier, &history, true)
             .expect_err("a drifted export fails the check");
         match err {
             SchemaError::StaleExport { major, .. } => assert_eq!(major, 1),
             other => panic!("a drifted export must fail the check, got {other}"),
         }
         std::fs::remove_file(history.join("1.sql")).expect("the export deletes");
-        let err = export_tier::<String, TextIds>(&schema, &tier, &history, true)
+        let err = export_tier(&schema, &tier, &history, true)
             .expect_err("a missing export fails the check");
         match err {
             SchemaError::MissingExport { major, .. } => assert_eq!(major, 1),
@@ -1786,9 +2104,8 @@ mod tests {
         let tier = dir.path().join("tier.sql");
         std::fs::write(&schema, "CREATE TABLE orders (id INT);").expect("the source writes");
         std::fs::write(&tier, "CREATE TABLE notes (id INT);").expect("the source writes");
-        let err =
-            export_tier::<String, TextIds>(&schema, &tier, &dir.path().join("tier_history"), false)
-                .expect_err("a source without the directive refuses");
+        let err = export_tier(&schema, &tier, &dir.path().join("tier_history"), false)
+            .expect_err("a source without the directive refuses");
         assert!(matches!(
             err,
             SchemaError::Major(connetto_core::MajorError::Missing)
@@ -1805,11 +2122,11 @@ mod tests {
         std::fs::write(&schema, majored("CREATE TABLE orders (id INT);"))
             .expect("the schema source writes");
         let history = dir.path().join("tier_history");
-        let err = export_tier::<String, TextIds>(&schema, &tier, &history, false)
-            .expect_err("a missing source refuses");
+        let err =
+            export_tier(&schema, &tier, &history, false).expect_err("a missing source refuses");
         assert!(matches!(err, SchemaError::Io(_)));
         std::fs::write(&tier, "not a Postgres document").expect("the source writes");
-        let err = export_tier::<String, TextIds>(&schema, &tier, &history, false)
+        let err = export_tier(&schema, &tier, &history, false)
             .expect_err("an unparseable source refuses");
         assert!(matches!(err, SchemaError::Translate(_)));
         std::fs::write(
@@ -1819,7 +2136,7 @@ mod tests {
              ALTER TABLE notes RENAME TO notes_v2;",
         )
         .expect("the source writes");
-        let err = export_tier::<String, TextIds>(&schema, &tier, &history, false)
+        let err = export_tier(&schema, &tier, &history, false)
             .expect_err("a refused translation refuses the export");
         assert!(matches!(err, SchemaError::Translate(_)));
     }
@@ -1834,9 +2151,8 @@ mod tests {
             .expect("the schema source writes");
         std::fs::write(&tier, "CREATE TABLE notes (id INT PRIMARY KEY, id INT);")
             .expect("the tier source writes");
-        let err =
-            export_tier::<String, TextIds>(&schema, &tier, &dir.path().join("tier_history"), false)
-                .expect_err("the duplicated column refuses the export");
+        let err = export_tier(&schema, &tier, &dir.path().join("tier_history"), false)
+            .expect_err("the duplicated column refuses the export");
         assert!(matches!(
             err,
             SchemaError::Translate(detail) if detail.contains("`id` already exists")
@@ -1859,7 +2175,7 @@ mod tests {
         std::fs::write(&tier, "CREATE TABLE notes (id INT);").expect("the tier source writes");
         let history = dir.path().join("tier_history");
         std::fs::create_dir_all(history.join("1.sql")).expect("the directory writes");
-        let err = export_tier::<String, TextIds>(&schema, &tier, &history, false)
+        let err = export_tier(&schema, &tier, &history, false)
             .expect_err("a directory where the export should be refuses");
         assert!(matches!(err, SchemaError::Io(_)));
     }
@@ -1876,7 +2192,7 @@ mod tests {
         std::fs::write(&tier, "CREATE TABLE notes (id INT);").expect("the tier source writes");
         let blocker = dir.path().join("blocker");
         std::fs::write(&blocker, "a file in the way").expect("the blocker writes");
-        let err = export_tier::<String, TextIds>(&schema, &tier, &blocker.join("history"), false)
+        let err = export_tier(&schema, &tier, &blocker.join("history"), false)
             .expect_err("a history that cannot be created refuses");
         assert!(matches!(err, SchemaError::Io(_)));
     }
@@ -1886,20 +2202,67 @@ mod tests {
     #[test]
     fn emit_refuses_a_tier_source_that_is_missing_or_untranslatable() {
         let dir = tempfile::tempdir().expect("a scratch directory");
-        let (schema, policies, tier, _) = emit_inputs(dir.path(), 1);
+        let (sources, tier, _) = emit_inputs(dir.path(), 1);
         let history = dir.path().join("tier_history");
         std::fs::create_dir_all(&history).expect("the history directory writes");
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).expect("the output directory writes");
         let source = TierSource::new(&tier, &history);
         std::fs::remove_file(&tier).expect("the source deletes");
-        let err = emit_to::<String, TextIds>(&schema, &policies, Some(&source), &[], &out)
+        let err = emit_to::<String, TextIds>(paths(&sources), READER, Some(&source), &[], &out)
             .expect_err("a missing tier source refuses");
         assert!(matches!(err, SchemaError::Io(_)));
         std::fs::write(&tier, "not a Postgres document").expect("the source writes");
-        let err = emit_to::<String, TextIds>(&schema, &policies, Some(&source), &[], &out)
+        let err = emit_to::<String, TextIds>(paths(&sources), READER, Some(&source), &[], &out)
             .expect_err("an untranslatable tier source refuses");
         assert!(matches!(err, SchemaError::Translate(_)));
+    }
+
+    /// A share key bound to the identity's own setting refuses the
+    /// deployment description, and with it every translation built on it.
+    #[test]
+    fn a_share_key_on_the_identity_setting_refuses_the_description() {
+        #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+        struct OnIdentity(String);
+        impl std::fmt::Display for OnIdentity {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+        impl CapabilityKey for OnIdentity {
+            const SETTING: &'static str = connetto_core::auth::DEFAULT_USER_SETTING;
+        }
+
+        assert!(matches!(
+            deployment::<OnIdentity>(READER),
+            Err(SchemaError::Deployment(_))
+        ));
+        assert!(matches!(
+            query_options::<OnIdentity>(READER),
+            Err(SchemaError::Deployment(_))
+        ));
+        assert!(matches!(
+            translate::<OnIdentity, TextIds>(documents(&majored("CREATE TABLE t (id INT);"), "")),
+            Err(SchemaError::Deployment(_))
+        ));
+    }
+
+    /// A build whose roles document is missing, or never creates the reader
+    /// role, refuses before it writes its bundle.
+    #[test]
+    fn emit_refuses_a_roles_document_that_is_missing_or_lacks_the_reader() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let (sources, _, _) = emit_inputs(dir.path(), 1);
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).expect("the output directory writes");
+        std::fs::write(&sources[2], "CREATE ROLE someone_else LOGIN;").expect("the roles write");
+        let err = emit_to::<String, TextIds>(paths(&sources), READER, None, &[], &out)
+            .expect_err("a roles document without the reader refuses");
+        assert!(err.to_string().contains(READER), "{err}");
+        std::fs::remove_file(&sources[2]).expect("the roles source deletes");
+        let err = emit_to::<String, TextIds>(paths(&sources), READER, None, &[], &out)
+            .expect_err("a missing roles document refuses");
+        assert!(matches!(err, SchemaError::Io(_)));
     }
 
     /// A build whose history directory it cannot read refuses with the
@@ -1908,7 +2271,7 @@ mod tests {
     #[cfg(unix)]
     fn emit_refuses_a_history_directory_it_cannot_read() {
         let dir = tempfile::tempdir().expect("a scratch directory");
-        let (schema, policies, tier, _) = emit_inputs(dir.path(), 1);
+        let (sources, tier, _) = emit_inputs(dir.path(), 1);
         let history = dir.path().join("tier_history");
         std::fs::create_dir_all(&history).expect("the history directory writes");
         std::fs::set_permissions(
@@ -1919,7 +2282,7 @@ mod tests {
         let source = TierSource::new(&tier, &history);
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).expect("the output directory writes");
-        let result = emit_to::<String, TextIds>(&schema, &policies, Some(&source), &[], &out);
+        let result = emit_to::<String, TextIds>(paths(&sources), READER, Some(&source), &[], &out);
         std::fs::set_permissions(
             &history,
             std::os::unix::fs::PermissionsExt::from_mode(0o755),
@@ -1934,12 +2297,13 @@ mod tests {
     #[test]
     fn emit_refuses_outside_a_build_script() {
         let dir = tempfile::tempdir().expect("a scratch directory");
-        let (schema, policies, _, _) = emit_inputs(dir.path(), 1);
+        let (sources, _, _) = emit_inputs(dir.path(), 1);
+        let [schema, policies, roles] = paths(&sources);
         assert!(
             std::env::var("OUT_DIR").is_err(),
             "cargo leaves OUT_DIR unset for tests"
         );
-        let err = emit::<String, TextIds>(&schema, &policies, None, &[])
+        let err = emit::<String, TextIds>(schema, policies, roles, READER, None, &[])
             .expect_err("without OUT_DIR the entry point refuses");
         assert!(matches!(err, SchemaError::MissingOutDir));
     }
@@ -1948,18 +2312,18 @@ mod tests {
     #[test]
     fn emit_to_refuses_an_output_file_that_is_a_directory() {
         let dir = tempfile::tempdir().expect("a scratch directory");
-        let (schema, policies, _, _) = emit_inputs(dir.path(), 1);
+        let (sources, _, _) = emit_inputs(dir.path(), 1);
         let out = dir.path().join("out");
         std::fs::create_dir_all(out.join("connetto-cap-policies.sql"))
             .expect("the blocking directory writes");
-        let err = emit_to::<String, TextIds>(&schema, &policies, None, &[], &out)
+        let err = emit_to::<String, TextIds>(paths(&sources), READER, None, &[], &out)
             .expect_err("a directory where the cap file should be refuses");
         assert!(matches!(err, SchemaError::Io(_)));
         let out = dir.path().join("out2");
         std::fs::create_dir_all(&out).expect("the output directory writes");
         std::fs::create_dir_all(out.join("connetto-schema.rs"))
             .expect("the blocking directory writes");
-        let err = emit_to::<String, TextIds>(&schema, &policies, None, &[], &out)
+        let err = emit_to::<String, TextIds>(paths(&sources), READER, None, &[], &out)
             .expect_err("a directory where the bundle file should be refuses");
         assert!(matches!(err, SchemaError::Io(_)));
     }
@@ -2065,8 +2429,7 @@ mod tests {
     /// The bundle a build of the consumer schema sharing `words` produces.
     fn shared_consumer_bundle() -> connetto_core::SchemaBundle {
         translate_shared::<String, connetto_core::bots::TextIds>(
-            SHARED_CONSUMER_SCHEMA,
-            SHARED_CONSUMER_POLICIES,
+            documents(SHARED_CONSUMER_SCHEMA, SHARED_CONSUMER_POLICIES),
             &["words"],
         )
         .expect("the schema translates with a shared store")
@@ -2272,10 +2635,10 @@ mod tests {
     /// does.
     #[test]
     fn sharing_a_table_does_not_change_the_wire_version() {
-        let unshared = translate::<String, connetto_core::bots::TextIds>(
+        let unshared = translate::<String, connetto_core::bots::TextIds>(documents(
             SHARED_CONSUMER_SCHEMA,
             SHARED_CONSUMER_POLICIES,
-        )
+        ))
         .expect("translates unshared");
         let shared = shared_consumer_bundle();
         assert_eq!(
@@ -2290,11 +2653,29 @@ mod tests {
     #[test]
     fn a_source_without_the_directive_is_refused_by_the_translation() {
         assert!(matches!(
-            translate::<String, connetto_core::bots::TextIds>(
+            translate::<String, connetto_core::bots::TextIds>(documents(
                 "CREATE TABLE orders (id INT PRIMARY KEY, label TEXT);",
                 ""
-            ),
+            )),
             Err(SchemaError::Major(connetto_core::MajorError::Missing))
         ));
+    }
+
+    /// The bookkeeping `user_id` columns follow the deployment's id type the
+    /// way the registry's do, so a non-text deployment's writer and enrolment
+    /// rows decode as the deployment stores them (R77 decision 11).
+    #[test]
+    fn bookkeeping_ddl_follows_the_deployment_id_type() {
+        let text = bookkeeping_ddl::<connetto_core::bots::TextIds>();
+        assert!(text.contains("user_id TEXT"));
+        let uuid = bookkeeping_ddl::<connetto_core::bots::UuidIds>();
+        assert!(uuid.contains("user_id UUID"));
+        assert!(!uuid.contains("user_id TEXT"));
+
+        let text_enrol = enrolment_ddl::<connetto_core::bots::TextIds>();
+        assert!(text_enrol.contains("user_id TEXT NOT NULL"));
+        let uuid_enrol = enrolment_ddl::<connetto_core::bots::UuidIds>();
+        assert!(uuid_enrol.contains("user_id UUID NOT NULL"));
+        assert!(!uuid_enrol.contains("user_id TEXT"));
     }
 }

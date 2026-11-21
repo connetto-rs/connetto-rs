@@ -94,10 +94,33 @@ impl PageSession {
     /// When the socket does not open or announces no committed page within
     /// [`REPLY_BOUND`].
     pub async fn webkit(url: &str) -> Result<Self> {
+        Self::webkit_within(url, REPLY_BOUND).await
+    }
+
+    /// A session on the first of `urls` whose page attaches through
+    /// [`webkit`](Self::webkit) within `bound`, or [`None`] when none does.
+    ///
+    /// The proxy keeps listing a page after iOS suspended its process, as the
+    /// login view of a sign-in that finished, and such a page accepts the
+    /// connection and announces nothing, so a page that does not attach is
+    /// skipped rather than ending the caller's wait.
+    pub async fn webkit_first(urls: &[String], bound: Duration) -> Option<Self> {
+        for url in urls {
+            match Self::webkit_within(url, bound).await {
+                Ok(page) => return Some(page),
+                Err(err) => {
+                    eprintln!("{url} did not attach ({err:#}), trying the next listed page");
+                }
+            }
+        }
+        None
+    }
+
+    async fn webkit_within(url: &str, bound: Duration) -> Result<Self> {
         let (mut socket, _) = tokio_tungstenite::connect_async(url)
             .await
             .context("opening the WebKit inspector session")?;
-        let deadline = Instant::now() + REPLY_BOUND;
+        let deadline = Instant::now() + bound;
         let mut target_events = Vec::new();
         // Frames commit provisional targets too, so only a page's commit is followed.
         let mut provisional_pages = Vec::new();
@@ -267,6 +290,29 @@ impl PageSession {
         refusals: &[&str],
         limit: Duration,
     ) -> Result<()> {
+        self.wait_for_match(text, refusals, limit, |page| page.contains(text))
+            .await
+    }
+
+    /// Wait for a linked peer by short account id and key prefix.
+    ///
+    /// # Errors
+    ///
+    /// When the peer is absent past `limit` or the page does not answer.
+    pub async fn wait_for_link(&mut self, peer: &str, limit: Duration) -> Result<()> {
+        self.wait_for_match(peer, &[], limit, |page| {
+            crate::peer_devices::page_names_peer(page, peer)
+        })
+        .await
+    }
+
+    async fn wait_for_match(
+        &mut self,
+        text: &str,
+        refusals: &[&str],
+        limit: Duration,
+        matches: impl Fn(&str) -> bool,
+    ) -> Result<()> {
         let deadline = Instant::now() + limit;
         loop {
             let page = match self.page_text().await {
@@ -280,7 +326,7 @@ impl PageSession {
                 }
                 Err(error) => return Err(error),
             };
-            if page.contains(text) {
+            if matches(&page) {
                 return Ok(());
             }
             if let Some(refusal) = refusals.iter().find(|refusal| page.contains(**refusal)) {
@@ -288,6 +334,33 @@ impl PageSession {
             }
             if Instant::now() >= deadline {
                 bail!("the page never showed {text:?}, it shows:\n{page}");
+            }
+            sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    /// Confirm the demo's delete and log out where it asks, which it does
+    /// while local writes are still unsent, and return once the page shows
+    /// the confirmation clicked, the signed-out banner or an error.
+    ///
+    /// # Errors
+    ///
+    /// When none of them shows within `limit`, naming what the page shows,
+    /// or as [`PageSession::call`].
+    pub async fn confirm_the_delete(&mut self, limit: Duration) -> Result<()> {
+        let deadline = Instant::now() + limit;
+        loop {
+            let page = self.page_text().await?;
+            if page.contains("Confirm: delete and log out") {
+                return self.click("Confirm: delete and log out").await;
+            }
+            if page.contains("Sign in to begin.") || page.contains("Error: ") {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "the sign out asked neither for confirmation nor to sign out, the page shows:\n{page}"
+                );
             }
             sleep(Duration::from_millis(500)).await;
         }
@@ -326,6 +399,22 @@ impl PageSession {
             serde_json::Value::Bool(true) => Ok(()),
             found => bail!("the page has {found} buttons starting with {prefix:?}, not one"),
         }
+    }
+
+    /// Switch to the account named by a `Signed in as <badge>` line.
+    ///
+    /// # Errors
+    ///
+    /// When the line names no identity, when no single button switches to it,
+    /// or as [`PageSession::call`].
+    pub async fn switch_to_account(&mut self, signed_in_line: &str) -> Result<()> {
+        let identity = signed_in_line
+            .strip_prefix("Signed in as ")
+            .map(str::trim)
+            .filter(|badge| !badge.is_empty())
+            .ok_or_else(|| anyhow!("the signed-in line {signed_in_line:?} names no identity"))?;
+        self.click_starting_with(&format!("Switch to {identity}"))
+            .await
     }
 
     /// The first line of the page's text that starts with `prefix`.
@@ -530,6 +619,66 @@ mod tests {
         }
     }
 
+    /// The switch clicks the one button naming the signed-in line's short
+    /// identity, finds none for an identity no button names, and refuses a
+    /// line naming no identity before any click.
+    #[tokio::test]
+    async fn the_switch_clicks_the_button_naming_the_identity() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = socket.next().await {
+                let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let script = request["params"]["expression"].as_str().unwrap_or_default();
+                // One button starts with the asked prefix, any other finds none.
+                let found = if script.contains("\"Switch to alice d5e24135\"") {
+                    serde_json::Value::Bool(true)
+                } else {
+                    serde_json::json!(0)
+                };
+                let answer = serde_json::json!({
+                    "id": request["id"],
+                    "result": { "result": { "value": found } },
+                });
+                socket
+                    .send(Message::Text(answer.to_string()))
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut page = PageSession::devtools(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        page.switch_to_account("Signed in as alice d5e24135")
+            .await
+            .unwrap();
+        let unknown = page
+            .switch_to_account("Signed in as bob cc072008")
+            .await
+            .unwrap_err();
+        assert!(unknown.to_string().contains("0 buttons"), "{unknown:#}");
+        let error = page.switch_to_account("Signed in as ").await.unwrap_err();
+        assert!(error.to_string().contains("names no identity"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn linked_wait_matches_names_independently() {
+        let url = endpoint(vec![Ok("linked: bob 89abcdef/01234567 via 10.42.0.7:4431")]).await;
+        let mut page = PageSession::devtools(&url).await.unwrap();
+        page.wait_for_link("89abcdef/01234567", Duration::ZERO)
+            .await
+            .unwrap();
+        let url = endpoint(vec![Ok("linked: bob 89abcdef/76543210")]).await;
+        let mut page = PageSession::devtools(&url).await.unwrap();
+        assert!(
+            page.wait_for_link("89abcdef/01234567", Duration::ZERO)
+                .await
+                .is_err()
+        );
+    }
+
     /// A line is found by its prefix among the page's trimmed lines, and a
     /// page without one names what it shows.
     #[tokio::test]
@@ -546,6 +695,57 @@ mod tests {
         );
         let error = page.line_starting_with("Signed in as ").await.unwrap_err();
         assert!(error.to_string().contains("status: online"), "{error:#}");
+    }
+
+    /// A delete that asks is confirmed by its button, a signed-out banner
+    /// needs no click, and a page showing neither fails within its bound
+    /// naming what it shows.
+    #[tokio::test]
+    async fn a_delete_is_confirmed_where_it_asks() {
+        let confirm = "1 write unsent\nConfirm: delete and log out";
+        let url = value_endpoint(vec![serde_json::json!(confirm), serde_json::json!(true)]).await;
+        let mut page = PageSession::devtools(&url).await.unwrap();
+        page.confirm_the_delete(Duration::from_secs(5))
+            .await
+            .unwrap();
+        let url = value_endpoint(vec![serde_json::json!(confirm), serde_json::json!(false)]).await;
+        let mut page = PageSession::devtools(&url).await.unwrap();
+        let missing = page
+            .confirm_the_delete(Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(
+            missing.to_string().contains("Confirm: delete and log out"),
+            "{missing:#}"
+        );
+        let url = value_endpoint(vec![serde_json::json!("Sign in to begin.")]).await;
+        let mut page = PageSession::devtools(&url).await.unwrap();
+        page.confirm_the_delete(Duration::from_secs(5))
+            .await
+            .unwrap();
+        let url = value_endpoint(vec![serde_json::json!("status: online")]).await;
+        let mut page = PageSession::devtools(&url).await.unwrap();
+        let neither = page.confirm_the_delete(Duration::ZERO).await.unwrap_err();
+        assert!(
+            neither.to_string().contains("status: online"),
+            "{neither:#}"
+        );
+    }
+
+    /// A page that shows the confirmation only on a later read is waited on,
+    /// and the confirmation is clicked once it shows.
+    #[tokio::test]
+    async fn a_delete_waits_for_a_confirmation_that_shows_late() {
+        let url = value_endpoint(vec![
+            serde_json::json!("status: online"),
+            serde_json::json!("1 write unsent\nConfirm: delete and log out"),
+            serde_json::json!(true),
+        ])
+        .await;
+        let mut page = PageSession::devtools(&url).await.unwrap();
+        page.confirm_the_delete(Duration::from_secs(5))
+            .await
+            .unwrap();
     }
 
     /// A click waits for the button to stand enabled, and clicks it the
@@ -826,5 +1026,37 @@ mod tests {
             format!("{error:#}").contains("no reply within 200ms"),
             "{error:#}"
         );
+    }
+
+    /// A page the proxy still lists after iOS suspended it, as the login view
+    /// of a finished sign-in, accepts the connection and announces nothing,
+    /// so the session goes to the next page the listing matched.
+    #[tokio::test]
+    async fn a_listed_page_that_never_announces_itself_is_skipped() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let suspended = format!("ws://{}", listener.local_addr().unwrap());
+        // The two attaches the test makes, held open and silent by the receiver.
+        let (accepted, _held) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let _ = accepted.send(tokio_tungstenite::accept_async(stream).await.unwrap());
+            }
+        });
+        let (seen, mut expressions) = tokio::sync::mpsc::unbounded_channel();
+        let live = webkit_endpoint(seen).await;
+
+        let mut page =
+            PageSession::webkit_first(&[suspended.clone(), live], Duration::from_millis(200))
+                .await
+                .expect("the live page attaches");
+        page.set_input("user", "second").await.unwrap();
+        assert!(
+            expressions.try_recv().is_ok(),
+            "the session reached the live page"
+        );
+
+        let none = PageSession::webkit_first(&[suspended], Duration::from_millis(200)).await;
+        assert!(none.is_none(), "no listed page attached");
     }
 }

@@ -413,6 +413,10 @@ pub struct BootedSession<Id> {
     pub session_expires_at: Option<u64>,
     /// Credential-store key this identity's account is addressed by.
     pub account: Option<String>,
+    /// Whether the replica survives a reload. `false` for an anonymous boot and
+    /// for a signed-in one in a browser that refuses OPFS, where a reload loses
+    /// the replica and every write not yet sent.
+    pub replica_persistent: bool,
     /// Whether configured content storage is durable, or `None` when content is disabled.
     pub content_persistent: Option<bool>,
 }
@@ -492,6 +496,14 @@ where
     report_boot_progress("signed-in");
     let (spec, mut worker, content_root_key) =
         replica::open_worker(core, &config, resolved, &storage, &key_store).await?;
+    // Before the first connect, since the server sends the account's courier
+    // notices right after the handshake and the boot's own pump discards the
+    // events they raise, so the worker holds them for the tabs (R78 decision
+    // 41 as amended).
+    worker.relay_courier_notices();
+    // An anonymous boot never opens through the pool, so only a signed-in one
+    // can be persistent, and only where the pool is OPFS.
+    let replica_persistent = spec.identified && storage.is_persistent();
     report_boot_progress("replica-opened");
     services::retry_shared_departures(&mut worker).await;
     report_boot_progress("departures-retried");
@@ -506,7 +518,7 @@ where
     services::hold_alive_lock().await;
     report_boot_progress("alive-lock-held");
     let (hub, content_persistent) =
-        services::start_boot_services(&config, &spec, worker, content_root_key).await?;
+        services::start_boot_services(&config, &spec, worker, content_root_key, &key_store).await?;
     // The re-check guards what the gate protects, so it runs once the key
     // actually came from the user's own verification.
     let gated = crate::unlock::custody() == connetto_core::custody::Custody::Verified;
@@ -515,6 +527,7 @@ where
         identity: spec.identity,
         session_expires_at: spec.session_expires_at,
         account: spec.active_account,
+        replica_persistent,
         content_persistent,
     })
 }

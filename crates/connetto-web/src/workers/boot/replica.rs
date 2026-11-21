@@ -21,7 +21,7 @@ pub(crate) struct BootReplicaSpec<Id> {
     pub(crate) replica_db_name: String,
     /// The account key the identity is addressed by.
     pub(crate) active_account: Option<String>,
-    /// Whether the replica is durable, which only a signed-in boot is.
+    /// Whether a signed-in identity opened the replica through the storage pool.
     pub(crate) identified: bool,
     /// Whether the replica was already in the pool.
     pub(crate) existing: bool,
@@ -254,7 +254,7 @@ pub(super) async fn open_worker<Id>(
     }
     let content_root_key = key.as_ref().map(|key| *key.as_bytes());
     let worker = core
-        .with_held_content(connetto_file_client::held_content())
+        .with_content_hooks(connetto_file_client::content_hooks())
         .signed_in(resolved.credential)
         .durable(
             place,

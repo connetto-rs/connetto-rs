@@ -19,7 +19,7 @@ use connetto_server::{
 };
 use connetto_test_harness::{
     Client, Fixture, HarnessAuth, PUBLICATION, RowValue, Server, ServerConfig, drop_slot,
-    insert_changeset, spawn_server,
+    engine_ddl, insert_changeset, spawn_server,
 };
 use diesel::QueryableByName;
 use diesel_async::RunQueryDsl;
@@ -100,10 +100,14 @@ async fn stack(fixture: &Fixture) -> Server {
         ])
         .await;
     let admin = fixture.admin().clone();
-    let snapshot = PgSnapshotSource::from_ddl(admin.clone(), PG_DDL)
+    // The one catalog the server parts read, the way the harness appends it
+    // inside `spawn_server`, so the numbering matches the materializer's
+    // and the auth's (R77 decision 11).
+    let engine_ddl = engine_ddl(PG_DDL);
+    let snapshot = PgSnapshotSource::from_ddl(admin.clone(), &engine_ddl)
         .expect("snapshot source")
         .with_publication(PUBLICATION);
-    let auth = HarnessAuth::rls(RlsAuth::from_ddl(admin.clone(), PG_DDL).expect("rls auth"));
+    let auth = HarnessAuth::rls(RlsAuth::from_ddl(admin.clone(), &engine_ddl).expect("rls auth"));
     let guard = Arc::new(RequestGuard::new(
         ThrottleConfig::default().with_identified(TierLimits::identified().with_page_bytes(512)),
         AbuseConfig::default(),

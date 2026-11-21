@@ -10,9 +10,9 @@ use std::time::Duration;
 
 use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection, SyncSchema};
 use connetto_core::traits::Transport;
-use connetto_server::{PgSnapshotSource, RlsAuth, SessionConfig};
+use connetto_server::{LoopbackTransport, PgSnapshotSource, RlsAuth, SessionConfig};
 use connetto_test_harness::{
-    Fixture, HarnessAuth, Server, ServerConfig, pool_for, spawn_server, with_user,
+    Fixture, HarnessAuth, Server, ServerConfig, engine_ddl, pool_for, spawn_server, with_user,
 };
 use diesel::prelude::*;
 
@@ -58,8 +58,15 @@ diesel::table! {
     }
 }
 fn schema() -> connetto_core::schema::SchemaBundle {
-    connetto_schema::translate::<String, connetto_core::bots::TextIds>(PG_DDL, POLICIES)
-        .expect("translate the sources")
+    connetto_schema::translate::<String, connetto_core::bots::TextIds>(
+        connetto_schema::Documents::new(
+            PG_DDL,
+            POLICIES,
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
+    )
+    .expect("translate the sources")
 }
 
 async fn server(fixture: &Fixture) -> Server {
@@ -89,8 +96,12 @@ async fn server(fixture: &Fixture) -> Server {
         )
         .await;
     let reader = pool_for(&with_user(fixture.admin_url(), "app_writer", "app_writer")).await;
-    let snapshot = PgSnapshotSource::from_ddl(reader.clone(), PG_DDL).expect("snapshot source");
-    let auth = HarnessAuth::rls(RlsAuth::from_ddl(reader.clone(), PG_DDL).expect("rls auth"));
+    // The one catalog the server parts read, the way the harness appends it
+    // inside `spawn_server` (R77 decision 11).
+    let engine_ddl = engine_ddl(PG_DDL);
+    let snapshot =
+        PgSnapshotSource::from_ddl(reader.clone(), &engine_ddl).expect("snapshot source");
+    let auth = HarnessAuth::rls(RlsAuth::from_ddl(reader.clone(), &engine_ddl).expect("rls auth"));
     spawn_server(
         ServerConfig::new(PG_DDL, fixture.admin_url())
             .with_replication(["notes", "pages"])
@@ -129,14 +140,15 @@ where
 }
 
 async fn alice(server: &Server) -> ConnettoConnection<impl Transport<Error: core::fmt::Display>> {
-    ClientBuilder::new(
+    let mut conn = ClientBuilder::new(
         SyncSchema::new(schema()),
-        super::support::Once::new(server.attach()),
+        super::support::NeverDial::<LoopbackTransport>::default(),
     )
     .signed_in(super::support::held("alice"))
-    .connect_driven()
-    .await
-    .expect("connect")
+    .open_driven()
+    .expect("open replica");
+    conn.attach(server.attach()).await.expect("connect");
+    conn
 }
 
 /// A left-out nullable column holds the server's value, at the snapshot and

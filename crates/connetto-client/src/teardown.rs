@@ -228,8 +228,12 @@ pub enum ForgetError {
     /// keeps it.
     #[error(transparent)]
     Refused(#[from] ForgetRefusal),
-    /// The client is closed and part of the teardown failed. The application
-    /// drops the client and signs in again.
+    /// Part of the teardown failed. After
+    /// [`NativeClient::forget_device`](crate::NativeClient::forget_device) the
+    /// client is closed, and the application drops it and signs in again.
+    /// After
+    /// [`NativeClient::forget_stored_account`](crate::NativeClient::forget_stored_account)
+    /// the live client keeps working, and the next start finishes the rest.
     #[error(transparent)]
     Incomplete(Box<ForgetIncomplete>),
 }
@@ -248,6 +252,19 @@ pub enum ForgetRefusal {
     /// The client could not read the writes the server has not acknowledged.
     #[error("reading the unsynced writes: {0}")]
     Unreadable(crate::ClientError),
+    /// The account named is the live one, which
+    /// [`NativeClient::forget_device`](crate::NativeClient::forget_device)
+    /// forgets.
+    #[error("the account is the live one")]
+    LiveAccount,
+    /// The device stores no credential for the account named.
+    #[error("the device stores no such account")]
+    UnknownAccount,
+    /// Taking the stored account out of the shared store failed, which left
+    /// the store as it was. Its replica stays, holding the queued shared
+    /// writes a later delete undoes.
+    #[error("leaving the shared store: {0}")]
+    Shared(crate::ClientError),
 }
 
 /// What failed in a forget that went past closing the client. Every part runs
@@ -258,7 +275,7 @@ pub enum ForgetRefusal {
 #[cfg(feature = "native-auth")]
 #[derive(Debug, Default, thiserror::Error)]
 #[non_exhaustive]
-#[error("the client is closed, but{}", FailedParts(self))]
+#[error("the teardown is incomplete:{}", FailedParts(self))]
 pub struct ForgetIncomplete {
     /// Releasing the replica's file handles failed, so a platform that refuses
     /// to delete an open file keeps the replica.

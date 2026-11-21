@@ -493,9 +493,9 @@ fn run_container_phase(probe: &Path, phase: &str, key: &Path, state: &Path) {
     );
 }
 
-/// `CONNETTO_R71_PROBE` names the built `secret_store_probe` example.
+/// `CONNETTO_R71_PROBE` names the demo's built `secret-store-probe`.
 #[test]
-#[ignore = "needs Docker and the secret_store_probe example, which CI builds"]
+#[ignore = "needs Docker and the demo's secret-store-probe, which CI builds"]
 fn a_restarted_container_reads_its_keys_back_through_a_mounted_key_file() {
     let probe = PathBuf::from(
         std::env::var_os("CONNETTO_R71_PROBE").expect("CONNETTO_R71_PROBE names the probe"),

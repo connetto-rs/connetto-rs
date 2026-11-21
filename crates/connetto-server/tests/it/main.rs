@@ -16,19 +16,32 @@ mod bots_client;
 
 mod builder_coverage;
 
+mod catalog_reads;
+
 mod ticket_shared;
 
 mod ticket_budget;
 
 mod ticket_mint;
 
+mod ticket_carried;
+
+mod ticket_session;
+
+mod ticket_logout;
+
+mod audit_catalog;
+
 mod audit_producers;
+
+mod auth_hooks;
+mod auth_hooks_events;
 
 mod audit_table;
 
-mod auth_retry;
+mod courier_audit;
 
-mod authorization_facts;
+mod auth_retry;
 
 mod authentication;
 
@@ -48,7 +61,7 @@ mod deployment_schema;
 
 mod device_identity;
 
-mod e2e;
+mod drift_refusal;
 
 mod enrolment;
 
@@ -101,6 +114,8 @@ mod preflight_oplog_payload;
 
 mod provider;
 
+mod provider_oauth;
+
 mod one_event;
 
 mod read_ceiling;
@@ -134,8 +149,6 @@ mod share_key_reach;
 mod share_key_terms;
 mod share_keys;
 
-mod restore;
-
 mod slot_watch;
 
 mod snapshot_nonfatal;
@@ -160,6 +173,10 @@ mod writer_shared;
 
 mod provisional;
 
+mod provisional_push;
+
 mod courier_frontier;
+
+mod courier_wire;
 
 mod upkeep_consulted;

@@ -425,8 +425,8 @@ pub(super) fn decode_pending(
     Ok(entries)
 }
 
-/// The stored peer entries behind their framing, in position order
-/// (R77 decision 16).
+/// The held peer entries behind their framing, in position order (R77
+/// decision 16, R78 decision 20).
 pub(super) fn decode_peer_entries(
     bytes: &[u8],
 ) -> Result<Vec<super::super::ArchivedPeerEntry>, ClientError> {
@@ -435,17 +435,20 @@ pub(super) fn decode_peer_entries(
     let malformed = || ClientError::Import("the peer entry record is malformed".to_owned());
     let mut at: usize = 0;
     let count = u64::from_be_bytes(read_array(bytes, &mut at, &malformed)?);
-    // Every entry costs at least its fixed 59 bytes, so a count above what the
+    // Every entry costs at least its fixed 83 bytes, so a count above what the
     // entry can hold is refused before one vector per entry is allocated.
-    if count > u64::try_from((bytes.len() - at) / 59).unwrap_or(u64::MAX) {
+    if count > u64::try_from((bytes.len() - at) / 83).unwrap_or(u64::MAX) {
         return Err(malformed());
     }
     let mut entries = Vec::new();
     for _ in 0..count {
         let author = read_bytes_field(bytes, &mut at, &malformed)?;
         let seq = i64::from_be_bytes(read_array(bytes, &mut at, &malformed)?);
+        let state = i64::from_be_bytes(read_array(bytes, &mut at, &malformed)?);
         let major = i64::from_be_bytes(read_array(bytes, &mut at, &malformed)?);
-        let changeset = read_bytes_field(bytes, &mut at, &malformed)?;
+        let digest = read_array(bytes, &mut at, &malformed)?;
+        let origin = read_optional_bytes(bytes, &mut at, &malformed)?;
+        let changeset = read_optional_bytes(bytes, &mut at, &malformed)?;
         let account = read_text_field(bytes, &mut at, &malformed)?;
         let bot_list = match read_array::<1>(bytes, &mut at, &malformed)? {
             [0] => None,
@@ -456,7 +459,10 @@ pub(super) fn decode_peer_entries(
         entries.push(ArchivedPeerEntry {
             author,
             seq,
+            state,
             major,
+            origin,
+            digest,
             changeset,
             account,
             bot_list,
@@ -475,9 +481,9 @@ pub(super) fn decode_peer_cursors(
     let malformed = || ClientError::Import("the peer cursor record is malformed".to_owned());
     let mut at: usize = 0;
     let count = u64::from_be_bytes(read_array(bytes, &mut at, &malformed)?);
-    // Every cursor costs at least its fixed 64 bytes, so a count above what
+    // Every cursor costs at least its fixed 72 bytes, so a count above what
     // the entry can hold is refused before one vector per cursor is allocated.
-    if count > u64::try_from((bytes.len() - at) / 64).unwrap_or(u64::MAX) {
+    if count > u64::try_from((bytes.len() - at) / 72).unwrap_or(u64::MAX) {
         return Err(malformed());
     }
     let mut cursors = Vec::new();
@@ -487,12 +493,14 @@ pub(super) fn decode_peer_cursors(
         let seq = i64::from_be_bytes(read_array(bytes, &mut at, &malformed)?);
         let head = read_array(bytes, &mut at, &malformed)?;
         let offer = read_bytes_field(bytes, &mut at, &malformed)?;
+        let expires_at = i64::from_be_bytes(read_array(bytes, &mut at, &malformed)?);
         cursors.push(ArchivedPeerCursor {
             author,
             account,
             seq,
             head,
             offer,
+            expires_at,
         });
     }
     Ok(cursors)
@@ -525,6 +533,19 @@ fn read_bytes_field(
         .ok_or_else(malformed)?;
     *at += value.len();
     Ok(value.to_vec())
+}
+
+/// A byte string behind its presence byte, absent when the byte is zero.
+fn read_optional_bytes(
+    bytes: &[u8],
+    at: &mut usize,
+    malformed: &impl Fn() -> ClientError,
+) -> Result<Option<Vec<u8>>, ClientError> {
+    match read_array::<1>(bytes, at, malformed)? {
+        [0] => Ok(None),
+        [1] => read_bytes_field(bytes, at, malformed).map(Some),
+        _ => Err(malformed()),
+    }
 }
 
 /// A length-prefixed UTF-8 string at `at`, advancing past it.
@@ -711,8 +732,11 @@ mod tests {
             ArchivedPeerEntry {
                 author: vec![1u8, 2],
                 seq: 7,
+                state: 3,
                 major: 3,
-                changeset: vec![4u8, 5, 6],
+                origin: Some(vec![8u8]),
+                digest: [5u8; 32],
+                changeset: Some(vec![4u8, 5, 6]),
                 account: "peer-anna".to_owned(),
                 bot_list: Some("*".to_owned()),
                 received_at: 1_700_000_000,
@@ -720,8 +744,11 @@ mod tests {
             ArchivedPeerEntry {
                 author: vec![9u8],
                 seq: 1,
+                state: 2,
                 major: 1,
-                changeset: vec![],
+                origin: None,
+                digest: [6u8; 32],
+                changeset: None,
                 account: "peer-ben".to_owned(),
                 bot_list: None,
                 received_at: 1_700_000_001,
@@ -734,6 +761,7 @@ mod tests {
                 seq: 7,
                 head: [3u8; 32],
                 offer: vec![77u8, 88],
+                expires_at: 1_800_000_000,
             },
             ArchivedPeerCursor {
                 author: vec![9u8],
@@ -741,6 +769,7 @@ mod tests {
                 seq: 1,
                 head: [4u8; 32],
                 offer: vec![],
+                expires_at: 0,
             },
         ];
         (entries, cursors)
@@ -980,8 +1009,11 @@ mod tests {
         let entry = ArchivedPeerEntry {
             author: vec![1u8, 2],
             seq: 7,
+            state: 1,
             major: 3,
-            changeset: vec![4u8, 5, 6],
+            origin: Some(vec![8u8]),
+            digest: [5u8; 32],
+            changeset: Some(vec![4u8, 5, 6]),
             account: "peer-anna".to_owned(),
             bot_list: Some("*".to_owned()),
             received_at: 1_700_000_000,
@@ -991,8 +1023,16 @@ mod tests {
             decode_peer_entries(&bytes).expect("a valid peer entry"),
             std::slice::from_ref(&entry).to_vec()
         );
-        // The bot-list presence byte, the count and the fields preceding it.
-        let presence_at = 8 + 8 + 2 + 8 + 8 + 8 + 3 + 8 + 10;
+        // The origin presence byte, after the count, the author, the
+        // sequence, the state, the major and the digest.
+        let origin_at = 8 + 8 + 2 + 8 + 8 + 8 + 32;
+        let mut unknown_origin = bytes.clone();
+        unknown_origin[origin_at] = 2;
+        // The body presence byte, after the origin.
+        let mut unknown_body = bytes.clone();
+        unknown_body[origin_at + 1 + 8 + 1] = 2;
+        // The bot-list presence byte, after the body and the account.
+        let presence_at = origin_at + 1 + 8 + 1 + 1 + 8 + 3 + 8 + 9;
         let mut unknown = bytes.clone();
         unknown[presence_at] = 2;
         // The account's first byte, made invalid UTF-8.
@@ -1002,7 +1042,10 @@ mod tests {
         let mut overcount = bytes.clone();
         overcount[..8].copy_from_slice(&2u64.to_be_bytes());
         let cuts = (0..bytes.len()).map(|len| bytes[..len].to_vec());
-        for malformed in [unknown, not_text, overcount].into_iter().chain(cuts) {
+        for malformed in [unknown_origin, unknown_body, unknown, not_text, overcount]
+            .into_iter()
+            .chain(cuts)
+        {
             assert!(matches!(
                 decode_peer_entries(&malformed),
                 Err(crate::ClientError::Import(_))
@@ -1023,6 +1066,7 @@ mod tests {
             seq: 7,
             head: [3u8; 32],
             offer: vec![77u8],
+            expires_at: 1_800_000_000,
         };
         let bytes = super::super::write::encode_peer_cursors(std::slice::from_ref(&cursor));
         assert_eq!(

@@ -20,10 +20,11 @@ use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection};
 use connetto_core::Cursor;
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired, HandshakeAck, SnapshotBegin,
-    SnapshotEnd, SnapshotPatch, SubscriptionPriority,
+    SnapshotEnd, SnapshotPatch,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{LoopbackTransport, loopback};
+use connetto_test_harness::wire_tables::orders_table;
 use diesel::prelude::*;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 
@@ -42,14 +43,6 @@ diesel::table! {
         /// Order state.
         status -> Text,
     }
-}
-
-fn orders_table() -> SimpleTable {
-    SimpleTable::new(
-        "orders",
-        &[("id", ""), ("price", ""), ("quantity", ""), ("status", "")],
-        &[0],
-    )
 }
 
 /// Raw insert-patchset bytes for one snapshot's rows, compressed the way the
@@ -82,7 +75,6 @@ async fn send_snapshot(
     server
         .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
             sub_id: sub_id.to_owned(),
-            priority: SubscriptionPriority::default(),
         }))
         .await
         .expect("begin");
@@ -114,6 +106,7 @@ async fn ack_handshake(server: &mut LoopbackTransport) {
             current_cursor: Cursor::new(Vec::new()),
             schema_version: None,
             sunset_at_secs: None,
+            courier: false,
             initial_credits: 64,
             writer: Some(connetto_core::messages::WriterGrant {
                 number: 1,

@@ -37,13 +37,27 @@ ZABBLY_FINGERPRINT=4EFC590696CB15B87C73A3AD82CC8797C838DCFD
 # commons is shared with other people, who keep about 50 GiB of its 251 GiB.
 EMI_MEMORY_GIB=440
 EMI_VMS=28
-EMI_CPUS=64
+# Above emi's 64 threads, since its runners leave most of their vCPUs idle and ci.slice yields to emi's people.
+EMI_CPUS=88
 COMMONS_MEMORY_GIB=200
 COMMONS_VMS=16
 COMMONS_CPUS=64
-# The largest flavor, which a VM still being created is counted as.
-LARGEST_GIB=32
-LARGEST_CPUS=8
+# The two runner flavors. A cold build of the dioxus demo for Android peaked at 13.7 GiB
+# and was killed at 15.9 GiB on a 16 GiB light VM, and a heavy VM's largest measured peak is 21.8 GiB.
+LIGHT_GIB=24
+LIGHT_CPUS=4
+# Heavy is the largest flavor, which a VM still being created is counted as.
+HEAVY_GIB=32
+HEAVY_CPUS=8
+# The member the CI phones are plugged into, the profile its phone VM uses, and the
+# emi account that enrols and holds the phones with its own Incus certificate.
+PHONE_MEMBER=emi
+PHONE_PROFILE=ci-android
+PHONE_USER=lucac
+# A small VM on the phone member that holds a phone for hands-on adb while phone-hold.sh holds it.
+HANDS_ON_PROFILE=ci-hands-on
+HANDS_ON_GIB=12
+HANDS_ON_CPUS=4
 
 case "$MEMBER" in
   emi)
@@ -175,13 +189,50 @@ Wants=wg-quick@$WG.service
 After=wg-quick@$WG.service
 RequiresMountsFor=$POOL_DIR
 EOF
-cat > /etc/systemd/system/incus.service.d/ci-cpu-weight.conf <<EOF
-[Service]
-CPUWeight=10
+# The VMs' QEMU runs in incus.service's own cgroup, and a weight counts only against its siblings,
+# so Incus sits in a top-level slice beside user.slice and system.slice, each weighing 100.
+# A busy host leaves CI about one percent of the CPU, the share of nice 19, and an idle one all of it.
+cat > /etc/systemd/system/ci.slice <<EOF
+[Unit]
+Description=connetto CI runner VMs
+
+[Slice]
+CPUWeight=1
 EOF
+cat > /etc/systemd/system/incus.service.d/ci-slice.conf <<EOF
+[Service]
+Slice=ci.slice
+EOF
+rm -f /etc/systemd/system/incus.service.d/ci-cpu-weight.conf
 systemctl daemon-reload
-# No instance exists yet on a first run, so the restart interrupts nothing.
-incus list --all-projects --format csv --columns n | grep -q . || systemctl restart incus.service
+current=$(systemctl show incus.service -p ControlGroup --value)
+if [ "$current" != /ci.slice/incus.service ]; then
+  # incus.service kills only its main process on a stop, so a running VM would stay behind in the old cgroup.
+  vms=0
+  if [ -n "$current" ]; then
+    procs=$(cat "/sys/fs/cgroup$current/cgroup.procs") \
+      || { echo "cannot read the processes of $current, so incus.service stays there" >&2; exit 1; }
+    for pid in $procs; do
+      case $(cat "/proc/$pid/comm" 2>/dev/null) in qemu-system*) vms=$((vms + 1)) ;; esac
+    done
+  fi
+  if [ "$vms" -gt 0 ]; then
+    echo "incus.service in $current still runs $vms VMs: run this again once $MEMBER has none, ci-share.sh $MEMBER 0 0 0 stops new runners there" >&2
+    exit 1
+  fi
+  if [ -n "$current" ]; then
+    systemctl stop incus.socket incus.service
+    # systemd keeps a unit's old cgroup while anything is left in it, dnsmasq included, so the rest is killed first.
+    [ -z "$(cat "/sys/fs/cgroup$current/cgroup.procs" 2>/dev/null || true)" ] || systemctl kill incus.service
+    for _ in $(seq 1 30); do
+      [ -z "$(systemctl show incus.service -p ControlGroup --value)" ] && break
+      sleep 1
+    done
+    [ -z "$(systemctl show incus.service -p ControlGroup --value)" ] \
+      || { echo "incus.service still holds $current and is stopped: start it with systemctl start incus.socket incus.service" >&2; exit 1; }
+  fi
+  systemctl start incus.socket incus.service
+fi
 
 log "Host caches every runner VM mounts"
 # Only what is read and written with plain file IO: virtiofs in these VMs refuses shared mmap,
@@ -192,6 +243,25 @@ done
 if [ "$MEMBER" = emi ]; then
   chown "$GUEST_UID:$GUEST_UID" "$CACHE_ROOT/cargo-registry" "$CACHE_ROOT/sccache" "$CACHE_ROOT/handoff"
   chmod 0755 "$CACHE_ROOT"
+  # The adb key the phones trust, readable by the phone VM's runner and by the account that enrols phones, which share uid 1001 on emi.
+  install -d -m 0700 -o "$GUEST_UID" -g "$GUEST_UID" "$CACHE_ROOT/android-adb"
+  [ -f "$CACHE_ROOT/android-adb/enrolled" ] || install -m 0600 -o "$GUEST_UID" -g "$GUEST_UID" /dev/null "$CACHE_ROOT/android-adb/enrolled"
+
+  log "Phones sync-phones.sh enrolled are root-only on emi from their next plug-in, so no host adb claims one before the phone VM"
+  # A serial only ever restricts a device, so the list may stay writable by the account that enrols phones.
+  install -d -m 0755 /usr/local/libexec
+  cat > /usr/local/libexec/ci-phone-enrolled <<EOF
+#!/bin/sh
+case "\$1" in ''|*[!A-Za-z0-9]*) exit 1 ;; esac
+exec grep -qxF -- "\$1" $CACHE_ROOT/android-adb/enrolled
+EOF
+  chmod 0755 /usr/local/libexec/ci-phone-enrolled
+  # Sorts after 60-libgphoto2 and 69-libmtp and before 70-uaccess, which would tag the phone for a desktop session's ACL, since udev 255 cannot untag a device mid-event.
+  cat > /etc/udev/rules.d/70-ci-phones.rules <<'EOF'
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{serial}=="?*", PROGRAM="/usr/local/libexec/ci-phone-enrolled $attr{serial}", MODE:="0600", GROUP:="root", ENV{ID_USB_INTERFACES}="", ENV{ID_GPHOTO2}="", ENV{ID_MTP_DEVICE}="", ENV{ID_MEDIA_PLAYER}="", ENV{ID_PDA}=""
+EOF
+  udevadm control --reload-rules
+  udevadm trigger --subsystem-match=usb --action=change
 else
   chown "$GUEST_UID:$GUEST_UID" "$CACHE_ROOT/cargo-registry" "$CACHE_ROOT/sccache"
   # uid 1001 is a person on commons, so only root may reach the caches. The VMs reach them through virtiofsd, which runs as root.
@@ -347,6 +417,7 @@ if [ "$MEMBER" = emi ]; then
     restricted=true \
     restricted.devices.disk=allow \
     restricted.devices.disk.paths="$CACHE_ROOT" \
+    restricted.devices.usb=allow \
     restricted.networks.access="$BRIDGE" \
     restricted.storage-pools.access="$POOL" \
     limits.memory="$((EMI_MEMORY_GIB + COMMONS_MEMORY_GIB))GiB" \
@@ -356,7 +427,7 @@ if [ "$MEMBER" = emi ]; then
   # Incus 7.0.1 refuses to launch the project's own published images while this option is set (upstream/incus-restricted-image-servers-blocks-local-images.md).
   incus project unset "$PROJECT" restricted.images.servers
 
-  log "Profiles: default (disk, network), ci-light and ci-heavy (size and caches)"
+  log "Profiles: default (disk, network), ci-light, ci-heavy, $PHONE_PROFILE and $HANDS_ON_PROFILE (size and caches)"
   incus profile device show default --project "$PROJECT" | grep -q '^root:' \
     || incus profile device add default root disk path=/ pool="$POOL" size=100GiB --project "$PROJECT"
   incus profile device show default --project "$PROJECT" | grep -q '^eth0:' \
@@ -378,10 +449,15 @@ if [ "$MEMBER" = emi ]; then
     incus profile device show "$name" --project "$PROJECT" | grep -q "^actions:" \
       || incus profile device add "$name" actions disk source="$CACHE_ROOT/actions" path=/srv/cache/actions readonly=true --project "$PROJECT"
   }
-  # The largest measured peaks are 21.8 GiB on a heavy VM, and on a light one
-  # 8.7 GiB for a browser shard's cold wasm build alone, beside the shard's services.
-  make_profile ci-light 4 16GiB
-  make_profile ci-heavy "$LARGEST_CPUS" "${LARGEST_GIB}GiB"
+  make_profile ci-light "$LIGHT_CPUS" "${LIGHT_GIB}GiB"
+  make_profile ci-heavy "$HEAVY_CPUS" "${HEAVY_GIB}GiB"
+  # The phone VM, sized as a heavy one. Its phones are usb devices sync-phones.sh adds from ci/emi/phones.
+  make_profile "$PHONE_PROFILE" "$HEAVY_CPUS" "${HEAVY_GIB}GiB"
+  make_profile "$HANDS_ON_PROFILE" "$HANDS_ON_CPUS" "${HANDS_ON_GIB}GiB"
+  for name in "$PHONE_PROFILE" "$HANDS_ON_PROFILE"; do
+    incus profile device show "$name" --project "$PROJECT" | grep -q '^android-adb:' \
+      || incus profile device add "$name" android-adb disk source="$CACHE_ROOT/android-adb" path=/srv/cache/android-adb readonly=true --project "$PROJECT"
+  done
 
   log "Account $RUNNER_USER, which runs GARM and holds the GitHub App key"
   id "$RUNNER_USER" >/dev/null 2>&1 \
@@ -401,6 +477,18 @@ if [ "$MEMBER" = emi ]; then
   incus config trust list --format json | grep -q "\"name\":\"$RUNNER_USER\"" \
     || incus config trust add-certificate "$RUNNER_HOME/incus/client.crt" --name "$RUNNER_USER" --restricted --projects "$PROJECT"
 
+  log "Incus client certificate for $PHONE_USER, valid in project $PROJECT only, for sync-phones.sh and phone-hold.sh"
+  phone_home=$(getent passwd "$PHONE_USER" | cut -d: -f6)
+  phone_config=$phone_home/.config/incus
+  sudo -u "$PHONE_USER" mkdir -p "$phone_config"
+  if [ ! -f "$phone_config/client.crt" ]; then
+    sudo -u "$PHONE_USER" openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:secp384r1 \
+      -days 3650 -subj "/CN=$PHONE_USER" \
+      -keyout "$phone_config/client.key" -out "$phone_config/client.crt"
+  fi
+  incus config trust list --format json | grep -q "\"name\":\"$PHONE_USER\"" \
+    || incus config trust add-certificate "$phone_config/client.crt" --name "$PHONE_USER" --restricted --projects "$PROJECT"
+
   log "Cluster bootstrapped on emi, its only database voter, reached by commons over the link"
   if ! clustered; then
     if incus list --project "$PROJECT" --format csv --columns n | grep -q .; then
@@ -417,11 +505,17 @@ if [ "$MEMBER" = emi ]; then
   # ci-runner's own incus remote, which the image build uses, pins it too.
   remote_cert=$RUNNER_HOME/.config/incus/servercerts/emi.crt
   [ -f "$remote_cert" ] && install -m 0644 -o "$RUNNER_USER" -g "$RUNNER_USER" "$cert" "$remote_cert"
+  # $PHONE_USER's remote ci pins it as well, and is added once the certificate is trusted.
+  if sudo -u "$PHONE_USER" incus remote list --format csv | grep -q '^ci,'; then
+    install -m 0644 -o "$PHONE_USER" -g "$PHONE_USER" "$cert" "$phone_config/servercerts/ci.crt"
+  else
+    sudo -u "$PHONE_USER" incus remote add ci https://127.0.0.1:8443 --project "$PROJECT" --accept-certificate
+  fi
 
-  log "Placement: each new CI VM goes to the member with the most CI memory left, within the share ci-share.sh set"
+  log "Placement: each new CI VM goes to the member with the most CI memory left, within the share ci-share.sh set, and a phone or hands-on VM to the member the phones are plugged into, where runners leave their room free"
   incus config set instances.placement.scriptlet="$(cat <<EOF
-LARGEST = $LARGEST_GIB
-LARGEST_CPUS = $LARGEST_CPUS
+LARGEST = $HEAVY_GIB
+LARGEST_CPUS = $HEAVY_CPUS
 GIB = 1024 * 1024 * 1024
 
 def share(member, key):
@@ -442,16 +536,33 @@ def cpus(instance):
         return LARGEST_CPUS
     return int(value)
 
+def reserved(instance):
+    return "$PHONE_PROFILE" in instance.profiles or "$HANDS_ON_PROFILE" in instance.profiles
+
+def runner_flavor(profiles):
+    if "ci-heavy" in profiles:
+        return "heavy"
+    if "ci-light" in profiles:
+        return "light"
+    return None
+
 def instance_placement(request, candidate_members):
     if request.project != "$PROJECT" or request.reason != "new":
         return
     resources = get_instance_resources()
     wanted = resources.memory_size // GIB
     wanted_cpus = resources.cpu_cores
+    # incus passes a host's USB devices only to VMs on that host.
+    phones = "$PHONE_PROFILE" in request.profiles or "$HANDS_ON_PROFILE" in request.profiles
+    flavor = runner_flavor(request.profiles)
+    phone_members = 0
     best = None
     best_room = -1
     for member in candidate_members:
         name = member.server_name
+        if phones and member.config.get("user.ci.phones", "") != "true":
+            continue
+        phone_members += 1
         share_memory = share(member, "memory_gib")
         share_vms = share(member, "vms")
         share_cpus = share(member, "cpus")
@@ -463,16 +574,40 @@ def instance_placement(request, candidate_members):
         stopped = len([i for i in instances if i.status == "Stopped"])
         unrecorded = max(0, operations - stopped)
         count = len(instances) + unrecorded
+        # ci-share.sh sized each member's slots to fit together, so any order of requests within GARM's caps places.
+        # A creation without a record yet may be of either flavor, so it takes a slot of both.
+        if flavor != None:
+            taken = len([i for i in instances if runner_flavor(i.profiles) == flavor]) + unrecorded
+            if taken >= share(member, flavor + "_slots"):
+                continue
         used = LARGEST * unrecorded
         used_cpus = LARGEST_CPUS * unrecorded
+        held_memory = 0
+        held_cpus = 0
+        held_vms = 0
         for instance in instances:
             used += memory_gib(instance)
             used_cpus += cpus(instance)
+            if reserved(instance):
+                held_memory += memory_gib(instance)
+                held_cpus += cpus(instance)
+                held_vms += 1
         room = share_memory - used
-        fits = count < share_vms and room >= wanted and share_cpus - used_cpus >= wanted_cpus
+        cpu_room = share_cpus - used_cpus
+        vm_room = share_vms - count
+        # A runner leaves room for the phone and hands-on VMs that don't exist yet.
+        if not phones:
+            room -= max(0, share(member, "reserved_memory_gib") - held_memory)
+            cpu_room -= max(0, share(member, "reserved_cpus") - held_cpus)
+            vm_room -= max(0, share(member, "reserved_vms") - held_vms)
+        fits = vm_room > 0 and room >= wanted and cpu_room >= wanted_cpus
         if fits and room > best_room:
             best = name
             best_room = room
+    if phones and phone_members == 0:
+        fail("no cluster member has user.ci.phones=true, which host-setup.sh sets on the member holding the CI phones")
+    if best == None and phones:
+        fail("the member with the CI phones is at its CI share")
     if best == None:
         fail("every member is at its CI share")
     set_target(best)
@@ -521,6 +656,14 @@ for entry in "emi $EMI_MEMORY_GIB $EMI_VMS $EMI_CPUS" "commons $COMMONS_MEMORY_G
   incus cluster set "$name" user.ci.ceiling_cpus="$cpus"
 done
 
+log "$PHONE_MEMBER holds the CI phones, so the placement scriptlet sends the phone and hands-on VMs there and keeps their room free of runners"
+if incus cluster list --format csv --columns n | grep -qx "$PHONE_MEMBER"; then
+  incus cluster set "$PHONE_MEMBER" user.ci.phones=true
+  incus cluster set "$PHONE_MEMBER" user.ci.reserved_memory_gib=$((HEAVY_GIB + HANDS_ON_GIB))
+  incus cluster set "$PHONE_MEMBER" user.ci.reserved_cpus=$((HEAVY_CPUS + HANDS_ON_CPUS))
+  incus cluster set "$PHONE_MEMBER" user.ci.reserved_vms=2
+fi
+
 log "Docker Hub pull-through mirror on $BRIDGE_IP:$MIRROR_PORT"
 # Host networking, because a published port DNATs to Docker's 172.17/16, which the CI egress ACL drops.
 if [ "$(docker inspect -f '{{.HostConfig.NetworkMode}}' ci-registry-mirror 2>/dev/null)" != host ]; then
@@ -538,4 +681,5 @@ if [ "$MEMBER" = emi ]; then
   incus project show "$PROJECT"
   incus config trust list
   echo "ci-runner can now reach Incus at https://127.0.0.1:8443 with the certificate in $RUNNER_HOME/incus"
+  echo "$PHONE_USER enrols the phones listed in ci/emi/phones with: bash ci/emi/sync-phones.sh"
 fi

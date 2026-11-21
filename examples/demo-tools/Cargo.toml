@@ -1,0 +1,52 @@
+[package]
+name = "connetto-demo-tools"
+description = "The demo's processes: the sync server, the sync client, the schema, certificate authority and identity provider tools, and the custody probe, each a program over the connetto libraries."
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+publish = false
+repository = "https://github.com/connetto-rs/connetto-rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+connetto-core = { workspace = true, features = ["native-transport", "logging", "device-cert"] }
+connetto-server = { path = "../../crates/connetto-server" }
+connetto-client = { path = "../../crates/connetto-client", features = ["native-transport", "native-auth"] }
+connetto-schema = { workspace = true }
+connetto-ca = { path = "../../crates/connetto-ca" }
+# The mock identity provider `demo-idp` starts, the one the test stacks use.
+connetto-test-harness = { path = "../../crates/connetto-test-harness" }
+axum = { workspace = true }
+# `postgres_backend` for the `users` row the sign-in hooks write.
+diesel = { workspace = true, features = ["sqlite", "postgres_backend"] }
+diesel-async = { version = "0.10", default-features = false, features = ["postgres"] }
+tokio = { workspace = true, features = ["fs", "signal"] }
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
+# `CONNETTO_SUNSET` is an RFC 3339 instant the server validates at boot (R107).
+time = { version = "0.3.55", default-features = false, features = ["std", "parsing"] }
+# The device issuer key read at boot is wiped once loaded, and so is the CA
+# passphrase.
+zeroize = "1"
+rpassword = "7"
+
+[dev-dependencies]
+connetto-core = { workspace = true, features = ["test-support"] }
+connetto-server = { path = "../../crates/connetto-server", features = ["test-seams"] }
+connetto-file-server = { path = "../../crates/connetto-file-server" }
+diesel-async = { version = "0.10", default-features = false, features = ["postgres", "bb8"] }
+openfga-client = { version = "0.6.1", default-features = false }
+openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest", "rustls-tls"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "x509-parser"] }
+ring = "0.17"
+serde_json = "1"
+tempfile = "3"
+uuid = { version = "1", features = ["v4", "v5"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+keyring-core = "1.0.0"
+linux-keyutils-keyring-store = "1.0.0"
