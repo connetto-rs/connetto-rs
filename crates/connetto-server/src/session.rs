@@ -345,6 +345,63 @@ struct MemberTable {
     subjects: bool,
 }
 
+/// The membership tables a filter's terms watch, one entry per table and
+/// column, carrying every caller kind the terms over it read.
+///
+/// Collapsed rather than one entry per term, because the mirror is keyed by
+/// table and opened once. Two terms over one table under different caller
+/// kinds would otherwise open the first and silently skip the second, leaving
+/// that kind's membership moves undelivered.
+///
+/// # Errors
+///
+/// [`SubscribeRefusal::MembershipTableUnreachable`] when a term's table is not
+/// the one its bare name reaches in `catalog`.
+fn member_tables_of<DB: DatabaseLike>(
+    terms: &[TermDescription],
+    catalog: &DB,
+) -> Result<Arc<[MemberTable]>, SubscribeRefusal> {
+    let mut tables: Vec<MemberTable> = Vec::new();
+    for term in terms {
+        let TermDescription::Membership(membership) = term else {
+            continue;
+        };
+        let stored = &membership.member_table;
+        let reached = subql::catalog_helpers::table_id_for_name::<Postgres, _>(
+            catalog,
+            sql_traits::structs::TargetName::new(&stored.name, true),
+        );
+        if reached.is_none()
+            || reached != subql::catalog_helpers::stored_table_id::<Postgres, _>(catalog, stored)
+        {
+            return Err(SubscribeRefusal::MembershipTableUnreachable(
+                match &stored.schema {
+                    Some(schema) => format!("{schema}.{}", stored.name),
+                    None => stored.name.to_string(),
+                },
+            ));
+        }
+        let held = tables.iter().position(|held| {
+            held.table == membership.member_table.name && held.subject == membership.member_subject
+        });
+        let at = held.unwrap_or_else(|| {
+            tables.push(MemberTable {
+                table: membership.member_table.name.to_string(),
+                subject: membership.member_subject.clone(),
+                identity: false,
+                subjects: false,
+            });
+            tables.len() - 1
+        });
+        let entry = &mut tables[at];
+        match membership.caller {
+            TermCaller::Identity => entry.identity = true,
+            TermCaller::Subjects => entry.subjects = true,
+        }
+    }
+    Ok(tables.into())
+}
+
 /// Why a subscription was not registered, beyond the materializer's own
 /// refusals. Every cause is answered on the wire with the one fixed
 /// `SUBSCRIPTION_REFUSED` detail (R38), so this exists for the structured log.
@@ -369,6 +426,11 @@ enum SubscribeRefusal {
         "membership table {0} is not carried by the publication, so a membership change would never move rows"
     )]
     Unpublished(String),
+    /// A membership term reads a table its bare name does not reach. The seed,
+    /// the mirror and the replica name a membership table bare, so they would
+    /// read another table or none.
+    #[error("membership table {0} is not the table its bare name reaches")]
+    MembershipTableUnreachable(String),
     /// The snapshot source has no publication to verify against.
     #[error(
         "no publication is configured on the snapshot source, so a membership table cannot be verified as replicated"
@@ -9497,7 +9559,7 @@ where
                         .snapshot_source
                         .term_seed(
                             &membership.seed_sql,
-                            &membership.member_table,
+                            &membership.member_table.name,
                             &membership.member_subject,
                             &member_keys,
                             &state.principal,
@@ -9509,7 +9571,7 @@ where
                         Some(true) => {}
                         Some(false) => {
                             return Err(SubscribeRefusal::Unpublished(
-                                membership.member_table.clone(),
+                                membership.member_table.name.to_string(),
                             ));
                         }
                         None => return Err(SubscribeRefusal::NoPublication),
@@ -9582,8 +9644,8 @@ where
         let terms = materializer
             .describe_terms(consumer_id, &pg_sql, &sub.spec.binds, subscriber, subjects)
             .unwrap_or_default();
+        let member_tables = member_tables_of(&terms, materializer.catalog())?;
         let seed = self.seed_for_terms(&terms, state).await?;
-        let member_tables = Self::member_tables_of(&terms);
         let reads_subjects = terms
             .iter()
             .any(|term| caller_of(term) == TermCaller::Subjects);
@@ -9630,42 +9692,6 @@ where
             ))
             .with_statements(binding.setup_statements())
         })
-    }
-
-    /// The membership tables a registration's terms read, paired with the member
-    /// subject column, for the session's term-move routing.
-    /// The membership tables a filter's terms watch, one entry per table and
-    /// column, carrying every caller kind the terms over it read.
-    ///
-    /// Collapsed rather than one entry per term, because the mirror is keyed
-    /// by table and opened once. Two terms over one table under different
-    /// caller kinds would otherwise open the first and silently skip the
-    /// second, leaving that kind's membership moves undelivered.
-    fn member_tables_of(terms: &[TermDescription]) -> std::sync::Arc<[MemberTable]> {
-        let mut tables: Vec<MemberTable> = Vec::new();
-        for term in terms {
-            let TermDescription::Membership(membership) = term else {
-                continue;
-            };
-            let held = tables.iter().position(|held| {
-                held.table == membership.member_table && held.subject == membership.member_subject
-            });
-            let at = held.unwrap_or_else(|| {
-                tables.push(MemberTable {
-                    table: membership.member_table.clone(),
-                    subject: membership.member_subject.clone(),
-                    identity: false,
-                    subjects: false,
-                });
-                tables.len() - 1
-            });
-            let entry = &mut tables[at];
-            match membership.caller {
-                TermCaller::Identity => entry.identity = true,
-                TermCaller::Subjects => entry.subjects = true,
-            }
-        }
-        tables.into()
     }
 
     async fn handle_subscribe<T: Transport>(
@@ -11879,6 +11905,91 @@ mod tests {
             super::reject_reason(&refused),
             connetto_core::messages::MutationRejectReason::SchemaMismatch
         );
+    }
+
+    /// A membership term over a table its bare name does not reach is refused
+    /// before any read, since the seed, the mirror and the replica name the
+    /// table bare. Off the search path the bare name reaches nothing, beside a
+    /// public twin it reaches the twin, and a search path naming another schema
+    /// first shadows a table declared without one. The server's own builder
+    /// refuses such a catalog at boot, so the materializer here takes its
+    /// translator directly, as a manager built over a caller's own materializer
+    /// does.
+    #[test]
+    fn a_membership_table_its_bare_name_misses_is_refused() {
+        const DOCS: &str = "CREATE TABLE docs (id BIGINT PRIMARY KEY, project_id BIGINT NOT NULL);";
+        const ORG: &str = "CREATE SCHEMA org;\nCREATE TABLE org.project_members (project_id BIGINT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (project_id, user_id));";
+        const PUBLIC: &str = "CREATE TABLE project_members (project_id BIGINT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (project_id, user_id));";
+        const ORG_FIRST: &str = "SET search_path TO org, public;";
+        const READER: &str = "app_reader";
+        let term = |column: &str, member_table: &str| {
+            format!(
+                "{column} IN (SELECT project_id FROM {member_table} WHERE user_id = current_app_user())"
+            )
+        };
+        let member_tables = |ddl: &str, filter: &str| {
+            let translator = rls2fga::translator::TranslatorBuilder::new(
+                connetto_schema::deployment::<String>(READER)
+                    .expect("the test deployment's description holds"),
+            )
+            .with_min_confidence(rls2fga::types::ConfidenceLevel::B)
+            .build();
+            let materializer = crate::materializer::Materializer::builder(ddl)
+                .with_translator(translator)
+                .with_caller(
+                    crate::materializer::CallerMappings::of::<String>(READER)
+                        .expect("the test deployment's description holds"),
+                )
+                .build()
+                .expect("the catalog parses");
+            let pg_sql = materializer
+                .translate_subscription_sql(&format!("SELECT * FROM docs WHERE {filter}"))
+                .expect("the caller function reverse translates");
+            let terms = materializer
+                .describe_terms(1, &pg_sql, &[], None, Vec::new())
+                .expect("the membership term describes");
+            let member_tables = super::member_tables_of(&terms, materializer.catalog());
+            (terms.len(), member_tables)
+        };
+        for (ddl, member_table, refused) in [
+            (
+                format!("{DOCS}\n{ORG}"),
+                "org.project_members",
+                "org.project_members",
+            ),
+            (
+                format!("{DOCS}\n{PUBLIC}\n{ORG}"),
+                "org.project_members",
+                "org.project_members",
+            ),
+            (
+                format!("{DOCS}\n{PUBLIC}\n{ORG_FIRST}\n{ORG}"),
+                "public.project_members",
+                "project_members",
+            ),
+        ] {
+            match member_tables(&ddl, &term("project_id", member_table)).1 {
+                Err(SubscribeRefusal::MembershipTableUnreachable(table)) => {
+                    assert_eq!(table, refused);
+                }
+                other => panic!("expected {member_table} refused over {ddl}, got {other:?}"),
+            }
+        }
+        // Two terms over the one reached table share its single entry.
+        let (described, reached) = member_tables(
+            &format!("{DOCS}\n{PUBLIC}\n{ORG}"),
+            &format!(
+                "{} AND {}",
+                term("project_id", "project_members"),
+                term("id", "project_members")
+            ),
+        );
+        assert_eq!(described, 2, "both terms describe");
+        let reached = reached.expect("the table the bare name reaches is watched");
+        let [watched] = &reached[..] else {
+            panic!("one membership table, got {reached:?}");
+        };
+        assert_eq!(watched.table, "project_members");
     }
 
     /// Bytes released by a sent patch make room again, and an overflow stays final even once the queue drains.
