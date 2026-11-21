@@ -200,12 +200,9 @@ async fn seed_owned_rls(pool: &Pool<AsyncPgConnection>, user_id: &str) {
     provision_cap_policies(pool, OWNED_PG_DDL, OWNED_POLICIES).await;
 }
 
-/// The count an aggregate answer carries, which the client reads only as a
-/// bare number.
+/// The integer in a scalar aggregate answer.
 fn count_of(update: &AggregateUpdate) -> i64 {
-    let body = update.result_json.as_deref().expect("an answer has a body");
-    body.parse()
-        .unwrap_or_else(|_| panic!("a count answers as a bare number, got {body}"))
+    super::reexec::integer(update)
 }
 
 /// The next aggregate answer for `sub_id`.
@@ -228,6 +225,10 @@ async fn first_count(client: &mut WebSocketTransport<TcpStream>, sub_id: &str, q
         }))
         .await
         .expect("send the subscription");
+    assert!(matches!(
+        next_control(client).await,
+        ControlMessage::AggregateColumns(_)
+    ));
     count_of(&next_update(client, sub_id).await)
 }
 

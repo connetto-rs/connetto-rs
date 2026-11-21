@@ -1,103 +1,93 @@
-//! Aggregate subscription result delivery.
+//! Server-computed answer delivery.
 //!
-//! `subql` maintains aggregate accumulators server-side (Q5.1). When a group's
-//! value changes, or when a re-execution replaces the result set, the server
-//! delivers the result as a JSON envelope keyed by opaque group bytes (Q5.7).
-//! JSON is used only here (and in [`crate::messages::mutation::MutationConflict`])
-//! because the shape is not known at compile time. Q2.1 reserves JSON for
-//! shape-unknown data.
+//! `subql` maintains aggregates and computed row sets server-side (Q5.1). The
+//! server tells the client the declared type of every column of an answer
+//! once per registration with [`AggregateColumns`], then moves the answer with
+//! [`AggregateUpdate`]s. Every cell is a [`SqliteValue`] in the form the
+//! replica stores the column it comes from, so the client rests it as it rests
+//! rows and decodes it through the same diesel `FromSql` impls (R117).
 
 use serde::{Deserialize, Serialize};
 
-/// Update for one aggregate subscription group.
+use super::subscription::SqliteValue;
+
+/// The declared type of one column of a computed answer, which a client
+/// declares the column of its `STRICT` resting table with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ColumnType {
+    /// `INTEGER`.
+    Integer,
+    /// `REAL`.
+    Real,
+    /// `TEXT`.
+    Text,
+    /// `BLOB`.
+    Blob,
+    /// `ANY`, an output no catalog column stands behind, whose cells keep
+    /// whatever storage class their value family is stored as.
+    Any,
+}
+
+impl ColumnType {
+    /// The SQLite type name a `STRICT` table declares the column with.
+    #[must_use]
+    pub const fn sql_name(self) -> &'static str {
+        match self {
+            Self::Integer => "INTEGER",
+            Self::Real => "REAL",
+            Self::Text => "TEXT",
+            Self::Blob => "BLOB",
+            Self::Any => "ANY",
+        }
+    }
+}
+
+/// The columns of one computed subscription's answer, in select order.
 ///
-/// The `group_key` bytes are opaque to connetto. `subql` chooses the encoding
-/// and the client's local aggregate table uses them verbatim as a primary key
-/// (see the `_connetto_aggregates` schema in Q5.7). `None` means "single-group"
-/// aggregate: no `GROUP BY`, so there is exactly one row to maintain.
+/// Sent once at each registration, ahead of the subscription's first
+/// [`AggregateUpdate`] and also when its answer starts empty, so the client
+/// can create the table the answer rests in before any value arrives.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AggregateColumns {
+    /// Which subscription the columns describe.
+    pub sub_id: String,
+    /// One declared type per select-list item, in select order.
+    pub columns: Vec<ColumnType>,
+}
+
+/// One movement of a computed subscription's answer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AggregateUpdate {
     /// Which subscription this update belongs to.
     pub sub_id: String,
-    /// Opaque group key, or `None` for a single-group aggregate.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[serde(with = "serde_bytes_option")]
-    pub group_key: Option<Vec<u8>>,
-    /// The decoded group values as a JSON array in `GROUP BY` order, present
-    /// exactly when `group_key` is. The key bytes stay the stored identity
-    /// (their encoding is a backend detail), while these values are what a
-    /// typed keyed handle exposes as its public map key (R84).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub group_values_json: Option<String>,
-    /// JSON-encoded result, deserialised by the client into its
-    /// application-defined result struct. `None` removes the addressed key:
-    /// the group (or keyed row) left the result set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result_json: Option<String>,
-    /// Whether this update replaces the entire result set (true) or upserts a
-    /// single group (false). Full replacement is produced by re-execution.
-    /// Per-group upserts are produced by the IVM fast path (Q5.6).
-    #[serde(default)]
-    pub is_full_result: bool,
+    /// What moved.
+    pub change: AggregateChange,
 }
 
-// serde_bytes support for `Option<Vec<u8>>`. serde_bytes ships helpers only for
-// the direct `Vec<u8>` and `[u8]` cases, so provide a light wrapper for the
-// optional field so it still rides as a `MessagePack` `bin` on the wire.
-#[expect(
-    clippy::ref_option,
-    reason = "serde with = \"...\" calls serialize(&self, ..) with a reference to the Option"
-)]
-mod serde_bytes_option {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    use serde_bytes::ByteBuf;
-
-    pub(super) fn serialize<S>(value: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match value {
-            Some(bytes) => serde_bytes::Bytes::new(bytes).serialize(serializer),
-            None => serializer.serialize_none(),
-        }
-    }
-
-    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Option::<ByteBuf>::deserialize(deserializer).map(|opt| opt.map(ByteBuf::into_vec))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn single_group_default_is_delta() {
-        let u = AggregateUpdate {
-            sub_id: "s1".into(),
-            group_key: None,
-            group_values_json: None,
-            result_json: Some("{\"count\":10}".into()),
-            is_full_result: false,
-        };
-        assert!(!u.is_full_result);
-        assert!(u.group_key.is_none());
-        assert!(u.result_json.is_some());
-    }
-
-    #[test]
-    fn grouped_update_carries_key() {
-        let u = AggregateUpdate {
-            sub_id: "s2".into(),
-            group_key: Some(b"region=eu".to_vec()),
-            group_values_json: Some("[\"eu\"]".into()),
-            result_json: Some("{\"count\":3}".into()),
-            is_full_result: false,
-        };
-        assert_eq!(u.group_key.as_deref(), Some(&b"region=eu"[..]));
-        assert_eq!(u.group_values_json.as_deref(), Some("[\"eu\"]"));
-    }
+/// What one [`AggregateUpdate`] does to the answer. Every row holds one cell
+/// per column [`AggregateColumns`] declared, in select order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum AggregateChange {
+    /// Write the row under `key`: a fold's group, or a keyed computed row.
+    Upsert {
+        /// The opaque identity `subql` encodes the group or row key as. The
+        /// client stores it verbatim as the row's key.
+        #[serde(with = "serde_bytes")]
+        key: Vec<u8>,
+        /// The row, in select order.
+        row: Vec<SqliteValue>,
+    },
+    /// Remove the row under `key`, a group or keyed row that left the answer.
+    Remove {
+        /// The identity of the row that left.
+        #[serde(with = "serde_bytes")]
+        key: Vec<u8>,
+    },
+    /// Replace the whole answer with `rows`, in answer order. A scalar
+    /// aggregate's answer is one row of one cell, and no row at all when a
+    /// `HAVING` holds for none.
+    Replace {
+        /// The answer's rows, in answer order.
+        rows: Vec<Vec<SqliteValue>>,
+    },
 }

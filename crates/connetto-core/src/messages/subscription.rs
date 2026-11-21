@@ -2,7 +2,7 @@
 //!
 //! The subscription language is a SQLite-dialect `SELECT`, the same dialect the
 //! client runs against its local replica, with `?` placeholders accompanied by
-//! typed [`BindValue`]s in placeholder order. The server substitutes the binds
+//! typed [`SqliteValue`]s in placeholder order. The server substitutes the binds
 //! into the parsed statement, reverse-translates it to Postgres, and hands that
 //! to `subql` for parsing (Q4.1). Row-level and aggregate subscriptions share
 //! this envelope. The server classifies each subscription from its SQL, so the
@@ -12,11 +12,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::cursor::Cursor;
 
-/// One value bound to a `?` placeholder in a subscription query, in placeholder
-/// order. The five SQLite storage classes, which is exactly what a diesel query
-/// rendered against the client's replica can produce.
+/// One value in one of the five SQLite storage classes. A subscription's
+/// binds travel as these, in placeholder order, since a diesel query rendered
+/// against the client's replica can produce nothing else, and so do the cells
+/// of a server-computed answer, each in the form the replica stores its
+/// column in.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum BindValue {
+pub enum SqliteValue {
     /// SQL `NULL`.
     Null,
     /// An `INTEGER` value.
@@ -40,7 +42,7 @@ pub struct SubscriptionSpec {
     /// Values for the `?` placeholders in `query`, in placeholder order. Empty
     /// when the query has no placeholders.
     #[serde(default)]
-    pub binds: Vec<BindValue>,
+    pub binds: Vec<SqliteValue>,
 }
 
 impl SubscriptionSpec {
@@ -55,7 +57,7 @@ impl SubscriptionSpec {
 
     /// Attach the values for the query's `?` placeholders, in placeholder order.
     #[must_use]
-    pub fn with_binds(mut self, binds: Vec<BindValue>) -> Self {
+    pub fn with_binds(mut self, binds: Vec<SqliteValue>) -> Self {
         self.binds = binds;
         self
     }

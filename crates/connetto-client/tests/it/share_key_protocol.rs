@@ -17,9 +17,9 @@ use connetto_client::{ClientBuilder, ClientEvent, ConnettoClient, ConnettoConnec
 use connetto_core::Cursor;
 use connetto_core::auth::CapabilitySubject;
 use connetto_core::messages::{
-    AggregateUpdate, ControlMessage, FullResyncReason, FullResyncRequired, Handshake, HandshakeAck,
-    Pong, RateLimited, ReplaceShareKeys, ShareKeysReplaced, SnapshotBegin, SnapshotEnd,
-    WriterGrant,
+    AggregateChange, AggregateColumns, AggregateUpdate, ColumnType, ControlMessage,
+    FullResyncReason, FullResyncRequired, Handshake, HandshakeAck, Pong, RateLimited,
+    ReplaceShareKeys, ShareKeysReplaced, SnapshotBegin, SnapshotEnd, SqliteValue, WriterGrant,
 };
 use connetto_core::traits::{IncomingFrame, Transport as _};
 use diesel::prelude::*;
@@ -474,16 +474,7 @@ async fn a_computed_declaration_is_fenced_before_publication() {
         .expect("declare the computed subscription");
 
     // The synchronous bootstrap arrives, and the fence goes with it.
-    script.say(IncomingFrame::Control(ControlMessage::AggregateUpdate(
-        AggregateUpdate {
-            sub_id: "agg".to_owned(),
-            group_key: None,
-            group_values_json: None,
-            result_json: Some("3".to_owned()),
-            is_full_result: true,
-        },
-    )));
-    pump(&mut conn, Duration::from_secs(5)).await;
+    bootstrap_aggregate(&mut conn, &script).await;
     let nonce = script.pings().first().copied().expect("the fence is sent");
     assert!(matches!(
         conn.ping(nonce).await,
@@ -782,14 +773,31 @@ async fn offline_changes_present_only_the_accepted_set_on_the_next_handshake() {
     assert_eq!(coverage(&mut conn), Some(known(&["b"])));
 }
 
+/// The declared columns of the `agg` count, sent at its registration.
+fn aggregate_columns() -> IncomingFrame {
+    IncomingFrame::Control(ControlMessage::AggregateColumns(AggregateColumns {
+        sub_id: "agg".to_owned(),
+        columns: vec![ColumnType::Integer],
+    }))
+}
+
+/// The `agg` count's first answer.
 fn aggregate_bootstrap() -> IncomingFrame {
     IncomingFrame::Control(ControlMessage::AggregateUpdate(AggregateUpdate {
         sub_id: "agg".to_owned(),
-        group_key: None,
-        group_values_json: None,
-        result_json: Some("3".to_owned()),
-        is_full_result: true,
+        change: AggregateChange::Replace {
+            rows: vec![vec![SqliteValue::Integer(3)]],
+        },
     }))
+}
+
+/// Deliver the `agg` count's registration, its columns then its first
+/// answer, one pump step each.
+async fn bootstrap_aggregate(conn: &mut ConnettoConnection<Script>, script: &Script) {
+    script.say(aggregate_columns());
+    script.say(aggregate_bootstrap());
+    pump(conn, Duration::from_secs(5)).await;
+    pump(conn, Duration::from_secs(5)).await;
 }
 
 #[tokio::test]
@@ -814,8 +822,7 @@ async fn a_replacement_answer_does_not_settle_a_later_computed_declaration() {
     )));
     pump(&mut conn, Duration::from_secs(5)).await;
     assert_eq!(coverage(&mut conn), None);
-    script.say(aggregate_bootstrap());
-    pump(&mut conn, Duration::from_secs(5)).await;
+    bootstrap_aggregate(&mut conn, &script).await;
     assert_eq!(coverage(&mut conn), None);
     script.say(pong(nonce));
     pump(&mut conn, Duration::from_secs(5)).await;
@@ -878,8 +885,7 @@ async fn an_elapsed_retry_waits_for_the_declaration_fence_without_spinning() {
     conn.subscribe("agg", "SELECT COUNT(*) FROM notes")
         .await
         .expect("subscribe computed");
-    script.say(aggregate_bootstrap());
-    pump(&mut conn, Duration::from_secs(5)).await;
+    bootstrap_aggregate(&mut conn, &script).await;
     let nonce = *script.pings().last().expect("declaration fence");
     tokio::time::sleep(
         conn.share_key_timer().expect("retry timer").wait() + Duration::from_millis(20),

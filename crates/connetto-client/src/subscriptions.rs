@@ -10,7 +10,7 @@
 //! Normalised into three tables so a query shared by several subscriptions is
 //! stored once. R15 reads this same set to decide which rows are still covered.
 
-use connetto_core::messages::{BindValue, SubscriptionSpec};
+use connetto_core::messages::{SqliteValue, SubscriptionSpec};
 use core::time::Duration;
 
 use diesel::prelude::*;
@@ -92,7 +92,7 @@ diesel::table! {
         subscription_id -> Text,
         /// Placeholder index, from zero.
         position -> Integer,
-        /// Which [`BindValue`] variant `value` carries.
+        /// Which [`SqliteValue`] variant `value` carries.
         kind -> Integer,
         /// The value's bytes, absent only for SQL `NULL`.
         value -> Nullable<Binary>,
@@ -103,7 +103,7 @@ diesel::joinable!(subscription -> query_text (query_id));
 diesel::joinable!(bind -> subscription (subscription_id));
 diesel::allow_tables_to_appear_in_same_query!(query_text, subscription, bind);
 
-/// Discriminants for [`BindValue`], stored beside the bytes so a value reads
+/// Discriminants for [`SqliteValue`], stored beside the bytes so a value reads
 /// back as the storage class it went in as. An integer that returned as text
 /// would change what the server matches.
 const KIND_NULL: i32 = 0;
@@ -113,22 +113,23 @@ const KIND_TEXT: i32 = 3;
 const KIND_BLOB: i32 = 4;
 
 /// Split a bind value into its stored discriminant and bytes.
-fn encode_bind(value: &BindValue) -> (i32, Option<Vec<u8>>) {
+fn encode_bind(value: &SqliteValue) -> (i32, Option<Vec<u8>>) {
     match value {
-        BindValue::Null => (KIND_NULL, None),
-        BindValue::Integer(n) => (KIND_INTEGER, Some(n.to_be_bytes().to_vec())),
-        BindValue::Real(f) => (KIND_REAL, Some(f.to_be_bytes().to_vec())),
-        BindValue::Text(s) => (KIND_TEXT, Some(s.as_bytes().to_vec())),
-        BindValue::Blob(b) => (KIND_BLOB, Some(b.clone())),
+        SqliteValue::Null => (KIND_NULL, None),
+        SqliteValue::Integer(n) => (KIND_INTEGER, Some(n.to_be_bytes().to_vec())),
+        SqliteValue::Real(f) => (KIND_REAL, Some(f.to_be_bytes().to_vec())),
+        SqliteValue::Text(s) => (KIND_TEXT, Some(s.as_bytes().to_vec())),
+        SqliteValue::Blob(b) => (KIND_BLOB, Some(b.clone())),
     }
 }
 
 /// The canonical resting-table encoding of a bind list: every value in
 /// placeholder order, each as its [`encode_bind`] discriminant byte followed
 /// by a big-endian length and the value's bytes. This is the exact-identity
-/// form R83 keys `_connetto_aggregates` rows on, so a restart finds the row a
-/// live push wrote. One function so the upsert and the lookup share it.
-pub(crate) fn encode_binds(binds: &[BindValue]) -> Vec<u8> {
+/// form the `_connetto_stat_<query_id>` resting tables key rows on, so a
+/// restart finds the row a live push wrote. One function so the upsert and
+/// the lookup share it.
+pub(crate) fn encode_binds(binds: &[SqliteValue]) -> Vec<u8> {
     let mut out = Vec::new();
     for value in binds {
         let (kind, bytes) = encode_bind(value);
@@ -142,29 +143,29 @@ pub(crate) fn encode_binds(binds: &[BindValue]) -> Vec<u8> {
 }
 
 /// Rebuild a bind value from its stored discriminant and bytes.
-fn decode_bind(kind: i32, value: Option<Vec<u8>>) -> Result<BindValue, ClientError> {
+fn decode_bind(kind: i32, value: Option<Vec<u8>>) -> Result<SqliteValue, ClientError> {
     let malformed = || ClientError::Session("a persisted bind value is malformed".to_owned());
     match kind {
-        KIND_NULL => Ok(BindValue::Null),
+        KIND_NULL => Ok(SqliteValue::Null),
         KIND_INTEGER => {
             let bytes = value.ok_or_else(malformed)?;
-            Ok(BindValue::Integer(i64::from_be_bytes(
+            Ok(SqliteValue::Integer(i64::from_be_bytes(
                 bytes.try_into().map_err(|_| malformed())?,
             )))
         }
         KIND_REAL => {
             let bytes = value.ok_or_else(malformed)?;
-            Ok(BindValue::Real(f64::from_be_bytes(
+            Ok(SqliteValue::Real(f64::from_be_bytes(
                 bytes.try_into().map_err(|_| malformed())?,
             )))
         }
         KIND_TEXT => {
             let bytes = value.ok_or_else(malformed)?;
-            Ok(BindValue::Text(
+            Ok(SqliteValue::Text(
                 String::from_utf8(bytes).map_err(|_| malformed())?,
             ))
         }
-        KIND_BLOB => Ok(BindValue::Blob(value.ok_or_else(malformed)?)),
+        KIND_BLOB => Ok(SqliteValue::Blob(value.ok_or_else(malformed)?)),
         _ => Err(malformed()),
     }
 }
@@ -263,13 +264,14 @@ pub(crate) fn remember(
 }
 
 /// Drop the record for `sub_id`, and the query text with it once no
-/// subscription refers to it.
+/// subscription refers to it and its resting table holds no row. The
+/// statistic's resting table goes with its query text.
 ///
 /// # Errors
 ///
 /// [`ClientError::Session`] when the replica rejects the write.
 pub(crate) fn forget(db: &mut SqliteConnection, sub_id: &str) -> Result<(), ClientError> {
-    db.transaction(|conn| {
+    db.transaction::<_, ClientError, _>(|conn| {
         diesel::delete(bind::table.filter(bind::subscription_id.eq(sub_id))).execute(conn)?;
         diesel::delete(subscription::table.filter(subscription::id.eq(sub_id))).execute(conn)?;
         let orphans = query_text::table
@@ -277,19 +279,17 @@ pub(crate) fn forget(db: &mut SqliteConnection, sub_id: &str) -> Result<(), Clie
             .filter(subscription::id.nullable().is_null())
             .select(query_text::id)
             .load::<i32>(conn)?;
-        // A rested aggregate value keeps its query text alive past the
-        // subscription that produced it: an aggregate carries zero grace, so
-        // this sweep runs the moment its last handle drops, and deleting the
-        // text would strand the resting row a later restart reads through.
-        let referenced = crate::aggregates::aggregate::table
-            .filter(crate::aggregates::aggregate::query_id.eq_any(&orphans))
-            .select(crate::aggregates::aggregate::query_id)
-            .distinct()
-            .load::<i32>(conn)?;
-        let deletable: Vec<i32> = orphans
-            .into_iter()
-            .filter(|id| !referenced.contains(id))
-            .collect();
+        // A rested answer keeps its query text alive past the subscription
+        // that produced it: an aggregate carries zero grace, so this sweep
+        // runs the moment its last handle drops, and deleting the text would
+        // strand the resting table a later restart reads through.
+        let mut deletable = Vec::with_capacity(orphans.len());
+        for query_id in orphans {
+            if !crate::aggregates::holds_rows(conn, query_id)? {
+                crate::aggregates::drop_table(conn, query_id)?;
+                deletable.push(query_id);
+            }
+        }
         diesel::delete(query_text::table.filter(query_text::id.eq_any(deletable))).execute(conn)?;
         Ok(())
     })
@@ -320,7 +320,7 @@ pub(crate) fn is_declared(db: &mut SqliteConnection, sub_id: &str) -> Result<boo
 pub(crate) fn identity_of(
     db: &mut SqliteConnection,
     sub_id: &str,
-) -> Result<Option<(i32, Vec<BindValue>)>, ClientError> {
+) -> Result<Option<(i32, Vec<SqliteValue>)>, ClientError> {
     let query_id: Option<i32> = subscription::table
         .filter(subscription::id.eq(sub_id))
         .select(subscription::query_id)
@@ -354,7 +354,7 @@ pub(crate) fn live_identities(
 }
 
 /// The binds of one subscription, in placeholder order.
-fn binds_of(db: &mut SqliteConnection, sub_id: &str) -> Result<Vec<BindValue>, ClientError> {
+fn binds_of(db: &mut SqliteConnection, sub_id: &str) -> Result<Vec<SqliteValue>, ClientError> {
     let stored: Vec<(i32, Option<Vec<u8>>)> = bind::table
         .filter(bind::subscription_id.eq(sub_id))
         .order(bind::position)
@@ -630,10 +630,6 @@ mod tests {
     fn replica() -> SqliteConnection {
         let mut db = SqliteConnection::establish(":memory:").expect("open");
         install(&mut db).expect("ddl");
-        // `forget` reads `_connetto_aggregates` to spare a query row a rested
-        // value references, so the fixture carries it like an open replica does.
-        db.batch_execute(crate::aggregates::AGGREGATE_DDL)
-            .expect("aggregate ddl");
         db
     }
 
@@ -691,11 +687,11 @@ mod tests {
             query: "SELECT * FROM orders WHERE a = ? AND b = ? AND c = ? AND d = ? AND e = ?"
                 .to_owned(),
             binds: vec![
-                BindValue::Null,
-                BindValue::Integer(-9_007_199_254_740_993),
-                BindValue::Real(0.1 + 0.2),
-                BindValue::Text("caf\u{e9}".to_owned()),
-                BindValue::Blob(vec![0, 255, 128]),
+                SqliteValue::Null,
+                SqliteValue::Integer(-9_007_199_254_740_993),
+                SqliteValue::Real(0.1 + 0.2),
+                SqliteValue::Text("caf\u{e9}".to_owned()),
+                SqliteValue::Blob(vec![0, 255, 128]),
             ],
         };
         watch(&mut db, "wire-0", &spec);
@@ -714,7 +710,7 @@ mod tests {
                 id,
                 &SubscriptionSpec {
                     query: sql.to_owned(),
-                    binds: vec![BindValue::Integer(customer)],
+                    binds: vec![SqliteValue::Integer(customer)],
                 },
             );
         }
@@ -764,12 +760,12 @@ mod tests {
             "wire-0",
             &SubscriptionSpec {
                 query: "SELECT * FROM orders WHERE a = ? AND b = ?".to_owned(),
-                binds: vec![BindValue::Integer(1), BindValue::Integer(2)],
+                binds: vec![SqliteValue::Integer(1), SqliteValue::Integer(2)],
             },
         );
         let narrowed = SubscriptionSpec {
             query: "SELECT * FROM orders WHERE a = ?".to_owned(),
-            binds: vec![BindValue::Integer(1)],
+            binds: vec![SqliteValue::Integer(1)],
         };
         watch(&mut db, "wire-0", &narrowed);
         assert_eq!(listed(&mut db), vec![("wire-0".to_owned(), narrowed)]);

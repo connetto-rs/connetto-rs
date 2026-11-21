@@ -229,7 +229,7 @@ mod pg {
         ColumnId, DatabaseLike, ParserDB, PgCommitPosition, PgLsn, TableId, catalog_helpers,
     };
 
-    use connetto_core::messages::BindValue;
+    use connetto_core::messages::SqliteValue;
     use connetto_core::{Cursor, Principal};
 
     use super::{
@@ -337,7 +337,7 @@ mod pg {
         fn plan_page<'a>(
             &self,
             select_sql: &str,
-            binds: &[BindValue],
+            binds: &[SqliteValue],
             page: &PageSpec,
         ) -> Result<PagePlan<'a>, SnapshotError> {
             let table = table_from_select(select_sql)?;
@@ -588,13 +588,13 @@ mod pg {
 
     /// Attach the wire binds to `query` in placeholder order, each with its
     /// natural Postgres type.
-    pub(crate) fn attach_binds(query: Boxed<'_>, binds: Vec<BindValue>) -> Boxed<'_> {
+    pub(crate) fn attach_binds(query: Boxed<'_>, binds: Vec<SqliteValue>) -> Boxed<'_> {
         binds.into_iter().fold(query, |query, bind| match bind {
-            BindValue::Null => query.bind::<Nullable<Text>, _>(None::<String>),
-            BindValue::Integer(value) => query.bind::<BigInt, _>(value),
-            BindValue::Real(value) => query.bind::<Double, _>(value),
-            BindValue::Text(value) => query.bind::<Text, _>(value),
-            BindValue::Blob(bytes) => query.bind::<Binary, _>(bytes),
+            SqliteValue::Null => query.bind::<Nullable<Text>, _>(None::<String>),
+            SqliteValue::Integer(value) => query.bind::<BigInt, _>(value),
+            SqliteValue::Real(value) => query.bind::<Double, _>(value),
+            SqliteValue::Text(value) => query.bind::<Text, _>(value),
+            SqliteValue::Blob(bytes) => query.bind::<Binary, _>(bytes),
         })
     }
 
@@ -688,7 +688,7 @@ mod pg {
         async fn estimate(
             &self,
             select_sql: &str,
-            binds: &[BindValue],
+            binds: &[SqliteValue],
             caller: &Principal<Id, Key>,
         ) -> Result<SnapshotEstimate, Self::Error> {
             let table = table_from_select(select_sql)?;
@@ -763,7 +763,7 @@ mod pg {
         async fn snapshot_page(
             &self,
             select_sql: &str,
-            binds: &[BindValue],
+            binds: &[SqliteValue],
             caller: &Principal<Id, Key>,
             page: &PageSpec,
         ) -> Result<SnapshotPage, Self::Error> {

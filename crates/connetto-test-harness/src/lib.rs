@@ -2769,6 +2769,24 @@ impl Client {
         }
     }
 
+    /// Read a computed subscription's column declaration, the first frame the
+    /// server sends at its registration.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the next control frame is not an `AggregateColumns` for `sub_id`, or when the transport returns a receive error.
+    pub async fn expect_aggregate_columns(
+        &mut self,
+        sub_id: &str,
+    ) -> connetto_core::messages::AggregateColumns {
+        let frame = self.next_control().await;
+        let ControlMessage::AggregateColumns(columns) = frame else {
+            panic!("expected aggregate columns, got {frame:?}");
+        };
+        assert_eq!(columns.sub_id, sub_id, "columns for the wrong subscription");
+        columns
+    }
+
     /// Wait for a live patch to arrive, skipping any interleaved control frames
     /// (keepalive pongs and the like). Panics if none arrives within `timeout`.
     ///

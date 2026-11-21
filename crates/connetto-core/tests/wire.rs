@@ -17,18 +17,19 @@ use connetto_core::{
         RetractCause, Retraction, SignedOffer,
     },
     messages::{
-        AckCredits, AggregateUpdate, BindDevice, BotListEntry, BotRegistered, BulkMessage,
-        Challenge, ConflictRow, ControlMessage, CourierAnswer, CourierBody, CourierNotice,
-        CourierNoticeAck, CourierNoticeRow, CourierRange, DeviceAttestation, DeviceRevokedAck,
-        DeviceSummary, DevicesList, DevicesRequest, EnrolChallenge, EnrolChallengeRequest,
-        EnrolGrant, EnrolRefusal, EnrolRefused, EnrolRequest, FatalError, FatalErrorReason,
-        FullResyncReason, FullResyncRequired, Grant, Handshake, HandshakeAck, LivePatch,
-        MutationConflict, MutationHeader, MutationPatch, MutationReject, MutationRejectReason,
-        NonFatalError, PauseCause, Ping, Pong, Provenance, ProvisionalStatus, ProvisionalVerdicts,
-        RateLimited, RegisterBot, ReplaceShareKeys, RetireWriter, RevocationUpdate,
-        RevokeDeviceRequest, ShareKeysReplaced, SignedList, SnapshotBegin, SnapshotEnd,
-        SnapshotPatch, Subscribe, SubscriptionSpec, Unsubscribe, Verdict, WriterAnswer,
-        WriterGrant, WriterOutcome, WriterRef, WriterRequest, WriterSecret,
+        AckCredits, AggregateChange, AggregateColumns, AggregateUpdate, BindDevice, BotListEntry,
+        BotRegistered, BulkMessage, Challenge, ColumnType, ConflictRow, ControlMessage,
+        CourierAnswer, CourierBody, CourierNotice, CourierNoticeAck, CourierNoticeRow,
+        CourierRange, DeviceAttestation, DeviceRevokedAck, DeviceSummary, DevicesList,
+        DevicesRequest, EnrolChallenge, EnrolChallengeRequest, EnrolGrant, EnrolRefusal,
+        EnrolRefused, EnrolRequest, FatalError, FatalErrorReason, FullResyncReason,
+        FullResyncRequired, Grant, Handshake, HandshakeAck, LivePatch, MutationConflict,
+        MutationHeader, MutationPatch, MutationReject, MutationRejectReason, NonFatalError,
+        PauseCause, Ping, Pong, Provenance, ProvisionalStatus, ProvisionalVerdicts, RateLimited,
+        RegisterBot, ReplaceShareKeys, RetireWriter, RevocationUpdate, RevokeDeviceRequest,
+        ShareKeysReplaced, SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch, SqliteValue,
+        Subscribe, SubscriptionSpec, Unsubscribe, Verdict, WriterAnswer, WriterGrant,
+        WriterOutcome, WriterRef, WriterRequest, WriterSecret,
     },
     version::PROTOCOL_VERSION,
 };
@@ -300,32 +301,36 @@ fn mutation_control_frames_round_trip() {
 }
 
 #[test]
-fn aggregate_update_round_trip() {
+fn aggregate_frames_round_trip() {
+    round_trip_control(&ControlMessage::AggregateColumns(AggregateColumns {
+        sub_id: "sub-count".into(),
+        columns: vec![ColumnType::Blob, ColumnType::Integer, ColumnType::Any],
+    }));
     round_trip_control(&ControlMessage::AggregateUpdate(AggregateUpdate {
         sub_id: "sub-count".into(),
-        group_key: Some(b"region=eu".to_vec()),
-        group_values_json: Some(r#"["eu"]"#.into()),
-        result_json: Some(r#"{"count":42}"#.into()),
-        is_full_result: false,
+        change: AggregateChange::Upsert {
+            key: vec![0xff, 0x00],
+            row: vec![
+                SqliteValue::Blob(vec![0xff, 0x00]),
+                SqliteValue::Integer(42),
+                SqliteValue::Null,
+            ],
+        },
+    }));
+    round_trip_control(&ControlMessage::AggregateUpdate(AggregateUpdate {
+        sub_id: "sub-count".into(),
+        change: AggregateChange::Remove {
+            key: vec![0xff, 0x00],
+        },
     }));
     round_trip_control(&ControlMessage::AggregateUpdate(AggregateUpdate {
         sub_id: "sub-total".into(),
-        group_key: None,
-        group_values_json: None,
-        result_json: Some(r#"{"total":9001}"#.into()),
-        is_full_result: true,
-    }));
-}
-
-#[test]
-fn aggregate_removal_round_trip() {
-    // A grouped key leaving the result set: result_json is absent on the wire.
-    round_trip_control(&ControlMessage::AggregateUpdate(AggregateUpdate {
-        sub_id: "sub-count".into(),
-        group_key: Some(b"region=eu".to_vec()),
-        group_values_json: Some(r#"["eu"]"#.into()),
-        result_json: None,
-        is_full_result: false,
+        change: AggregateChange::Replace {
+            rows: vec![
+                vec![SqliteValue::Real(9001.5)],
+                vec![SqliteValue::Text("t".into())],
+            ],
+        },
     }));
 }
 

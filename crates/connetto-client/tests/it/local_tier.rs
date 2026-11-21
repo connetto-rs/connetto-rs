@@ -70,36 +70,42 @@ struct Note {
 }
 
 /// A downstream-style application SQL type: the comma-joined result of a
-/// `group_concat`. Only this test crate owns it, so the orphan rule lets it
-/// carry its own [`AggregateWire`](connetto_client::dsl::AggregateWire) impl,
-/// which is the whole point of the extension seam.
+/// `group_concat`. Only this test crate owns it, so it loads through its own
+/// diesel [`FromSql`](diesel::deserialize::FromSql) impl, with no code in
+/// connetto, which is the whole point of the extension seam.
 #[derive(diesel::sql_types::SqlType, diesel::query_builder::QueryId)]
 #[diesel(sqlite_type(name = "Text"))]
 pub struct CsvList;
 
 diesel::define_sql_function! {
     /// The SQLite built-in `group_concat` aggregate, returning the custom
-    /// [`CsvList`] type. Its name is absent from connetto's built-in
-    /// `AGGREGATE_FUNCTIONS`, so only the typed `live()` path (which reads
-    /// diesel's `IsAggregate` marker) classifies it as an aggregate. The
-    /// `#[aggregate]` attribute is what sets that marker.
+    /// [`CsvList`] type, `NULL` over no row. Its name is absent from
+    /// connetto's built-in `AGGREGATE_FUNCTIONS`, so only the typed `live()`
+    /// path (which reads diesel's `IsAggregate` marker) classifies it as an
+    /// aggregate. The `#[aggregate]` attribute is what sets that marker.
     #[aggregate]
-    fn group_concat(body: diesel::sql_types::Text) -> CsvList;
+    fn group_concat(body: diesel::sql_types::Text) -> diesel::sql_types::Nullable<CsvList>;
 }
 
-impl connetto_client::dsl::AggregateWire for CsvList {
-    type Value = Option<String>;
+/// The application value a [`CsvList`] loads as, its items in order.
+#[derive(Debug, Clone, PartialEq, Eq, diesel::deserialize::FromSqlRow)]
+pub struct Csv(Vec<String>);
 
-    fn decode(json: &str) -> Result<Option<String>, connetto_client::ClientError> {
-        use connetto_client::dsl::wire;
-        match wire::json_value(json)? {
-            serde_json::Value::Null => Ok(None),
-            serde_json::Value::String(s) => Ok(Some(s)),
-            other => Err(connetto_client::ClientError::Session(format!(
-                "expected a csv string, got {other}"
-            ))),
-        }
+impl diesel::deserialize::FromSql<CsvList, diesel::sqlite::Sqlite> for Csv {
+    fn from_sql(
+        value: diesel::sqlite::SqliteValue<'_, '_, '_>,
+    ) -> diesel::deserialize::Result<Self> {
+        let joined = <String as diesel::deserialize::FromSql<
+            diesel::sql_types::Text,
+            diesel::sqlite::Sqlite,
+        >>::from_sql(value)?;
+        Ok(Self(joined.split(',').map(str::to_owned).collect()))
     }
+}
+
+/// The [`Csv`] of `items`.
+fn csv(items: &[&str]) -> Csv {
+    Csv(items.iter().map(|item| (*item).to_owned()).collect())
 }
 
 /// A snapshot source that records every subscription's `select_sql`, so the
@@ -120,7 +126,7 @@ impl SnapshotSource for RecordingSnapshot {
     async fn estimate(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &connetto_core::Principal,
     ) -> Result<SnapshotEstimate, Self::Error> {
         Ok(SnapshotEstimate {
@@ -136,7 +142,7 @@ impl SnapshotSource for RecordingSnapshot {
     async fn snapshot_page(
         &self,
         select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &connetto_core::Principal,
         _page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {
@@ -401,10 +407,10 @@ async fn local_custom_aggregate_decodes_via_extension_seam() {
     // (CsvList). It proves two facets at once: the typed live() path
     // classifies it as an aggregate from diesel's IsAggregate marker rather
     // than the SQL-text name list (a text classifier would misread it as a
-    // row query and reject it), and a downstream AggregateWire impl over the
-    // app's own SQL type drives live() end to end through the public wire
-    // primitives. It runs on the local tier, so the client recomputes it with
-    // json_quote and no subscription reaches the server.
+    // row query and reject it), and the app's own diesel FromSql impl over
+    // its SQL type drives live() end to end. It runs on the local tier, so
+    // the client recomputes it through diesel and no subscription reaches
+    // the server.
     let fixture = Fixture::acquire().await;
     let (_manager, seen, addr, server) = spawn_server(&fixture, 1).await;
     let conn = connect_with_tier(addr).await;
@@ -412,13 +418,12 @@ async fn local_custom_aggregate_decodes_via_extension_seam() {
     tokio::spawn(pump);
     let mut events = client.events();
 
-    let mut joined = notes::table
+    let mut joined: connetto_client::LiveValue<Option<Csv>> = notes::table
         .select(group_concat(notes::body))
         .live(&client)
         .await
         .expect("local live custom aggregate");
-    // The empty set: group_concat is NULL, json_quote renders "null", the
-    // app's decoder maps it to None.
+    // The empty set: group_concat is NULL, which loads as None.
     assert_eq!(
         joined.value(),
         Some(None),
@@ -442,7 +447,7 @@ async fn local_custom_aggregate_decodes_via_extension_seam() {
     joined.changed().await.expect("local recompute");
     assert_eq!(
         joined.value(),
-        Some(Some("a,b".to_owned())),
+        Some(Some(csv(&["a", "b"]))),
         "the custom aggregate recomputed locally and decoded through the seam",
     );
 
@@ -460,13 +465,13 @@ async fn local_custom_aggregate_decodes_via_extension_seam() {
     joined.changed().await.expect("second local recompute");
     assert_eq!(
         joined.value(),
-        Some(Some("a,b,c".to_owned())),
+        Some(Some(csv(&["a", "b", "c"]))),
         "a further change updates the custom aggregate",
     );
 
     // The nullable round-trip: deleting every row empties the set, group_concat
-    // is NULL again, and the seam decoder maps it back to None. This is the
-    // corner a nullable custom decoder most often gets wrong.
+    // is NULL again, and it loads back as None. This is the corner a nullable
+    // custom decoder most often gets wrong.
     client
         .with_conn(|conn| diesel::delete(notes::table).execute(conn.conn()))
         .await
@@ -500,12 +505,12 @@ async fn mixed_tier_aggregate_is_refused_at_registration() {
     let (client, pump) = ConnettoClient::with_pump(conn);
     tokio::spawn(pump);
 
-    let Err(err) = orders::table
+    let refused: Result<connetto_client::LiveValue<i64>, _> = orders::table
         .inner_join(notes::table.on(notes::id.eq(orders::id)))
         .count()
         .live(&client)
-        .await
-    else {
+        .await;
+    let Err(err) = refused else {
         panic!("a mixed-tier aggregate must be refused");
     };
     assert!(

@@ -15,7 +15,7 @@ The shipped spec carries two fields.
 ```text
 SubscriptionSpec {
   query:    String,                // full SELECT in the client's SQLite dialect
-  binds:    Vec<BindValue>,        // values for the ? placeholders, in order
+  binds:    Vec<SqliteValue>,      // values for the ? placeholders, in order
 }
 ```
 

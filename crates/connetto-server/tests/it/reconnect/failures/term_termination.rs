@@ -2,7 +2,7 @@
 
 use std::future::{Future, ready};
 
-use connetto_core::messages::{BindValue, FatalErrorReason, Ping};
+use connetto_core::messages::{FatalErrorReason, Ping, SqliteValue};
 use connetto_server::CallerMappings;
 use connetto_server::session::TermSeedRead;
 use subql::backend::Value as PgValue;
@@ -24,7 +24,7 @@ impl SnapshotSource for MembershipSeed {
     async fn estimate(
         &self,
         sql: &str,
-        binds: &[BindValue],
+        binds: &[SqliteValue],
         caller: &Principal,
     ) -> Result<SnapshotEstimate, Self::Error> {
         SeedSnapshot.estimate(sql, binds, caller).await
@@ -33,7 +33,7 @@ impl SnapshotSource for MembershipSeed {
     async fn snapshot_page(
         &self,
         sql: &str,
-        binds: &[BindValue],
+        binds: &[SqliteValue],
         caller: &Principal,
         page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {

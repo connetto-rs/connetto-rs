@@ -27,11 +27,6 @@ native-transport = [
   "tokio/io-util",
   "dep:getrandom",
 ]
-# Aggregate decode support for the Postgres-only diesel SQL types `Uuid` and
-# `Timestamptz`. Their diesel markers live behind diesel's postgres_backend
-# (no libpq), which the orphan rule forbids a downstream crate from mapping, so
-# they are opt-in here rather than forced on every SQLite-only client.
-postgres-types = ["diesel/postgres_backend"]
 # A bot registering itself over a live connection (R91): the Ed25519
 # signature over the connection's nonce. Native only, like `native-auth`,
 # because ring does not build for the browser's wasm target.

@@ -82,7 +82,7 @@ pub struct TabIdentity {
 }
 
 use super::{
-    aggregate::AggregateUpdate,
+    aggregate::{AggregateColumns, AggregateUpdate},
     content::{ContentTicketGrant, ContentTicketRequest},
     courier::{
         CourierAnswer, CourierAuditAnswer, CourierAuditCancel, CourierAuditRequest, CourierNotice,
@@ -148,7 +148,10 @@ pub enum ControlMessage {
     /// Server reports that a mutation collided with a newer server-side row.
     MutationConflict(MutationConflict),
 
-    /// Server pushes an aggregate result update (JSON payload).
+    /// Server declares a computed subscription's columns, once per
+    /// registration and ahead of its first `AggregateUpdate`.
+    AggregateColumns(AggregateColumns),
+    /// Server moves a computed subscription's answer.
     AggregateUpdate(AggregateUpdate),
 
     /// Server tells the client the subscription cannot resume incrementally.

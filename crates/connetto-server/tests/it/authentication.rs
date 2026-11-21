@@ -44,7 +44,7 @@ impl SnapshotSource for CapturingSnapshot {
     async fn estimate(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &Principal,
     ) -> Result<SnapshotEstimate, Self::Error> {
         Ok(SnapshotEstimate {
@@ -60,7 +60,7 @@ impl SnapshotSource for CapturingSnapshot {
     async fn snapshot_page(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         caller: &Principal,
         _page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {

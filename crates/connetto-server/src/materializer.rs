@@ -30,7 +30,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use connetto_core::messages::{BindValue, MutationPatch};
+use connetto_core::messages::{AggregateChange, ColumnType, MutationPatch, SqliteValue};
 use connetto_core::quote_ident;
 use connetto_core::write::{VersionColumn, WritableCatalog};
 use diesel::query_builder::{BoxedSqlQuery, SqlQuery};
@@ -55,16 +55,17 @@ use subql::backend::{
     CdcEvent, Postgres, RowKind, ScalarFamily, Value as PgValue, encode_value_key,
 };
 use subql::emit::{
-    WireTable, pgoutput_changeset_builder, pgoutput_patchset, pgoutput_patchset_builder,
+    StorageClass, StorageEncoder, StorageError, StorageLayout, StorageType, WireTable,
+    pgoutput_changeset_builder, pgoutput_patchset, pgoutput_patchset_builder,
 };
 use subql::patchset::SqliteAdapter;
 use subql::reexec::{
     AsyncConnector, AsyncMode, AutoResolvingEngine, ReExecError, RowDelta, RowsUpdate, ScalarUpdate,
 };
 use subql::{
-    AggValue, AggregateBootstrap, AggregateResultValue, AggregateValueChange, AggregateValueUpdate,
+    AggregateBootstrap, AggregateResultValue, AggregateValueChange, AggregateValueUpdate,
     AsyncSubscriptionDispatch, Checkpoint, ColumnId, DatabaseLike, DefaultIds, Incompatibility,
-    MaintenanceTransition, NoRefusals, NumericValue, OpaqueCheckpoint, ParserDB, PgChangeEvent,
+    MaintenanceTransition, NoRefusals, OpaqueCheckpoint, ParserDB, PgChangeEvent,
     SubscriptionEngine, SubscriptionId, SubscriptionRequest, TableId, TableLike, Tier,
     catalog_helpers,
 };
@@ -472,6 +473,8 @@ pub struct Dispatched {
     /// scalar extremes, re-read row answers, and keyed row changes, each
     /// already shaped for the wire.
     pub computed: Vec<ComputedChange>,
+    /// Computed subscriptions whose cells could not be encoded.
+    pub computed_refused: Vec<SubscriptionId>,
     /// Membership moves this event caused: a subscription's answer changed
     /// because a relationship row moved, never because a row it reads changed
     /// (R27). Empty for every event until a membership term is registered.
@@ -507,6 +510,8 @@ struct Encoded {
 pub struct Drained {
     /// Every answer the drain installed before it stopped.
     pub computed: Vec<ComputedChange>,
+    /// Computed subscriptions whose cells could not be encoded.
+    pub computed_refused: Vec<SubscriptionId>,
     /// The failure that stopped the drain. Retryable reads stay queued.
     pub failure: Option<MaterializerError>,
     /// The reads subql ended for good, whose subscriptions the engine no
@@ -530,19 +535,8 @@ pub struct ComputedChange {
     pub subscription_id: SubscriptionId,
     /// Consumer that owns it.
     pub consumer_id: u64,
-    /// The addressed key: a fold group's opaque encoding, a keyed row's
-    /// key encoding, or `None` for a single-valued answer.
-    pub group_key: Option<Vec<u8>>,
-    /// The decoded group values as a JSON array in `GROUP BY` order, present
-    /// exactly when `group_key` is, so a typed keyed handle never decodes the
-    /// opaque key bytes (R84).
-    pub group_values_json: Option<String>,
-    /// The new value as JSON, or `None` when the addressed key left the
-    /// result.
-    pub result_json: Option<String>,
-    /// Whether this replaces the subscription's whole result rather than
-    /// upserting one key.
-    pub is_full_result: bool,
+    /// The typed movement in select order.
+    pub change: AggregateChange,
 }
 
 /// The engine the materializer hosts: subql's auto-resolving wrapper in async
@@ -602,9 +596,9 @@ where
     /// membership term, where a subscription never names the caller.
     caller: Option<CallerMappings>,
     audit_tables: Vec<(TableId, &'static str)>,
-    /// Per-viewer re-reads of an ungrouped aggregate, whose one-cell answer
-    /// goes on the wire as that value, the shape a client reads a scalar in.
-    scalar_rereads: HashSet<SubscriptionId>,
+    storage_layouts: HashMap<SubscriptionId, StorageLayout>,
+    computed_columns: HashMap<SubscriptionId, Vec<ColumnType>>,
+    storage_encoder: StorageEncoder,
     /// The tables refused while this process runs, which the apply path, the
     /// subscribe gate and the ingest loop all consult.
     refused: RefusedSet,
@@ -718,7 +712,9 @@ impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
             write,
             caller,
             audit_tables: private_tables,
-            scalar_rereads: HashSet::new(),
+            storage_layouts: HashMap::new(),
+            computed_columns: HashMap::new(),
+            storage_encoder: StorageEncoder::new(),
             refused: RefusedSet::default(),
             policy_readers,
             reads: HashMap::new(),
@@ -747,7 +743,7 @@ impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
         &mut self,
         consumer_id: u64,
         sqlite_sql: &str,
-        binds: &[BindValue],
+        binds: &[SqliteValue],
         budget: ReadBudget,
     ) -> Result<SqliteRegistration, MaterializerError> {
         let pg_sql = self.translate_subscription_sql(sqlite_sql)?;
@@ -911,15 +907,15 @@ impl<W: WritableCatalog, C: ReadConnector> MaterializerBuilder<W, C> {
 /// [`SubscriptionRequest`] carries. Total by construction: every wire variant
 /// has a subql counterpart, blobs included, so a bind can only be refused by
 /// the engine's own placeholder pairing.
-pub(crate) fn wire_binds(binds: &[BindValue]) -> Vec<PgValue<Postgres>> {
+pub(crate) fn wire_binds(binds: &[SqliteValue]) -> Vec<PgValue<Postgres>> {
     binds
         .iter()
         .map(|bind| match bind {
-            BindValue::Null => PgValue::Null,
-            BindValue::Integer(value) => PgValue::Int(*value),
-            BindValue::Real(value) => PgValue::Float(*value),
-            BindValue::Text(value) => PgValue::String(value.clone()),
-            BindValue::Blob(bytes) => PgValue::Bytes(bytes.clone()),
+            SqliteValue::Null => PgValue::Null,
+            SqliteValue::Integer(value) => PgValue::Int(*value),
+            SqliteValue::Real(value) => PgValue::Float(*value),
+            SqliteValue::Text(value) => PgValue::String(value.clone()),
+            SqliteValue::Blob(bytes) => PgValue::Bytes(bytes.clone()),
         })
         .collect()
 }
@@ -1196,6 +1192,40 @@ where
     {
         let registered = self.engine.register(request, setup)?;
         let subscription_id = registered.subscription_id;
+        let needs_layout = match &registered.tier {
+            Tier::InProcess(served) => served.aggregate_bootstrap.is_some(),
+            Tier::Scalar { .. } | Tier::GroupedScalar { .. } => true,
+            Tier::KeyedRows { .. } | Tier::WholeRows { .. } => false,
+        };
+        if needs_layout
+            && !registered
+                .storage_layout
+                .as_ref()
+                .is_some_and(fold_layout_complete)
+        {
+            self.engine.unregister_subscription(subscription_id);
+            return Err(MaterializerError::Install(
+                "computed select list cannot be laid out".to_owned(),
+            ));
+        }
+        if let Some(layout) = registered.storage_layout {
+            self.computed_columns.insert(
+                subscription_id,
+                layout
+                    .outputs()
+                    .iter()
+                    .map(|output| {
+                        output.map_or(ColumnType::Any, |storage| match storage.storage_class() {
+                            StorageClass::Integer => ColumnType::Integer,
+                            StorageClass::Real => ColumnType::Real,
+                            StorageClass::Text => ColumnType::Text,
+                            StorageClass::Blob => ColumnType::Blob,
+                        })
+                    })
+                    .collect(),
+            );
+            self.storage_layouts.insert(subscription_id, layout);
+        }
         Ok(match registered.tier {
             Tier::InProcess(served) => match served.aggregate_bootstrap {
                 Some(bootstrap) => Registration::Computed(ComputedCapture {
@@ -1255,22 +1285,17 @@ where
         let subql::reexec::ScalarInstalled::Value(update) = installed else {
             return Ok(None);
         };
-        Ok(Some(ComputedChange {
-            subscription_id: update.subscription_id,
-            consumer_id: update.consumer_id,
-            group_key: None,
-            group_values_json: None,
-            result_json: Some(value_to_json(&update.value)),
-            is_full_result: true,
-        }))
+        self.scalar_change(update.subscription_id, update.consumer_id, &update.value)
+            .map(Some)
     }
 
     /// Drop a subscription of any tier by its engine id. Returns whether it
     /// existed. One call for rows, folds, and read tiers alike: the wrapper
     /// resolves whichever registry holds the id (U7).
     pub fn unregister(&mut self, sub_id: SubscriptionId) -> bool {
-        self.scalar_rereads.remove(&sub_id);
         self.reads.remove(&sub_id);
+        self.storage_layouts.remove(&sub_id);
+        self.computed_columns.remove(&sub_id);
         self.engine.unregister_subscription(sub_id)
     }
 
@@ -1357,8 +1382,8 @@ where
             changes: output
                 .updates
                 .into_iter()
-                .map(Self::aggregate_change)
-                .collect(),
+                .map(|update| self.aggregate_change(update))
+                .collect::<Result<_, _>>()?,
             needs_snapshot: !output.triggers.is_empty(),
         })
     }
@@ -1390,30 +1415,18 @@ where
         };
         Ok(match result {
             subql::reexec::SnapshotResult::Scalar(value, _) => {
-                vec![ComputedChange {
-                    subscription_id,
-                    consumer_id,
-                    group_key: None,
-                    group_values_json: None,
-                    result_json: Some(value_to_json(&value)),
-                    is_full_result: true,
-                }]
+                vec![self.scalar_change(subscription_id, consumer_id, &value)?]
             }
-            subql::reexec::SnapshotResult::GroupedAggregate { updates, .. } => {
-                updates.into_iter().map(Self::aggregate_change).collect()
+            subql::reexec::SnapshotResult::GroupedAggregate { updates, .. } => updates
+                .into_iter()
+                .map(|update| self.aggregate_change(update))
+                .collect::<Result<_, _>>()?,
+            subql::reexec::SnapshotResult::Rows { columns, rows, .. } => {
+                self.computed_columns
+                    .entry(subscription_id)
+                    .or_insert_with(|| vec![ColumnType::Any; columns.len()]);
+                vec![self.replace_rows(subscription_id, consumer_id, &rows)?]
             }
-            subql::reexec::SnapshotResult::Rows { columns, rows, .. } => vec![ComputedChange {
-                subscription_id,
-                consumer_id,
-                group_key: None,
-                group_values_json: None,
-                result_json: Some(whole_answer_json(
-                    self.scalar_rereads.contains(&subscription_id),
-                    &columns,
-                    &rows,
-                )),
-                is_full_result: true,
-            }],
             // The enum is non_exhaustive upstream: a tier this build does not
             // know cannot be delivered, so it refuses rather than sending a
             // shape the wire has no meaning for.
@@ -1425,29 +1438,140 @@ where
         })
     }
 
-    /// One wire-shaped change from an engine aggregate movement.
-    fn aggregate_change(update: AggUpdate) -> ComputedChange {
-        let is_full_result = update.group.is_none();
-        let (group_key, group_values_json) = match update.group {
-            Some(group) => (Some(group.key), Some(values_json(&group.values))),
-            None => (None, None),
-        };
-        ComputedChange {
-            subscription_id: update.subscription,
-            consumer_id: update.consumer,
-            group_key,
-            group_values_json,
-            result_json: match update.change {
-                AggregateValueChange::Set(AggregateResultValue::Folded(value)) => {
-                    Some(agg_value_to_json(value))
-                }
-                AggregateValueChange::Set(AggregateResultValue::Scalar(value)) => {
-                    Some(value_to_json(&value))
-                }
-                AggregateValueChange::Remove => None,
+    /// The declared storage classes for a computed answer.
+    pub fn computed_columns(&self, subscription_id: SubscriptionId) -> Option<Vec<ColumnType>> {
+        self.computed_columns.get(&subscription_id).cloned()
+    }
+
+    /// The source storage type for one select position.
+    fn storage_type(
+        &self,
+        subscription_id: SubscriptionId,
+        position: usize,
+    ) -> Option<StorageType> {
+        self.storage_layouts
+            .get(&subscription_id)
+            .and_then(|layout| layout.outputs().get(position))
+            .copied()
+            .flatten()
+    }
+
+    /// Report an unencodable computed cell.
+    fn storage_failure(subscription_id: SubscriptionId, error: &StorageError) -> MaterializerError {
+        tracing::error!(subscription_id, %error, "computed cell encoding failed");
+        MaterializerError::Install(error.to_string())
+    }
+
+    /// Encode one select-order row.
+    fn encode_row(
+        &self,
+        subscription_id: SubscriptionId,
+        row: &[PgValue<Postgres>],
+    ) -> Result<Vec<SqliteValue>, MaterializerError> {
+        row.iter()
+            .enumerate()
+            .map(|(position, value)| {
+                self.storage_encoder
+                    .value(value, self.storage_type(subscription_id, position))
+                    .map(sqlite_value)
+                    .map_err(|error| Self::storage_failure(subscription_id, &error))
+            })
+            .collect()
+    }
+
+    /// Encode a whole answer.
+    fn replace_rows(
+        &self,
+        subscription_id: SubscriptionId,
+        consumer_id: u64,
+        rows: &[Vec<PgValue<Postgres>>],
+    ) -> Result<ComputedChange, MaterializerError> {
+        Ok(ComputedChange {
+            subscription_id,
+            consumer_id,
+            change: AggregateChange::Replace {
+                rows: rows
+                    .iter()
+                    .map(|row| self.encode_row(subscription_id, row))
+                    .collect::<Result<_, _>>()?,
             },
-            is_full_result,
-        }
+        })
+    }
+
+    /// Encode a scalar answer.
+    fn scalar_change(
+        &self,
+        subscription_id: SubscriptionId,
+        consumer_id: u64,
+        value: &PgValue<Postgres>,
+    ) -> Result<ComputedChange, MaterializerError> {
+        Ok(ComputedChange {
+            subscription_id,
+            consumer_id,
+            change: AggregateChange::Replace {
+                rows: vec![self.encode_row(subscription_id, std::slice::from_ref(value))?],
+            },
+        })
+    }
+
+    /// One wire-shaped change from an engine aggregate movement.
+    fn aggregate_change(&self, update: AggUpdate) -> Result<ComputedChange, MaterializerError> {
+        let subscription_id = update.subscription;
+        let change = match update.change {
+            AggregateValueChange::Remove => match update.group {
+                Some(group) => AggregateChange::Remove { key: group.key },
+                None => AggregateChange::Replace { rows: Vec::new() },
+            },
+            AggregateValueChange::Set(value) => {
+                let layout = self.storage_layouts.get(&subscription_id).ok_or_else(|| {
+                    MaterializerError::Install("missing computed storage layout".to_owned())
+                })?;
+                let position = layout.aggregate().ok_or_else(|| {
+                    MaterializerError::Install("missing aggregate position".to_owned())
+                })?;
+                let mut row = vec![SqliteValue::Null; layout.outputs().len()];
+                row[position] = match value {
+                    AggregateResultValue::Folded(value) => self
+                        .storage_encoder
+                        .aggregate(&value, layout.outputs()[position]),
+                    AggregateResultValue::Scalar(value) => self
+                        .storage_encoder
+                        .value(&value, layout.outputs()[position]),
+                }
+                .map(sqlite_value)
+                .map_err(|error| Self::storage_failure(subscription_id, &error))?;
+                match update.group {
+                    Some(group) => {
+                        if group.values.len() != layout.groups().len() {
+                            return Err(MaterializerError::Install(
+                                "group storage layout mismatch".to_owned(),
+                            ));
+                        }
+                        for (value, position) in group.values.iter().zip(layout.groups()) {
+                            if let Some(position) = position {
+                                row[*position] = self
+                                    .storage_encoder
+                                    .value(value, layout.outputs()[*position])
+                                    .map(sqlite_value)
+                                    .map_err(|error| {
+                                        Self::storage_failure(subscription_id, &error)
+                                    })?;
+                            }
+                        }
+                        AggregateChange::Upsert {
+                            key: group.key,
+                            row,
+                        }
+                    }
+                    None => AggregateChange::Replace { rows: vec![row] },
+                }
+            }
+        };
+        Ok(ComputedChange {
+            subscription_id,
+            consumer_id: update.consumer,
+            change,
+        })
     }
 
     /// Log tier transitions: the demotion decision (R30) is server-visible
@@ -1514,14 +1638,13 @@ where
         Self::log_transitions(&reads.transitions);
         Self::log_transitions(&notifications.transitions);
 
-        let computed = Self::computed_changes(
+        let (computed, computed_refused) = self.computed_changes(
             notifications.aggregate_updates,
             reads.aggregate_updates,
             notifications.scalar_updates,
             reads.scalar_updates,
             reads.rows_updates,
             reads.row_deltas,
-            &self.scalar_rereads,
         );
 
         let engine = &notifications.engine;
@@ -1567,6 +1690,7 @@ where
             patches,
             refused,
             computed,
+            computed_refused,
             narrowings,
             record,
             failure,
@@ -1585,16 +1709,17 @@ where
             .map(reexec_error);
         Self::log_transitions(&reads.transitions);
         let stopped = stopped_reads(&mut reads);
+        let (computed, computed_refused) = self.computed_changes(
+            Vec::new(),
+            reads.aggregate_updates,
+            Vec::new(),
+            reads.scalar_updates,
+            reads.rows_updates,
+            reads.row_deltas,
+        );
         Drained {
-            computed: Self::computed_changes(
-                Vec::new(),
-                reads.aggregate_updates,
-                Vec::new(),
-                reads.scalar_updates,
-                reads.rows_updates,
-                reads.row_deltas,
-                &self.scalar_rereads,
-            ),
+            computed,
+            computed_refused,
             failure,
             stopped,
         }
@@ -1656,42 +1781,60 @@ where
     /// Build the computed-result changes from a dispatch's immediate results
     /// plus the connector reads that the dispatch resolved.
     fn computed_changes(
-        agg_updates: Vec<AggUpdate>,
-        resolved_agg: Vec<AggUpdate>,
+        &self,
+        aggregate_updates: Vec<AggUpdate>,
+        resolved_aggregate: Vec<AggUpdate>,
         scalar_updates: Vec<ScalarUpd>,
         resolved_scalar: Vec<ScalarUpd>,
         rows_updates: Vec<RowsUpd>,
         row_deltas: Vec<RowDlt>,
-        scalar_rereads: &HashSet<SubscriptionId>,
-    ) -> Vec<ComputedChange> {
+    ) -> (Vec<ComputedChange>, Vec<SubscriptionId>) {
         let mut computed = Vec::new();
-        for update in agg_updates.into_iter().chain(resolved_agg) {
-            computed.push(Self::aggregate_change(update));
+        let mut refused = Vec::new();
+        let mut collect =
+            |subscription_id, result: Result<ComputedChange, MaterializerError>| match result {
+                Ok(change) => computed.push(change),
+                Err(error) => {
+                    tracing::error!(subscription_id, %error, "computed answer encoding failed");
+                    refused.push(subscription_id);
+                }
+            };
+        for update in aggregate_updates.into_iter().chain(resolved_aggregate) {
+            collect(update.subscription, self.aggregate_change(update));
         }
         for update in scalar_updates.into_iter().chain(resolved_scalar) {
-            computed.push(ComputedChange {
-                subscription_id: update.subscription_id,
-                consumer_id: update.consumer_id,
-                group_key: None,
-                group_values_json: None,
-                result_json: Some(value_to_json(&update.value)),
-                is_full_result: true,
-            });
+            collect(
+                update.subscription_id,
+                self.scalar_change(update.subscription_id, update.consumer_id, &update.value),
+            );
         }
-        computed.extend(Self::rows_changes(rows_updates, scalar_rereads));
+        for (subscription_id, result) in self.rows_changes(rows_updates) {
+            collect(subscription_id, result);
+        }
         for delta in row_deltas {
-            computed.push(ComputedChange {
-                subscription_id: delta.subscription_id,
-                consumer_id: delta.consumer_id,
-                group_key: Some(encode_value_key::<Postgres>(&delta.key).unwrap_or_default()),
-                group_values_json: Some(values_json(&delta.key)),
-                result_json: delta
-                    .row
-                    .map(|row| row_json(&delta.columns, row.as_slice())),
-                is_full_result: false,
-            });
+            let result = (|| {
+                let key = encode_value_key::<Postgres>(&delta.key).ok_or_else(|| {
+                    MaterializerError::Install("computed row key cannot be encoded".to_owned())
+                })?;
+                let change = match delta.row {
+                    Some(row) => AggregateChange::Upsert {
+                        key,
+                        row: self.encode_row(delta.subscription_id, &row)?,
+                    },
+                    None => AggregateChange::Remove { key },
+                };
+                Ok(ComputedChange {
+                    subscription_id: delta.subscription_id,
+                    consumer_id: delta.consumer_id,
+                    change,
+                })
+            })();
+            collect(delta.subscription_id, result);
         }
-        computed
+        refused.sort_unstable();
+        refused.dedup();
+        computed.retain(|change| refused.binary_search(&change.subscription_id).is_err());
+        (computed, refused)
     }
 
     /// Collapse re-read pages into one full-result change per subscription.
@@ -1704,9 +1847,9 @@ where
     /// generation whose read failed before its final page is dropped, and its
     /// retry delivers a higher one.
     fn rows_changes(
+        &self,
         updates: Vec<RowsUpd>,
-        scalar_rereads: &HashSet<SubscriptionId>,
-    ) -> Vec<ComputedChange> {
+    ) -> Vec<(SubscriptionId, Result<ComputedChange, MaterializerError>)> {
         /// One subscription's newest re-read, its pages concatenated.
         struct PendingRows {
             consumer_id: u64,
@@ -1744,17 +1887,11 @@ where
         latest
             .into_iter()
             .filter(|(_, pending)| pending.complete)
-            .map(|(subscription_id, pending)| ComputedChange {
-                subscription_id,
-                consumer_id: pending.consumer_id,
-                group_key: None,
-                group_values_json: None,
-                result_json: Some(whole_answer_json(
-                    scalar_rereads.contains(&subscription_id),
-                    &pending.columns,
-                    &pending.rows,
-                )),
-                is_full_result: true,
+            .map(|(subscription_id, pending)| {
+                (
+                    subscription_id,
+                    self.replace_rows(subscription_id, pending.consumer_id, &pending.rows),
+                )
             })
             .collect()
     }
@@ -2355,7 +2492,7 @@ where
         &self,
         consumer_id: u64,
         pg_sql: &str,
-        binds: &[BindValue],
+        binds: &[SqliteValue],
         subscriber: Option<PgValue<Postgres>>,
         subjects: Vec<PgValue<Postgres>>,
     ) -> Result<Vec<subql::term::TermDescription>, MaterializerError> {
@@ -2403,7 +2540,7 @@ where
         &mut self,
         consumer_id: u64,
         pg_sql: &str,
-        binds: &[BindValue],
+        binds: &[SqliteValue],
         seed: Option<TermSeed>,
         budget: ReadBudget,
         viewer: Option<crate::reexec::ConnettoReadSetup>,
@@ -2444,10 +2581,6 @@ where
                 )?;
                 if let Registration::Computed(capture) = &mut registered {
                     capture.per_viewer = true;
-                    // The refusal names an aggregate, so one ungrouped projection is a scalar one.
-                    if answers_one_value(pg_sql) {
-                        self.scalar_rereads.insert(capture.subscription_id);
-                    }
                 }
                 registered
             }
@@ -2530,55 +2663,30 @@ where
     }
 }
 
-/// One row as a JSON object keyed by column name, so the client deserializes
-/// it field-name-based per Q5.7, column order irrelevant.
-fn row_object(columns: &[String], row: &[PgValue<Postgres>]) -> serde_json::Value {
-    serde_json::Value::Object(
-        columns
+/// Whether group and aggregate positions cover every select item.
+fn fold_layout_complete(layout: &StorageLayout) -> bool {
+    let Some(aggregate) = layout.aggregate() else {
+        return false;
+    };
+    aggregate < layout.outputs().len()
+        && layout
+            .groups()
             .iter()
-            .zip(row)
-            .map(|(column, value)| (column.clone(), value_json(value)))
-            .collect(),
-    )
+            .flatten()
+            .all(|position| *position < layout.outputs().len())
+        && (0..layout.outputs().len())
+            .all(|position| position == aggregate || layout.groups().contains(&Some(position)))
 }
 
-/// One keyed row as a JSON object string.
-pub(crate) fn row_json(columns: &[String], row: &[PgValue<Postgres>]) -> String {
-    row_object(columns, row).to_string()
-}
-
-/// A whole row answer as a JSON array of objects.
-pub(crate) fn rows_json(columns: &[String], rows: &[Vec<PgValue<Postgres>>]) -> String {
-    serde_json::Value::Array(rows.iter().map(|row| row_object(columns, row)).collect()).to_string()
-}
-
-/// A whole re-read's wire body: a scalar re-read's one cell as that value,
-/// any other answer as its row objects.
-fn whole_answer_json(scalar: bool, columns: &[String], rows: &[Vec<PgValue<Postgres>>]) -> String {
-    if scalar {
-        // No row at all is an ungrouped aggregate whose `HAVING` held for none.
-        return rows
-            .first()
-            .and_then(|row| row.first())
-            .map_or_else(|| value_to_json(&PgValue::Null), value_to_json);
+/// Move an encoded storage cell onto the protocol.
+fn sqlite_value(value: WireValue) -> SqliteValue {
+    match value {
+        Value::Null => SqliteValue::Null,
+        Value::Integer(value) => SqliteValue::Integer(value),
+        Value::Real(value) => SqliteValue::Real(value),
+        Value::Text(value) => SqliteValue::Text(value),
+        Value::Blob(value) => SqliteValue::Blob(value),
     }
-    rows_json(columns, rows)
-}
-
-/// Whether `pg_sql` is one `SELECT` with no `GROUP BY` projecting one item.
-fn answers_one_value(pg_sql: &str) -> bool {
-    let Ok(statements) = Parser::parse_sql(&PostgreSqlDialect {}, pg_sql) else {
-        return false;
-    };
-    let [Statement::Query(query)] = statements.as_slice() else {
-        return false;
-    };
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return false;
-    };
-    select.projection.len() == 1
-        && matches!(&select.group_by, GroupByExpr::Expressions(exprs, mods)
-            if exprs.is_empty() && mods.is_empty())
 }
 
 /// The catalog target a relation names, preserving schema and quoting, or
@@ -2755,98 +2863,6 @@ fn catalog_columns(
             })
             .collect(),
     )
-}
-
-/// Decoded group values as a JSON array string, in `GROUP BY` order (R84).
-fn values_json(values: &[PgValue<Postgres>]) -> String {
-    serde_json::Value::Array(values.iter().map(value_json).collect()).to_string()
-}
-
-/// One scalar as a JSON value, the shared shape behind every delivery.
-fn value_json(value: &PgValue<Postgres>) -> serde_json::Value {
-    match value {
-        PgValue::Missing | PgValue::Null => serde_json::Value::Null,
-        PgValue::Bool(b) => serde_json::Value::Bool(*b),
-        PgValue::Int(i) => serde_json::Value::from(*i),
-        PgValue::Float(f) => {
-            if f.is_finite() {
-                serde_json::Number::from_f64(*f)
-                    .map_or(serde_json::Value::Null, serde_json::Value::Number)
-            } else {
-                // Infinity or NaN cannot be represented in JSON; the raw IEEE
-                // string preserves the value, matching agg_value_to_json.
-                serde_json::Value::String(f.to_string())
-            }
-        }
-        PgValue::String(s) => serde_json::Value::String(s.clone()),
-        PgValue::Bytes(b) => serde_json::Value::String(String::from_utf8_lossy(b).into_owned()),
-        PgValue::Uuid(u) => serde_json::Value::String(u.to_string()),
-        PgValue::Timestamp(t) => serde_json::Value::String(t.to_string()),
-        PgValue::TimestampTz(t) => {
-            serde_json::Value::String(t.format("%Y-%m-%d %H:%M:%S%.6f+00:00").to_string())
-        }
-        PgValue::Date(d) => serde_json::Value::String(d.to_string()),
-        PgValue::Time(t) => serde_json::Value::String(t.to_string()),
-        PgValue::Interval(i) => serde_json::Value::String(i.to_string()),
-        PgValue::Decimal(d) => serde_json::Value::String(d.to_string()),
-        PgValue::Json(j) | PgValue::Jsonb(j) => j.clone(),
-        // Uninhabited for this backend, as above.
-        PgValue::Custom(never) => match *never {},
-    }
-}
-
-/// Serialize a re-executed scalar value as a JSON string for delivery.
-pub(crate) fn value_to_json(value: &PgValue<Postgres>) -> String {
-    value_json(value).to_string()
-}
-
-/// Serialize a folded [`AggValue`] as a JSON string for delivery.
-///
-/// The JSON type per variant matches what [`value_to_json`] produces for the
-/// equivalent Postgres value on the scalar re-execution path:
-/// - `CountStar`/`CountColumn` → JSON integer (same as `PgValue::Int`)
-/// - `Sum`/`Avg` with `Integer` → JSON integer (same as `PgValue::Int`)
-/// - `Sum`/`Avg` with `Decimal` → JSON string (same as `PgValue::Decimal`)
-/// - `Sum`/`Avg` with `Interval` → JSON string (same as `PgValue::Interval`)
-/// - `Sum`/`Avg`/`VarPop`/`VarSamp`/`StddevPop`/`StddevSamp` with `Double` → JSON float
-/// - any `None` → JSON null (no rows contributed; SQL returns NULL for an empty aggregate)
-///
-/// A non-finite double (infinity, `NaN`) becomes a JSON string of its IEEE
-/// representation so no real aggregate value is silently discarded.
-pub(crate) fn agg_value_to_json(value: AggValue) -> String {
-    let json = match value {
-        AggValue::CountStar(c) | AggValue::CountColumn(c) => serde_json::Value::from(c),
-        AggValue::Sum(Some(NumericValue::Integer(i)))
-        | AggValue::Avg(Some(NumericValue::Integer(i))) => serde_json::Value::from(i),
-        AggValue::Sum(Some(NumericValue::Decimal(d)))
-        | AggValue::Avg(Some(NumericValue::Decimal(d))) => serde_json::Value::String(d.to_string()),
-        AggValue::Sum(Some(NumericValue::Interval(i)))
-        | AggValue::Avg(Some(NumericValue::Interval(i))) => {
-            serde_json::Value::String(i.to_string())
-        }
-        AggValue::Sum(Some(NumericValue::Double(f)))
-        | AggValue::Avg(Some(NumericValue::Double(f)))
-        | AggValue::VarPop(Some(f))
-        | AggValue::VarSamp(Some(f))
-        | AggValue::StddevPop(Some(f))
-        | AggValue::StddevSamp(Some(f)) => {
-            if f.is_finite() {
-                serde_json::Number::from_f64(f)
-                    .map_or(serde_json::Value::Null, serde_json::Value::Number)
-            } else {
-                // Infinity or NaN cannot be represented in JSON; the raw IEEE
-                // string preserves the value so no real aggregate is discarded.
-                serde_json::Value::String(f.to_string())
-            }
-        }
-        AggValue::Sum(None)
-        | AggValue::Avg(None)
-        | AggValue::VarPop(None)
-        | AggValue::VarSamp(None)
-        | AggValue::StddevPop(None)
-        | AggValue::StddevSamp(None) => serde_json::Value::Null,
-    };
-    json.to_string()
 }
 
 /// `SELECT EXISTS(...)` row from Postgres, which yields a boolean.
@@ -3211,206 +3227,225 @@ mod widen_tests {
 
 #[cfg(test)]
 mod wire_contract {
-    //! Pin the exact JSON string [`value_to_json`] emits for each
-    //! [`PgValue`] variant. The client aggregate decoders in
-    //! `connetto-client` are written against these bytes, so a change here
-    //! that is not mirrored there is a wire break, and this test is the
-    //! canary.
-
-    use super::{AggValue, NumericValue, PgValue, Postgres, agg_value_to_json, value_to_json};
+    use super::{PgValue, Postgres, SqliteValue, StorageEncoder, sqlite_value};
+    use subql::{AggValue, NumericValue};
 
     #[test]
-    fn value_to_json_renders_each_scalar_variant() {
-        // Absent and explicit null both collapse to JSON null.
-        assert_eq!(value_to_json(&PgValue::<Postgres>::Missing), "null");
-        assert_eq!(value_to_json(&PgValue::<Postgres>::Null), "null");
-
-        // Bool is a JSON bool, not the SQLite 0/1 integer.
-        assert_eq!(value_to_json(&PgValue::<Postgres>::Bool(true)), "true");
-        assert_eq!(value_to_json(&PgValue::<Postgres>::Bool(false)), "false");
-
-        // Integers are JSON integers, floats are JSON numbers.
-        assert_eq!(value_to_json(&PgValue::<Postgres>::Int(42)), "42");
-        assert_eq!(value_to_json(&PgValue::<Postgres>::Float(1.5)), "1.5");
-        // Non-finite floats become JSON strings, matching agg_value_to_json.
-        assert_eq!(
-            value_to_json(&PgValue::<Postgres>::Float(f64::INFINITY)),
-            "\"inf\"",
-        );
-        assert_eq!(
-            value_to_json(&PgValue::<Postgres>::Float(f64::NEG_INFINITY)),
-            "\"-inf\"",
-        );
-        assert_eq!(
-            value_to_json(&PgValue::<Postgres>::Float(f64::NAN)),
-            "\"NaN\"",
-        );
-
-        // Text is a JSON string.
-        assert_eq!(
-            value_to_json(&PgValue::<Postgres>::String("hi".to_owned())),
-            "\"hi\"",
-        );
-
-        // Bytes render through String::from_utf8_lossy, not base64. Valid
-        // UTF-8 rides through verbatim, and an invalid byte becomes the
-        // replacement character (this is lossy by design, see Trap 3).
-        assert_eq!(
-            value_to_json(&PgValue::<Postgres>::Bytes(b"hi".to_vec())),
-            "\"hi\"",
-        );
-        assert_eq!(
-            value_to_json(&PgValue::<Postgres>::Bytes(vec![0xff, b'a'])),
-            "\"\u{fffd}a\"",
-        );
-
-        // Uuid, the temporal types, and decimals render as their to_string,
-        // wrapped as JSON strings, never as numbers.
+    fn storage_cells_cover_each_scalar_variant() {
+        let encoder = StorageEncoder::new();
+        assert!(encoder.value(&PgValue::<Postgres>::Missing, None).is_err());
         let uuid =
             uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").expect("valid uuid");
-        assert_eq!(
-            value_to_json(&PgValue::<Postgres>::Uuid(uuid)),
-            "\"550e8400-e29b-41d4-a716-446655440000\"",
-        );
-        let stamp = chrono::NaiveDate::from_ymd_opt(2020, 1, 2)
-            .expect("valid date")
+        let timestamp = chrono::NaiveDate::from_ymd_opt(2020, 1, 2)
+            .expect("date")
             .and_hms_opt(3, 4, 5)
-            .expect("valid time");
-        assert_eq!(
-            value_to_json(&PgValue::<Postgres>::Timestamp(stamp)),
-            "\"2020-01-02 03:04:05\"",
-        );
-        assert_eq!(
-            value_to_json(&PgValue::<Postgres>::TimestampTz(stamp.and_utc())),
-            "\"2020-01-02 03:04:05.000000+00:00\"",
-        );
-        let fractional = chrono::NaiveDate::from_ymd_opt(2020, 1, 2)
-            .expect("valid date")
-            .and_hms_micro_opt(3, 4, 5, 678_900)
-            .expect("valid time");
-        assert_eq!(
-            value_to_json(&PgValue::<Postgres>::TimestampTz(fractional.and_utc())),
-            "\"2020-01-02 03:04:05.678900+00:00\"",
-        );
-        assert_eq!(
-            value_to_json(&PgValue::<Postgres>::Date(
-                chrono::NaiveDate::from_ymd_opt(2020, 1, 2).expect("valid date"),
-            )),
-            "\"2020-01-02\"",
-        );
-        assert_eq!(
-            value_to_json(&PgValue::<Postgres>::Time(
-                chrono::NaiveTime::from_hms_opt(3, 4, 5).expect("valid time"),
-            )),
-            "\"03:04:05\"",
-        );
+            .expect("time");
+        for (value, expected) in [
+            (PgValue::<Postgres>::Null, SqliteValue::Null),
+            (PgValue::Bool(true), SqliteValue::Integer(1)),
+            (PgValue::Bool(false), SqliteValue::Integer(0)),
+            (PgValue::Int(42), SqliteValue::Integer(42)),
+            (PgValue::Float(1.5), SqliteValue::Real(1.5)),
+            (
+                PgValue::Float(f64::INFINITY),
+                SqliteValue::Real(f64::INFINITY),
+            ),
+            (
+                PgValue::Float(f64::NEG_INFINITY),
+                SqliteValue::Real(f64::NEG_INFINITY),
+            ),
+            (PgValue::Float(f64::NAN), SqliteValue::Null),
+            (
+                PgValue::String("hi".to_owned()),
+                SqliteValue::Text("hi".to_owned()),
+            ),
+            (
+                PgValue::Bytes(b"hi".to_vec()),
+                SqliteValue::Blob(b"hi".to_vec()),
+            ),
+            (
+                PgValue::Bytes(vec![0xff, b'a']),
+                SqliteValue::Blob(vec![0xff, b'a']),
+            ),
+            (
+                PgValue::Uuid(uuid),
+                SqliteValue::Blob(uuid.as_bytes().to_vec()),
+            ),
+            (
+                PgValue::Timestamp(timestamp),
+                SqliteValue::Text("2020-01-02 03:04:05.000000".to_owned()),
+            ),
+            (
+                PgValue::TimestampTz(timestamp.and_utc()),
+                SqliteValue::Text("2020-01-02 03:04:05.000000+00:00".to_owned()),
+            ),
+            (
+                PgValue::Date(timestamp.date()),
+                SqliteValue::Text("2020-01-02".to_owned()),
+            ),
+            (
+                PgValue::Time(timestamp.time()),
+                SqliteValue::Text("03:04:05.000000".to_owned()),
+            ),
+            (
+                PgValue::Json(serde_json::json!({"k": 1})),
+                SqliteValue::Text("{\"k\":1}".to_owned()),
+            ),
+            (
+                PgValue::Jsonb(serde_json::json!({"k": 1})),
+                SqliteValue::Text("{\"k\": 1}".to_owned()),
+            ),
+            (
+                PgValue::Interval(interval()),
+                SqliteValue::Text("1 day 02:03:04.5".to_owned()),
+            ),
+            (
+                PgValue::Decimal("123456789.1234567890123456789".parse().expect("decimal")),
+                SqliteValue::Text("123456789.1234567890123456789".to_owned()),
+            ),
+        ] {
+            let stored = sqlite_value(encoder.value(&value, None).expect("storage cell"));
+            assert_eq!(stored, expected, "storage cell of {value:?}");
+        }
+    }
 
-        // Json and Jsonb pass the raw JSON value through unquoted.
-        let doc = serde_json::json!({ "k": 1 });
-        assert_eq!(
-            value_to_json(&PgValue::<Postgres>::Json(doc.clone())),
-            "{\"k\":1}",
-        );
-        assert_eq!(value_to_json(&PgValue::<Postgres>::Jsonb(doc)), "{\"k\":1}");
+    #[test]
+    fn aggregate_cells_match_the_wire_contract() {
+        let encoder = StorageEncoder::new();
+        for (value, expected) in [
+            (AggValue::CountStar(0), SqliteValue::Integer(0)),
+            (AggValue::CountStar(1), SqliteValue::Integer(1)),
+            (AggValue::CountColumn(0), SqliteValue::Integer(0)),
+            (AggValue::CountColumn(42), SqliteValue::Integer(42)),
+            (AggValue::Sum(None), SqliteValue::Null),
+            (
+                AggValue::Sum(Some(NumericValue::Integer(10))),
+                SqliteValue::Integer(10),
+            ),
+            (
+                AggValue::Sum(Some(NumericValue::Integer(9_007_199_254_740_993))),
+                SqliteValue::Integer(9_007_199_254_740_993),
+            ),
+            (
+                AggValue::Sum(Some(NumericValue::Decimal(
+                    "123456789.1234567890123456789".parse().expect("decimal"),
+                ))),
+                SqliteValue::Text("123456789.1234567890123456789".to_owned()),
+            ),
+            (
+                AggValue::Sum(Some(NumericValue::Double(10.0))),
+                SqliteValue::Real(10.0),
+            ),
+            (
+                AggValue::Sum(Some(NumericValue::Double(f64::INFINITY))),
+                SqliteValue::Real(f64::INFINITY),
+            ),
+            (AggValue::Avg(None), SqliteValue::Null),
+            (
+                AggValue::Avg(Some(NumericValue::Decimal(
+                    "15.0000000000000000".parse().expect("decimal"),
+                ))),
+                SqliteValue::Text("15.0000000000000000".to_owned()),
+            ),
+            (
+                AggValue::Avg(Some(NumericValue::Double(15.0))),
+                SqliteValue::Real(15.0),
+            ),
+            (
+                AggValue::Sum(Some(NumericValue::Interval(interval()))),
+                SqliteValue::Text("1 day 02:03:04.5".to_owned()),
+            ),
+            (
+                AggValue::Avg(Some(NumericValue::Interval(interval()))),
+                SqliteValue::Text("1 day 02:03:04.5".to_owned()),
+            ),
+            (AggValue::VarPop(Some(1.0)), SqliteValue::Real(1.0)),
+            (AggValue::VarPop(None), SqliteValue::Null),
+            (
+                AggValue::VarPop(Some(f64::NEG_INFINITY)),
+                SqliteValue::Real(f64::NEG_INFINITY),
+            ),
+            (AggValue::VarSamp(Some(2.0)), SqliteValue::Real(2.0)),
+            (AggValue::VarSamp(None), SqliteValue::Null),
+            (
+                AggValue::VarSamp(Some(f64::INFINITY)),
+                SqliteValue::Real(f64::INFINITY),
+            ),
+            (AggValue::StddevPop(Some(1.0)), SqliteValue::Real(1.0)),
+            (AggValue::StddevPop(None), SqliteValue::Null),
+            (AggValue::StddevSamp(Some(3.5)), SqliteValue::Real(3.5)),
+            (AggValue::StddevSamp(None), SqliteValue::Null),
+        ] {
+            assert_eq!(
+                sqlite_value(encoder.aggregate(&value, None).expect("storage cell")),
+                expected
+            );
+        }
+    }
 
-        // An interval is a JSON string of PostgreSQL's own output.
+    #[test]
+    fn fold_layout_places_groups_in_select_order_and_unregister_drops_it() {
+        let mut materializer = super::Materializer::builder(
+            "CREATE TABLE items (id BIGINT PRIMARY KEY, category UUID NOT NULL)",
+        )
+        .build()
+        .expect("catalog");
+        let super::Registration::Computed(capture) = materializer
+            .register(1, "SELECT COUNT(*), category FROM items GROUP BY category")
+            .expect("computed registration")
+        else {
+            panic!("computed registration")
+        };
         assert_eq!(
-            value_to_json(&PgValue::<Postgres>::Interval(interval())),
-            "\"1 day 02:03:04.5\"",
+            materializer.computed_columns(capture.subscription_id),
+            Some(vec![super::ColumnType::Integer, super::ColumnType::Blob])
+        );
+        let uuid = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").expect("uuid");
+        let seeded = materializer
+            .install_fold_seed(
+                capture.subscription_id,
+                vec![vec![PgValue::Uuid(uuid), PgValue::Int(4), PgValue::Int(4)]],
+                None,
+            )
+            .expect("seed");
+        let super::AggregateChange::Upsert { row, .. } = &seeded.changes[0].change else {
+            panic!("group upsert")
+        };
+        assert_eq!(
+            row,
+            &[
+                SqliteValue::Integer(4),
+                SqliteValue::Blob(uuid.as_bytes().to_vec())
+            ]
+        );
+        assert!(materializer.unregister(capture.subscription_id));
+        assert!(
+            materializer
+                .computed_columns(capture.subscription_id)
+                .is_none()
+        );
+        assert!(
+            !materializer
+                .storage_layouts
+                .contains_key(&capture.subscription_id)
         );
     }
 
     #[test]
-    fn agg_value_to_json_matches_wire_contract() {
-        // COUNT(*): rows matched, never NULL, always a JSON integer.
-        assert_eq!(agg_value_to_json(AggValue::CountStar(0)), "0");
-        assert_eq!(agg_value_to_json(AggValue::CountStar(1)), "1");
-        // COUNT(col): non-null row count, same wire shape as CountStar.
-        assert_eq!(agg_value_to_json(AggValue::CountColumn(0)), "0");
-        assert_eq!(agg_value_to_json(AggValue::CountColumn(42)), "42");
-
-        // SUM over an empty table is null, matching SQL and the scalar path.
-        assert_eq!(agg_value_to_json(AggValue::Sum(None)), "null");
-        // SUM over an integer column is a JSON integer.
-        assert_eq!(
-            agg_value_to_json(AggValue::Sum(Some(NumericValue::Integer(10)))),
-            "10",
+    fn an_uncovered_fold_projection_is_refused() {
+        let mut materializer = super::Materializer::builder(
+            "CREATE TABLE items (id BIGINT PRIMARY KEY, category TEXT NOT NULL)",
+        )
+        .build()
+        .expect("catalog");
+        assert!(
+            materializer
+                .register(
+                    1,
+                    "SELECT category, category, COUNT(*) FROM items GROUP BY category"
+                )
+                .is_err()
         );
-        // An i64 beyond f64's exact range stays exact as a JSON integer.
-        let large: i64 = 9_007_199_254_740_993;
-        assert_eq!(
-            agg_value_to_json(AggValue::Sum(Some(NumericValue::Integer(large)))),
-            "9007199254740993",
-        );
-        // SUM over a decimal column is a JSON string, preserving exactness.
-        let precise = "123456789.1234567890123456789"
-            .parse()
-            .expect("parse decimal");
-        assert_eq!(
-            agg_value_to_json(AggValue::Sum(Some(NumericValue::Decimal(precise)))),
-            "\"123456789.1234567890123456789\"",
-        );
-        // SUM over a float column is a JSON float.
-        assert_eq!(
-            agg_value_to_json(AggValue::Sum(Some(NumericValue::Double(10.0)))),
-            "10.0",
-        );
-        // A non-finite double surfaces as a JSON string, not null.
-        assert_eq!(
-            agg_value_to_json(AggValue::Sum(Some(NumericValue::Double(f64::INFINITY)))),
-            "\"inf\"",
-        );
-
-        // AVG over an empty table is null (undefined for an empty set).
-        assert_eq!(agg_value_to_json(AggValue::Avg(None)), "null");
-        // AVG with a decimal result is a JSON string.
-        let avg_decimal = "15.0000000000000000".parse().expect("parse avg decimal");
-        assert_eq!(
-            agg_value_to_json(AggValue::Avg(Some(NumericValue::Decimal(avg_decimal)))),
-            "\"15.0000000000000000\"",
-        );
-        // AVG with a double result is a JSON float.
-        assert_eq!(
-            agg_value_to_json(AggValue::Avg(Some(NumericValue::Double(15.0)))),
-            "15.0",
-        );
-
-        // SUM and AVG over an interval column spell the scalar path's string.
-        assert_eq!(
-            agg_value_to_json(AggValue::Sum(Some(NumericValue::Interval(interval())))),
-            value_to_json(&PgValue::<Postgres>::Interval(interval())),
-        );
-        assert_eq!(
-            agg_value_to_json(AggValue::Avg(Some(NumericValue::Interval(interval())))),
-            value_to_json(&PgValue::<Postgres>::Interval(interval())),
-        );
-
-        // VAR_POP: population variance. Each variant is now distinct so a
-        // consumer can tell them apart (VarPop(1.0) != StddevPop(1.0) on the
-        // wire even though their payloads over rows 5 and 7 are byte-identical).
-        assert_eq!(agg_value_to_json(AggValue::VarPop(Some(1.0))), "1.0");
-        assert_eq!(agg_value_to_json(AggValue::VarPop(None)), "null");
-        assert_eq!(
-            agg_value_to_json(AggValue::VarPop(Some(f64::NEG_INFINITY))),
-            "\"-inf\"",
-        );
-
-        // VAR_SAMP: sample variance.
-        assert_eq!(agg_value_to_json(AggValue::VarSamp(Some(2.0))), "2.0");
-        assert_eq!(agg_value_to_json(AggValue::VarSamp(None)), "null");
-        assert_eq!(
-            agg_value_to_json(AggValue::VarSamp(Some(f64::INFINITY))),
-            "\"inf\"",
-        );
-
-        // STDDEV_POP: population standard deviation.
-        assert_eq!(agg_value_to_json(AggValue::StddevPop(Some(1.0))), "1.0");
-        assert_eq!(agg_value_to_json(AggValue::StddevPop(None)), "null");
-
-        // STDDEV_SAMP: sample standard deviation. Use a value that is not
-        // close to a named constant so the literal lint does not fire.
-        assert_eq!(agg_value_to_json(AggValue::StddevSamp(Some(3.5))), "3.5");
-        assert_eq!(agg_value_to_json(AggValue::StddevSamp(None)), "null");
     }
 
     fn interval() -> subql::backend::Interval {
@@ -3894,9 +3929,9 @@ mod rows_update_merge_tests {
     //! How a re-read's pages merge into one full answer, and what a higher
     //! generation does to a lower one still pending.
 
-    use std::collections::HashSet;
-
-    use super::{Materializer, ParserDB, PgValue, Postgres, RowsUpd, SubscriptionId};
+    use super::{
+        AggregateChange, Materializer, PgValue, Postgres, RowsUpd, SqliteValue, SubscriptionId,
+    };
 
     /// One page of one subscription's re-read.
     fn page(
@@ -3923,20 +3958,20 @@ mod rows_update_merge_tests {
     fn a_newer_generation_replaces_the_pending_older_one() {
         let older = page(7, 5, "old", vec![PgValue::Int(1)], true);
         let newer = page(7, 9, "new", vec![PgValue::Int(2), PgValue::Int(3)], false);
-        let changes = Materializer::<ParserDB>::rows_changes(vec![older, newer], &HashSet::new());
+        let materializer = Materializer::builder("CREATE TABLE items (id BIGINT PRIMARY KEY)")
+            .build()
+            .expect("catalog");
+        let changes = materializer.rows_changes(vec![older, newer]);
         assert_eq!(
             changes.len(),
             1,
             "one full answer per subscription, the newest generation's"
         );
-        assert!(
-            changes[0].is_full_result,
-            "a re-read replacement is atomic, not a page"
-        );
         assert_eq!(
-            changes[0].result_json.as_deref(),
-            Some("[{\"new\":2},{\"new\":3}]"),
-            "the frame carries the newer generation's columns and rows, never the older's"
+            changes[0].1.as_ref().expect("encoded rows").change,
+            AggregateChange::Replace {
+                rows: vec![vec![SqliteValue::Integer(2)], vec![SqliteValue::Integer(3)]]
+            },
         );
     }
 
@@ -3946,10 +3981,40 @@ mod rows_update_merge_tests {
     fn a_newer_generation_with_no_final_page_delivers_nothing() {
         let older = page(7, 5, "old", vec![PgValue::Int(1)], false);
         let newer = page(7, 9, "new", vec![PgValue::Int(2)], true);
-        let changes = Materializer::<ParserDB>::rows_changes(vec![older, newer], &HashSet::new());
+        let materializer = Materializer::builder("CREATE TABLE items (id BIGINT PRIMARY KEY)")
+            .build()
+            .expect("catalog");
+        let changes = materializer.rows_changes(vec![older, newer]);
         assert!(
             changes.is_empty(),
             "the retry delivers the higher generation that supersedes it"
+        );
+    }
+
+    #[test]
+    fn a_storage_failure_refuses_only_its_subscription() {
+        let materializer = Materializer::builder("CREATE TABLE items (id BIGINT PRIMARY KEY)")
+            .build()
+            .expect("catalog");
+        let (changes, refused) = materializer.computed_changes(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![
+                page(7, 1, "value", vec![PgValue::Missing], false),
+                page(8, 1, "value", vec![PgValue::Int(3)], false),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(refused, [7]);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].subscription_id, 8);
+        assert_eq!(
+            changes[0].change,
+            AggregateChange::Replace {
+                rows: vec![vec![SqliteValue::Integer(3)]]
+            }
         );
     }
 }
