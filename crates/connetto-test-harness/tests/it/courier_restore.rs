@@ -231,6 +231,11 @@ async fn run_restore() {
     drop(alice_watches);
     alice.close().await;
     drop(alice);
+    let retained_sequences: Vec<u64> = held_rows(&bob, &alice_key)
+        .await
+        .into_iter()
+        .map(|(sequence, _state)| sequence.try_into().expect("held sequences are positive"))
+        .collect();
     drop(bob_watches);
     bob.close().await;
     drop(bob);
@@ -260,7 +265,8 @@ async fn run_restore() {
 
     // The ask answers Pending, standing the rows as candidates from alice's
     // first entry on.
-    let candidate = wait_pending_candidate(&bob2, &mut bob_events, &alice_key).await;
+    let candidate =
+        wait_pending_candidate(&bob2, &mut bob_events, &alice_key, &retained_sequences).await;
     // Whether alice's two notes queued as one entry or two depends on when her
     // pump flushed, so the candidate offers her entries from her first on.
     assert!(
@@ -397,18 +403,17 @@ enum Candidacy {
     Lagged,
 }
 
-/// Wait for `author`'s candidate carrying the ask's `Pending` answer, from the
-/// state at hand once `events` is subscribed and then from `CourierCandidates`
-/// events, which also fire when only the verdict changes. Panics on the ask
-/// refusal that keeps the rows out of candidacy. `BOUND` only detects a run
-/// that never gets there.
+/// Wait for the author's complete held sequence set with a `Pending` verdict.
 async fn wait_pending_candidate(
     client: &connetto_client::NativeClient<connetto_client::NativeTransport>,
     events: &mut tokio::sync::broadcast::Receiver<ClientEvent>,
     author: &[u8],
+    expected_sequences: &[u64],
 ) -> CourierCandidate {
     let pending = |candidate: &CourierCandidate| {
-        candidate.author == author && candidate.last == Some(Verdict::Pending)
+        candidate.author == author
+            && candidate.seqs == expected_sequences
+            && candidate.last == Some(Verdict::Pending)
     };
     let deadline = tokio::time::Instant::now() + BOUND;
     loop {
@@ -460,12 +465,12 @@ async fn wait_pending_candidate(
             .expect("bob's candidates are read");
         assert!(
             !refused,
-            "the restored server refused the retained ask, so the rows never \
-             become candidates; bob holds {rows:?}, his candidates read {candidates:?}"
+            "the restored server refused the retained ask, bob holds {rows:?}, \
+             his candidates read {candidates:?}, expected sequences {expected_sequences:?}"
         );
         panic!(
-            "no candidate for the author carried the Pending answer and no ask was \
-             refused, bob holds {rows:?}, his candidates read {candidates:?}"
+            "no complete Pending candidate arrived, bob holds {rows:?}, \
+             his candidates read {candidates:?}, expected sequences {expected_sequences:?}"
         );
     }
 }
@@ -805,7 +810,8 @@ async fn run_retired() {
     wait_for_certificate(&bob2, BOUND)
         .await
         .expect("bob holds his device");
-    let candidate = wait_pending_candidate(&bob2, &mut bob_events, &alice_key).await;
+    let candidate =
+        wait_pending_candidate(&bob2, &mut bob_events, &alice_key, &[1, 2, 3, 4, 5]).await;
     assert!(
         candidate.seqs.contains(&3) && candidate.seqs.contains(&4) && candidate.seqs.contains(&5),
         "n3, n4 and n5 stand as candidates, the candidate is {candidate:?}"
