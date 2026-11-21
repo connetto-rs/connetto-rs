@@ -17,6 +17,7 @@ use connetto_server::{
 };
 use connetto_test_harness::Fixture;
 use diesel_async::AsyncPgConnection;
+use futures_util::FutureExt as _;
 use parking_lot::Mutex;
 use rcgen::{KeyPair, PublicKeyData as _};
 
@@ -211,6 +212,11 @@ async fn reporting_a_device_lost_closes_it_lists_it_and_revokes_its_session() {
         ControlMessage::DeviceRevokedAck(DeviceRevokedAck {
             request_id: "r".into()
         })
+    );
+    assert_eq!(
+        revoked_sessions.count().await,
+        1,
+        "its auth-store session is revoked"
     );
     let after = verified(&next_lists(&mut laptop).await, &root);
     assert!(
@@ -457,6 +463,11 @@ async fn the_owners_second_revoke_still_closes_the_device() {
             request_id: "r2".into()
         })
     );
+    assert_eq!(
+        revoked_sessions.count().await,
+        1,
+        "the second revoke revokes the device's session"
+    );
     let pushed = verified(&next_lists(&mut watcher).await, &root);
     assert!(
         pushed.revokes(cert.serial()),
@@ -579,6 +590,108 @@ async fn a_retired_issuer_keeps_listing_its_certificates_beside_the_roots_list()
         "the new issuer signed none of it"
     );
     assert!(by_signer(root.certificate()).revokes(&[9; 16]));
+}
+
+struct BlockedRevocation {
+    started: Mutex<Option<tokio::sync::oneshot::Sender<connetto_core::SessionId>>>,
+    release: Mutex<Option<tokio::sync::oneshot::Receiver<connetto_core::SessionId>>>,
+    committed: Mutex<Option<connetto_core::SessionId>>,
+}
+
+impl AuthHooks<ConnettoDefaults> for BlockedRevocation {
+    fn user_for<'a>(
+        &'a self,
+        transaction: &'a mut AsyncPgConnection,
+        claims: &'a VerifiedClaims,
+    ) -> HookFuture<'a, String> {
+        AuthHooks::<ConnettoDefaults>::user_for(&DefaultAuthHooks, transaction, claims)
+    }
+
+    fn sessions_ended<'a>(
+        &'a self,
+        _transaction: &'a mut AsyncPgConnection,
+        ended: &'a SessionsEnded<'a, String>,
+    ) -> HookFuture<'a, ()> {
+        Box::pin(async move {
+            let [session] = ended.sessions else {
+                panic!("one session is revoked");
+            };
+            self.started
+                .lock()
+                .take()
+                .expect("one revocation")
+                .send(*session)
+                .expect("revocation observer");
+            let release = self.release.lock().take().expect("one release");
+            let released = tokio::time::timeout(BOUND, release)
+                .await
+                .expect("revocation release within the bound")
+                .expect("revocation release");
+            assert_eq!(released, *session);
+            Ok(())
+        })
+    }
+
+    fn committed(&self, notice: CommittedNotice<String, ()>) {
+        if let CommittedNotice::SessionsEnded { sessions, .. } = notice {
+            assert_eq!(sessions.len(), 1);
+            *self.committed.lock() = Some(sessions[0]);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn self_revocation_acknowledges_completion_before_closing() {
+    let fixture = Fixture::acquire().await;
+    let (_, _, issuer) = rooted_issuer();
+    let (started, started_receiver) = tokio::sync::oneshot::channel();
+    let (release, release_receiver) = tokio::sync::oneshot::channel();
+    let hooks = Arc::new(BlockedRevocation {
+        started: Mutex::new(Some(started)),
+        release: Mutex::new(Some(release_receiver)),
+        committed: Mutex::new(None),
+    });
+    let auth = fixture
+        .enrolment_auth(Arc::<BlockedRevocation>::clone(&hooks))
+        .await;
+    let enrolment = DeviceEnrolment::new(DeviceCertConfig::new(issuer), auth);
+    let manager = enrolling_manager(&fixture, Some(enrolment)).await;
+    let mut device = connect(&fixture, &manager, Some("alice")).await;
+    let key = device_key();
+    let _ = enrolled(&mut device, &key).await;
+    device
+        .send_control(ControlMessage::RevokeDeviceRequest(RevokeDeviceRequest {
+            request_id: "self-revoke".into(),
+            key_id: *key_id(&key).as_bytes(),
+        }))
+        .await
+        .expect("request self-revocation");
+    let session = tokio::time::timeout(BOUND, started_receiver)
+        .await
+        .expect("revoker starts within the bound")
+        .expect("revoker started");
+    assert!(
+        device.recv().now_or_never().is_none(),
+        "neither acknowledgement nor closure precedes revoker completion"
+    );
+    release.send(session).expect("release the session revoker");
+    let reply = tokio::time::timeout(BOUND, device.recv())
+        .await
+        .expect("acknowledgement within the bound")
+        .expect("receive acknowledgement");
+    assert_eq!(
+        reply,
+        Some(IncomingFrame::Control(ControlMessage::DeviceRevokedAck(
+            DeviceRevokedAck {
+                request_id: "self-revoke".into()
+            }
+        )))
+    );
+    assert_eq!(*hooks.committed.lock(), Some(session));
+    assert_eq!(
+        closed_by(&mut device).await,
+        FatalErrorReason::DeviceRevoked
+    );
 }
 
 /// The hook whose refusal a rollback test exercises.

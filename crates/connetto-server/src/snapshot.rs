@@ -349,7 +349,9 @@ mod pg {
                 catalog_helpers::primary_key_columns(&self.catalog, table_id).unwrap_or_default();
             let names: Vec<String> = key
                 .iter()
-                .filter_map(|column| catalog_helpers::column_name(&self.catalog, table_id, *column))
+                .filter_map(|column| {
+                    catalog_helpers::column_name::<Postgres, _>(&self.catalog, table_id, *column)
+                })
                 .collect();
             // A wrap can only name what the inner query returns, so a
             // projection without the key is read as one capped page and
@@ -1012,16 +1014,16 @@ mod pg {
 #[cfg(test)]
 mod tests {
     use super::{PgSnapshotSource, SnapshotError, page_sql, projection_exposes};
-    use crate::catalog_shapes::{unconnected_pool, unnameable_column, unnameable_columns_ddl};
+    use crate::catalog_shapes::{unconnected_pool, unresolvable_key_column, unresolvable_key_ddl};
 
     #[tokio::test]
-    async fn a_catalog_that_cannot_name_its_columns_refuses_the_snapshot_source() {
-        let refusal = PgSnapshotSource::from_ddl(unconnected_pool(), &unnameable_columns_ddl())
+    async fn a_catalog_with_an_unresolvable_key_refuses_the_snapshot_source() {
+        let refusal = PgSnapshotSource::from_ddl(unconnected_pool(), &unresolvable_key_ddl())
             .err()
             .map(|err| err.to_string());
         assert_eq!(
             refusal,
-            Some(SnapshotError::Catalog(unnameable_column()).to_string())
+            Some(SnapshotError::Catalog(unresolvable_key_column()).to_string())
         );
     }
 

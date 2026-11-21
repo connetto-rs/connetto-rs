@@ -278,7 +278,16 @@ async fn apply_upload(
 ) -> Result<usize, CommitError> {
     let adapter = PgAdapter::new(catalog)
         .map_err(|e| CommitError::Probe(MaterializerError::Catalog(e.to_string())))?;
-    Ok(apply_diffset_bytes_async_with_catalog(catalog, bytes, &NoRefusals, conn, &adapter).await?)
+    Ok(
+        apply_diffset_bytes_async_with_catalog::<subql::backend::Postgres, _, _, _, _, _>(
+            catalog,
+            bytes,
+            &NoRefusals,
+            conn,
+            &adapter,
+        )
+        .await?,
+    )
 }
 
 /// Whether Postgres refused a statement with `42501` (`insufficient_privilege`).
@@ -862,7 +871,7 @@ fn commit_failure(err: CommitError) -> WriteError {
 #[cfg(test)]
 mod tests {
     use super::{CommitError, MaterializerError, WriteError, commit_failure, pg_write_target};
-    use crate::catalog_shapes::{unconnected_pool, unnameable_column, unnameable_columns_ddl};
+    use crate::catalog_shapes::{unconnected_pool, unresolvable_key_column, unresolvable_key_ddl};
     use crate::defaults::ConnettoDefaults;
     use crate::reexec::coded_error;
     use crate::writer_schema::StoredValue;
@@ -871,14 +880,14 @@ mod tests {
     use diesel::result::{DatabaseErrorKind, Error};
 
     #[tokio::test]
-    async fn a_catalog_that_cannot_name_its_columns_refuses_the_write_target() {
+    async fn a_catalog_with_an_unresolvable_key_refuses_the_write_target() {
         let refusal =
-            pg_write_target::<ConnettoDefaults>(unconnected_pool(), &unnameable_columns_ddl())
+            pg_write_target::<ConnettoDefaults>(unconnected_pool(), &unresolvable_key_ddl())
                 .err()
                 .map(|err| err.to_string());
         assert_eq!(
             refusal,
-            Some(MaterializerError::Catalog(unnameable_column()).to_string())
+            Some(MaterializerError::Catalog(unresolvable_key_column()).to_string())
         );
     }
 

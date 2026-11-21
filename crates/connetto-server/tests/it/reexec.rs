@@ -20,7 +20,7 @@ use connetto_server::{
 };
 use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use subql::backend::{Postgres, ScalarFamily, Value as PgValue};
-use subql::reexec::{AsyncConnector, ReadQuery, RowPage, Snapshot as ConnectorRead};
+use subql::reexec::{AsyncConnector, FailureClass, ReadQuery, RowPage, Snapshot as ConnectorRead};
 use subql::{CdcSource, PgCommitPosition, PgLsn, PgSnapshotFence, PgSqliteEmuSource, SourceItem};
 
 const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);";
@@ -62,6 +62,10 @@ impl AsyncConnector for QueuedConnector {
     type Error = std::io::Error;
     type Checkpoint = PgCommitPosition;
     type Backend = Postgres;
+
+    fn failure_class(&self, _error: &std::io::Error) -> FailureClass {
+        FailureClass::Transient
+    }
 
     fn execute_scalar(
         &self,

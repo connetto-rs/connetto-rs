@@ -40,7 +40,7 @@ impl CatalogShapes {
         let tables = (0..)
             .zip(catalog.tables())
             .map(|(table_id, _)| {
-                let shape = catalog_helpers::simple_table(catalog, table_id)?;
+                let shape = catalog_helpers::simple_table::<Postgres, _>(catalog, table_id)?;
                 let select_list = shape
                     .column_names()
                     .iter()
@@ -100,21 +100,22 @@ impl CatalogShapes {
     }
 }
 
-/// A table of 65,537 columns, one past the last ordinal a column id holds,
-/// which parses as a catalog whose columns cannot all be named.
+/// A table of 65,537 columns keyed by its last, one past the last ordinal a
+/// column id holds, which parses as a catalog whose key cannot be resolved.
 #[cfg(test)]
-pub(crate) fn unnameable_columns_ddl() -> String {
-    let columns = (0..=usize::from(u16::MAX) + 1)
+pub(crate) fn unresolvable_key_ddl() -> String {
+    let last = usize::from(u16::MAX) + 1;
+    let columns = (0..last)
         .map(|ordinal| format!("c{ordinal} INT"))
         .collect::<Vec<_>>()
         .join(", ");
-    format!("CREATE TABLE wide ({columns});")
+    format!("CREATE TABLE wide ({columns}, c{last} INT PRIMARY KEY);")
 }
 
-/// The cause a catalog of [`unnameable_columns_ddl`] refuses to load with,
-/// rendered: the first ordinal its one table cannot name.
+/// The cause a catalog of [`unresolvable_key_ddl`] refuses to load with,
+/// rendered: the key ordinal no column id holds.
 #[cfg(test)]
-pub(crate) fn unnameable_column() -> String {
+pub(crate) fn unresolvable_key_column() -> String {
     CatalogError::UnknownColumn {
         table_id: 0,
         ordinal: usize::from(u16::MAX) + 1,

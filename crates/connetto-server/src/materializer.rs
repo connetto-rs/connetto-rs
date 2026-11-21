@@ -87,8 +87,10 @@ type ScalarUpd = ScalarUpdate<DefaultIds, Postgres, subql::PgCommitPosition>;
 type RowsUpd = RowsUpdate<DefaultIds, Postgres, subql::PgCommitPosition>;
 /// Row-level keyed delta pinned to connetto's backend and default id set.
 type RowDlt = RowDelta<DefaultIds, Postgres, subql::PgCommitPosition>;
-/// Read deliveries pinned to connetto's backend and default id set.
-type ResolvedReads = subql::reexec::ResolvedReads<DefaultIds, Postgres, subql::PgCommitPosition>;
+/// Read deliveries pinned to connetto's backend and default id set, failing
+/// with the connector's error `E`.
+type ResolvedReads<E> =
+    subql::reexec::ResolvedReads<DefaultIds, Postgres, subql::PgCommitPosition, E>;
 /// The wire patchset one event folds into.
 type WirePatchSet = PatchSet<WireTable, String, Vec<u8>>;
 
@@ -474,6 +476,9 @@ pub struct Dispatched {
     pub record: Option<ChangeRecord>,
     /// The failure that stopped the queued reads, which stay queued for [`Materializer::resolve_reads`].
     pub failure: Option<MaterializerError>,
+    /// The reads subql ended for good, whose subscriptions the engine no
+    /// longer holds.
+    pub stopped: Vec<EndedRead>,
 }
 
 /// A matched consumer and whether the row left its window rather than changing in it.
@@ -499,6 +504,19 @@ pub struct Drained {
     pub computed: Vec<ComputedChange>,
     /// The failure that stopped the drain. Retryable reads stay queued.
     pub failure: Option<MaterializerError>,
+    /// The reads subql ended for good, whose subscriptions the engine no
+    /// longer holds.
+    pub stopped: Vec<EndedRead>,
+}
+
+/// A computed subscription whose read subql ended for good.
+pub struct EndedRead {
+    /// The subscription subql unregistered.
+    pub subscription: SubscriptionId,
+    /// The class of the failure that ended it.
+    pub class: crate::reexec::ReadFailure,
+    /// The failure, for the log.
+    pub detail: String,
 }
 
 /// One server-computed result movement, ready to frame on the wire.
@@ -936,14 +954,15 @@ fn term_moves<DB: DatabaseLike>(
         .map(|narrowing| TermMove {
             sub_id: narrowing.subscription,
             table_id: narrowing.table,
-            table: catalog_helpers::table_name(db, narrowing.table).unwrap_or_default(),
+            table: catalog_helpers::table_name::<Postgres, _>(db, narrowing.table)
+                .unwrap_or_default(),
             pairs: narrowing
                 .columns
                 .iter()
                 .zip(&narrowing.values)
                 .map(|(column, value)| {
                     (
-                        catalog_helpers::column_name(db, narrowing.table, *column)
+                        catalog_helpers::column_name::<Postgres, _>(db, narrowing.table, *column)
                             .unwrap_or_default(),
                         value.clone(),
                     )
@@ -1399,7 +1418,7 @@ where
         // captures, scalar extremes and keyed rows arrive as the read half,
         // everything the fold answered without a round trip as the other.
         // Every read that answered reaches the sink even when a sibling fails.
-        let mut reads = ResolvedReads::default();
+        let mut reads = ResolvedReads::<C::Error>::default();
         let settled = self
             .engine
             .consumers(event)
@@ -1409,6 +1428,7 @@ where
             .await;
         let notifications = settled.dispatched;
         let failure = settled.reads.err().map(reexec_error);
+        let stopped = stopped_reads(&mut reads);
         Self::log_transitions(&reads.transitions);
         Self::log_transitions(&notifications.transitions);
 
@@ -1468,12 +1488,13 @@ where
             narrowings,
             record,
             failure,
+            stopped,
         })
     }
 
     /// Drain the reads an earlier dispatch left queued, without applying any event.
     pub async fn resolve_reads(&mut self) -> Drained {
-        let mut reads = ResolvedReads::default();
+        let mut reads = ResolvedReads::<C::Error>::default();
         let failure = self
             .engine
             .resolve(|delivery| reads.push(delivery))
@@ -1481,6 +1502,7 @@ where
             .err()
             .map(reexec_error);
         Self::log_transitions(&reads.transitions);
+        let stopped = stopped_reads(&mut reads);
         Drained {
             computed: Self::computed_changes(
                 Vec::new(),
@@ -1492,6 +1514,7 @@ where
                 &self.scalar_rereads,
             ),
             failure,
+            stopped,
         }
     }
 
@@ -2156,12 +2179,15 @@ where
         let adapter = SqliteAdapter::new(&self.catalog)
             .map_err(|e| MaterializerError::Catalog(e.to_string()))?;
         // No drift guard refuses tables on this path, so the view refuses none.
-        Ok(subql::patchset::apply_diffset_bytes_with_catalog(
-            &self.catalog,
-            &bytes,
-            &NoRefusals,
-            conn,
-            &adapter,
+        Ok(subql::patchset::apply_diffset_bytes_with_catalog::<
+            subql::backend::SQLite,
+            _,
+            _,
+            _,
+            _,
+            _,
+        >(
+            &self.catalog, &bytes, &NoRefusals, conn, &adapter
         )?)
     }
 
@@ -2200,14 +2226,16 @@ where
         let bytes = decompress(payload_zstd)?;
         let adapter =
             PgAdapter::new(&self.catalog).map_err(|e| MaterializerError::Catalog(e.to_string()))?;
-        Ok(subql::patchset::apply_diffset_bytes_async_with_catalog(
-            &self.catalog,
-            &bytes,
-            &NoRefusals,
-            conn,
-            &adapter,
+        Ok(
+            subql::patchset::apply_diffset_bytes_async_with_catalog::<Postgres, _, _, _, _, _>(
+                &self.catalog,
+                &bytes,
+                &NoRefusals,
+                conn,
+                &adapter,
+            )
+            .await?,
         )
-        .await?)
     }
 
     /// What each membership term this subscription names needs seeded, as
@@ -2335,6 +2363,29 @@ pub struct FoldSeeded {
     pub changes: Vec<ComputedChange>,
     /// Whether a demotion left the first answer to a follow-up read.
     pub needs_snapshot: bool,
+}
+
+/// The reads a drain ended for good, each classed as [`reexec_error`] classes
+/// a failure, so the session ends each subscription as it ends a refused read.
+fn stopped_reads<E>(reads: &mut ResolvedReads<E>) -> Vec<EndedRead>
+where
+    E: core::fmt::Display + crate::reexec::FailedRead,
+{
+    reads
+        .stopped
+        .drain(..)
+        .map(|stopped| {
+            let (class, detail) = match reexec_error(stopped.error) {
+                MaterializerError::Read { class, detail, .. } => (class, detail),
+                other => (crate::reexec::ReadFailure::Other, other.to_string()),
+            };
+            EndedRead {
+                subscription: stopped.subscription_id,
+                class,
+                detail,
+            }
+        })
+        .collect()
 }
 
 /// Map an engine drive failure onto the materializer's error, keeping the
@@ -2864,7 +2915,7 @@ fn column_name_at<DB: DatabaseLike>(
 ) -> Result<String, MaterializerError> {
     let column_id =
         u16::try_from(index).map_err(|_| MaterializerError::SchemaMismatch(index.to_string()))?;
-    catalog_helpers::column_name(db, table_id, column_id)
+    catalog_helpers::column_name::<Postgres, _>(db, table_id, column_id)
         .ok_or_else(|| MaterializerError::SchemaMismatch(format!("column {index}")))
 }
 
@@ -3803,8 +3854,8 @@ mod audit_privacy_tests {
     }
 
     #[test]
-    fn a_catalog_that_cannot_name_its_columns_refuses_construction() {
-        let ddl = crate::catalog_shapes::unnameable_columns_ddl();
+    fn a_catalog_with_an_unresolvable_key_refuses_construction() {
+        let ddl = crate::catalog_shapes::unresolvable_key_ddl();
         let refusal = Materializer::builder(&ddl)
             .build()
             .err()
@@ -3812,7 +3863,8 @@ mod audit_privacy_tests {
         assert_eq!(
             refusal,
             Some(
-                MaterializerError::Catalog(crate::catalog_shapes::unnameable_column()).to_string()
+                MaterializerError::Catalog(crate::catalog_shapes::unresolvable_key_column())
+                    .to_string()
             )
         );
     }
