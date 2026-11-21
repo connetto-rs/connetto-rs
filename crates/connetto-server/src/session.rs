@@ -11910,16 +11910,24 @@ mod tests {
     /// A membership term over a table its bare name does not reach is refused
     /// before any read, since the seed, the mirror and the replica name the
     /// table bare. Off the search path the bare name reaches nothing, beside a
-    /// public twin it reaches the twin. The server's own builder refuses such a
-    /// catalog at boot, so the materializer here takes its translator directly,
-    /// as a manager built over a caller's own materializer does.
+    /// public twin it reaches the twin, and a search path naming another schema
+    /// first shadows a table declared without one. The server's own builder
+    /// refuses such a catalog at boot, so the materializer here takes its
+    /// translator directly, as a manager built over a caller's own materializer
+    /// does.
     #[test]
     fn a_membership_table_its_bare_name_misses_is_refused() {
         const DOCS: &str = "CREATE TABLE docs (id BIGINT PRIMARY KEY, project_id BIGINT NOT NULL);";
         const ORG: &str = "CREATE SCHEMA org;\nCREATE TABLE org.project_members (project_id BIGINT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (project_id, user_id));";
         const PUBLIC: &str = "CREATE TABLE project_members (project_id BIGINT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (project_id, user_id));";
+        const ORG_FIRST: &str = "SET search_path TO org, public;";
         const READER: &str = "app_reader";
-        let member_tables = |ddl: &str, member_table: &str| {
+        let term = |column: &str, member_table: &str| {
+            format!(
+                "{column} IN (SELECT project_id FROM {member_table} WHERE user_id = current_app_user())"
+            )
+        };
+        let member_tables = |ddl: &str, filter: &str| {
             let translator = rls2fga::translator::TranslatorBuilder::new(
                 connetto_schema::deployment::<String>(READER)
                     .expect("the test deployment's description holds"),
@@ -11935,25 +11943,49 @@ mod tests {
                 .build()
                 .expect("the catalog parses");
             let pg_sql = materializer
-                .translate_subscription_sql(&format!(
-                    "SELECT * FROM docs WHERE project_id IN (SELECT project_id FROM {member_table} WHERE user_id = current_app_user())"
-                ))
+                .translate_subscription_sql(&format!("SELECT * FROM docs WHERE {filter}"))
                 .expect("the caller function reverse translates");
             let terms = materializer
                 .describe_terms(1, &pg_sql, &[], None, Vec::new())
                 .expect("the membership term describes");
-            super::member_tables_of(&terms, materializer.catalog())
+            let member_tables = super::member_tables_of(&terms, materializer.catalog());
+            (terms.len(), member_tables)
         };
-        for ddl in [format!("{DOCS}\n{ORG}"), format!("{DOCS}\n{PUBLIC}\n{ORG}")] {
-            match member_tables(&ddl, "org.project_members") {
+        for (ddl, member_table, refused) in [
+            (
+                format!("{DOCS}\n{ORG}"),
+                "org.project_members",
+                "org.project_members",
+            ),
+            (
+                format!("{DOCS}\n{PUBLIC}\n{ORG}"),
+                "org.project_members",
+                "org.project_members",
+            ),
+            (
+                format!("{DOCS}\n{PUBLIC}\n{ORG_FIRST}\n{ORG}"),
+                "public.project_members",
+                "project_members",
+            ),
+        ] {
+            match member_tables(&ddl, &term("project_id", member_table)).1 {
                 Err(SubscribeRefusal::MembershipTableUnreachable(table)) => {
-                    assert_eq!(table, "org.project_members");
+                    assert_eq!(table, refused);
                 }
-                other => panic!("expected the off-path table refused over {ddl}, got {other:?}"),
+                other => panic!("expected {member_table} refused over {ddl}, got {other:?}"),
             }
         }
-        let reached = member_tables(&format!("{DOCS}\n{PUBLIC}\n{ORG}"), "project_members")
-            .expect("the table the bare name reaches is watched");
+        // Two terms over the one reached table share its single entry.
+        let (described, reached) = member_tables(
+            &format!("{DOCS}\n{PUBLIC}\n{ORG}"),
+            &format!(
+                "{} AND {}",
+                term("project_id", "project_members"),
+                term("id", "project_members")
+            ),
+        );
+        assert_eq!(described, 2, "both terms describe");
+        let reached = reached.expect("the table the bare name reaches is watched");
         let [watched] = &reached[..] else {
             panic!("one membership table, got {reached:?}");
         };
