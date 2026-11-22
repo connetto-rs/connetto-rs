@@ -7,7 +7,7 @@
 //! bot is held to its declared tables rather than refused.
 
 use connetto_core::auth::{
-    ContentCaller, DEFAULT_SUBJECTS_SETTING, DEFAULT_USER_SETTING, absent_marker,
+    ContentCaller, DEFAULT_SUBJECTS_SETTING, DEFAULT_USER_SETTING, UnsetSettings,
 };
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 
@@ -28,6 +28,9 @@ pub struct CallerSettings {
     /// The character the subjects are joined by, which the deployment's
     /// policies split them on.
     pub separator: char,
+    /// Which of the two the deployment's policies may find unset, as the
+    /// server's schema declares it.
+    pub unset: UnsetSettings,
 }
 
 impl Default for CallerSettings {
@@ -36,29 +39,32 @@ impl Default for CallerSettings {
             user: DEFAULT_USER_SETTING.to_owned(),
             subjects: DEFAULT_SUBJECTS_SETTING.to_owned(),
             separator: ',',
+            unset: UnsetSettings::ALWAYS_BOUND,
         }
     }
 }
 
 /// Bind all three values of `caller` for the rest of the transaction.
 ///
-/// A value the caller does not hold takes [`absent_marker`], which no row can
-/// carry, so a comparison against it is false. Leaving it unbound instead
-/// would read as `''` to the next caller on a pooled connection, because
-/// Postgres keeps the placeholder for the life of the session once anything
-/// has bound it. The bot list is always held, the wildcard for a caller
-/// holding no login.
+/// A value the caller does not hold takes `''` when the deployment declared it
+/// may be unset, and the absent marker otherwise, which no row can carry, so
+/// a comparison against it is false. Leaving it unbound instead would read as
+/// `''` to the next caller on a pooled connection, because Postgres keeps the
+/// placeholder for the life of the session once anything has bound it. The
+/// bot list is always held, the wildcard for a caller holding no login.
 pub(crate) async fn bind_caller(
     conn: &mut AsyncPgConnection,
     settings: &CallerSettings,
     caller: &ContentCaller,
 ) -> Result<(), diesel::result::Error> {
-    let marker = absent_marker();
     let subjects = caller
         .packed_subjects(settings.separator)
-        .unwrap_or_else(|| marker.to_owned());
+        .unwrap_or_else(|| settings.unset.absent_subjects().to_owned());
+    let user = caller
+        .identity()
+        .unwrap_or_else(|| settings.unset.absent_user());
     diesel::select((
-        functions::set_config(&settings.user, caller.identity().unwrap_or(marker), true),
+        functions::set_config(&settings.user, user, true),
         functions::set_config(&settings.subjects, subjects.as_str(), true),
         functions::set_config(connetto_core::BOT_LIST_SETTING, caller.bot_list(), true),
     ))

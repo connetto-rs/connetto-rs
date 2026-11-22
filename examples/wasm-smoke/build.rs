@@ -15,6 +15,7 @@ fn main() {
         std::path::Path::new("../deployment/policies.sql"),
         std::path::Path::new("../deployment/roles.sql"),
         "connetto_reader",
+        connetto_schema::UnsetSettings::ALWAYS_BOUND,
         Some(&connetto_schema::TierSource::new(
             "frontend.sql",
             "tier_history",

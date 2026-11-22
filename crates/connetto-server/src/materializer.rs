@@ -625,16 +625,18 @@ pub struct CallerMappings {
 
 impl CallerMappings {
     /// The caller functions of a deployment whose server reads as
-    /// `reader_role`, with the settings `Key` binds.
+    /// `reader_role`, with the settings `Key` binds, `unset` naming the ones
+    /// a caller may leave unset.
     ///
     /// # Errors
     ///
     /// As [`connetto_schema::deployment`].
     pub fn of<Key: connetto_core::auth::CapabilityKey>(
         reader_role: &str,
+        unset: connetto_core::auth::UnsetSettings,
     ) -> Result<Self, connetto_schema::SchemaError> {
         Ok(Self {
-            options: Box::new(connetto_schema::query_options::<Key>(reader_role)?),
+            options: Box::new(connetto_schema::query_options::<Key>(reader_role, unset)?),
             subjects_setting: Key::SETTING,
             reader_role: reader_role.to_owned(),
         })
@@ -3529,7 +3531,8 @@ mod membership_term_tests {
     }
 
     fn mapping() -> CallerMappings {
-        CallerMappings::of::<String>(READER).expect("the test deployment's description holds")
+        CallerMappings::of::<String>(READER, connetto_core::auth::UnsetSettings::ALWAYS_BOUND)
+            .expect("the test deployment's description holds")
     }
 
     // The whole happy path at this seam: the caller rewrites, the canonical

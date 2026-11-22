@@ -247,6 +247,41 @@ async fn signed_in_build_answers_the_caller_function_with_the_display_identity()
     );
 }
 
+/// An anonymous build answers the caller function the way the server binds an
+/// absent identity: `''` where the bundle declares the identity may be unset,
+/// and the absent marker where it does not.
+#[tokio::test]
+async fn an_anonymous_caller_answers_as_its_bundle_declares() {
+    let unset = connetto_core::auth::UnsetSettings::ALWAYS_BOUND.with_user();
+    for (schema, expected) in [
+        (bundle(), connetto_core::auth::absent_marker()),
+        (
+            SyncSchema::new(
+                SchemaBundle::new(
+                    SOURCE,
+                    "policies",
+                    DDL,
+                    Vec::<(String, String)>::new(),
+                    Vec::<String>::new(),
+                    None::<&str>,
+                )
+                .expect("the source declares major 1")
+                .with_unset_settings(unset),
+            ),
+            "",
+        ),
+    ] {
+        let mut conn = ClientBuilder::new(schema, Once::new(snapshot_server()))
+            .connect_driven()
+            .await
+            .expect("connect driven");
+        let caller: String = diesel::select(current_app_user())
+            .get_result(conn.conn())
+            .expect("read the caller");
+        assert_eq!(caller, expected);
+    }
+}
+
 /// A key store that records every name it is asked for, so the test can name
 /// the record the build chose.
 #[cfg(feature = "native-transport")]

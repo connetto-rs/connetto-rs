@@ -1183,6 +1183,9 @@ pub(crate) struct ClientConfig {
     /// What brings an existing device-private tier to this build's major,
     /// `None` for a build declaring no major (R31).
     tier_plan: Option<TierPlan>,
+    /// Which caller settings the deployment's policies may find unset, from
+    /// the storage schema, deciding what an absent identity renders as.
+    unset: connetto_core::auth::UnsetSettings,
 }
 
 impl ClientConfig {
@@ -1208,6 +1211,7 @@ impl ClientConfig {
             relay_mirror: false,
             content_hooks: ContentHooks::NONE,
             tier_plan: None,
+            unset: connetto_core::auth::UnsetSettings::ALWAYS_BOUND,
         }
     }
 
@@ -1219,6 +1223,7 @@ impl ClientConfig {
         }
         self.connection_ddl =
             (!schema.connection_ddl().is_empty()).then(|| Arc::from(schema.connection_ddl()));
+        self.unset = schema.unset_settings();
         self
     }
 
@@ -1239,22 +1244,19 @@ impl ClientConfig {
     /// generated view and its three `INSTEAD OF` triggers call it and would
     /// otherwise fail to resolve on the first read.
     ///
-    /// An unheld identity renders as [`absent_marker`], the same shape the
-    /// server binds, rather than as `""`. An empty string is a real identity
-    /// that a row can carry, so a replica answering `""` would show its holder
-    /// rows the server hides.
-    ///
-    /// [`absent_marker`]: connetto_core::auth::absent_marker
+    /// An unheld identity renders as the server binds it, read from the
+    /// storage schema folded in before this: `""` where the deployment
+    /// declared the identity may be unset, and the absent marker otherwise.
+    /// Where the deployment declared nothing, an empty string is a real
+    /// identity that a row can carry, so a replica answering `""` would show
+    /// its holder rows the server hides.
     #[must_use]
     pub fn with_caller(
         mut self,
         function: impl Into<String>,
         identity: Option<impl Into<String>>,
     ) -> Self {
-        let identity = identity.map_or_else(
-            || connetto_core::auth::absent_marker().to_owned(),
-            Into::into,
-        );
+        let identity = identity.map_or_else(|| self.unset.absent_user().to_owned(), Into::into);
         self.caller = Some((function.into(), identity));
         self
     }
@@ -12321,7 +12323,7 @@ where
             connetto_core::CALLER_FUNCTION,
             identity
                 .caller
-                .unwrap_or_else(|| connetto_core::auth::absent_marker().to_owned()),
+                .unwrap_or_else(|| self.config.unset.absent_user().to_owned()),
         )?;
         register_subjects(&mut self.db, SUBJECTS_FUNCTION, identity.subjects)?;
         let tables: Vec<String> = sqlite_catalog::table

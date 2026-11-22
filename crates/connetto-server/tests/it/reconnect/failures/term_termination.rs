@@ -92,8 +92,11 @@ async fn term_manager(
         Materializer::builder(&ddl)
             .with_translator(translator)
             .with_caller(
-                CallerMappings::of::<String>(connetto_test_harness::FIXTURE_READER)
-                    .expect("the deployment description builds"),
+                CallerMappings::of::<String>(
+                    connetto_test_harness::FIXTURE_READER,
+                    connetto_core::auth::UnsetSettings::ALWAYS_BOUND,
+                )
+                .expect("the deployment description builds"),
             )
             .build()
             .expect("materializer"),

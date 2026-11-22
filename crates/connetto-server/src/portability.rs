@@ -18,13 +18,13 @@ use std::sync::Arc;
 use crate::audit::{AuditWriteError, AuthEvent, AuthOp};
 use crate::authn::service::AuthError;
 use crate::builder::BuildError;
-use crate::capability::CallerBinding;
+use crate::capability::{BindingSettings, CallerBinding};
 use crate::key_filter::{KeyError, KeyFilter};
 use crate::materializer::{CallerMappings, MaterializerError, translate_select, wire_binds};
 use crate::snapshot::{BinaryRows, attach_binds, page_sql};
 use crate::throttle::ReadLimits;
 use connetto_core::SessionId;
-use connetto_core::auth::{AuthContext, DEFAULT_USER_SETTING, Principal, Subject, VerifiedSession};
+use connetto_core::auth::{AuthContext, Principal, Subject, UnsetSettings, VerifiedSession};
 use connetto_core::messages::SqliteValue;
 use diesel::QueryableByName;
 use diesel::sql_types::{Bool, Text, Timestamptz};
@@ -443,7 +443,7 @@ impl ValidatedList {
     }
 
     /// The download served from `reader` and `owner` under `limits`, reading
-    /// file bytes from `files`.
+    /// file bytes from `files` and binding the person as `unset` declares.
     ///
     /// # Errors
     ///
@@ -455,6 +455,7 @@ impl ValidatedList {
         owner: Pool<AsyncPgConnection>,
         limits: ReadLimits,
         files: Option<FileSource>,
+        unset: UnsetSettings,
     ) -> Result<PortabilityState, BuildError> {
         if files.is_none()
             && let Some(query) = self.queries.iter().find(|query| query.file.is_some())
@@ -470,6 +471,7 @@ impl ValidatedList {
             owner,
             limits,
             files,
+            binding: BindingSettings::default().with_unset(unset),
         })
     }
 }
@@ -711,6 +713,8 @@ pub(crate) struct PortabilityState {
     owner: Pool<AsyncPgConnection>,
     limits: ReadLimits,
     files: Option<FileSource>,
+    /// How the person's reads bind them.
+    binding: BindingSettings,
 }
 
 /// The moment the download's snapshot was taken (decision 7).
@@ -917,7 +921,7 @@ impl PortabilityState {
             accepted.is_ok(),
             "a fresh principal takes its first identity"
         );
-        let binding = CallerBinding::of(&caller, Arc::from(DEFAULT_USER_SETTING));
+        let binding = CallerBinding::of(&caller, &self.binding);
         let timeout_ms = crate::reexec::statement_timeout_ms(self.limits.timeout);
         let owner_snapshot = self.list.needs_owner_snapshot();
         let rows = &rows;
