@@ -953,6 +953,7 @@ async fn a_built_gate_connects_after_the_launch_prompt_and_rechecks_beyond_its_g
 /// A launch prompt the user dismisses fails the connect with the lock.
 #[tokio::test]
 async fn a_dismissed_launch_prompt_fails_the_connect() {
+    connetto_core::logging::install(std::io::stdout, "connetto_client::builder=debug");
     let mechanism = FakeMechanism::new();
     let connecting = gated_connect(&mechanism);
     until_asked(&mechanism, 1).await;

@@ -722,6 +722,7 @@ impl TransportFactory for Unanswered {
 /// redialed, which the reconnect attempts say.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_handshake_without_an_ack_is_abandoned_and_redialed() {
+    connetto_core::logging::install(std::io::stdout, "connetto_client::builder=debug");
     let dials = Arc::new(AtomicU32::new(0));
     let (running, pump) = ClientBuilder::new(
         super::support::bundle(DDL),

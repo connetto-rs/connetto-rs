@@ -967,8 +967,7 @@ where
         name = "client_startup",
         level = "debug",
         skip_all,
-        fields(startup_id = tracing::field::Empty),
-        err
+        fields(startup_id = tracing::field::Empty)
     )]
     pub async fn connect_with_pump(
         self,
@@ -979,6 +978,7 @@ where
                 startup_span.record("startup_id", startup_identifier.into_u64());
             }
         }
+        let log_error = |error: &ClientError| tracing::error!(%error);
         tracing::debug!(stage = "resolve", "client startup");
         let DurableResolved {
             base,
@@ -993,10 +993,11 @@ where
             custody,
             gate,
             share_key_store,
-        } = self.resolve().await?;
+        } = self.resolve().await.inspect_err(log_error)?;
         tracing::debug!(stage = "replica_open", "client startup");
         let replica =
-            open_encrypted_replica(&located.url, &key, !located.exists, ddl.as_ref(), shared)?;
+            open_encrypted_replica(&located.url, &key, !located.exists, ddl.as_ref(), shared)
+                .inspect_err(log_error)?;
         run_core(
             &replica,
             base,
@@ -1014,6 +1015,7 @@ where
             },
         )
         .await
+        .inspect_err(log_error)
     }
 
     async fn resolve(self) -> Result<DurableResolved<T, C>, ClientError> {
