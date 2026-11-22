@@ -239,7 +239,7 @@ async fn connected_shared() -> (ConnettoConnection<Script>, Script) {
     let script = Script::default();
     script.say(support::handshake_ack());
     let schema = SyncSchema::new(
-        connetto_schema::translate_shared::<String, connetto_core::bots::TextIds>(connetto_schema::Documents::new("-- connetto:major 1\nCREATE TABLE vocabulary (id INT PRIMARY KEY, label TEXT NOT NULL); \
+        connetto_translate::translate_shared::<String, connetto_core::bots::TextIds>(connetto_translate::Documents::new("-- connetto:major 1\nCREATE TABLE vocabulary (id INT PRIMARY KEY, label TEXT NOT NULL); \
          CREATE TABLE notes (id INT PRIMARY KEY, vocabulary_id INT NOT NULL, \
           owner TEXT NOT NULL); \
          ALTER TABLE vocabulary ENABLE ROW LEVEL SECURITY; \

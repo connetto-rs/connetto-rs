@@ -1304,7 +1304,7 @@ dependencies = [
  "connetto-peer",
  "connetto-peer-android",
  "connetto-peer-apple",
- "connetto-schema",
+ "connetto-translate",
  "core-foundation",
  "diesel",
  "diesel-sqlite-session",
@@ -1391,7 +1391,7 @@ dependencies = [
  "connetto-demo-deployment",
  "connetto-file-client",
  "connetto-file-core",
- "connetto-schema",
+ "connetto-translate",
  "connetto-web",
  "diesel",
  "image",
@@ -1598,20 +1598,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "connetto-schema"
-version = "0.0.0"
-dependencies = [
- "connetto-core",
- "diesel",
- "pg2sqlite",
- "serde",
- "sql-traits",
- "sqlparser",
- "thiserror 2.0.21",
- "toml 0.8.2",
-]
-
-[[package]]
 name = "connetto-server"
 version = "0.0.0"
 dependencies = [
@@ -1626,7 +1612,7 @@ dependencies = [
  "connetto-core",
  "connetto-file-core",
  "connetto-file-server",
- "connetto-schema",
+ "connetto-translate",
  "diesel",
  "diesel-async",
  "futures-util",
@@ -1674,8 +1660,8 @@ dependencies = [
  "connetto-client",
  "connetto-core",
  "connetto-peer-apple",
- "connetto-schema",
  "connetto-server",
+ "connetto-translate",
  "diesel",
  "diesel-async",
  "dispatch2",
@@ -1704,6 +1690,20 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "zstd",
+]
+
+[[package]]
+name = "connetto-translate"
+version = "0.0.0"
+dependencies = [
+ "connetto-core",
+ "diesel",
+ "pg2sqlite",
+ "serde",
+ "sql-traits",
+ "sqlparser",
+ "thiserror 2.0.21",
+ "toml 0.8.2",
 ]
 
 [[package]]

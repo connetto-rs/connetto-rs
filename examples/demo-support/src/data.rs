@@ -16,7 +16,7 @@ use diesel::prelude::*;
 use diesel::sqlite::pragma::{FreelistCount, PageCount, SchemaPragma};
 use rosetta_uuid::Uuid;
 
-include!(concat!(env!("OUT_DIR"), "/connetto-schema.rs"));
+include!(concat!(env!("OUT_DIR"), "/connetto-translate.rs"));
 
 pub use connetto_demo_deployment::{AUTH_BASE, DEMO_WS_URL, auth_landing};
 

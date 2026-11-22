@@ -49,8 +49,8 @@ const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 /// decision 11). A publication row for a table outside the catalog wedges the
 /// change stream.
 fn catalog_ddl() -> String {
-    connetto_schema::with_bookkeeping::<connetto_core::bots::TextIds>(
-        &connetto_schema::with_registry::<connetto_core::bots::TextIds>(PG_DDL),
+    connetto_translate::with_bookkeeping::<connetto_core::bots::TextIds>(
+        &connetto_translate::with_registry::<connetto_core::bots::TextIds>(PG_DDL),
         true,
     )
 }

@@ -152,7 +152,7 @@ connetto-client = { path = "../connetto-client", default-features = false, featu
 # The holder proofs serve a bare node's requests on loopback, its
 # certificates minted in memory, under a translated policy schema.
 connetto-peer = { path = "../connetto-peer", features = ["test-support"] }
-connetto-schema.workspace = true
+connetto-translate.workspace = true
 # The retention proofs apply a captured peer entry, whose manifest row names
 # the SHA-256 of its body.
 sha2 = "0.10"

@@ -622,7 +622,7 @@ impl Translated {
     ///
     /// The schema, the policies, the cap they generate and the roles are
     /// parsed as one catalog, translated under the same
-    /// [`connetto_schema::deployment`] the client build reads, so the model
+    /// [`connetto_translate::deployment`] the client build reads, so the model
     /// and the replica are told one thing about each session setting.
     ///
     /// `devices` carries the deployment's device identity, so the model's
@@ -636,7 +636,7 @@ impl Translated {
     /// reader role, and [`SetupError::Untranslated`] naming every expression
     /// left unhandled.
     pub fn of<Key: CapabilityKey, D: ConnettoSchema>(
-        documents: connetto_schema::Documents<'_>,
+        documents: connetto_translate::Documents<'_>,
         devices: bool,
     ) -> Result<Self, SetupError> {
         // The model holds a bot to its list exactly as Postgres does, over the
@@ -645,9 +645,11 @@ impl Translated {
             .map_err(|err| SetupError::Catalog(err.to_string()))?;
         let catalog = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(&sql)
             .map_err(|err| SetupError::Catalog(err.to_string()))?;
-        let deployment =
-            connetto_schema::deployment::<Key>(documents.reader_role(), documents.unset_settings())
-                .map_err(|err| SetupError::Catalog(err.to_string()))?;
+        let deployment = connetto_translate::deployment::<Key>(
+            documents.reader_role(),
+            documents.unset_settings(),
+        )
+        .map_err(|err| SetupError::Catalog(err.to_string()))?;
         let translator = rls2fga::translator::TranslatorBuilder::new(deployment)
             .with_min_confidence(rls2fga::types::ConfidenceLevel::B)
             .build();
@@ -2002,7 +2004,7 @@ mod tests {
 
     fn translated(policies: &str) -> Translated {
         Translated::of::<String, crate::defaults::ConnettoDefaults>(
-            connetto_schema::Documents::new(
+            connetto_translate::Documents::new(
                 SCHEMA,
                 policies,
                 connetto_test_harness::FIXTURE_ROLES,
@@ -2250,7 +2252,7 @@ mod tests {
     /// really writes.
     fn share_records(viewer: &'static str) -> (Arc<SubjectNaming>, Vec<Record>) {
         let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
-            connetto_schema::Documents::new(
+            connetto_translate::Documents::new(
                 SHARE_SCHEMA,
                 SHARE_POLICY,
                 connetto_test_harness::FIXTURE_ROLES,
@@ -2516,7 +2518,7 @@ mod tests {
     #[test]
     fn a_table_with_no_policy_at_all_grants_everybody_without_a_round_trip() {
         let shapes = Translated::of::<String, crate::defaults::ConnettoDefaults>(
-            connetto_schema::Documents::new(
+            connetto_translate::Documents::new(
                 "CREATE TABLE orders (id INT PRIMARY KEY, quantity BIGINT NOT NULL);",
                 "",
                 connetto_test_harness::FIXTURE_ROLES,
@@ -2541,7 +2543,7 @@ mod tests {
     #[test]
     fn a_policy_with_no_translation_refuses_startup() {
         let refused = Translated::of::<String, crate::defaults::ConnettoDefaults>(
-            connetto_schema::Documents::new(
+            connetto_translate::Documents::new(
                 SCHEMA,
                 "CREATE FUNCTION mystery_function(who TEXT) RETURNS BOOLEAN LANGUAGE plpgsql \
                  AS $$ BEGIN RETURN who IS NOT NULL; END $$; \
@@ -2564,7 +2566,7 @@ mod tests {
     #[test]
     fn a_reader_role_the_roles_document_never_creates_refuses_startup() {
         let refused = Translated::of::<String, crate::defaults::ConnettoDefaults>(
-            connetto_schema::Documents::new(
+            connetto_translate::Documents::new(
                 "CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT);",
                 "",
                 "CREATE ROLE someone_else LOGIN;",
@@ -2596,7 +2598,7 @@ mod tests {
         }
 
         let refused = Translated::of::<OnIdentity, crate::defaults::ConnettoDefaults>(
-            connetto_schema::Documents::new(
+            connetto_translate::Documents::new(
                 "CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT);",
                 "",
                 connetto_test_harness::FIXTURE_ROLES,
@@ -2652,7 +2654,7 @@ mod tests {
     #[test]
     fn a_share_written_as_a_join_table_row_boots_since_the_upstream_repair() {
         let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
-            connetto_schema::Documents::new(
+            connetto_translate::Documents::new(
                 SHARE_SCHEMA,
                 SHARE_POLICY,
                 connetto_test_harness::FIXTURE_ROLES,
@@ -2690,7 +2692,7 @@ mod tests {
 
         let Err(super::SetupError::Unwithdrawable(named)) =
             Translated::of::<String, crate::defaults::ConnettoDefaults>(
-                connetto_schema::Documents::new(
+                connetto_translate::Documents::new(
                     SCHEMA,
                     POLICY,
                     connetto_test_harness::FIXTURE_ROLES,
@@ -2736,7 +2738,7 @@ mod tests {
               AND s.weight > (SELECT avg(weight) FROM paper_shares)))";
 
         let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
-            connetto_schema::Documents::new(
+            connetto_translate::Documents::new(
                 SCHEMA,
                 POLICY,
                 connetto_test_harness::FIXTURE_ROLES,
@@ -2769,7 +2771,7 @@ mod tests {
               AND s.viewer = current_setting('app.user_id', true) \
               AND s.weight > (SELECT avg(weight) FROM item_share)))";
         let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
-            connetto_schema::Documents::new(
+            connetto_translate::Documents::new(
                 SCHEMA,
                 POLICY,
                 connetto_test_harness::FIXTURE_ROLES,
@@ -2820,7 +2822,7 @@ mod tests {
 
         let Err(super::SetupError::Unplannable(detail)) =
             Translated::of::<String, crate::defaults::ConnettoDefaults>(
-                connetto_schema::Documents::new(
+                connetto_translate::Documents::new(
                     SCHEMA,
                     POLICY,
                     connetto_test_harness::FIXTURE_ROLES,
@@ -2862,7 +2864,7 @@ mod tests {
             author = current_setting('app.user_id', true))";
 
         let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
-            connetto_schema::Documents::new(
+            connetto_translate::Documents::new(
                 SCHEMA,
                 POLICIES,
                 connetto_test_harness::FIXTURE_ROLES,

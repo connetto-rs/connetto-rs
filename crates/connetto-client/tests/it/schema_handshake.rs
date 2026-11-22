@@ -25,8 +25,8 @@ const POLICIES: &str = "ALTER TABLE orders ENABLE ROW LEVEL SECURITY; \
 /// The bundle version a side declares, derived the way the production binary
 /// derives it, from the same sources both sides hold.
 fn derived_version() -> SchemaVersion {
-    connetto_schema::translate::<String, connetto_core::bots::TextIds>(
-        connetto_schema::Documents::new(
+    connetto_translate::translate::<String, connetto_core::bots::TextIds>(
+        connetto_translate::Documents::new(
             PG_DDL,
             POLICIES,
             connetto_test_harness::FIXTURE_ROLES,
@@ -81,8 +81,8 @@ async fn the_handshake_gate_hashes_the_same_bundle_on_both_sides() {
 
     let mut conn = ClientBuilder::new(
         SyncSchema::new(
-            connetto_schema::translate::<String, connetto_core::bots::TextIds>(
-                connetto_schema::Documents::new(
+            connetto_translate::translate::<String, connetto_core::bots::TextIds>(
+                connetto_translate::Documents::new(
                     PG_DDL,
                     POLICIES,
                     connetto_test_harness::FIXTURE_ROLES,

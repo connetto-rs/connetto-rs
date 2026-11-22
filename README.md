@@ -48,7 +48,7 @@ The drawing below is the whole system coloured by build status. It is too dense 
 | `connetto-server` | Session manager, subscription materializer, auth stack, mutation handler, and the server builder that assembles them |
 | `connetto-client` | Native Diesel connection, its builder, background sync, live queries, teardown, archives |
 | `connetto-auth-session` | The platform browser tab a phone signs in through, returning to the app by redirect |
-| `connetto-schema` | The build step translating a deployment's Postgres sources into the bundle client and server share |
+| `connetto-translate` | The build step translating a deployment's Postgres sources into the bundle client and server share |
 | `connetto-web` | Browser platform on wasm32, the DB worker, the relay, storage and custody |
 | `connetto-dioxus`, `connetto-yew` | Framework adapters exposing live queries as hooks |
 | `connetto-file-core`, `connetto-file-server`, `connetto-file-client` | The file stack, which depends on connetto and never the reverse |

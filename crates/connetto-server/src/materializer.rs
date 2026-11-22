@@ -630,13 +630,16 @@ impl CallerMappings {
     ///
     /// # Errors
     ///
-    /// As [`connetto_schema::deployment`].
+    /// As [`connetto_translate::deployment`].
     pub fn of<Key: connetto_core::auth::CapabilityKey>(
         reader_role: &str,
         unset: connetto_core::auth::UnsetSettings,
-    ) -> Result<Self, connetto_schema::SchemaError> {
+    ) -> Result<Self, connetto_translate::SchemaError> {
         Ok(Self {
-            options: Box::new(connetto_schema::query_options::<Key>(reader_role, unset)?),
+            options: Box::new(connetto_translate::query_options::<Key>(
+                reader_role,
+                unset,
+            )?),
             subjects_setting: Key::SETTING,
             reader_role: reader_role.to_owned(),
         })
@@ -2734,7 +2737,7 @@ fn private_relations<DB: DatabaseLike, V: sqlparser::ast::Visit>(
         let Some(ident) = name.0.last().and_then(|part| part.as_ident()) else {
             return core::ops::ControlFlow::Continue(());
         };
-        if let Some(table) = connetto_schema::BOOKKEEPING_TABLES
+        if let Some(table) = connetto_translate::BOOKKEEPING_TABLES
             .iter()
             .find(|table| ident.value.eq_ignore_ascii_case(table))
         {
@@ -3498,7 +3501,7 @@ mod membership_term_tests {
 
     fn materializer(caller: Option<CallerMappings>) -> Materializer {
         let translator = Translated::of::<String, crate::defaults::ConnettoDefaults>(
-            connetto_schema::Documents::new(SCHEMA, POLICIES, ROLES, READER),
+            connetto_translate::Documents::new(SCHEMA, POLICIES, ROLES, READER),
             true,
         )
         .expect("the motivating policy translates")
@@ -3517,7 +3520,7 @@ mod membership_term_tests {
     /// beside the schema, as the server's own catalog does.
     fn materializer_over(policies: &str) -> Materializer {
         let translator = Translated::of::<String, crate::defaults::ConnettoDefaults>(
-            connetto_schema::Documents::new(SCHEMA, policies, ROLES, READER),
+            connetto_translate::Documents::new(SCHEMA, policies, ROLES, READER),
             true,
         )
         .expect("the policies translate")
@@ -3746,7 +3749,7 @@ mod membership_term_tests {
 
     fn own_materializer() -> Materializer {
         let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
-            connetto_schema::Documents::new(OWN_DDL, OWN_POLICIES, ROLES, READER),
+            connetto_translate::Documents::new(OWN_DDL, OWN_POLICIES, ROLES, READER),
             true,
         )
         .expect("the own-shape policy translates");

@@ -153,9 +153,9 @@ diesel::table! {
 fn options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_deployment(
-            connetto_schema::deployment::<String>(
+            connetto_translate::deployment::<String>(
                 connetto_test_harness::FIXTURE_READER,
-                connetto_schema::UnsetSettings::ALWAYS_BOUND,
+                connetto_translate::UnsetSettings::ALWAYS_BOUND,
             )
             .expect("the deployment description builds"),
         )

@@ -68,7 +68,7 @@ fn malformed_documents_refuse_catalog_and_authorization_translation() {
         let schema = ServerSchema::new(ddl, policies, FIXTURE_ROLES, FIXTURE_READER);
         assert!(matches!(
             schema.catalog::<ConnettoDefaults>(),
-            Err(connetto_schema::SchemaError::Translate(_))
+            Err(connetto_translate::SchemaError::Translate(_))
         ));
         assert!(matches!(
             Translated::of::<String, ConnettoDefaults>(schema.documents(), false),

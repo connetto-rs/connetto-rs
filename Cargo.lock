@@ -1417,8 +1417,8 @@ dependencies = [
  "connetto-file-core",
  "connetto-file-server",
  "connetto-peer",
- "connetto-schema",
  "connetto-server",
+ "connetto-translate",
  "connetto-yew",
 ]
 
@@ -1466,9 +1466,9 @@ dependencies = [
  "connetto-peer",
  "connetto-peer-android",
  "connetto-peer-apple",
- "connetto-schema",
  "connetto-server",
  "connetto-test-harness",
+ "connetto-translate",
  "core-foundation",
  "diesel",
  "diesel-async",
@@ -1597,7 +1597,7 @@ dependencies = [
  "connetto-demo-deployment",
  "connetto-file-client",
  "connetto-file-core",
- "connetto-schema",
+ "connetto-translate",
  "connetto-web",
  "diesel",
  "image",
@@ -1626,9 +1626,9 @@ dependencies = [
  "connetto-client",
  "connetto-core",
  "connetto-file-server",
- "connetto-schema",
  "connetto-server",
  "connetto-test-harness",
+ "connetto-translate",
  "diesel",
  "diesel-async",
  "keyring-core",
@@ -1697,9 +1697,9 @@ dependencies = [
  "connetto-file-core",
  "connetto-file-server",
  "connetto-peer",
- "connetto-schema",
  "connetto-server",
  "connetto-test-harness",
+ "connetto-translate",
  "diesel",
  "diesel-async",
  "futures-util",
@@ -1855,22 +1855,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "connetto-schema"
-version = "0.0.0"
-dependencies = [
- "connetto-core",
- "connetto-demo-deployment",
- "diesel",
- "pg2sqlite",
- "serde",
- "sql-traits",
- "sqlparser",
- "tempfile",
- "thiserror 2.0.21",
- "toml 0.8.2",
-]
-
-[[package]]
 name = "connetto-server"
 version = "0.0.0"
 dependencies = [
@@ -1886,8 +1870,8 @@ dependencies = [
  "connetto-core",
  "connetto-file-core",
  "connetto-file-server",
- "connetto-schema",
  "connetto-test-harness",
+ "connetto-translate",
  "diesel",
  "diesel-async",
  "futures-util",
@@ -1962,8 +1946,8 @@ dependencies = [
  "connetto-demo-support",
  "connetto-file-client",
  "connetto-peer-apple",
- "connetto-schema",
  "connetto-server",
+ "connetto-translate",
  "diesel",
  "diesel-async",
  "dispatch2",
@@ -1993,6 +1977,22 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "zstd",
+]
+
+[[package]]
+name = "connetto-translate"
+version = "0.0.0"
+dependencies = [
+ "connetto-core",
+ "connetto-demo-deployment",
+ "diesel",
+ "pg2sqlite",
+ "serde",
+ "sql-traits",
+ "sqlparser",
+ "tempfile",
+ "thiserror 2.0.21",
+ "toml 0.8.2",
 ]
 
 [[package]]

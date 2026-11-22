@@ -44,8 +44,8 @@ fn schema() -> SyncSchema {
 
 fn schema_at(major: u32) -> SyncSchema {
     SyncSchema::new(
-        connetto_schema::translate_shared::<String, connetto_core::bots::TextIds>(
-            connetto_schema::Documents::new(
+        connetto_translate::translate_shared::<String, connetto_core::bots::TextIds>(
+            connetto_translate::Documents::new(
                 &format!("{} {major}\n{SCHEMA}", connetto_core::MAJOR_DIRECTIVE),
                 POLICIES,
                 connetto_test_harness::FIXTURE_ROLES,

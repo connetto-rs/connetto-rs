@@ -339,8 +339,8 @@ impl ServerSchema {
 
     /// The documents both translators read, as the client build reads them.
     #[must_use]
-    pub fn documents(&self) -> connetto_schema::Documents<'_> {
-        connetto_schema::Documents::new(
+    pub fn documents(&self) -> connetto_translate::Documents<'_> {
+        connetto_translate::Documents::new(
             &self.pg_ddl,
             &self.pg_policies,
             &self.pg_roles,
@@ -359,7 +359,7 @@ impl ServerSchema {
 
     /// Declare which caller settings the deployment's policies may find unset,
     /// the declaration the client build passed to
-    /// [`connetto_schema::emit`]. The server binds `''` for an absent caller
+    /// [`connetto_translate::emit`]. The server binds `''` for an absent caller
     /// half declared so, and the two sides advertise one schema version only
     /// when they agree.
     #[must_use]
@@ -385,9 +385,9 @@ impl ServerSchema {
     ///
     /// # Errors
     ///
-    /// [`connetto_schema::SchemaError::Translate`] when either document does
+    /// [`connetto_translate::SchemaError::Translate`] when either document does
     /// not parse.
-    pub fn catalog<D: ConnettoSchema>(&self) -> Result<String, connetto_schema::SchemaError> {
+    pub fn catalog<D: ConnettoSchema>(&self) -> Result<String, connetto_translate::SchemaError> {
         crate::schema::catalog::<D>(self.documents(), self.devices)
     }
 }
@@ -572,7 +572,7 @@ pub enum BuildError {
     Materializer(#[from] crate::materializer::MaterializerError),
     /// The replica schema documents did not translate.
     #[error(transparent)]
-    Schema(#[from] connetto_schema::SchemaError),
+    Schema(#[from] connetto_translate::SchemaError),
     /// A registered download query was refused.
     #[error("download query {name:?} refused")]
     Portability {
@@ -1973,8 +1973,8 @@ where
         let portability = portability
             .map(|list| {
                 let documents = schema.documents();
-                let replica = connetto_schema::translate::<String, RegistryIds<D>>(
-                    connetto_schema::Documents::new(
+                let replica = connetto_translate::translate::<String, RegistryIds<D>>(
+                    connetto_translate::Documents::new(
                         documents.schema(),
                         "",
                         documents.roles(),
@@ -2269,11 +2269,12 @@ async fn require_schema_tables<D: ConnettoSchema>(
 
 /// The tables the cap and the reader checks cover.
 ///
-/// The same table list the generator walks, [`connetto_schema::schema_tables`]
+/// The same table list the generator walks, [`connetto_translate::schema_tables`]
 /// over the schema document with the registry tables connetto appends to it.
 fn synced_tables<D: ConnettoSchema>(pg_ddl: &str) -> Result<Vec<String>, BuildError> {
-    let combined = connetto_schema::with_registry::<<D::Bots as ConnettoBotSchema>::IdSql>(pg_ddl);
-    Ok(connetto_schema::schema_tables(&combined)?)
+    let combined =
+        connetto_translate::with_registry::<<D::Bots as ConnettoBotSchema>::IdSql>(pg_ddl);
+    Ok(connetto_translate::schema_tables(&combined)?)
 }
 
 /// Refuse a deployment whose synced tables are not held to the bot cap.
@@ -2369,11 +2370,11 @@ async fn prepare_change_log(
         // decision 11). The writer and settled tables always stand.
         Artifact::PublishedTable {
             publication,
-            table: connetto_schema::BOOKKEEPING_TABLES[0],
+            table: connetto_translate::BOOKKEEPING_TABLES[0],
         },
         Artifact::PublishedTable {
             publication,
-            table: connetto_schema::BOOKKEEPING_TABLES[1],
+            table: connetto_translate::BOOKKEEPING_TABLES[1],
         },
     ];
     // The enrolment table stands only with device identity, so its publication
@@ -2381,7 +2382,7 @@ async fn prepare_change_log(
     if device_identity {
         artifacts.push(Artifact::PublishedTable {
             publication,
-            table: connetto_schema::BOOKKEEPING_TABLES[2],
+            table: connetto_translate::BOOKKEEPING_TABLES[2],
         });
     }
     artifacts.push(Artifact::PreviousImages { publication });
@@ -2569,7 +2570,7 @@ fn is_loopback_origin(origin: &str) -> bool {
 fn require_one_numbering(model: &ParserDB, engine_ddl: &str) -> Result<(), BuildError> {
     let engine = ParserDB::parse::<PostgreSqlDialect>(engine_ddl)
         .map_err(|err| SetupError::Catalog(format!("{err:?}")))?;
-    for table in connetto_schema::schema_tables(engine_ddl)? {
+    for table in connetto_translate::schema_tables(engine_ddl)? {
         let in_model = subql::catalog_helpers::table_id::<Postgres, _>(model, &table);
         let in_engine = subql::catalog_helpers::table_id::<Postgres, _>(&engine, &table);
         if in_model != in_engine {
@@ -2605,7 +2606,7 @@ async fn translate_authorization<D: ConnettoSchema>(
     // The owner pool reads the facts off the tables the policies read, and
     // the withdrawals and the bot registry off the synced tables, each for
     // every caller at once, so row-level security must filter none of them.
-    let mut read_in_full = connetto_schema::schema_tables(&engine_ddl)?;
+    let mut read_in_full = connetto_translate::schema_tables(&engine_ddl)?;
     read_in_full.extend(translated.policy_tables().iter().cloned());
     read_in_full.sort_unstable();
     read_in_full.dedup();
@@ -2721,7 +2722,7 @@ async fn build_write_side<D: ConnettoSchema>(
     let withdrawals = PgSnapshotSource::from_ddl(pools.owner.clone(), &schema.engine_ddl::<D>())?
         .with_unset_settings(schema.unset);
     // A changed policy makes an existing replica stale, so a client holding one is told through the advertised version.
-    let bundle = connetto_schema::translate::<String, <D::Bots as ConnettoBotSchema>::IdSql>(
+    let bundle = connetto_translate::translate::<String, <D::Bots as ConnettoBotSchema>::IdSql>(
         schema.documents(),
     )?;
     let facts = FactSource::owner(pools.owner);
@@ -3118,7 +3119,7 @@ mod tests {
         let budget = Duration::from_millis(200);
         let openfga = OpenFga::new(format!("http://{address}"), "store").with_call_budget(budget);
         let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
-            connetto_schema::Documents::new(
+            connetto_translate::Documents::new(
                 "CREATE TABLE papers (id INTEGER PRIMARY KEY, owner TEXT); \
                  ALTER TABLE papers ENABLE ROW LEVEL SECURITY;",
                 "CREATE POLICY papers_p ON papers FOR SELECT USING \

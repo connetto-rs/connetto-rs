@@ -86,7 +86,7 @@ The full discussion is in [05](05-aggregate-queries.md).
 
 | Piece | Description |
 |---|---|
-| Schema translation | The build step turns the deployment's Postgres sources into the replica DDL and the policy views, filtered to the tables the client can access, via [`connetto_schema::translate`] and [`connetto_schema::emit`] |
+| Schema translation | The build step turns the deployment's Postgres sources into the replica DDL and the policy views, filtered to the tables the client can access, via [`connetto_translate::translate`] and [`connetto_translate::emit`] |
 | Schema version envelope | A content hash over the whole bundle, one value, in [`connetto_core::schema::SchemaVersion`] |
 | Schema version handshake | The server advertises the version in `HandshakeAck`, and the client never fetches or applies a schema at runtime |
 | Stale-build detection | The client compares the advertised version with the one it was baked with. A mismatch means this app build is stale and must reload, since the schema is compiled in and the client runs no DDL. Reload boots a fresh baked template and full-resyncs |
@@ -134,7 +134,7 @@ One Cargo workspace holds the crates, and each publishes independently so a down
 | Crate | Role |
 |---|---|
 | `connetto-core` | The wire types, the framing and codec, and the traits every side agrees on. Both `connetto-server` and `connetto-client` depend on it, and neither depends on the other |
-| `connetto-schema` | The build step that translates a deployment's Postgres sources into the bundle the client and server share |
+| `connetto-translate` | The build step that translates a deployment's Postgres sources into the bundle the client and server share |
 | `connetto-server` | The server library. Sessions, CDC ingest, the materializer, the auth stack, the mutation handler, and the server builder |
 | `connetto-client` | The native client. The Diesel connection, its builder, the background sync, the live queries, and the archives |
 | `connetto-dioxus` | The Dioxus hooks that bind live queries to component scope |

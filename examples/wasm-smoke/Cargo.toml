@@ -55,7 +55,7 @@ web-sys = { version = "0.3", features = [
 # this demo's local tier into the bundle the app includes and the version it
 # presents at handshake.
 [build-dependencies]
-connetto-schema = { path = "../../crates/connetto-schema" }
+connetto-translate = { path = "../../crates/connetto-translate" }
 
 [dev-dependencies]
 connetto-demo-support = { path = "../demo-support", features = ["web"] }

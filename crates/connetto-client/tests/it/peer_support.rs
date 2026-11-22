@@ -118,8 +118,8 @@ pub async fn receiver_holding(
     let script = Script::default();
     script.say(support::handshake_ack());
     let schema = SyncSchema::new(
-        connetto_schema::translate::<String, connetto_core::bots::TextIds>(
-            connetto_schema::Documents::new(
+        connetto_translate::translate::<String, connetto_core::bots::TextIds>(
+            connetto_translate::Documents::new(
                 schema,
                 policies,
                 connetto_test_harness::FIXTURE_ROLES,

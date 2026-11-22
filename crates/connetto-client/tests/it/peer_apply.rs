@@ -1913,8 +1913,8 @@ async fn shared_receiver() -> (ConnettoConnection<Script>, Script) {
     let script = Script::default();
     script.say(support::handshake_ack());
     let schema = SyncSchema::new(
-        connetto_schema::translate_shared::<String, connetto_core::bots::TextIds>(
-            connetto_schema::Documents::new(
+        connetto_translate::translate_shared::<String, connetto_core::bots::TextIds>(
+            connetto_translate::Documents::new(
                 "-- connetto:major 1\n \
          CREATE TABLE orders (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, \
          status TEXT NOT NULL); \

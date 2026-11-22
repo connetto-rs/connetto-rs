@@ -1606,8 +1606,8 @@ async fn deleting_a_stored_account_refuses_without_destroying_anything() {
 /// policy, so the replica holds the policy views the build's map names.
 fn policy_schema() -> connetto_client::SyncSchema {
     connetto_client::SyncSchema::new(
-        connetto_schema::translate::<String, connetto_core::bots::TextIds>(
-            connetto_schema::Documents::new(
+        connetto_translate::translate::<String, connetto_core::bots::TextIds>(
+            connetto_translate::Documents::new(
                 "-- connetto:major 1\nCREATE TABLE items (id INT PRIMARY KEY, label TEXT);",
                 "ALTER TABLE items ENABLE ROW LEVEL SECURITY; \
                  CREATE POLICY items_p ON items USING (true) WITH CHECK (true);",

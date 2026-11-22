@@ -43,7 +43,7 @@ async fn manager(fixture: &Fixture, clock: &ExpiryClock) -> Manager {
         ])
         .await;
     let (_, translator, _) = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-        connetto_schema::Documents::new(
+        connetto_translate::Documents::new(
             DDL,
             POLICIES,
             connetto_test_harness::FIXTURE_ROLES,

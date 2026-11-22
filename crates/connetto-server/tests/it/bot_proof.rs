@@ -109,7 +109,7 @@ async fn shipped_executor(
 ) {
     let (channel, store) = fixture.fga_store().await;
     let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-        connetto_schema::Documents::new(
+        connetto_translate::Documents::new(
             PG_DDL,
             NO_POLICIES,
             connetto_test_harness::FIXTURE_ROLES,
