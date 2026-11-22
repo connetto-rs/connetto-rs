@@ -119,8 +119,8 @@ where
 {
     type Handle = ContentHandle<T>;
 
-    fn held_content() -> connetto_client::HeldContent {
-        crate::db::held_content()
+    fn content_hooks() -> connetto_client::ContentHooks {
+        crate::db::content_hooks()
     }
 
     #[cfg(feature = "peer")]

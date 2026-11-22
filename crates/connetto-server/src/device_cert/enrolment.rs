@@ -1,19 +1,27 @@
 //! Enrolling a signed-in device's key (R74 step 3), revoking it and publishing
 //! the lists that say so (step 5).
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use connetto_core::SessionId;
 use connetto_core::device_cert::{
-    AttestationLevel, CertificateRequest, CertificateSerial, IssueError, KeyId, ListError, Revoked,
+    AttestationLevel, CertificateRequest, CertificateSerial, IssueError, KeyId, ListError,
 };
 use connetto_core::messages::{DeviceSummary, EnrolGrant, EnrolRefusal, EnrolRequest, SignedList};
+use diesel_async::AsyncConnection as _;
+use diesel_async::AsyncPgConnection;
+use diesel_async::pooled_connection::bb8::PooledConnection;
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::time::Instant;
 
-use super::{DeviceCertConfig, LifetimeError, StatusList, verify};
+use super::{DeviceCertConfig, EnrolmentStore, LifetimeError, StatusList, verify};
+use crate::authn::schema::{Desc, SessionRecord};
+use crate::authn::{
+    AuthService, AuthStoreError, CommittedNotice, ConnettoStoreSchema, DeviceEnrolled,
+    DeviceRevoked, EndCause, HookError,
+};
+use crate::schema::ConnettoSchema;
 
 /// The largest descriptor accepted, in bytes.
 const DESCRIPTOR_LIMIT: usize = 4096;
@@ -79,7 +87,10 @@ pub struct KeyRecord<Id> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Recorded {
     /// Recorded, so the certificate may be sent.
-    Granted,
+    Granted {
+        /// Whether the key had no enrolment before, so this is its first.
+        first: bool,
+    },
     /// The key's enrolment is revoked, so nothing was recorded.
     Revoked,
     /// The key is enrolled under another account, so nothing was recorded.
@@ -108,9 +119,12 @@ pub struct Device {
 
 /// What revoking a key found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Revocation {
-    /// Revoked now, naming the session that last enrolled or renewed it.
+pub enum Revocation<Id> {
+    /// Revoked now, naming the account it was enrolled under and the session
+    /// that last enrolled or renewed it.
     Revoked {
+        /// The account the key was enrolled under.
+        user: Id,
         /// The auth-store session the enrolment records.
         session: SessionId,
     },
@@ -132,7 +146,7 @@ pub enum EnrolmentError {
     Pool(#[source] diesel_async::pooled_connection::bb8::RunError),
     /// A statement against the enrolment tables failed.
     #[error("the enrolment tables refused a statement")]
-    Query(#[source] diesel::result::Error),
+    Query(#[from] diesel::result::Error),
     /// The descriptor would not encode into the tables' columns.
     #[error("the descriptor could not be encoded")]
     Descriptor(#[source] rmp_serde::encode::Error),
@@ -142,294 +156,21 @@ pub enum EnrolmentError {
     /// An issuer's list number does not fit a CRL Number.
     #[error("a list number does not fit a CRL Number")]
     ListNumber(#[source] std::num::TryFromIntError),
-    /// The stored attestation level is not one the server records.
+    /// The stored attestation level is not a level the server records.
     #[error("the stored attestation level is not a level")]
     StoredLevel,
+    /// The auth store, or the application's hook in its transaction, failed.
+    #[error(transparent)]
+    Auth(#[from] AuthStoreError),
 }
 
-/// The answer to one enrolment-table operation.
-pub type EnrolmentFuture<'a, T> =
-    core::pin::Pin<Box<dyn Future<Output = Result<T, EnrolmentError>> + Send + 'a>>;
-
-/// Records the certificates the server issues and the keys it revokes.
-///
-/// A trait object for the reason [`crate::ban::BanStore`] is one.
-pub trait EnrolmentStore<Id>: Send + Sync + 'static {
-    /// Record `enrolment` unless its key's enrolment is revoked or belongs to
-    /// another account, deciding in one step.
-    fn record(&self, enrolment: Enrolment<Id>) -> EnrolmentFuture<'_, Recorded>;
-
-    /// `user`'s devices, revoked ones included.
-    fn devices<'a>(&'a self, user: &'a Id) -> EnrolmentFuture<'a, Vec<Device>>;
-
-    /// Revoke `key` at `at`, only when it is `user`'s when a user is named.
-    fn revoke<'a>(
-        &'a self,
-        user: Option<&'a Id>,
-        key: KeyId,
-        at: SystemTime,
-    ) -> EnrolmentFuture<'a, Revocation>;
-
-    /// Every serial `issuer` signed for a revoked key, whose certificate has
-    /// not lapsed more than `DEVICE_SKEW` ago, the window a peer still accepts
-    /// it (chapter 21, class G).
-    fn revoked_serials(&self, issuer: KeyId) -> EnrolmentFuture<'_, Vec<Revoked>>;
-
-    /// The next CRL Number of the issuer `issuer`, above every number handed
-    /// out before, across restarts.
-    fn next_list_number(&self, issuer: KeyId) -> EnrolmentFuture<'_, u64>;
-
-    /// The level the key's first enrolment under `user` recorded, `None`
-    /// when the key has no enrolment under `user`.
-    fn stored_attestation<'a>(
-        &'a self,
-        user: &'a Id,
-        key: KeyId,
-    ) -> EnrolmentFuture<'a, Option<AttestationLevel>>;
-
-    /// The enrolment of `key`, with the account that holds it and whether its
-    /// certificate is still live, when `user` names no account or names the
-    /// account the key is enrolled under, `None` otherwise (R75).
-    fn key_record<'a>(
-        &'a self,
-        user: Option<&'a Id>,
-        key: KeyId,
-    ) -> EnrolmentFuture<'a, Option<KeyRecord<Id>>>;
-}
-
-#[derive(Debug)]
-struct Row<Id> {
-    user: Id,
-    enrolled_at: SystemTime,
-    last_seen: SystemTime,
-    revoked_at: Option<SystemTime>,
-    session: SessionId,
-    descriptor: Vec<u8>,
-    attestation: AttestationLevel,
-    bot_list: String,
-}
-
-#[derive(Debug)]
-struct Memory<Id> {
-    grants: Vec<Enrolment<Id>>,
-    rows: HashMap<KeyId, Row<Id>>,
-    numbers: HashMap<KeyId, u64>,
-}
-
-/// An [`EnrolmentStore`] in memory, for tests and single-process runs.
-#[derive(Debug)]
-pub struct MemoryEnrolments<Id> {
-    state: parking_lot::Mutex<Memory<Id>>,
-}
-
-impl<Id> Default for MemoryEnrolments<Id> {
-    fn default() -> Self {
-        Self {
-            state: parking_lot::Mutex::new(Memory {
-                grants: Vec::new(),
-                rows: HashMap::new(),
-                numbers: HashMap::new(),
-            }),
+impl EnrolmentError {
+    /// The application's refusal, when its hook refused the event.
+    fn refusal(&self) -> Option<&str> {
+        match self {
+            Self::Auth(AuthStoreError::Hook(HookError::Refused(reason))) => Some(reason),
+            _ => None,
         }
-    }
-}
-
-impl<Id: Clone> MemoryEnrolments<Id> {
-    /// Every certificate recorded, oldest first.
-    #[must_use]
-    pub fn records(&self) -> Vec<Enrolment<Id>> {
-        self.state.lock().grants.clone()
-    }
-}
-
-impl<Id: Clone + PartialEq + Send + 'static> MemoryEnrolments<Id> {
-    /// Revoke `key` whoever it belongs to, as an operator would, without
-    /// publishing a list.
-    pub fn revoke_key(&self, key: KeyId) {
-        let _ = self.revoke_now(None, key, SystemTime::now());
-    }
-}
-
-impl<Id: Clone + PartialEq + Send + 'static> MemoryEnrolments<Id> {
-    fn record_now(&self, enrolment: Enrolment<Id>) -> Recorded {
-        let mut state = self.state.lock();
-        if let Some(row) = state.rows.get_mut(&enrolment.key) {
-            if row.revoked_at.is_some() {
-                return Recorded::Revoked;
-            }
-            if row.user != enrolment.user {
-                return Recorded::HeldElsewhere;
-            }
-            row.last_seen = enrolment.issued_at;
-            row.session = enrolment.session;
-            row.descriptor.clone_from(&enrolment.descriptor);
-            row.bot_list.clone_from(&enrolment.bot_list);
-        } else {
-            state.rows.insert(
-                enrolment.key,
-                Row {
-                    user: enrolment.user.clone(),
-                    enrolled_at: enrolment.issued_at,
-                    last_seen: enrolment.issued_at,
-                    revoked_at: None,
-                    session: enrolment.session,
-                    descriptor: enrolment.descriptor.clone(),
-                    attestation: enrolment.attestation,
-                    bot_list: enrolment.bot_list.clone(),
-                },
-            );
-        }
-        state.grants.push(enrolment);
-        Recorded::Granted
-    }
-
-    fn revoke_now(&self, user: Option<&Id>, key: KeyId, at: SystemTime) -> Revocation {
-        let mut state = self.state.lock();
-        match state.rows.get_mut(&key) {
-            Some(row) if user.is_none_or(|user| *user == row.user) => {
-                if row.revoked_at.is_some() {
-                    Revocation::AlreadyRevoked {
-                        session: row.session,
-                    }
-                } else {
-                    row.revoked_at = Some(at);
-                    Revocation::Revoked {
-                        session: row.session,
-                    }
-                }
-            }
-            _ => Revocation::NotFound,
-        }
-    }
-}
-
-impl<Id: Clone + PartialEq + Send + Sync + 'static> EnrolmentStore<Id> for MemoryEnrolments<Id> {
-    fn record(&self, enrolment: Enrolment<Id>) -> EnrolmentFuture<'_, Recorded> {
-        Box::pin(core::future::ready(Ok(self.record_now(enrolment))))
-    }
-
-    fn devices<'a>(&'a self, user: &'a Id) -> EnrolmentFuture<'a, Vec<Device>> {
-        let devices = self
-            .state
-            .lock()
-            .rows
-            .iter()
-            .filter(|(_, row)| row.user == *user)
-            .map(|(key, row)| Device {
-                key: *key,
-                enrolled_at: row.enrolled_at,
-                last_seen: row.last_seen,
-                revoked_at: row.revoked_at,
-                session: row.session,
-                descriptor: row.descriptor.clone(),
-            })
-            .collect();
-        Box::pin(core::future::ready(Ok(devices)))
-    }
-
-    fn revoke<'a>(
-        &'a self,
-        user: Option<&'a Id>,
-        key: KeyId,
-        at: SystemTime,
-    ) -> EnrolmentFuture<'a, Revocation> {
-        Box::pin(core::future::ready(Ok(self.revoke_now(user, key, at))))
-    }
-
-    fn revoked_serials(&self, issuer: KeyId) -> EnrolmentFuture<'_, Vec<Revoked>> {
-        let state = self.state.lock();
-        // A peer still accepts a certificate up to `DEVICE_SKEW` past its
-        // `not_after`, so the list reaches that far into the past.
-        let cutoff = SystemTime::now()
-            .checked_sub(connetto_core::clock::DEVICE_SKEW)
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        let serials = state
-            .grants
-            .iter()
-            .filter(|grant| grant.issuer == issuer && grant.expires_at > cutoff)
-            .filter_map(|grant| {
-                let at = state.rows.get(&grant.key)?.revoked_at?;
-                Some(Revoked {
-                    serial: grant.serial.to_vec(),
-                    at,
-                })
-            })
-            .collect();
-        Box::pin(core::future::ready(Ok(serials)))
-    }
-
-    fn next_list_number(&self, issuer: KeyId) -> EnrolmentFuture<'_, u64> {
-        let mut state = self.state.lock();
-        let number = state.numbers.entry(issuer).or_insert(0);
-        *number += 1;
-        let number = *number;
-        Box::pin(core::future::ready(Ok(number)))
-    }
-
-    fn stored_attestation<'a>(
-        &'a self,
-        user: &'a Id,
-        key: KeyId,
-    ) -> EnrolmentFuture<'a, Option<AttestationLevel>> {
-        let stored = self
-            .state
-            .lock()
-            .rows
-            .get(&key)
-            .filter(|row| row.user == *user)
-            .map(|row| row.attestation);
-        Box::pin(core::future::ready(Ok(stored)))
-    }
-
-    fn key_record<'a>(
-        &'a self,
-        user: Option<&'a Id>,
-        key: KeyId,
-    ) -> EnrolmentFuture<'a, Option<KeyRecord<Id>>> {
-        let record = {
-            let state = self.state.lock();
-            let now = SystemTime::now();
-            // The tolerance window a peer still accepts within (R77 decision 11).
-            let past_skew = now
-                .checked_sub(connetto_core::clock::DEVICE_SKEW)
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            state
-                .rows
-                .get(&key)
-                .filter(|row| user.is_none_or(|user| row.user == *user))
-                .map(|row| {
-                    let public_key = state
-                        .grants
-                        .iter()
-                        .find(|grant| grant.key == key)
-                        .map(|grant| grant.public_key.clone())
-                        .unwrap_or_default();
-                    // The latest expiry across the key's certificates is when
-                    // the tolerance window closes, the instant the timer fires.
-                    let certificate_expiry = state
-                        .grants
-                        .iter()
-                        .filter(|grant| grant.key == key)
-                        .map(|grant| grant.expires_at)
-                        .max();
-                    KeyRecord {
-                        user: row.user.clone(),
-                        revoked: row.revoked_at.is_some(),
-                        certificate_live: state
-                            .grants
-                            .iter()
-                            .any(|grant| grant.key == key && grant.expires_at > now),
-                        certificate_live_past_skew: state
-                            .grants
-                            .iter()
-                            .any(|grant| grant.key == key && grant.expires_at > past_skew),
-                        certificate_expiry,
-                        public_key,
-                        bot_list: Some(row.bot_list.clone()),
-                    }
-                })
-        };
-        Box::pin(core::future::ready(Ok(record)))
     }
 }
 
@@ -452,30 +193,6 @@ pub(crate) struct PendingChallenge {
     expires: Instant,
 }
 
-/// Revokes an auth-store session, which the deployment points at its auth service.
-pub type SessionRevoker =
-    Arc<dyn Fn(SessionId) -> core::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
-
-/// A device key the account never had, granted its first certificate.
-#[derive(Debug, Clone)]
-pub struct FirstEnrolment<Id> {
-    /// The account the key enrolled under.
-    pub user: Id,
-    /// The session the key enrolled during.
-    pub session: SessionId,
-    /// The enrolled key.
-    pub key: KeyId,
-    /// The descriptor the device sent.
-    pub descriptor: Vec<u8>,
-    /// When the certificate was issued.
-    pub at: SystemTime,
-}
-
-/// Observes a key's first enrolment, never a renewal. Fired synchronously
-/// after the enrolment is recorded, so async work belongs on a spawned task
-/// inside the hook.
-pub type FirstEnrolmentHook<Id> = Arc<dyn Fn(FirstEnrolment<Id>) + Send + Sync>;
-
 /// Why a device could not be revoked.
 #[derive(Debug, thiserror::Error)]
 pub enum RevokeError {
@@ -485,9 +202,36 @@ pub enum RevokeError {
     /// No device enrolment is installed on the server.
     #[error("no device enrolment is installed")]
     NotInstalled,
+    /// The application's hook refused the revocation, with its reason.
+    #[error("the application refused the revocation: {0}")]
+    Refused(String),
     /// The enrolment table or the issuer failed.
     #[error("the device could not be revoked")]
     Unavailable(#[source] EnrolmentError),
+}
+
+impl RevokeError {
+    /// The application's refusal as [`RevokeError::Refused`], any other
+    /// failure as [`RevokeError::Unavailable`].
+    fn of(err: EnrolmentError) -> Self {
+        match err.refusal() {
+            Some(reason) => Self::Refused(reason.to_owned()),
+            None => Self::Unavailable(err),
+        }
+    }
+}
+
+/// A key revoked and committed, with what the caller closes and pushes.
+#[derive(Debug)]
+pub(crate) struct KeyRevoked<Id> {
+    /// Whether the revocation is new.
+    pub(crate) fresh: bool,
+    /// The session the key last enrolled with.
+    pub(crate) session: SessionId,
+    /// The session's account, when the revocation ended the session.
+    pub(crate) ended: Option<Id>,
+    /// The lists published after the commit.
+    pub(crate) lists: Vec<SignedList>,
 }
 
 /// A source the enrolment draws its nonces and serials from.
@@ -506,16 +250,15 @@ impl RandomSource for SystemRandom {
     }
 }
 
-/// The issuer settings, the table enrolments are recorded in, and the
-/// revocation lists last published.
-pub struct DeviceEnrolment<Id> {
+/// The issuer settings, the tables enrolments are recorded in, the auth
+/// service whose hooks run in the same transactions, and the revocation
+/// lists last published.
+pub struct DeviceEnrolment<D: ConnettoSchema> {
     config: DeviceCertConfig,
-    store: Arc<dyn EnrolmentStore<Id>>,
+    auth: Arc<AuthService<D>>,
+    store: EnrolmentStore<D>,
     random: Box<dyn RandomSource>,
     lists: tokio::sync::Mutex<Option<Vec<SignedList>>>,
-    revoker: Option<SessionRevoker>,
-    /// Told of each key's first enrolment.
-    first_enrolment: Option<FirstEnrolmentHook<Id>>,
     /// The attestation status list an Android chain's serials are checked against.
     status: Option<StatusList>,
     /// The time a certificate is issued at.
@@ -528,17 +271,20 @@ fn secs(at: SystemTime) -> u64 {
         .map_or(0, |since| since.as_secs())
 }
 
-impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
-    /// Issue under `config`, recording into `store`.
+impl<D: ConnettoSchema> DeviceEnrolment<D> {
+    /// Issue under `config`, recording into the deployment's enrolment tables
+    /// on the owner pool `auth`'s store runs on, with `auth`'s hooks in the
+    /// same transactions, and ending through `auth` the session a revoked
+    /// device last enrolled with, so a stolen device still signed in cannot
+    /// enrol a fresh key and undo the report.
     #[must_use]
-    pub fn new(config: DeviceCertConfig, store: Arc<dyn EnrolmentStore<Id>>) -> Self {
+    pub fn new(config: DeviceCertConfig, auth: Arc<AuthService<D>>) -> Self {
         Self {
             config,
-            store,
+            auth,
+            store: EnrolmentStore::default(),
             random: Box::new(SystemRandom::new()),
             lists: tokio::sync::Mutex::new(None),
-            revoker: None,
-            first_enrolment: None,
             clock: SystemTime::now,
             status: None,
         }
@@ -562,23 +308,6 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
         self
     }
 
-    /// Revoke the auth-store session a revoked device last enrolled with
-    /// through `revoker`, so a stolen device still signed in cannot enrol a
-    /// fresh key and undo the report.
-    #[must_use]
-    pub fn with_session_revoker(mut self, revoker: SessionRevoker) -> Self {
-        self.revoker = Some(revoker);
-        self
-    }
-
-    /// Tell `hook` of each key's first enrolment, so the deployment can tell
-    /// the person a new device signed in (R105 decision 9).
-    #[must_use]
-    pub fn with_first_enrolment_hook(mut self, hook: FirstEnrolmentHook<Id>) -> Self {
-        self.first_enrolment = Some(hook);
-        self
-    }
-
     /// The attestation status list an Android chain's serials are checked
     /// against, fetched by the task the builder starts.
     #[must_use]
@@ -587,14 +316,28 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
         self
     }
 
+    /// An owner connection, from the pool the auth store runs on.
+    async fn connection(&self) -> Result<PooledConnection<'_, AsyncPgConnection>, EnrolmentError> {
+        self.auth
+            .store()
+            .pool()
+            .get()
+            .await
+            .map_err(EnrolmentError::Pool)
+    }
+
     /// The enrolled key's record, for a bind signature check, delegating to the store.
     pub(crate) async fn key_record(
         &self,
-        user: Option<&Id>,
+        user: Option<&D::Id>,
         key: KeyId,
-    ) -> Result<Option<KeyRecord<Id>>, EnrolRefusal> {
+    ) -> Result<Option<KeyRecord<D::Id>>, EnrolRefusal> {
+        let mut connection = self
+            .connection()
+            .await
+            .map_err(|_| EnrolRefusal::IssuerUnavailable)?;
         self.store
-            .key_record(user, key)
+            .key_record(&mut connection, user, key)
             .await
             .map_err(|_| EnrolRefusal::IssuerUnavailable)
     }
@@ -621,7 +364,7 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
     /// connection binds (R77 decision 12).
     pub(crate) async fn enrol(
         &self,
-        user: &Id,
+        user: &D::Id,
         session: SessionId,
         pending: &mut Option<PendingChallenge>,
         request: EnrolRequest,
@@ -641,8 +384,14 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
         }
         let key = KeyId::of_public_key(csr.public_key());
         // The level the first enrolment recorded stands, whatever a renewal sends.
-        let stored = self.store.stored_attestation(user, key).await;
-        let first = matches!(stored, Ok(None));
+        let stored = match self.connection().await {
+            Ok(mut connection) => {
+                self.store
+                    .stored_attestation(&mut connection, user, key)
+                    .await
+            }
+            Err(err) => Err(err),
+        };
         let level = match stored {
             Ok(Some(stored)) => stored,
             Ok(None) => verify(
@@ -687,6 +436,7 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
                 bot_list,
             )
             .map_err(|err| issue_refusal(&err))?;
+        let descriptor = request.descriptor;
         let enrolment = Enrolment {
             user: user.clone(),
             key,
@@ -696,15 +446,14 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
             expires_at: not_before + lifetime,
             session,
             public_key: csr.public_key().to_vec(),
-            descriptor: request.descriptor,
+            descriptor: descriptor.clone(),
             attestation: level,
             bot_list: bot_list.to_owned(),
         };
-        let told = first.then(|| self.told(&enrolment)).flatten();
-        match self.store.record(enrolment).await {
-            Ok(Recorded::Granted) => {
-                if let Some((hook, first)) = told {
-                    hook(first);
+        match self.record(enrolment).await {
+            Ok((Recorded::Granted { .. }, first)) => {
+                if let Some(session) = first {
+                    self.tell_enrolled(session, key, descriptor, not_before);
                 }
                 Ok(EnrolGrant {
                     request_id: request.request_id,
@@ -712,48 +461,84 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
                     revocation_lists: self.lists().await.unwrap_or_default(),
                 })
             }
-            Ok(Recorded::Revoked) => Err(EnrolRefusal::Revoked),
-            Ok(Recorded::HeldElsewhere | Recorded::UnreadableDescriptor) => {
+            Ok((Recorded::Revoked, _)) => Err(EnrolRefusal::Revoked),
+            Ok((Recorded::HeldElsewhere | Recorded::UnreadableDescriptor, _)) => {
                 Err(EnrolRefusal::InvalidRequest)
             }
-            Err(err) => {
-                tracing::warn!(error = %err, "the enrolment table refused a record");
-                Err(EnrolRefusal::IssuerUnavailable)
-            }
+            Err(err) => Err(record_refusal(&err)),
         }
     }
 
-    /// The first-enrolment hook with what it is told about `enrolment`,
-    /// `None` when no hook is attached.
-    fn told(
+    /// Tell [`committed`](crate::AuthHooks::committed) that `key` first
+    /// enrolled during `session` at `at`, once its transaction committed.
+    fn tell_enrolled(
         &self,
-        enrolment: &Enrolment<Id>,
-    ) -> Option<(&FirstEnrolmentHook<Id>, FirstEnrolment<Id>)> {
-        self.first_enrolment.as_ref().map(|hook| {
-            (
-                hook,
-                FirstEnrolment {
-                    user: enrolment.user.clone(),
-                    session: enrolment.session,
-                    key: enrolment.key,
-                    descriptor: enrolment.descriptor.clone(),
-                    at: enrolment.issued_at,
-                },
-            )
-        })
+        session: SessionRecord<D::Id, Desc<D>>,
+        key: KeyId,
+        device: Vec<u8>,
+        at: SystemTime,
+    ) {
+        self.auth
+            .store()
+            .hooks()
+            .committed(CommittedNotice::DeviceEnrolled {
+                session,
+                key,
+                device,
+                at,
+            });
+    }
+
+    /// Record `enrolment` in one transaction that, on the key's first
+    /// enrolment, also runs [`device_enrolled`](crate::AuthHooks::device_enrolled)
+    /// with the session the key enrolled during, answering that session for
+    /// the committed notice.
+    async fn record(
+        &self,
+        enrolment: Enrolment<D::Id>,
+    ) -> Result<(Recorded, Option<SessionRecord<D::Id, Desc<D>>>), EnrolmentError> {
+        let session = enrolment.session;
+        let key = enrolment.key;
+        let descriptor = enrolment.descriptor.clone();
+        let store = &self.store;
+        let hooks = self.auth.store().hooks();
+        let mut connection = self.connection().await?;
+        connection
+            .transaction::<_, EnrolmentError, _>(async move |c| {
+                let recorded = store.record(c, enrolment).await?;
+                if recorded != (Recorded::Granted { first: true }) {
+                    return Ok((recorded, None));
+                }
+                let record = <D::Auth as ConnettoStoreSchema>::session_record(c, session)
+                    .await?
+                    .ok_or(diesel::result::Error::NotFound)?;
+                hooks
+                    .device_enrolled(
+                        c,
+                        &DeviceEnrolled {
+                            session: &record,
+                            key,
+                            device: &descriptor,
+                        },
+                    )
+                    .await
+                    .map_err(AuthStoreError::Hook)?;
+                Ok((recorded, Some(record)))
+            })
+            .await
     }
 
     /// `user`'s enrolments, revoked ones included, each with the session it
     /// last enrolled under.
-    pub(crate) async fn enrolled(&self, user: &Id) -> Result<Vec<Device>, EnrolmentError> {
-        self.store.devices(user).await
+    pub(crate) async fn enrolled(&self, user: &D::Id) -> Result<Vec<Device>, EnrolmentError> {
+        let mut connection = self.connection().await?;
+        self.store.devices(&mut connection, user).await
     }
 
     /// `user`'s devices, as the device list shows them.
-    pub(crate) async fn devices(&self, user: &Id) -> Result<Vec<DeviceSummary>, EnrolmentError> {
+    pub(crate) async fn devices(&self, user: &D::Id) -> Result<Vec<DeviceSummary>, EnrolmentError> {
         Ok(self
-            .store
-            .devices(user)
+            .enrolled(user)
             .await?
             .into_iter()
             .map(|device| DeviceSummary {
@@ -782,22 +567,37 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
     }
 
     /// Sign a fresh list naming every unexpired serial of every revoked key,
-    /// under the next number, and keep it as the published one.
-    async fn publish(&self) -> Result<Vec<SignedList>, EnrolmentError> {
+    /// under the next number, and keep it as the published one. A failure
+    /// drops the cached lists, so the next handshake or grant rebuilds them.
+    pub(crate) async fn publish(&self) -> Result<Vec<SignedList>, EnrolmentError> {
         let mut lists = self.lists.lock().await;
-        let built = self.build_lists().await?;
-        *lists = Some(built.clone());
-        Ok(built)
+        match self.build_lists().await {
+            Ok(built) => {
+                *lists = Some(built.clone());
+                Ok(built)
+            }
+            Err(err) => {
+                *lists = None;
+                Err(err)
+            }
+        }
     }
 
     /// One list per issuer still signing, the current one and every retired
     /// one not yet expired, then the root's lists as given.
     async fn build_lists(&self) -> Result<Vec<SignedList>, EnrolmentError> {
         let now = SystemTime::now();
+        let mut connection = self.connection().await?;
         let mut lists = Vec::new();
         for issuer in self.config.signing_issuers(now) {
-            let revoked = self.store.revoked_serials(issuer.key_id()).await?;
-            let number = self.store.next_list_number(issuer.key_id()).await?;
+            let revoked = self
+                .store
+                .revoked_serials(&mut connection, issuer.key_id())
+                .await?;
+            let number = self
+                .store
+                .next_list_number(&mut connection, issuer.key_id())
+                .await?;
             // No list promises a next one later than the longest certificate
             // it could name stays valid.
             let list = issuer.sign_list(number, &revoked, now, now + self.config.ceiling())?;
@@ -810,44 +610,155 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
         Ok(lists)
     }
 
-    /// Revoke `key`, `user`'s when one is named, and publish the list that
-    /// says so, repeating the publish when the key is already revoked.
-    /// Answers whether the revocation is new, the session the key last
-    /// enrolled with, and the lists, for the caller to close and push.
+    /// Revoke `key`, `user`'s when one is named, and the session it last
+    /// enrolled with, in one transaction that runs
+    /// [`device_revoked`](crate::AuthHooks::device_revoked) when the
+    /// revocation is new and
+    /// [`sessions_ended`](crate::AuthHooks::sessions_ended) when the session
+    /// was live, then publish the list that says so, repeating both when the
+    /// key is already revoked. The caller closes the device's connection,
+    /// then hands an ended session to [`session_ended`](Self::session_ended).
     ///
     /// # Errors
     ///
-    /// [`RevokeError::NotFound`] for a key not enrolled, or not `user`'s, and
-    /// [`RevokeError::Unavailable`] when the table or the issuer fails, the
-    /// cached lists dropped so the next handshake or grant rebuilds them.
+    /// [`RevokeError::NotFound`] for a key not enrolled, or not `user`'s,
+    /// [`RevokeError::Refused`] when a hook refuses, which leaves the key and
+    /// the session standing, and [`RevokeError::Unavailable`] when the table
+    /// or the issuer fails.
     pub(crate) async fn revoke(
         &self,
-        user: Option<&Id>,
+        user: Option<&D::Id>,
         key: KeyId,
-    ) -> Result<(bool, SessionId, Vec<SignedList>), RevokeError> {
-        let outcome = self
-            .store
-            .revoke(user, key, SystemTime::now())
+    ) -> Result<KeyRevoked<D::Id>, RevokeError> {
+        let store = &self.store;
+        let auth = self.auth.store();
+        let hooks = auth.hooks();
+        let mut connection = self.connection().await.map_err(RevokeError::Unavailable)?;
+        let revoked = connection
+            .transaction::<_, EnrolmentError, _>(async move |c| {
+                let (owner, session) = match store.revoke(c, user, key, SystemTime::now()).await? {
+                    Revocation::NotFound => return Ok(None),
+                    Revocation::AlreadyRevoked { session } => (None, session),
+                    Revocation::Revoked { user, session } => {
+                        hooks
+                            .device_revoked(
+                                c,
+                                &DeviceRevoked {
+                                    user_id: &user,
+                                    key,
+                                },
+                            )
+                            .await
+                            .map_err(AuthStoreError::Hook)?;
+                        (Some(user), session)
+                    }
+                };
+                let ended = auth.revoke_in(c, session, EndCause::Revoked).await?;
+                Ok(Some((owner, session, ended)))
+            })
             .await
-            .map_err(RevokeError::Unavailable)?;
-        let (fresh, session) = match outcome {
-            Revocation::NotFound => return Err(RevokeError::NotFound),
-            Revocation::AlreadyRevoked { session } => (false, session),
-            Revocation::Revoked { session } => (true, session),
+            .map_err(RevokeError::of)?;
+        let Some((owner, session, ended)) = revoked else {
+            return Err(RevokeError::NotFound);
         };
+        let fresh = owner.is_some();
+        if let Some(user_id) = owner {
+            hooks.committed(CommittedNotice::DeviceRevoked { user_id, key });
+        }
         match self.publish().await {
-            Ok(lists) => Ok((fresh, session, lists)),
+            Ok(lists) => Ok(KeyRevoked {
+                fresh,
+                session,
+                ended,
+                lists,
+            }),
             Err(err) => {
-                *self.lists.lock().await = None;
+                // The revocation committed, so its ended session is closed
+                // and recorded even though no list could be published.
+                if let Some(user) = &ended {
+                    self.session_ended(user, session);
+                }
                 Err(RevokeError::Unavailable(err))
             }
         }
     }
 
-    /// Revoke the auth-store session `session`, when a revoker is set.
-    pub(crate) async fn revoke_session(&self, session: SessionId) {
-        if let Some(revoker) = &self.revoker {
-            revoker(session).await;
-        }
+    /// Close and record `session` of `user`, ended by a device revocation
+    /// after the device's own connection closed.
+    pub(crate) fn session_ended(&self, user: &D::Id, session: SessionId) {
+        self.auth.ended_with_device(user, session);
     }
+
+    /// Revoke every live key of `user` on `transaction`, the caller's, only
+    /// those last enrolled during `session` when one is named, running
+    /// [`device_revoked`](crate::AuthHooks::device_revoked) for each.
+    /// Answers each revoked key with the session it last enrolled with, for
+    /// [`after_keys_revoked`](Self::after_keys_revoked) once the caller
+    /// commits.
+    pub(crate) async fn revoke_keys_in(
+        &self,
+        transaction: &mut AsyncPgConnection,
+        user: &D::Id,
+        session: Option<SessionId>,
+    ) -> Result<Vec<(KeyId, SessionId)>, EnrolmentError> {
+        let hooks = self.auth.store().hooks();
+        let at = SystemTime::now();
+        let mut revoked = Vec::new();
+        for device in self.store.devices(transaction, user).await? {
+            if device.revoked_at.is_some() || session.is_some_and(|only| only != device.session) {
+                continue;
+            }
+            if let Revocation::Revoked { user, session } = self
+                .store
+                .revoke(transaction, Some(user), device.key, at)
+                .await?
+            {
+                hooks
+                    .device_revoked(
+                        transaction,
+                        &DeviceRevoked {
+                            user_id: &user,
+                            key: device.key,
+                        },
+                    )
+                    .await
+                    .map_err(AuthStoreError::Hook)?;
+                revoked.push((device.key, session));
+            }
+        }
+        Ok(revoked)
+    }
+
+    /// Tell [`committed`](crate::AuthHooks::committed) of each key of `user`
+    /// a committed transaction revoked, and publish the list that says so.
+    ///
+    /// # Errors
+    ///
+    /// [`EnrolmentError`] when the table or the issuer fails.
+    pub(crate) async fn after_keys_revoked(
+        &self,
+        user: &D::Id,
+        keys: &[(KeyId, SessionId)],
+    ) -> Result<Vec<SignedList>, EnrolmentError> {
+        let hooks = self.auth.store().hooks();
+        for (key, _) in keys {
+            hooks.committed(CommittedNotice::DeviceRevoked {
+                user_id: user.clone(),
+                key: *key,
+            });
+        }
+        self.publish().await
+    }
+}
+
+/// The refusal an enrolment answers when recording it failed, the
+/// application's own reason when its hook refused.
+fn record_refusal(err: &EnrolmentError) -> EnrolRefusal {
+    if let Some(reason) = err.refusal() {
+        return EnrolRefusal::Refused {
+            reason: reason.to_owned(),
+        };
+    }
+    tracing::warn!(error = %err, "the enrolment table refused a record");
+    EnrolRefusal::IssuerUnavailable
 }

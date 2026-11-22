@@ -421,3 +421,33 @@ pub async fn stage_photo(
         })
         .await
 }
+
+/// The file in the app's data folder the login names of the device's stored
+/// accounts live in.
+pub const STORED_NAMES_FILE: &str = "stored-names.json";
+
+/// The login names the device keeps for its stored accounts in `data_dir`,
+/// empty when none were kept or the file does not decode.
+#[must_use]
+pub fn read_stored_names(data_dir: &Path) -> crate::view::StoredNames {
+    std::fs::read(data_dir.join(STORED_NAMES_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Keep `names` in `data_dir`, written beside the file and renamed over it,
+/// so a crash mid-write leaves the previous names.
+///
+/// # Errors
+///
+/// The I/O error of the write or the rename.
+pub fn write_stored_names(
+    data_dir: &Path,
+    names: &crate::view::StoredNames,
+) -> std::io::Result<()> {
+    let file = data_dir.join(STORED_NAMES_FILE);
+    let partial = file.with_extension("json.partial");
+    std::fs::write(&partial, serde_json::to_vec(names)?)?;
+    std::fs::rename(partial, file)
+}

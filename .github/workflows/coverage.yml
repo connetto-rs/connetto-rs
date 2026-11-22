@@ -18,6 +18,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # cargo-llvm-cov finds no test binary in a nextest archive built with
+  # Cargo 1.100's build-dir layout, so the server partitions report none of
+  # their tests (taiki-e/cargo-llvm-cov#520). Remove once a release carries
+  # taiki-e/cargo-llvm-cov#538.
+  __CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT: 1
 
 # Caches are saved only from main, which restores exact keys only, so a
 # tree saved after a Cargo.lock change holds none of the artifacts the
@@ -54,6 +59,7 @@ jobs:
               -p connetto-schema
               -p connetto-ca
               -p connetto-test-harness
+              -p connetto-demo-stack
               -p connetto-dioxus
               -p connetto-yew
               -p tauri-plugin-connetto
@@ -85,10 +91,10 @@ jobs:
         with:
           components: llvm-tools-preview
 
-      - name: Install keyring helpers
+      - name: Install keyring helpers and libpq
         run: |
           sudo apt-get update
-          sudo apt-get -o DPkg::Lock::Timeout=300 install -y keyutils dbus gnome-keyring libdbus-1-dev pkg-config
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y keyutils dbus gnome-keyring libdbus-1-dev libpq-dev pkg-config
 
       # --all-features turns on connetto-dioxus's desktop feature.
       - name: Install desktop dependencies
@@ -106,11 +112,11 @@ jobs:
       - name: Run Rust suite under coverage
         run: |
           source <(cargo +stable llvm-cov show-env --sh)
-          # The offline-exchange proof spawns the server binary, built here
+          # The offline-exchange proof spawns the demo server, built here
           # with the same instrumentation so the report counts it too.
           if [ "${{ matrix.name }}" = rest ]; then
-            cargo +stable build --profile testfast --all-features -p connetto-server --bin connetto-server
-            export CONNETTO_SERVER_BIN="$PWD/target/testfast/connetto-server"
+            cargo +stable build --profile testfast -p connetto-demo-tools --bin demo-server
+            export CONNETTO_SERVER_BIN="$PWD/target/testfast/demo-server"
           fi
           keyctl session -- cargo +stable nextest run \
             --cargo-profile testfast \
@@ -184,25 +190,23 @@ jobs:
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get -o DPkg::Lock::Timeout=300 install -y libdbus-1-dev pkg-config
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y libdbus-1-dev libpq-dev pkg-config
 
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
 
-      # The binaries the e2e tests spawn carry the same instrumentation, so
-      # the report counts what the child processes execute too.
+      # The demo processes the e2e tests spawn are archived beside them with
+      # the same instrumentation, so the report counts what they execute too.
       - name: Build and archive the instrumented server suite
         run: |
           source <(cargo +stable llvm-cov show-env --sh)
-          cargo +stable build --profile testfast --all-features --bins -p connetto-server -p connetto-client
           mkdir coverage-server
           cargo +stable nextest archive \
             --cargo-profile testfast \
             --all-features \
             -p connetto-server \
+            -p connetto-demo-tools \
             --archive-file coverage-server/suite.tar.zst
-          # The archive carries the server's own binary but not the client's.
-          cp target/testfast/connetto-client coverage-server/
 
       - uses: $/.github/actions/put-files
         with:
@@ -232,10 +236,10 @@ jobs:
         with:
           components: llvm-tools-preview
 
-      - name: Install keyring helpers
+      - name: Install keyring helpers and libpq
         run: |
           sudo apt-get update
-          sudo apt-get -o DPkg::Lock::Timeout=300 install -y keyutils dbus gnome-keyring
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y keyutils dbus gnome-keyring libpq5
 
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
@@ -255,8 +259,6 @@ jobs:
           SUITE: ${{ runner.temp }}/coverage-server
         run: |
           source <(cargo +stable llvm-cov show-env --sh)
-          mkdir -p target/testfast
-          install -m 0755 "$SUITE/connetto-client" target/testfast/connetto-client
           keyctl session -- cargo +stable nextest run \
             --archive-file "$SUITE/suite.tar.zst" \
             --workspace-remap "$GITHUB_WORKSPACE" \

@@ -27,20 +27,23 @@ use connetto_client::{
     AffectedRow, ClientBuilder, ClientEvent, ConnettoClient, ConnettoConnection, DataDir, Grant,
     KeyValue, LiveQuery, MemoryRefreshStore, Watchable,
 };
-use connetto_core::messages::{MutationRejectReason, SUBSCRIPTION_REFUSED};
+use connetto_core::messages::{
+    AggregateChange, MutationRejectReason, SUBSCRIPTION_REFUSED, SqliteValue,
+};
 use connetto_core::{Cursor, test_support::TestGrantChecker, traits::HandshakeAuthority};
 use connetto_server::{
     ConnettoReadSetup, InMemoryOplog, ManagerBuilder, Materializer, NoConnector, Oplog,
     OplogConfig, PageSpec, PgOplog, RuntimeWritableCatalog, SessionConfig, SessionManager,
     SnapshotEstimate, SnapshotPage, SnapshotSource, WebSocketTransport, pg_write_target,
 };
+use connetto_test_harness::wire_tables::orders_table;
 use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
 use diesel::sql_query;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 use subql::backend::{Postgres, ScalarFamily, Value as PgValue};
 use subql::reexec::{
-    AsyncConnector, ReadQuery, RowPage, ScalarRowError, Snapshot as ConnectorRead,
+    AsyncConnector, FailureClass, ReadQuery, RowPage, ScalarRowError, Snapshot as ConnectorRead,
 };
 use subql::{CdcSource, PgCommitPosition, PgLsn, PgSnapshotFence, PgSqliteEmuSource, SourceItem};
 use tokio::net::{TcpListener, TcpStream};
@@ -68,11 +71,7 @@ struct SnapshotData {
 /// The one-row `orders` seed snapshot both snapshot sources serve, so a
 /// recording source and the plain seed stay byte-identical.
 fn seed_snapshot() -> SnapshotData {
-    let table = SimpleTable::new(
-        "orders",
-        &[("id", ""), ("price", ""), ("quantity", ""), ("status", "")],
-        &[0],
-    );
+    let table = orders_table();
     let insert = Insert::<_, String, Vec<u8>>::from(table)
         .set(0, Value::Integer(1))
         .expect("set id")
@@ -105,7 +104,7 @@ impl SnapshotSource for SeedSnapshot {
     async fn estimate(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &connetto_core::Principal,
     ) -> Result<SnapshotEstimate, Self::Error> {
         Ok(SnapshotEstimate {
@@ -121,7 +120,7 @@ impl SnapshotSource for SeedSnapshot {
     async fn snapshot_page(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &connetto_core::Principal,
         _page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {
@@ -159,7 +158,7 @@ impl SnapshotSource for CursoredSeed {
     async fn estimate(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &connetto_core::Principal,
     ) -> Result<SnapshotEstimate, Self::Error> {
         Ok(SnapshotEstimate {
@@ -175,7 +174,7 @@ impl SnapshotSource for CursoredSeed {
     async fn snapshot_page(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &connetto_core::Principal,
         _page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {
@@ -210,7 +209,7 @@ impl SnapshotSource for RecordingSeed {
     async fn estimate(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &connetto_core::Principal,
     ) -> Result<SnapshotEstimate, Self::Error> {
         Ok(SnapshotEstimate {
@@ -226,7 +225,7 @@ impl SnapshotSource for RecordingSeed {
     async fn snapshot_page(
         &self,
         select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &connetto_core::Principal,
         _page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {
@@ -354,7 +353,7 @@ impl SnapshotSource for GadgetSeed {
     async fn estimate(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &connetto_core::Principal,
     ) -> Result<SnapshotEstimate, Self::Error> {
         Ok(SnapshotEstimate {
@@ -370,7 +369,7 @@ impl SnapshotSource for GadgetSeed {
     async fn snapshot_page(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &connetto_core::Principal,
         _page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {
@@ -422,7 +421,7 @@ impl SnapshotSource for GatedSnapshot {
     async fn estimate(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &connetto_core::Principal,
     ) -> Result<SnapshotEstimate, Self::Error> {
         Ok(SnapshotEstimate {
@@ -434,7 +433,7 @@ impl SnapshotSource for GatedSnapshot {
     async fn snapshot_page(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &connetto_core::Principal,
         _page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {
@@ -442,11 +441,7 @@ impl SnapshotSource for GatedSnapshot {
         self.release.notified().await;
         let mut patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new();
         for row in &self.rows {
-            let table = SimpleTable::new(
-                "orders",
-                &[("id", ""), ("price", ""), ("quantity", ""), ("status", "")],
-                &[0],
-            );
+            let table = orders_table();
             let insert = Insert::<_, String, Vec<u8>>::from(table)
                 .set(0, Value::Integer(row.id))
                 .expect("set id")
@@ -1703,6 +1698,10 @@ impl AsyncConnector for QueuedConnector {
     type Checkpoint = PgCommitPosition;
     type Backend = Postgres;
 
+    fn failure_class(&self, _error: &std::io::Error) -> FailureClass {
+        FailureClass::Transient
+    }
+
     fn execute_scalar(
         &self,
         _query: &ReadQuery<'_, Postgres>,
@@ -1751,16 +1750,23 @@ impl AsyncConnector for QueuedConnector {
     }
 }
 
-/// Extract the JSON value from a `cheapest` aggregate event.
-fn aggregate_result(event: ClientEvent) -> String {
+/// The one cell of a scalar answer, which the server sends as a `Replace`
+/// of one row of one cell.
+fn scalar_cell(change: AggregateChange) -> SqliteValue {
+    let AggregateChange::Replace { rows } = change else {
+        panic!("a scalar answer moves as a whole, got {change:?}");
+    };
+    let [row] = <[Vec<SqliteValue>; 1]>::try_from(rows).expect("a scalar answer is one row");
+    let [cell] = <[SqliteValue; 1]>::try_from(row).expect("a scalar row is one cell");
+    cell
+}
+
+/// Extract the value from a `cheapest` aggregate event.
+fn aggregate_result(event: ClientEvent) -> SqliteValue {
     match event {
-        ClientEvent::Aggregate {
-            sub_id,
-            result_json,
-            ..
-        } => {
+        ClientEvent::Aggregate { sub_id, change } => {
             assert_eq!(sub_id, "cheapest");
-            result_json.expect("result_json present in aggregate event")
+            scalar_cell(change)
         }
         other => panic!("expected an aggregate event, got {other:?}"),
     }
@@ -1812,7 +1818,7 @@ async fn aggregate_subscription_bootstraps_and_updates_through_the_client() {
     let event = pump_until(&mut client, |e| matches!(e, ClientEvent::Aggregate { .. })).await;
     assert_eq!(
         aggregate_result(event),
-        "3",
+        SqliteValue::Integer(3),
         "the bootstrap value reached the client",
     );
 
@@ -1833,7 +1839,7 @@ async fn aggregate_subscription_bootstraps_and_updates_through_the_client() {
     let event = pump_until(&mut client, |e| matches!(e, ClientEvent::Aggregate { .. })).await;
     assert_eq!(
         aggregate_result(event),
-        "1",
+        SqliteValue::Integer(1),
         "the in-process fold reached the client",
     );
 
@@ -1853,7 +1859,7 @@ async fn aggregate_subscription_bootstraps_and_updates_through_the_client() {
     let event = pump_until(&mut client, |e| matches!(e, ClientEvent::Aggregate { .. })).await;
     assert_eq!(
         aggregate_result(event),
-        "9",
+        SqliteValue::Integer(9),
         "the re-executed value reached the client",
     );
 
@@ -1950,34 +1956,26 @@ async fn drain_events<S, C, O>(
 }
 
 /// Pump the client until it has observed one aggregate value for each label in
-/// `subs`, returning the latest `result_json` per label. Each dispatched CDC
-/// event delivers exactly one update per subscribed aggregate, so one event (or
-/// the bootstrap burst) yields exactly one value per label.
+/// `subs`, returning the latest value per label. Each dispatched CDC event
+/// delivers exactly one update per subscribed aggregate, so one event (or the
+/// bootstrap burst) yields exactly one value per label.
 async fn collect_aggregates(
     client: &mut ConnettoConnection<WebSocketTransport<TcpStream>>,
     subs: &[&str],
-) -> HashMap<String, String> {
-    let mut seen: HashMap<String, String> = HashMap::new();
+) -> HashMap<String, SqliteValue> {
+    let mut seen: HashMap<String, SqliteValue> = HashMap::new();
     while seen.len() < subs.len() {
         let event = pump_until(client, |e| matches!(e, ClientEvent::Aggregate { .. })).await;
-        if let ClientEvent::Aggregate {
-            sub_id,
-            result_json,
-            ..
-        } = event
-        {
-            seen.insert(
-                sub_id,
-                result_json.expect("result_json present in aggregate event"),
-            );
+        if let ClientEvent::Aggregate { sub_id, change } = event {
+            seen.insert(sub_id, scalar_cell(change));
         }
     }
     seen
 }
 
 /// Pump the client to the first aggregate frame carrying `sub_id`, and report
-/// whether it was a full result. Frames for other labels are skipped, so a
-/// second aggregate in the same session cannot decide the answer.
+/// whether it replaced the whole answer. Frames for other labels are skipped,
+/// so a second aggregate in the same session cannot decide the answer.
 async fn first_aggregate_frame(
     client: &mut ConnettoConnection<WebSocketTransport<TcpStream>>,
     sub_id: &str,
@@ -1986,12 +1984,11 @@ async fn first_aggregate_frame(
         let event = pump_until(client, |e| matches!(e, ClientEvent::Aggregate { .. })).await;
         if let ClientEvent::Aggregate {
             sub_id: label,
-            is_full_result,
-            ..
+            change,
         } = event
             && label == sub_id
         {
-            return is_full_result;
+            return matches!(change, AggregateChange::Replace { .. });
         }
     }
 }
@@ -2054,10 +2051,19 @@ async fn delta_aggregates_bootstrap_and_fold_through_the_client() {
 
     let subs = ["count", "sum", "avg"];
     let seeded = collect_aggregates(&mut client, &subs).await;
-    assert_eq!(seeded["count"], "0", "COUNT(*) seed over empty table");
-    assert_eq!(seeded["sum"], "null", "SUM seed over empty table");
     assert_eq!(
-        seeded["avg"], "null",
+        seeded["count"],
+        SqliteValue::Integer(0),
+        "COUNT(*) seed over empty table"
+    );
+    assert_eq!(
+        seeded["sum"],
+        SqliteValue::Null,
+        "SUM seed over empty table"
+    );
+    assert_eq!(
+        seeded["avg"],
+        SqliteValue::Null,
         "AVG seed over empty table is undefined"
     );
 
@@ -2069,9 +2075,12 @@ async fn delta_aggregates_bootstrap_and_fold_through_the_client() {
         .expect("emu insert");
     drain_events(&manager, &mut source).await;
     let after_first = collect_aggregates(&mut client, &subs).await;
-    assert_eq!(after_first["count"], "1");
-    assert_eq!(after_first["sum"], "10");
-    assert_eq!(after_first["avg"], "\"10.0000000000000000\"");
+    assert_eq!(after_first["count"], SqliteValue::Integer(1));
+    assert_eq!(after_first["sum"], SqliteValue::Integer(10));
+    assert_eq!(
+        after_first["avg"],
+        SqliteValue::Text("10.0000000000000000".to_owned())
+    );
 
     // Insert quantity 20: COUNT 2, SUM 30, AVG 15.
     source
@@ -2079,9 +2088,12 @@ async fn delta_aggregates_bootstrap_and_fold_through_the_client() {
         .expect("emu insert");
     drain_events(&manager, &mut source).await;
     let after_second = collect_aggregates(&mut client, &subs).await;
-    assert_eq!(after_second["count"], "2");
-    assert_eq!(after_second["sum"], "30");
-    assert_eq!(after_second["avg"], "\"15.0000000000000000\"");
+    assert_eq!(after_second["count"], SqliteValue::Integer(2));
+    assert_eq!(after_second["sum"], SqliteValue::Integer(30));
+    assert_eq!(
+        after_second["avg"],
+        SqliteValue::Text("15.0000000000000000".to_owned())
+    );
 
     // Delete quantity 10: COUNT 1, SUM 20, AVG 20.
     source
@@ -2089,9 +2101,12 @@ async fn delta_aggregates_bootstrap_and_fold_through_the_client() {
         .expect("emu delete");
     drain_events(&manager, &mut source).await;
     let after_delete = collect_aggregates(&mut client, &subs).await;
-    assert_eq!(after_delete["count"], "1");
-    assert_eq!(after_delete["sum"], "20");
-    assert_eq!(after_delete["avg"], "\"20.0000000000000000\"");
+    assert_eq!(after_delete["count"], SqliteValue::Integer(1));
+    assert_eq!(after_delete["sum"], SqliteValue::Integer(20));
+    assert_eq!(
+        after_delete["avg"],
+        SqliteValue::Text("20.0000000000000000".to_owned())
+    );
 
     client.close().await.expect("close");
     server.await.expect("join server");
@@ -2117,6 +2132,10 @@ impl AsyncConnector for GatedSeed {
     type Error = std::io::Error;
     type Checkpoint = PgCommitPosition;
     type Backend = Postgres;
+
+    fn failure_class(&self, _error: &std::io::Error) -> FailureClass {
+        FailureClass::Transient
+    }
 
     fn execute_scalar(
         &self,
@@ -2233,7 +2252,8 @@ async fn a_change_during_an_aggregate_bootstrap_is_counted() {
 
     let seeded = collect_aggregates(&mut client, &["count"]).await;
     assert_eq!(
-        seeded["count"], "1",
+        seeded["count"],
+        SqliteValue::Integer(1),
         "the seed reconciles the change dispatched during the read window",
     );
 
@@ -2244,7 +2264,8 @@ async fn a_change_during_an_aggregate_bootstrap_is_counted() {
     drain_events(&manager, &mut source).await;
     let after = collect_aggregates(&mut client, &["count"]).await;
     assert_eq!(
-        after["count"], "2",
+        after["count"],
+        SqliteValue::Integer(2),
         "the change dispatched during the bootstrap must be counted, not dropped",
     );
 
@@ -2318,7 +2339,7 @@ async fn an_aggregates_first_frame_is_its_full_result() {
     let first = first_aggregate_frame(&mut client, "count").await;
     assert!(
         first,
-        "the first frame for an aggregate must be its full result",
+        "the first frame for an aggregate must replace its whole answer",
     );
 
     client.close().await.expect("close");
@@ -2519,7 +2540,7 @@ async fn row_subscription_and_delta_aggregate_coexist() {
 
     let mut saw_live = false;
     let mut count_val = None;
-    while !(saw_live && count_val.as_deref() == Some("1")) {
+    while !(saw_live && count_val == Some(SqliteValue::Integer(1))) {
         let event = pump_until(&mut client, |e| {
             matches!(
                 e,
@@ -2529,12 +2550,8 @@ async fn row_subscription_and_delta_aggregate_coexist() {
         .await;
         match event {
             ClientEvent::LivePatch { sub_id, .. } if sub_id == "orders-live" => saw_live = true,
-            ClientEvent::Aggregate {
-                sub_id,
-                result_json,
-                ..
-            } if sub_id == "count" => {
-                count_val = result_json;
+            ClientEvent::Aggregate { sub_id, change } if sub_id == "count" => {
+                count_val = Some(scalar_cell(change));
             }
             _ => {}
         }
@@ -2604,7 +2621,7 @@ async fn unsubscribing_a_delta_aggregate_stops_updates() {
         .await
         .expect("subscribe aggregate");
     let seeded = collect_aggregates(&mut client, &["count"]).await;
-    assert_eq!(seeded["count"], "0");
+    assert_eq!(seeded["count"], SqliteValue::Integer(0));
 
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
     source
@@ -2612,7 +2629,7 @@ async fn unsubscribing_a_delta_aggregate_stops_updates() {
         .expect("emu insert");
     drain_events(&manager, &mut source).await;
     let after = collect_aggregates(&mut client, &["count"]).await;
-    assert_eq!(after["count"], "1");
+    assert_eq!(after["count"], SqliteValue::Integer(1));
 
     // Unsubscribe, then fence with a ping. Control frames are processed in
     // order, so receiving this Pong proves the server handled the Unsubscribe.
@@ -2934,11 +2951,10 @@ async fn live_value_tracks_a_server_aggregate() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_value_decodes_a_temporal_aggregate() {
     // A typed live() over MAX of a TIMESTAMP column. subql re-executes MIN/MAX
-    // on any orderable type, so a scalar outside the old numeric and text
-    // family rides the re-execution wire, where value_to_json renders it as a
-    // JSON string. The broadened AggregateWire family decodes it into
-    // Option<String>, proving the new type resolves through the real server on
-    // both the bootstrap and a later CDC-driven push.
+    // on any orderable type, so a scalar outside the numeric and text family
+    // rides the re-execution wire in the replica's timestamp storage form,
+    // six-digit text, and loads through diesel's own `Timestamp` impl on both
+    // the bootstrap and a later CDC-driven push.
     const METRICS_PG_DDL: &str = "CREATE TABLE metrics (id INT PRIMARY KEY, seen TIMESTAMP);";
     let fixture = Fixture::acquire().await;
     let seen = chrono::NaiveDate::from_ymd_opt(2020, 1, 2)
@@ -2978,9 +2994,9 @@ async fn live_value_decodes_a_temporal_aggregate() {
     tokio::spawn(pump);
     let mut events = client.events();
 
-    // MAX(seen) is Nullable<Timestamp>, so the typed live() infers a
-    // LiveValue<Option<String>> with no annotation.
-    let mut latest = metrics::table
+    // MAX(seen) is Nullable<Timestamp>, which diesel loads as Option<String>
+    // on SQLite.
+    let mut latest: connetto_client::LiveValue<Option<String>> = metrics::table
         .select(diesel::dsl::max(metrics::seen))
         .live(&client)
         .await
@@ -2996,13 +3012,13 @@ async fn live_value_decodes_a_temporal_aggregate() {
     }
     assert_eq!(
         latest.value(),
-        Some(Some("2020-01-02 03:04:05".to_owned())),
-        "the timestamp bootstrap decodes to its wire string",
+        Some(Some("2020-01-02 03:04:05.000000".to_owned())),
+        "the timestamp bootstrap loads as its storage text",
     );
 
     // A CDC insert raises the maximum. The re-execution family folds the new
-    // extreme in process and pushes it through value_to_json, and the typed
-    // LiveValue decodes the updated timestamp string.
+    // extreme in process and pushes it in its storage form, and the typed
+    // LiveValue loads the updated timestamp text.
     let mut source = PgSqliteEmuSource::open_in_memory(METRICS_PG_DDL).expect("open emu source");
     source
         .execute_sql("INSERT INTO metrics (id, seen) VALUES (1, '2021-06-07 08:09:10')")
@@ -3014,8 +3030,8 @@ async fn live_value_decodes_a_temporal_aggregate() {
         .expect("driver alive");
     assert_eq!(
         latest.value(),
-        Some(Some("2021-06-07 08:09:10".to_owned())),
-        "a CDC change pushes the new maximum, decoded as a timestamp string",
+        Some(Some("2021-06-07 08:09:10.000000".to_owned())),
+        "a CDC change pushes the new maximum, loaded as its storage text",
     );
 
     drop(client);
@@ -3505,18 +3521,17 @@ async fn watch_fn_drives_a_boxed_row_query() {
         .execute(source.connection())
         .expect("emu insert gadget");
     drain_events(&manager, &mut source).await;
-    tokio::time::timeout(Duration::from_secs(5), live.changed())
-        .await
-        .expect("live refresh timed out")
-        .expect("driver alive");
-    assert_eq!(
-        live.rows(),
-        vec![
+    // The seed wait may return without consuming the snapshot's refresh, so one
+    // `changed()` here could still report the seed. The wait is for the rows.
+    until_rows(
+        &mut live,
+        &[
             gadget(alpha_id, true, "alpha"),
             gadget(beta_id, true, "beta"),
             gadget(inactive_id, false, "zulu"),
         ],
-    );
+    )
+    .await;
 
     drop(client);
     server.await.expect("join server");
@@ -4112,7 +4127,7 @@ impl SnapshotSource for StatusSnapshot {
     async fn estimate(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &connetto_core::Principal,
     ) -> Result<SnapshotEstimate, Self::Error> {
         Ok(SnapshotEstimate {
@@ -4128,15 +4143,11 @@ impl SnapshotSource for StatusSnapshot {
     async fn snapshot_page(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &connetto_core::Principal,
         _page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {
-        let table = SimpleTable::new(
-            "orders",
-            &[("id", ""), ("price", ""), ("quantity", ""), ("status", "")],
-            &[0],
-        );
+        let table = orders_table();
         let insert = Insert::<_, String, Vec<u8>>::from(table)
             .set(0, Value::Integer(1))
             .expect("set id")
@@ -4420,11 +4431,12 @@ async fn a_durable_log_lets_a_restart_resume_incrementally() {
 /// value from the resting table, not `None`, before any reconnect.
 ///
 /// The first run subscribes a `COUNT(*)` value, sees the server's bootstrap,
-/// and its pump rests it in `_connetto_aggregates` on the file replica. The
-/// process then ends (the client and its pump are dropped and the connection
-/// closed), the same file is reopened with no server reachable, and the same
-/// value watch resolves from the rested row synchronously, so `value()` is the
-/// last synced value with nothing on the wire.
+/// and its pump rests it in the statistic's `_connetto_stat_<query_id>` table
+/// on the file replica. The process then ends (the client and its pump are
+/// dropped and the connection closed), the same file is reopened with no
+/// server reachable, and the same value watch resolves from the rested row
+/// synchronously, so `value()` is the last synced value with nothing on the
+/// wire.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restart_reads_the_last_synced_value_from_the_resting_table() {
     let fixture = Fixture::acquire().await;

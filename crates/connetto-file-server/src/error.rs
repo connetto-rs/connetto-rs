@@ -83,6 +83,10 @@ pub enum ServerError {
     #[error("store: {0}")]
     Store(#[from] crate::store::StoreError),
 
+    /// The auth store could not say whether the ticket's session is live.
+    #[error("session liveness: {0}")]
+    Liveness(#[from] connetto_core::LivenessUnknown),
+
     /// Request body too large for the configured limit.
     #[error("body too large")]
     BodyTooLarge,
@@ -119,7 +123,7 @@ impl IntoResponse for ServerError {
                 (StatusCode::SERVICE_UNAVAILABLE, Some(*retry_after_secs))
             }
             Self::BadParam(_) => (StatusCode::BAD_REQUEST, None),
-            Self::Db(_) | Self::Pool(_) | Self::Store(_) => {
+            Self::Db(_) | Self::Pool(_) | Self::Store(_) | Self::Liveness(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, None)
             }
         };

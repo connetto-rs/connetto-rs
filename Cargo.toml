@@ -26,8 +26,12 @@ members = [
   # The documents and the build-time translation every browser demo shares.
   # A member rather than an exclusion, so the root gate lints it with the rest.
   "examples/deployment",
+  # The demo launchers and device proofs.
+  "examples/demo-stack",
   # The schema rows, wording and browser pieces the browser demos share.
   "examples/demo-support",
+  # The demo's processes: server, client and the operator tools.
+  "examples/demo-tools",
 ]
 exclude = ["crates/connetto-web", "examples/dioxus-demo", "examples/webauthn-unlock"]
 
@@ -166,6 +170,8 @@ sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", 
 pg_walstream = { git = "https://github.com/isdaniel/pg-walstream", branch = "main" }
 # Until a sql-values release carries PostgreSQL's bpchar, which rls2fga main uses.
 sql-values = { git = "https://github.com/connetto-rs/sql-values", branch = "main" }
+# subql main follows sqlite-diff-rs main for its float4 storage form.
+sqlite-diff-rs = { git = "https://github.com/connetto-rs/sqlite-diff-rs", branch = "main" }
 # R51, until both are released: the keychain store's shared authentication
 # (apple-native-keyring-store #26) on security-framework's typed
 # authentication context (#263 and #264, on upstream main). Pinned by rev,

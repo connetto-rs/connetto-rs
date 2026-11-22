@@ -27,11 +27,10 @@
 //! current major holds no export, when that export is stale, or when its
 //! majors hold a gap.
 //!
-//! The `connetto-schema export-tier` command, the crate's binary
-//! `connetto-schema`, writes that current export instead. It translates the
+//! [`export_tier`] writes that current export instead. It translates the
 //! tier over the major the schema source declares and writes that major's
 //! `<N>.sql` alone, so it never rewrites the exports of the majors below
-//! the current one. With `--check` it writes nothing and fails instead when
+//! the current one. In `check` mode it writes nothing and fails instead when
 //! the current export is missing or stale, the gate a CI run adds to keep a
 //! history fresh.
 
@@ -109,7 +108,7 @@ pub enum SchemaError {
         dir: std::path::PathBuf,
     },
     /// The tier history holds no export for the build's own major.
-    #[error("the tier history holds no export for major {major}, run `connetto-schema export-tier --schema <schema> --tier <tier> --dir {dir}`", dir = .dir.display())]
+    #[error("the tier history holds no export for major {major}, write it with `connetto_schema::export_tier` into {dir}", dir = .dir.display())]
     MissingExport {
         /// The major the export is missing for.
         major: u32,
@@ -120,7 +119,7 @@ pub enum SchemaError {
     },
     /// The tier history's export for the build's major differs from the
     /// translation the build just computed.
-    #[error("the export {path} for major {major} is stale against the current sources, run `connetto-schema export-tier` over them", path = .path.display())]
+    #[error("the export {path} for major {major} is stale against the current sources, rewrite it with `connetto_schema::export_tier`", path = .path.display())]
     StaleExport {
         /// The major the export is stale for.
         major: u32,
@@ -335,10 +334,8 @@ pub fn with_registry<Id: BotRegistryIdSql>(schema_sql: &str) -> String {
 /// tables' and the enrolment base table's. The `user_id` column follows the
 /// deployment's id type `Id` the way the registry's id columns do, so the
 /// catalog decodes a non-text deployment's writer and enrolment rows as the
-/// deployment stores them. The settle-path column's enum type is declared by
-/// the deployment, and the catalog maps a column of an undeclared type to
-/// text, so the DDL here names the type without the `CREATE TYPE` that would
-/// redeclare it.
+/// deployment stores them. The settle-path enum is declared with the labels
+/// the server decodes, so the drift guard compares the live enum against them.
 #[must_use]
 pub fn with_bookkeeping<Id: BotRegistryIdSql>(schema_sql: &str, devices: bool) -> String {
     let mut out = schema_sql.trim_end().to_owned();
@@ -360,12 +357,14 @@ pub fn with_bookkeeping<Id: BotRegistryIdSql>(schema_sql: &str, devices: bool) -
     out
 }
 
-/// The writer and settled tables' DDL over the deployment's id type `Id`,
-/// `;`-terminated, the tables that stand with or without device identity.
+/// The settle-path enum, then the writer and settled tables' DDL over the
+/// deployment's id type `Id`, `;`-terminated, the tables that stand with or
+/// without device identity.
 #[must_use]
 pub fn bookkeeping_ddl<Id: BotRegistryIdSql>() -> String {
     format!(
-        "CREATE TABLE _connetto_writers \
+        "CREATE TYPE connetto_settle_path AS ENUM ('direct', 'restore', 'courier'); \
+         CREATE TABLE _connetto_writers \
          (writer BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY, \
           user_id {}, \
           session_id UUID, \

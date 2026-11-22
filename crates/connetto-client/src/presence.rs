@@ -149,11 +149,7 @@ fn utf8(path: &std::path::Path) -> Result<&str, ClientError> {
 /// newest first, as [`crate::undo_shared`] does.
 #[cfg(feature = "native-auth")]
 fn undo_queued_shared(db: &mut SqliteConnection, config: &ClientConfig) -> Result<(), ClientError> {
-    use crate::_connetto_pending;
-    let queued: Vec<Vec<u8>> = _connetto_pending::table
-        .select(_connetto_pending::changeset)
-        .order(_connetto_pending::position.desc())
-        .load(db)?;
+    let queued = crate::stored_replica_work(db)?.changesets;
     crate::undo_shared(db, &config.shared_tables, queued.iter().map(Vec::as_slice))
 }
 

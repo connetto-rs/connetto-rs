@@ -50,7 +50,7 @@ The passes and their scope.
 | An unsubscribe, a grace expiry or an unpin that `drain_dropped` retires | the tables whose holdings the record change released | the record is ended and its holdings go, its rows wait |
 | Attach, when a record is no longer live | every synced table, since the release happened offline or before a restart | not reachable |
 | The `SnapshotEnd` that leaves no resync outstanding | the tables the resync notices released and each resynced subscription's own tables, whose replacement is the server's whole answer for them | not reachable |
-| `TableTruncated` | that table, at the notice | not reachable |
+| `TableTruncated` and `TableRefused` | that table, at the notice | not reachable |
 | A departure batch | the departed keys alone, in the frame's transaction | not reachable |
 | An identity leaving the shared store | every shared table | runs online or not |
 

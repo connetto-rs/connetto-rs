@@ -205,7 +205,8 @@ impl KeyFilter {
                     });
                 }
             };
-            let Some(name) = catalog_helpers::column_name(catalog, table_id, column) else {
+            let Some(name) = catalog_helpers::column_name::<Postgres, _>(catalog, table_id, column)
+            else {
                 return Ok(None);
             };
             keys.push(KeyColumn {

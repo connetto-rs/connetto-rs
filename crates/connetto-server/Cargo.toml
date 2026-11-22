@@ -14,16 +14,14 @@ homepage.workspace = true
 [lints]
 workspace = true
 
-[[bin]]
-name = "connetto-server"
-path = "src/bin/connetto-server.rs"
-
 [dependencies]
-connetto-core = { workspace = true, features = ["native-transport", "diesel-pg", "logging", "env", "device-cert"] }
+connetto-core = { workspace = true, features = ["native-transport", "diesel-pg", "device-cert"] }
 # Derives the schema version it presents at handshake, hashing the translated
 # bundle rather than the source documents alone.
 connetto-schema = { workspace = true }
-subql = { workspace = true, features = ["sqlite-cdc", "pg-sqlite-emu", "apply-patchset-sqlite", "pgoutput-emit", "apply-patchset-postgres-async", "executor-diesel-async-postgres", "pg-streaming", "visibility-openfga", "membership-term"] }
+# Each `postgres-N` compiles one server major's catalog into the drift guard's
+# live reader, which reads with the one matching the server it reaches.
+subql = { workspace = true, features = ["sqlite-cdc", "pg-sqlite-emu", "apply-patchset-sqlite", "pgoutput-emit", "apply-patchset-postgres-async", "executor-diesel-async-postgres", "pg-streaming", "visibility-openfga", "membership-term", "postgres-14", "postgres-15", "postgres-16", "postgres-17", "postgres-18"] }
 # The policy text this server is given is translated here, and the model it
 # produces is written to the authorization server here. subql takes the same
 # crate with default features off and re-exports none of it, so the types
@@ -42,10 +40,11 @@ openfga-client = { version = "0.6.1", default-features = false }
 pg2sqlite = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main", default-features = false, features = ["std"] }
 # `DataTypeLike`, which subql does not re-export, from subql's own branch source.
 sql-traits = { git = "https://github.com/connetto-rs/sql-traits", branch = "main", default-features = false }
-# Read local attestation status lists and handle process shutdown signals.
-tokio = { workspace = true, features = ["fs", "signal"] }
+# Read local attestation status lists.
+tokio = { workspace = true, features = ["fs"] }
 thiserror.workspace = true
-diesel = { workspace = true, features = ["postgres_backend", "serde_json", "uuid", "chrono"] }
+# `postgres` for the drift guard's live catalog, which reads over diesel's blocking connection.
+diesel = { workspace = true, features = ["postgres", "postgres_backend", "serde_json", "uuid", "chrono"] }
 # Session deadlines and provider-token expiries are zone-aware timestamp columns,
 # and diesel maps those to chrono rather than to `std::time::SystemTime`, which it
 # only offers for a zone-less timestamp. Already in the build through subql.
@@ -91,8 +90,6 @@ diesel-async = { version = "0.10", default-features = false, features = ["postgr
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # Canonical primary-key codec: serialize the pk as Vec<subql Value<Postgres>>.
 rmp-serde.workspace = true
-# Binary error handling (connetto-server bin).
-anyhow.workspace = true
 # Structured logging (R12). The facade only: the library emits, and each
 # program installs `connetto_core::logging`.
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
@@ -132,10 +129,9 @@ url = "2"
 # comparison cannot leak a partial match through timing. ring's generic slice
 # compare is deprecated for external use, so subtle is the maintained primitive.
 subtle = "2"
-# CORS on the reference binary's auth endpoints. A browser app can serve its UI
-# on a different origin from the auth router, so script there cannot read a login
-# response without it. The library's `auth_router` stays a plain Router: the
-# binary decides.
+# CORS on the auth endpoints, for the origins `ServerBuilder::cors_origins`
+# lists. A browser app can serve its UI on a different origin from the auth
+# router, so script there cannot read a login response without it.
 tower-http = { version = "0.6", default-features = false, features = ["cors"] }
 # The four file routes mounted on the auth listener (R69 decision 1), behind
 # a default-on feature so every plain build and every CI leg of the executable
@@ -145,9 +141,8 @@ connetto-file-server = { path = "../connetto-file-server", optional = true }
 # The file identity and manifest types a download reads files through (R61).
 connetto-file-core = { path = "../connetto-file-core", optional = true }
 axum-extra = { version = "0.12.6", default-features = false, features = ["cookie"] }
-# `std` gives the sunset watch its `now_utc` wall reading, and `parsing` the
-# binary's boot validation of `CONNETTO_SUNSET` (R107).
-time = { version = "0.3.55", default-features = false, features = ["std", "parsing"] }
+# `std` gives the sunset watch its `now_utc` wall reading (R107).
+time = { version = "0.3.55", default-features = false, features = ["std"] }
 # Device attestation (R74 step 4): x509-parser verifies the Android chain's
 # signatures and Apple's `x5c`, reqwest fetches Google's status list, pem
 # reads the bundled attestation roots, ciborium decodes the App Attest
@@ -161,20 +156,25 @@ serde_bytes = { version = "0.11", features = ["std"] }
 [features]
 default = ["content"]
 content = ["dep:connetto-file-server", "dep:connetto-file-core"]
-# Gates the test-only assembly paths: `ManagerBuilder::new`, `Materializer::builder`, and the
-# in-memory auth store. Production builds leave the constructors crate-internal, so
-# `ServerBuilder` is the only way a dependent crate assembles a server.
+# Gates the test-only assembly paths: `ManagerBuilder::new` and
+# `Materializer::builder`. Production builds leave the constructors
+# crate-internal, so `ServerBuilder` is the only way a dependent crate
+# assembles a server.
 test-seams = []
+# Lets `connetto_schema!` take `rosetta_uuid::Uuid => rosetta_uuid::sql_types::Uuid`
+# as the deployment's id.
+rosetta-uuid = ["connetto-core/rosetta-uuid"]
 
 [dev-dependencies]
 # The device certificate settings tests create a root and issuer of their own.
 rcgen = { version = "0.14.10", default-features = false, features = ["ring", "x509-parser"] }
-# The e2e content boot tests write the ticket key document the server loads,
-# through the same ring keypair the server's signer parses.
+# The bot and builder suites mint the Ed25519 keys bots and content tickets
+# sign with, through the same ring keypair the server parses.
 ring = "0.17"
 # The handshake authority is a required constructor argument with no production
 # default (R2), so the suites install the test-only stand-in from the core.
-connetto-core = { workspace = true, features = ["test-support"] }
+# authn_generic_id.rs keys its schema on `rosetta_uuid::Uuid`.
+connetto-core = { workspace = true, features = ["test-support", "rosetta-uuid", "logging"] }
 # Paused-clock reserve-gate tests: the over-share refusal waits out a real
 # queue window, which `start_paused` advances instantly.
 tokio = { workspace = true, features = ["test-util"] }
@@ -190,19 +190,17 @@ tower = { version = "0.5", features = ["util"] }
 axum = { workspace = true, features = ["ws"] }
 # The content deployment's DDL, applied by the sweep and reconcile tests.
 connetto-file-server = { path = "../connetto-file-server" }
+# The photograph the logout ticket test splits into chunks and uploads.
+connetto-file-core = { path = "../connetto-file-core" }
 # The raw-frame WebSocket client the sync adapter tests drive over `/sync`.
 tokio-tungstenite = "0.24"
 http-body-util = "0.1"
-# The demo distributed id type, driving the generic in-memory auth store over a
-# typed user id (not a string) in authn_generic_id.rs.
-rosetta-uuid = { version = "0.2.0", features = ["serde"] }
+# The demo distributed id type, driving the database auth store over a typed
+# user id (not a string) in authn_generic_id.rs, stored as a Postgres `uuid`.
+rosetta-uuid = { version = "0.2.0", features = ["diesel", "postgres", "serde"] }
 # The in-process CDC-loop test harness over real Postgres. It depends on this
 # crate, so the harness-backed tests are Docker-gated (a dev-dependency cycle
 # Cargo permits).
 connetto-test-harness = { path = "../connetto-test-harness" }
-# Reading the client binary's encrypted replica in the e2e assertions.
+# The client the bot and courier suites connect with.
 connetto-client = { path = "../connetto-client" }
-
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-keyring-core = "1.0.0"
-linux-keyutils-keyring-store = "1.0.0"

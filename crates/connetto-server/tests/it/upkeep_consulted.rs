@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use connetto_core::Cursor;
 use connetto_core::auth::Principal;
-use connetto_core::messages::BindValue;
+use connetto_core::messages::SqliteValue;
 use connetto_core::test_support::TestGrantChecker;
 use connetto_server::openfga::{GrantMove, StoreUpkeep, UpkeepError};
 use connetto_server::{
@@ -69,7 +69,7 @@ impl SnapshotSource for EmptySnapshot {
     async fn estimate(
         &self,
         _sql: &str,
-        _binds: &[BindValue],
+        _binds: &[SqliteValue],
         _caller: &Principal,
     ) -> Result<SnapshotEstimate, Self::Error> {
         Ok(SnapshotEstimate {
@@ -85,7 +85,7 @@ impl SnapshotSource for EmptySnapshot {
     async fn snapshot_page(
         &self,
         _sql: &str,
-        _binds: &[BindValue],
+        _binds: &[SqliteValue],
         _caller: &Principal,
         _page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {

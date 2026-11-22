@@ -41,18 +41,19 @@ use connetto_core::exchange::{
     CourierEntryOutcome, CourierOutcome, CourierRefusal, ManifestRow, Origin, SignedOffer,
 };
 use connetto_core::messages::{
-    AggregateUpdate, BindDevice, BindValue, BotRegistered, BulkMessage, CONTENT_TICKET_REFUSED,
-    CONTENT_TICKET_SIGNER_ERROR, Challenge, ConflictRow, ContentTicketGrant, ContentTicketRequest,
-    ContentVerb, ControlMessage, DeviceRevokedAck, DevicesList, DevicesRequest, EnrolChallenge,
-    EnrolRefusal, EnrolRefused, EnrolRequest, FatalError, FatalErrorReason, FullResyncReason,
-    FullResyncRequired, Grant, Handshake, HandshakeAck, LivePatch, MembershipOpened,
-    MutationApplied, MutationConflict, MutationHeader, MutationPatch, MutationReject,
-    MutationRejectReason, NonFatalError, PROVISIONAL_ASK_REFUSED, PauseCause, Pong, PriorRefusal,
-    Provenance, ProvisionalStatus, ProvisionalVerdicts, RateLimited, RegisterBot, ReplaceShareKeys,
-    RetireWriter, RevocationUpdate, RevokeDeviceRequest, SUBSCRIPTION_REFUSED, ShareKeysReplaced,
-    SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionSpec,
-    WriterAnswer, WriterGrant, WriterOutcome, WriterRef, WriterRequest, WriterSecret,
-    bot_registration_message, writer_bind_message,
+    AggregateChange, AggregateColumns, AggregateUpdate, BindDevice, BotRegistered, BulkMessage,
+    CONTENT_TICKET_REFUSED, CONTENT_TICKET_SIGNER_ERROR, Challenge, ConflictRow,
+    ContentTicketGrant, ContentTicketRequest, ContentVerb, ControlMessage, DeviceRevokedAck,
+    DevicesList, DevicesRequest, EnrolChallenge, EnrolRefusal, EnrolRefused, EnrolRequest,
+    FatalError, FatalErrorReason, FullResyncReason, FullResyncRequired, Grant, Handshake,
+    HandshakeAck, LivePatch, MembershipOpened, MutationApplied, MutationConflict, MutationHeader,
+    MutationPatch, MutationReject, MutationRejectReason, NonFatalError, PROVISIONAL_ASK_REFUSED,
+    PauseCause, Pong, PriorRefusal, Provenance, ProvisionalStatus, ProvisionalVerdicts,
+    RateLimited, RegisterBot, ReplaceShareKeys, RetireWriter, RevocationUpdate,
+    RevokeDeviceRequest, SUBSCRIPTION_REFUSED, SUBSCRIPTION_REFUSED_SCHEMA, ShareKeysReplaced,
+    SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch, SqliteValue, Subscribe,
+    SubscriptionSpec, WriterAnswer, WriterGrant, WriterOutcome, WriterRef, WriterRequest,
+    WriterSecret, bot_registration_message, writer_bind_message,
 };
 use connetto_core::messages::{
     CourierAnswer, CourierBody, CourierNotice, CourierNoticeAck, CourierNoticeRow, CourierRange,
@@ -78,10 +79,12 @@ use subql::term::{TermCaller, TermDescription};
 use subql::visibility::transition::{Transition, TransitionError, Transitions, transitions};
 use subql::visibility::{EventRow, RowWrite, Verdict, VisibilityPolicy};
 use subql::{
-    AdvanceCursorError, CdcSource, Checkpoint, DatabaseLike, EventKind, OpaqueCheckpoint, ParserDB,
-    PgChangeEvent, PgCommit, PgCommitPosition, PgLsn, PgXid, Seen, SourceItem, SubscriptionId,
-    TableLike,
+    AdvanceCursorError, CdcSource, Checkpoint, DatabaseLike, DriftSignal, EventKind,
+    Incompatibility, OpaqueCheckpoint, ParserDB, PgChangeEvent, PgCommit, PgCommitPosition, PgLsn,
+    PgXid, RefusalView, RefusedTables, Seen, SourceItem, SubscriptionId, TableId, TableLike,
 };
+
+use crate::drift::{RefusedSet, StreamSignal};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tracing::Instrument;
 use uuid::Uuid;
@@ -90,6 +93,7 @@ use crate::abuse::{Caller, Reaction};
 use crate::bots::schema::{ListEntry, PgBotRegistry, RegistryError, Verb};
 
 use crate::audit::{AuthEvent, AuthOp};
+use crate::catalog_shapes::CatalogShapes;
 use crate::counters;
 use crate::courier::{
     Admitted, Applier, CourierAuthor, CourierEntry, CourierRun, CourierViolation, Settling, Slot,
@@ -341,6 +345,63 @@ struct MemberTable {
     subjects: bool,
 }
 
+/// The membership tables a filter's terms watch, one entry per table and
+/// column, carrying every caller kind the terms over it read.
+///
+/// Collapsed rather than one entry per term, because the mirror is keyed by
+/// table and opened once. Two terms over one table under different caller
+/// kinds would otherwise open the first and silently skip the second, leaving
+/// that kind's membership moves undelivered.
+///
+/// # Errors
+///
+/// [`SubscribeRefusal::MembershipTableUnreachable`] when a term's table is not
+/// the one its bare name reaches in `catalog`.
+fn member_tables_of<DB: DatabaseLike>(
+    terms: &[TermDescription],
+    catalog: &DB,
+) -> Result<Arc<[MemberTable]>, SubscribeRefusal> {
+    let mut tables: Vec<MemberTable> = Vec::new();
+    for term in terms {
+        let TermDescription::Membership(membership) = term else {
+            continue;
+        };
+        let stored = &membership.member_table;
+        let reached = subql::catalog_helpers::table_id_for_name::<Postgres, _>(
+            catalog,
+            sql_traits::structs::TargetName::new(&stored.name, true),
+        );
+        if reached.is_none()
+            || reached != subql::catalog_helpers::stored_table_id::<Postgres, _>(catalog, stored)
+        {
+            return Err(SubscribeRefusal::MembershipTableUnreachable(
+                match &stored.schema {
+                    Some(schema) => format!("{schema}.{}", stored.name),
+                    None => stored.name.to_string(),
+                },
+            ));
+        }
+        let held = tables.iter().position(|held| {
+            held.table == membership.member_table.name && held.subject == membership.member_subject
+        });
+        let at = held.unwrap_or_else(|| {
+            tables.push(MemberTable {
+                table: membership.member_table.name.to_string(),
+                subject: membership.member_subject.clone(),
+                identity: false,
+                subjects: false,
+            });
+            tables.len() - 1
+        });
+        let entry = &mut tables[at];
+        match membership.caller {
+            TermCaller::Identity => entry.identity = true,
+            TermCaller::Subjects => entry.subjects = true,
+        }
+    }
+    Ok(tables.into())
+}
+
 /// Why a subscription was not registered, beyond the materializer's own
 /// refusals. Every cause is answered on the wire with the one fixed
 /// `SUBSCRIPTION_REFUSED` detail (R38), so this exists for the structured log.
@@ -365,6 +426,11 @@ enum SubscribeRefusal {
         "membership table {0} is not carried by the publication, so a membership change would never move rows"
     )]
     Unpublished(String),
+    /// A membership term reads a table its bare name does not reach. The seed,
+    /// the mirror and the replica name a membership table bare, so they would
+    /// read another table or none.
+    #[error("membership table {0} is not the table its bare name reaches")]
+    MembershipTableUnreachable(String),
     /// The snapshot source has no publication to verify against.
     #[error(
         "no publication is configured on the snapshot source, so a membership table cannot be verified as replicated"
@@ -459,7 +525,7 @@ pub trait SnapshotSource<Id = String, Key = String>: Send + Sync {
     async fn estimate(
         &self,
         select_sql: &str,
-        binds: &[BindValue],
+        binds: &[SqliteValue],
         caller: &Principal<Id, Key>,
     ) -> Result<SnapshotEstimate, Self::Error>;
 
@@ -490,7 +556,7 @@ pub trait SnapshotSource<Id = String, Key = String>: Send + Sync {
     async fn snapshot_page(
         &self,
         select_sql: &str,
-        binds: &[BindValue],
+        binds: &[SqliteValue],
         caller: &Principal<Id, Key>,
         page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error>;
@@ -891,8 +957,12 @@ struct Applied {
     narrowings: Option<Vec<TermMove>>,
     /// Computed changes not yet delivered, in delivery order.
     computed: VecDeque<ComputedChange>,
+    /// Computed subscriptions whose values cannot be encoded.
+    computed_refused: Vec<SubscriptionId>,
     /// The read failure still to be answered.
     failure: Option<MaterializerError>,
+    /// The reads subql ended for good, still to be told.
+    stopped: Vec<crate::materializer::EndedRead>,
     /// Whether queued reads remain to be drained.
     drain_due: bool,
     /// Unknown-class read failures counted per subscription.
@@ -907,7 +977,9 @@ impl Applied {
             refused: dispatched.refused,
             narrowings: Some(dispatched.narrowings),
             computed: dispatched.computed.into(),
+            computed_refused: dispatched.computed_refused,
             failure: dispatched.failure,
+            stopped: dispatched.stopped,
             drain_due: false,
             unknown_attempts: HashMap::new(),
         }
@@ -1062,6 +1134,11 @@ pub enum SessionError {
          ALTER TABLE {0} REPLICA IDENTITY FULL"
     )]
     ChangeStreamUnusable(String),
+    /// The drift guard reported a signal this server cannot serve through,
+    /// lost changes of a table or a signal it does not know, so it stops
+    /// serving instead of reconnecting into the same report.
+    #[error("the change stream reported {0}, which this server cannot serve through")]
+    DriftUnserved(String),
     /// The authorization path refused an event for a reason the deployment fixes, so the server stops serving instead of retrying.
     #[error(
         "the authorization path cannot answer for a change in {table}, and asking again \
@@ -1422,15 +1499,24 @@ pub(crate) fn reject_reason(err: &MaterializerError) -> MutationRejectReason {
         MaterializerError::Parse(detail) => MutationRejectReason::Malformed {
             detail: detail.clone(),
         },
-        MaterializerError::NotWritable(_) | MaterializerError::SchemaMismatch(_) => {
-            MutationRejectReason::SchemaMismatch
-        }
+        MaterializerError::NotWritable(_)
+        | MaterializerError::SchemaMismatch(_)
+        | MaterializerError::Refused(_) => MutationRejectReason::SchemaMismatch,
         MaterializerError::Apply(inner) => MutationRejectReason::Constraint {
             detail: inner.to_string(),
         },
         other => MutationRejectReason::Other {
             detail: other.to_string(),
         },
+    }
+}
+
+/// Why a catch-up member reached by the emptying `record` of `table` replaces it.
+fn resync_reason(record: &ChangeRecord, table: String) -> FullResyncReason {
+    if record.is_refusal() {
+        FullResyncReason::TableRefused { table }
+    } else {
+        FullResyncReason::TableTruncated { table }
     }
 }
 
@@ -1569,6 +1655,8 @@ enum Outbound {
     Refuse {
         /// The client-facing label of the subscription.
         sub_id: String,
+        /// The fixed phrase the refusal carries.
+        detail: &'static str,
     },
 }
 
@@ -1594,7 +1682,7 @@ struct Route<Id, Key> {
     /// per subscriber per event.
     pg_sql: std::sync::Arc<str>,
     /// The subscription's bind values, paired with `pg_sql`'s placeholders.
-    binds: std::sync::Arc<[BindValue]>,
+    binds: std::sync::Arc<[SqliteValue]>,
     /// The membership tables this subscription's terms watch, empty for a
     /// filter naming none. A grant moved by a change to one of these tables is
     /// served incrementally by the term's own move (R27 decision 2), so the
@@ -1623,6 +1711,19 @@ fn budgeted_bytes(patch: &LivePatch) -> u64 {
         .saturating_add(len_bytes(patch.patchset_zstd.len()))
 }
 
+/// The bytes occupied by typed row values and their variable payloads.
+fn aggregate_row_bytes(row: &[SqliteValue]) -> u64 {
+    row.iter().fold(0_u64, |bytes, value| {
+        bytes
+            .saturating_add(len_bytes(std::mem::size_of::<SqliteValue>()))
+            .saturating_add(match value {
+                SqliteValue::Text(text) => len_bytes(text.len()),
+                SqliteValue::Blob(blob) => len_bytes(blob.len()),
+                SqliteValue::Null | SqliteValue::Integer(_) | SqliteValue::Real(_) => 0,
+            })
+    })
+}
+
 impl Outbound {
     /// The bytes this item counts against the connection's send budget while it waits.
     ///
@@ -1632,20 +1733,24 @@ impl Outbound {
             Self::Live(patch) => budgeted_bytes(patch),
             Self::Aggregate(update) => OUTBOUND_ITEM_BYTES
                 .saturating_add(len_bytes(update.sub_id.len()))
-                .saturating_add(len_bytes(update.group_key.as_ref().map_or(0, Vec::len)))
-                .saturating_add(len_bytes(
-                    update.group_values_json.as_ref().map_or(0, String::len),
-                ))
-                .saturating_add(len_bytes(
-                    update.result_json.as_ref().map_or(0, String::len),
-                )),
+                .saturating_add(match &update.change {
+                    AggregateChange::Upsert { key, row } => {
+                        len_bytes(key.len()).saturating_add(aggregate_row_bytes(row))
+                    }
+                    AggregateChange::Remove { key } => len_bytes(key.len()),
+                    AggregateChange::Replace { rows } => rows.iter().fold(0_u64, |bytes, row| {
+                        bytes
+                            .saturating_add(len_bytes(std::mem::size_of::<Vec<SqliteValue>>()))
+                            .saturating_add(aggregate_row_bytes(row))
+                    }),
+                }),
             Self::Fatal(_) | Self::Drop => 0,
             // Rare and of any shape, so it is measured by its encoding.
             Self::Control(msg) => OUTBOUND_ITEM_BYTES.saturating_add(
                 connetto_core::codec::encode_control(msg).map_or(0, |frame| len_bytes(frame.len())),
             ),
             Self::Resnapshot { sub_id, .. }
-            | Self::Refuse { sub_id }
+            | Self::Refuse { sub_id, .. }
             | Self::ReservedResnapshot { sub_id, .. }
             | Self::Rebootstrap { sub_id, .. } => {
                 OUTBOUND_ITEM_BYTES.saturating_add(len_bytes(sub_id.len()))
@@ -2477,6 +2582,9 @@ pub struct SessionManager<
     /// The visibility question holds a row view across an await, so it cannot
     /// borrow one through the materializer's mutex.
     catalog: Arc<ParserDB>,
+    /// Every catalog table's columns, shared with the materializer, which the
+    /// session's own reads project without the materializer's mutex.
+    shapes: Arc<CatalogShapes>,
     routes: Mutex<HashMap<u64, Route<Id, Key>>>,
     /// Held across one event's dispatch and fan-out, and by a session swapping
     /// its share keys, so no patch filtered under the old keys is queued behind
@@ -2547,7 +2655,7 @@ pub struct SessionManager<
     withdrawal_source: OnceLock<Snap>,
     /// Issues device certificates (R74). Without one, every enrolment is
     /// refused as [`EnrolRefusal::IssuerUnavailable`].
-    device_enrolment: OnceLock<Arc<crate::device_cert::DeviceEnrolment<Id>>>,
+    device_enrolment: OnceLock<Arc<crate::device_cert::DeviceEnrolment<D>>>,
     /// The deployment's content ticket signer, called after a successful
     /// visibility check to mint a signed URL the caller may use at the file
     /// server. Generic rather than boxed so a deployment wires it at compile
@@ -2574,6 +2682,9 @@ pub struct SessionManager<
     /// The sessions bound to each device writer (R75), so a retirement can
     /// close every connection that writes as the retired writer.
     writer_sessions: Mutex<HashMap<i64, HashSet<SessionId>>>,
+    /// The tables this process refused, the materializer's own set, so the
+    /// ingest loop's gate reads it without the materializer lock.
+    refused: RefusedSet,
 }
 
 /// Keeps the open-run-loop count right while one `serve` is in flight.
@@ -2730,6 +2841,8 @@ where
     let has_major = config.schema_major.is_some();
     let manager = Arc::new(SessionManager {
         catalog: Arc::new(materializer.catalog().clone()),
+        refused: materializer.refused().clone(),
+        shapes: Arc::clone(materializer.shapes()),
         materializer: Arc::new(Mutex::new(materializer)),
         routes: Mutex::new(HashMap::new()),
         dispatch_gate: Mutex::new(()),
@@ -2851,8 +2964,8 @@ where
     /// The enrolment handed over, when one is already installed.
     pub fn install_device_enrolment(
         &self,
-        enrolment: Arc<crate::device_cert::DeviceEnrolment<Id>>,
-    ) -> Result<(), Arc<crate::device_cert::DeviceEnrolment<Id>>> {
+        enrolment: Arc<crate::device_cert::DeviceEnrolment<D>>,
+    ) -> Result<(), Arc<crate::device_cert::DeviceEnrolment<D>>> {
         self.device_enrolment.set(enrolment)
     }
 
@@ -3574,7 +3687,7 @@ where
     async fn register_settled_filter(&self, session_id: SessionId, key: &[u8], writer: i64) {
         let consumer_id = self.next_consumer_id();
         let sql = "SELECT seq FROM _connetto_settled WHERE writer = $1";
-        let binds = [BindValue::Integer(writer)];
+        let binds = [SqliteValue::Integer(writer)];
         let mut materializer = self.materializer.lock().await;
         match materializer.register_translated(
             consumer_id,
@@ -3694,11 +3807,11 @@ where
         let (writers_sql, writers_bind) = match writer {
             Some(writer) => (
                 "SELECT frontier, retired_at FROM _connetto_writers WHERE writer = $1",
-                BindValue::Integer(writer),
+                SqliteValue::Integer(writer),
             ),
             None => (
                 "SELECT frontier, retired_at FROM _connetto_writers WHERE device_key = $1",
-                BindValue::Blob(key.to_vec()),
+                SqliteValue::Blob(key.to_vec()),
             ),
         };
         let mut consumers = Vec::new();
@@ -3714,7 +3827,7 @@ where
             .register_one_filter(
                 enrolment_consumer,
                 "SELECT revoked_at FROM connetto_device_enrolments WHERE key_id = $1",
-                &[BindValue::Blob(key.to_vec())],
+                &[SqliteValue::Blob(key.to_vec())],
             )
             .await
         {
@@ -3788,7 +3901,7 @@ where
         &self,
         consumer_id: u64,
         sql: &str,
-        binds: &[BindValue],
+        binds: &[SqliteValue],
     ) -> Option<SubscriptionId> {
         let mut materializer = self.materializer.lock().await;
         match materializer.register_translated(
@@ -4000,6 +4113,7 @@ where
                 );
                 let _ = route.tx.send(Outbound::Refuse {
                     sub_id: route.label.clone(),
+                    detail: SUBSCRIPTION_REFUSED,
                 });
             }
             applied.refused.clear();
@@ -4030,6 +4144,12 @@ where
     /// failure is one this path does not dispose of.
     async fn dispose_read_failure(&self, applied: &mut Applied) -> Result<(), SessionError> {
         loop {
+            // subql already unregistered each of these, so ending the route
+            // is all that remains.
+            for ended in core::mem::take(&mut applied.stopped) {
+                self.refuse_computed(ended.subscription, ended.class, 1, &ended.detail)
+                    .await;
+            }
             if let Some(failure) = applied.failure.take() {
                 applied.drain_due = true;
                 match failure {
@@ -4077,13 +4197,24 @@ where
                 .await;
             applied.drain_due = false;
             applied.computed.extend(drained.computed);
+            applied.computed_refused.extend(drained.computed_refused);
             applied.failure = drained.failure;
+            applied.stopped.extend(drained.stopped);
             self.deliver_owed(applied).await?;
         }
     }
 
     /// Revalidate private audit observers before consuming each computed delivery.
     async fn deliver_owed(&self, applied: &mut Applied) -> Result<(), SessionError> {
+        for subscription_id in applied.computed_refused.drain(..) {
+            self.refuse_computed(
+                subscription_id,
+                ReadFailure::Deterministic,
+                1,
+                &"computed values cannot be encoded",
+            )
+            .await;
+        }
         while let Some(change) = applied.computed.front() {
             self.wake_courier_audit_locked(change.consumer_id).await?;
             if let Some(change) = applied.computed.pop_front() {
@@ -4336,7 +4467,7 @@ where
         &self,
         source: &Snap,
         sql: &str,
-        binds: &[BindValue],
+        binds: &[SqliteValue],
         route: &Route<Id, Key>,
     ) -> Option<SnapshotPage> {
         let limits = self.guard.read_limits(Tier::of(&route.principal));
@@ -4414,8 +4545,12 @@ where
         let Some(source) = self.withdrawal_source.get() else {
             return false;
         };
+        let table_id = term_move.table_id;
+        // Project the catalog's columns so a column the live table gained
+        // under the running server stays out of the move-out read.
         let base = format!(
-            "SELECT * FROM {}",
+            "SELECT {} FROM {}",
+            self.shapes.select_list(table_id),
             connetto_core::quote_ident(&term_move.table)
         );
         let Some(sql) = narrowed_sql(&base, &term_move.pairs) else {
@@ -4425,12 +4560,6 @@ where
             return false;
         };
         let Ok(ParsedDiffSet::Patchset(set)) = ParsedDiffSet::parse(&snapshot.patchset) else {
-            return false;
-        };
-        let Some(table_id) = subql::catalog_helpers::table_id::<Postgres, _>(
-            self.catalog.as_ref(),
-            &term_move.table,
-        ) else {
             return false;
         };
         let mut deletes = PatchSet::<TableSchema<String>, String, Vec<u8>>::new();
@@ -4652,6 +4781,7 @@ where
     ) -> Result<(), SessionError>
     where
         Src: CdcSource<Event = PgChangeEvent, Commit = PgCommit>,
+        Src::Relation: StreamSignal,
         Src::Error: core::fmt::Display,
     {
         loop {
@@ -4667,6 +4797,13 @@ where
                     if let Some(commits) = self.ingested_commits.get() {
                         let _ = commits.send(commit);
                     }
+                }
+                Ok(Some(SourceItem::Event(event)))
+                    if self.refused.holds(&self.event_table(&event)) =>
+                {
+                    // A table this process refused stays refused when a later
+                    // guard accepts it again, until a restart.
+                    self.resume.set(Some(event.position()));
                 }
                 Ok(Some(SourceItem::Event(event))) => {
                     // One hold loop for both pause causes (R89 decision 2):
@@ -4753,9 +4890,7 @@ where
                     // A row is acknowledged with its commit, since acknowledging it alone moves nothing.
                     self.resume.set(Some(event.position()));
                 }
-                // A relation message states a table's definition, which the
-                // ingest loop has no use for, its rows arriving as events.
-                Ok(Some(SourceItem::Relation(_))) => {}
+                Ok(Some(SourceItem::Relation(item))) => self.handle_drift(item).await?,
                 Ok(None) => return Ok(()),
                 Err(err) => return Err(SessionError::Transport(err.to_string())),
             }
@@ -4790,6 +4925,7 @@ where
     ) -> Result<(), SessionError>
     where
         Src: CdcSource<Event = PgChangeEvent, Commit = PgCommit>,
+        Src::Relation: StreamSignal,
         Src::Error: core::fmt::Display,
         Connect: FnMut(ResumePoint) -> F,
         F: core::future::Future<Output = Result<Src, E>>,
@@ -4809,6 +4945,7 @@ where
                         // The same event meets the same refusal after a reconnect (R6 decision 4).
                         Err(
                             err @ (SessionError::ChangeStreamUnusable(_)
+                            | SessionError::DriftUnserved(_)
                             | SessionError::AuthorizationUnanswerable { .. }),
                         ) => return Err(err),
                         Err(err) => {
@@ -4847,6 +4984,132 @@ where
         }
     }
 
+    /// The name the catalog stores for `table`, for a message a person reads.
+    fn table_name(&self, table: TableId) -> String {
+        subql::catalog_helpers::table_name::<subql::backend::Postgres, _>(
+            self.catalog.as_ref(),
+            table,
+        )
+        .unwrap_or_else(|| format!("table {table}"))
+    }
+
+    /// Refuse `table` for `reasons`, with every table whose policy reads it
+    /// when its identity weakened, and end every subscription reading one
+    /// with [`SUBSCRIPTION_REFUSED_SCHEMA`] (R107 decisions 6, 10 and 11).
+    ///
+    /// Each refusal is persisted before any subscription ends, so the process
+    /// that next serves the table resyncs every cursor older than its return.
+    /// A table already refused draws nothing, so a reconnect re-reporting it
+    /// sends no frame.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::Oplog`] when a refusal could not be persisted.
+    pub async fn refuse_table(
+        &self,
+        table: TableId,
+        reasons: Vec<Incompatibility>,
+    ) -> Result<(), SessionError> {
+        let (refused, subscriptions) = {
+            let materializer = self.materializer.lock().await;
+            let refused = materializer.refuse_table(table, reasons.clone());
+            let subscriptions = materializer.subscriptions_reading(&refused);
+            (refused, subscriptions)
+        };
+        if refused.is_empty() {
+            return Ok(());
+        }
+        for name in &refused {
+            self.oplog.record_refusal(name).await.map_err(oplog_err)?;
+        }
+        tracing::error!(
+            tables = ?refused,
+            reasons = ?reasons,
+            "the live schema no longer matches the catalog, so these tables are refused \
+             until the server restarts on a matching schema"
+        );
+        let rows: Vec<(String, OutboundTx)> = self
+            .routes
+            .lock()
+            .await
+            .values()
+            .filter(|route| subscriptions.contains(&route.sub_id))
+            .map(|route| (route.label.clone(), route.tx.clone()))
+            .collect();
+        for (label, tx) in rows {
+            let _ = tx.send(Outbound::Refuse {
+                sub_id: label,
+                detail: SUBSCRIPTION_REFUSED_SCHEMA,
+            });
+        }
+        for subscription in subscriptions {
+            if self.fail_courier_audit_locked(subscription).await {
+                continue;
+            }
+            let route = { self.computed_routes.lock().await.remove(&subscription) };
+            let Some(route) = route else { continue };
+            self.materializer.lock().await.unregister(subscription);
+            let _ = route
+                .tx
+                .send(Outbound::Control(ControlMessage::NonFatalError(
+                    NonFatalError {
+                        related_to: Some(route.label),
+                        detail: SUBSCRIPTION_REFUSED_SCHEMA.to_owned(),
+                    },
+                )));
+        }
+        Ok(())
+    }
+
+    /// Act on one drift signal the stream carried.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::DriftUnserved`] for a signal connetto cannot serve,
+    /// which stops the stream, and whatever [`Self::refuse_table`] answers.
+    async fn handle_drift(&self, item: impl StreamSignal) -> Result<(), SessionError> {
+        match item.drift() {
+            None => Ok(()),
+            Some(DriftSignal::Refused { table, reasons }) => {
+                self.refuse_table(table, reasons).await
+            }
+            Some(DriftSignal::ChangesLost { table }) => Err(SessionError::DriftUnserved(format!(
+                "lost changes of {}",
+                self.table_name(table)
+            ))),
+            Some(other) => Err(SessionError::DriftUnserved(format!("{other:?}"))),
+        }
+    }
+
+    /// Take a new guard's refusals for the stretch before the ingest loop
+    /// handles them, and serve again every table an earlier process refused
+    /// that neither this process nor the guard refuses.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::Oplog`] when the refusals could not be read or settled.
+    pub async fn watch_guard(&self, guard: RefusedTables) -> Result<(), SessionError> {
+        let readmitted: Vec<String> = self
+            .oplog
+            .refusals()
+            .await
+            .map_err(oplog_err)?
+            .into_iter()
+            .filter(|table| !self.refused.holds(table) && guard.refusal(table).is_none())
+            .collect();
+        self.refused.watch(guard);
+        if readmitted.is_empty() {
+            return Ok(());
+        }
+        self.oplog.readmit(&readmitted).await.map_err(oplog_err)?;
+        tracing::info!(
+            tables = ?readmitted,
+            "tables an earlier process refused match the catalog again, and every client \
+             resuming from before their return resyncs them"
+        );
+        Ok(())
+    }
+
     /// Send one computed-result change to the session owning its
     /// subscription, if routed.
     async fn deliver_computed(&self, change: ComputedChange) {
@@ -4860,10 +5123,7 @@ where
         let Some(route) = route else { return };
         let update = AggregateUpdate {
             sub_id: route.label,
-            group_key: change.group_key,
-            group_values_json: change.group_values_json,
-            result_json: change.result_json,
-            is_full_result: change.is_full_result,
+            change: change.change,
         };
         let _ = route.tx.send(Outbound::Aggregate(update));
     }
@@ -6093,8 +6353,9 @@ where
                 self.rebootstrap_computed(transport, state, sub_id, retired_id)
                     .await?;
             }
-            Outbound::Refuse { sub_id } => {
-                self.refuse_subscription(transport, state, &sub_id).await?;
+            Outbound::Refuse { sub_id, detail } => {
+                self.refuse_subscription(transport, state, &sub_id, detail)
+                    .await?;
             }
         }
         Ok(true)
@@ -6298,7 +6559,10 @@ where
                     }
                 }
             } else {
-                Outbound::Refuse { sub_id: label }
+                Outbound::Refuse {
+                    sub_id: label,
+                    detail: SUBSCRIPTION_REFUSED,
+                }
             };
             let _ = state.outbound.send(instruction);
         }
@@ -6407,21 +6671,29 @@ where
             .map_err(transport_err)
     }
 
-    /// Answer one content ticket request: check visibility, call the signer,
-    /// charge the write budget after a successful mint, and send the grant.
+    /// Answer one content ticket request: confirm the login is still live,
+    /// check visibility, call the signer, charge the write budget after a
+    /// successful mint, and send the grant.
     ///
-    /// Visibility runs first on the reader pool, behind the same reader-share
+    /// A connection can stay open after its session ended, past the idle
+    /// window or before this server hears of a revocation, so a login's
+    /// session is asked about first and an ended one refused with the
+    /// invisible file's detail, rather than handed a ticket the file server
+    /// refuses (R109). A caller holding no login has no session to ask about.
+    ///
+    /// Visibility runs next on the reader pool, behind the same reader-share
     /// permit that subscription and mutation reads hold (R39), so an anonymous
     /// caller cannot starve identified callers. Invisibility and a budget
     /// refusal carry the same byte-identical detail so a caller cannot learn
-    /// that a file it cannot see exists. A signer fault carries a distinct
-    /// detail because it discloses nothing about data and a retry is
-    /// meaningful. The budget is charged after a successful mint, so a signer
-    /// failure never consumes the caller's upload window.
+    /// that a file it cannot see exists. A signer fault, or a session store
+    /// that cannot answer, carries a distinct detail because it discloses
+    /// nothing about data and a retry is meaningful. The budget is charged
+    /// after a successful mint, so a signer failure never consumes the
+    /// caller's upload window.
     ///
     /// A request naming `for_owner` carries the file for that account (R79
-    /// decision 17). It is minted only for a write by a caller holding an
-    /// account, and only when the deployment's `connetto_file_owner`, read
+    /// decision 17). It is minted only for a write by a caller holding a
+    /// login, and only when the deployment's `connetto_file_owner`, read
     /// with the caller's own rights, answers that account. Every other answer
     /// is refused with the invisible file's detail.
     async fn handle_content_ticket<T: Transport>(
@@ -6433,6 +6705,19 @@ where
         let request_id = req.request_id;
         let caller = crate::capability::rendered_caller(&state.principal);
         let budget_key = crate::capability::meter_key(&state.principal, state.session_id);
+
+        if let Some(session) = caller.session() {
+            match self.authority.session_is_live(session).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return refuse_ticket(transport, request_id, CONTENT_TICKET_REFUSED).await;
+                }
+                Err(err) => {
+                    tracing::warn!(request_id, %err, "content ticket session check failed");
+                    return refuse_ticket(transport, request_id, CONTENT_TICKET_SIGNER_ERROR).await;
+                }
+            }
+        }
 
         // Reader permit: visibility checks out a reader-pool connection, so
         // the same gate that protects subscriptions and mutations applies here.
@@ -6503,9 +6788,10 @@ where
     /// What a content ticket carries for the account `for_owner` names,
     /// `None` when it names none, or the refusal detail to answer.
     ///
-    /// Only a write by a caller holding an account may carry, and only when
-    /// the deployment's `connetto_file_owner`, read with the caller's own
-    /// rights, answers that account (R79 decision 17).
+    /// Only a write by a caller holding a login may carry, the carry audited
+    /// under the login's session the ticket names, and only when the
+    /// deployment's `connetto_file_owner`, read with the caller's own rights,
+    /// answers that account (R79 decision 17).
     async fn ticket_carry(
         &self,
         for_owner: Option<String>,
@@ -6517,7 +6803,9 @@ where
         let Some(for_owner) = for_owner else {
             return Ok(None);
         };
-        if !matches!(verb, ContentVerb::Write { .. }) || state.principal.identity().is_none() {
+        if !matches!(verb, ContentVerb::Write { .. })
+            || crate::capability::login_session(&state.principal).is_none()
+        {
             return Err(CONTENT_TICKET_REFUSED);
         }
         let answered = self
@@ -6531,10 +6819,7 @@ where
         if answered.as_deref() != Some(for_owner.as_str()) {
             return Err(CONTENT_TICKET_REFUSED);
         }
-        Ok(Some(ContentCarry {
-            owner: for_owner,
-            session: state.session_id,
-        }))
+        Ok(Some(ContentCarry { owner: for_owner }))
     }
 
     /// Answer a device list request with the caller's devices.
@@ -6562,7 +6847,7 @@ where
         transport.send_control(answer).await.map_err(transport_err)
     }
 
-    /// Revoke one of the caller's devices, answering before its connection closes.
+    /// Await revocation and acknowledge it before closing the caller's own connection.
     async fn handle_revoke_request<T: Transport>(
         &self,
         transport: &mut T,
@@ -6579,6 +6864,7 @@ where
                 .map_err(|err| match err {
                     RevokeError::NotFound => EnrolRefusal::InvalidRequest,
                     RevokeError::NotInstalled => EnrolRefusal::IssuerUnavailable,
+                    RevokeError::Refused(reason) => EnrolRefusal::Refused { reason },
                     RevokeError::Unavailable(source) => {
                         tracing::warn!(error = %source, "a device could not be revoked");
                         EnrolRefusal::IssuerUnavailable
@@ -6587,14 +6873,14 @@ where
             Err(refusal) => Err(refusal),
         };
         match revoked {
-            Ok((enrolment, (_, session, lists))) => {
+            Ok((enrolment, revoked)) => {
+                self.after_revocation(&enrolment, revoked).await;
                 transport
                     .send_control(ControlMessage::DeviceRevokedAck(DeviceRevokedAck {
                         request_id,
                     }))
                     .await
                     .map_err(transport_err)?;
-                self.after_revocation(&enrolment, session, lists).await;
                 Ok(())
             }
             Err(reason) => transport
@@ -6710,20 +6996,23 @@ where
     }
 
     /// Close the revoked device's connection, push the new lists to every
-    /// identified connection, and revoke the auth-store session.
+    /// identified connection, then close and record the auth-store session
+    /// the revocation ended.
     async fn after_revocation(
         &self,
-        enrolment: &crate::device_cert::DeviceEnrolment<Id>,
-        session: SessionId,
-        lists: Vec<SignedList>,
+        enrolment: &crate::device_cert::DeviceEnrolment<D>,
+        revoked: crate::device_cert::KeyRevoked<Id>,
     ) {
-        self.announce_revocation(session, lists).await;
-        enrolment.revoke_session(session).await;
+        self.announce_revocation(revoked.session, revoked.lists)
+            .await;
+        if let Some(user) = &revoked.ended {
+            enrolment.session_ended(user, revoked.session);
+        }
     }
 
     /// Close the revoked device's connection with `DeviceRevoked` and push
     /// the new lists to every identified connection.
-    async fn announce_revocation(&self, session: SessionId, lists: Vec<SignedList>) {
+    pub(crate) async fn announce_revocation(&self, session: SessionId, lists: Vec<SignedList>) {
         self.close_session(session, FatalErrorReason::DeviceRevoked)
             .await;
         let update = ControlMessage::RevocationUpdate(RevocationUpdate { lists });
@@ -6742,48 +7031,30 @@ where
     /// # Errors
     ///
     /// [`RevokeError::NotFound`] for a key never enrolled,
-    /// [`RevokeError::NotInstalled`] when no enrolment is installed, and
+    /// [`RevokeError::NotInstalled`] when no enrolment is installed,
+    /// [`RevokeError::Refused`] when the application's hook refuses, and
     /// [`RevokeError::Unavailable`] when the table or the issuer fails.
     pub async fn revoke_device(&self, key: KeyId) -> Result<bool, RevokeError> {
         let enrolment = self
             .device_enrolment
             .get()
             .ok_or(RevokeError::NotInstalled)?;
-        let (fresh, session, lists) = enrolment.revoke(None, key).await?;
-        self.after_revocation(enrolment, session, lists).await;
+        let revoked = enrolment.revoke(None, key).await?;
+        let fresh = revoked.fresh;
+        self.after_revocation(enrolment, revoked).await;
         Ok(fresh)
     }
 
-    /// `user`'s enrolled devices with the session each last enrolled under,
-    /// none when no enrolment is installed.
-    pub(crate) async fn devices_of(
-        &self,
-        user: &Id,
-    ) -> Result<Vec<crate::device_cert::Device>, crate::device_cert::EnrolmentError> {
-        match self.device_enrolment.get() {
-            Some(enrolment) => enrolment.enrolled(user).await,
-            None => Ok(Vec::new()),
-        }
-    }
-
-    /// Revoke `user`'s device key `key`, publishing the list and closing its
-    /// connection with `DeviceRevoked`, and leave its auth-store session to
-    /// the caller, which ends it with its own cause.
-    pub(crate) async fn revoke_device_of(&self, user: &Id, key: KeyId) -> Result<(), RevokeError> {
-        let enrolment = self
-            .device_enrolment
-            .get()
-            .ok_or(RevokeError::NotInstalled)?;
-        let (_, session, lists) = enrolment.revoke(Some(user), key).await?;
-        self.announce_revocation(session, lists).await;
-        Ok(())
+    /// The installed device enrolment, none when device identity is off.
+    pub(crate) fn device_enrolment(&self) -> Option<&Arc<crate::device_cert::DeviceEnrolment<D>>> {
+        self.device_enrolment.get()
     }
 
     /// The installed enrolment and the account enrolling, or why this session cannot enrol.
     fn enrolling(
         &self,
         state: &SessionState<Id, Key>,
-    ) -> Result<(Arc<crate::device_cert::DeviceEnrolment<Id>>, Id), EnrolRefusal> {
+    ) -> Result<(Arc<crate::device_cert::DeviceEnrolment<D>>, Id), EnrolRefusal> {
         let user = state
             .principal
             .identity()
@@ -9288,7 +9559,7 @@ where
                         .snapshot_source
                         .term_seed(
                             &membership.seed_sql,
-                            &membership.member_table,
+                            &membership.member_table.name,
                             &membership.member_subject,
                             &member_keys,
                             &state.principal,
@@ -9300,7 +9571,7 @@ where
                         Some(true) => {}
                         Some(false) => {
                             return Err(SubscribeRefusal::Unpublished(
-                                membership.member_table.clone(),
+                                membership.member_table.name.to_string(),
                             ));
                         }
                         None => return Err(SubscribeRefusal::NoPublication),
@@ -9373,8 +9644,8 @@ where
         let terms = materializer
             .describe_terms(consumer_id, &pg_sql, &sub.spec.binds, subscriber, subjects)
             .unwrap_or_default();
+        let member_tables = member_tables_of(&terms, materializer.catalog())?;
         let seed = self.seed_for_terms(&terms, state).await?;
-        let member_tables = Self::member_tables_of(&terms);
         let reads_subjects = terms
             .iter()
             .any(|term| caller_of(term) == TermCaller::Subjects);
@@ -9421,42 +9692,6 @@ where
             ))
             .with_statements(binding.setup_statements())
         })
-    }
-
-    /// The membership tables a registration's terms read, paired with the member
-    /// subject column, for the session's term-move routing.
-    /// The membership tables a filter's terms watch, one entry per table and
-    /// column, carrying every caller kind the terms over it read.
-    ///
-    /// Collapsed rather than one entry per term, because the mirror is keyed
-    /// by table and opened once. Two terms over one table under different
-    /// caller kinds would otherwise open the first and silently skip the
-    /// second, leaving that kind's membership moves undelivered.
-    fn member_tables_of(terms: &[TermDescription]) -> std::sync::Arc<[MemberTable]> {
-        let mut tables: Vec<MemberTable> = Vec::new();
-        for term in terms {
-            let TermDescription::Membership(membership) = term else {
-                continue;
-            };
-            let held = tables.iter().position(|held| {
-                held.table == membership.member_table && held.subject == membership.member_subject
-            });
-            let at = held.unwrap_or_else(|| {
-                tables.push(MemberTable {
-                    table: membership.member_table.clone(),
-                    subject: membership.member_subject.clone(),
-                    identity: false,
-                    subjects: false,
-                });
-                tables.len() - 1
-            });
-            let entry = &mut tables[at];
-            match membership.caller {
-                TermCaller::Identity => entry.identity = true,
-                TermCaller::Subjects => entry.subjects = true,
-            }
-        }
-        tables.into()
     }
 
     async fn handle_subscribe<T: Transport>(
@@ -9518,6 +9753,18 @@ where
         let consumer_id = self.next_consumer_id();
         let registered = match self.register_subscription(consumer_id, &sub, state).await {
             Ok(registered) => registered,
+            Err(SubscribeRefusal::Materializer(MaterializerError::RefusedRead(table))) => {
+                // A table refused for its schema says nothing about what the caller named.
+                tracing::warn!(sub_id = %sub.sub_id, table = %table, "subscription reads a refused table");
+                transport
+                    .send_control(ControlMessage::NonFatalError(NonFatalError {
+                        related_to: Some(sub.sub_id),
+                        detail: SUBSCRIPTION_REFUSED_SCHEMA.to_owned(),
+                    }))
+                    .await
+                    .map_err(transport_err)?;
+                return Ok(());
+            }
             Err(err) => {
                 tracing::warn!(sub_id = %sub.sub_id, error = %err, "subscription registration refused");
                 // Naming something that does not resolve is one of the four
@@ -9647,7 +9894,14 @@ where
                         // Without its membership rows the term's local answer is wrong, so the two are refused as a unit.
                         Err(SessionError::Snapshot(detail) | SessionError::ReadRefused(detail)) => {
                             tracing::warn!(sub_id = %sub_label, error = %detail, "membership read failed, refusing the term");
-                            return self.refuse_subscription(transport, state, &sub_label).await;
+                            return self
+                                .refuse_subscription(
+                                    transport,
+                                    state,
+                                    &sub_label,
+                                    SUBSCRIPTION_REFUSED,
+                                )
+                                .await;
                         }
                         Err(other) => return Err(other),
                     }
@@ -9784,6 +10038,12 @@ where
             )
         };
         let table = connetto_core::quote_ident(&member.table);
+        // Project the catalog's columns so a column the live table gained
+        // under the running server stays out of the mirror read.
+        let columns = self
+            .shapes
+            .select_list_named(self.catalog.as_ref(), &member.table)
+            .map_err(|err| SessionError::Snapshot(err.to_string()))?;
         let predicate = mirror_predicate(
             member,
             identity_function.as_deref(),
@@ -9800,7 +10060,7 @@ where
                     .to_owned(),
             })
         })?;
-        let query = format!("SELECT * FROM {table} WHERE {predicate}");
+        let query = format!("SELECT {columns} FROM {table} WHERE {predicate}");
         let hidden = Subscribe {
             sub_id: label.clone(),
             spec: SubscriptionSpec::new(query),
@@ -9954,7 +10214,9 @@ where
                         error = %detail,
                         "replacing a subscription was refused, ending it"
                     );
-                    return self.refuse_subscription(transport, state, sub_label).await;
+                    return self
+                        .refuse_subscription(transport, state, sub_label, SUBSCRIPTION_REFUSED)
+                        .await;
                 }
                 Err(other) => return Err(other),
             }
@@ -10124,6 +10386,7 @@ where
             let mut payloads = Vec::new();
             let mut truncated = false;
             let mut unencodable = false;
+            let mut refused_table = None;
             for record in records {
                 if replay.fence.seen(record.position()) != Seen::Missed {
                     continue;
@@ -10137,6 +10400,10 @@ where
                 let Some(departing) = matched else {
                     continue;
                 };
+                if record.is_refusal() {
+                    refused_table = Some(record.table().to_owned());
+                    break;
+                }
                 if record.event().kind() == EventKind::Truncate {
                     truncated = true;
                     break;
@@ -10154,12 +10421,23 @@ where
                     }
                 }
             }
+            if let Some(table) = refused_table {
+                self.resnapshot_row(
+                    transport,
+                    state,
+                    &replay.label,
+                    &FullResyncReason::TableRefused { table },
+                    None,
+                )
+                .await?;
+                continue;
+            }
             if truncated || unencodable {
                 tracing::warn!(
                     sub_id = %replay.label,
                     "a missed record the client cannot be sent is refused instead"
                 );
-                self.refuse_subscription(transport, state, &replay.label)
+                self.refuse_subscription(transport, state, &replay.label, SUBSCRIPTION_REFUSED)
                     .await?;
                 continue;
             }
@@ -10365,7 +10643,9 @@ where
         // A page above the ceiling is not a transient failure and a restart
         // would meet the same row, so this one ends the subscription.
         if admit_page(&label, &page, max_rows, average_width, limits).is_err() {
-            return self.refuse_subscription(transport, state, &label).await;
+            return self
+                .refuse_subscription(transport, state, &label, SUBSCRIPTION_REFUSED)
+                .await;
         }
         // Size the next page from what this one measured rather than from the
         // prediction, which cannot see the true size of a value stored out of
@@ -10421,7 +10701,9 @@ where
         let label = start.sub.sub_id.clone();
         if start.restarted {
             let _ = refuse_read(&label, &SubscribeRefusal::Interrupted(detail.to_owned()));
-            return self.refuse_subscription(transport, state, &label).await;
+            return self
+                .refuse_subscription(transport, state, &label, SUBSCRIPTION_REFUSED)
+                .await;
         }
         tracing::warn!(
             sub_id = %label,
@@ -10444,19 +10726,21 @@ where
             Ok(()) => Ok(()),
             Err(SessionError::Snapshot(detail) | SessionError::ReadRefused(detail)) => {
                 let _ = refuse_read(&label, &SubscribeRefusal::Interrupted(detail));
-                self.refuse_subscription(transport, state, &label).await
+                self.refuse_subscription(transport, state, &label, SUBSCRIPTION_REFUSED)
+                    .await
             }
             Err(other) => Err(other),
         }
     }
 
     /// Give up on one subscription: tear the registration down and answer with
-    /// the one fixed phrase (R38).
+    /// `detail`, one of the fixed phrases (R38).
     async fn refuse_subscription<T: Transport>(
         &self,
         transport: &mut T,
         state: &mut SessionState<Id, Key>,
         label: &str,
+        detail: &'static str,
     ) -> Result<(), SessionError> {
         for (consumer_id, sub_id) in take_row_subscription(state, label) {
             self.remove_route(consumer_id).await;
@@ -10465,7 +10749,7 @@ where
         transport
             .send_control(ControlMessage::NonFatalError(NonFatalError {
                 related_to: Some(label.to_owned()),
-                detail: SUBSCRIPTION_REFUSED.to_owned(),
+                detail: detail.to_owned(),
             }))
             .await
             .map_err(transport_err)
@@ -10569,7 +10853,7 @@ where
                     .await
             }
             CatchupWait::Ready(WaveEnd::Refused) => {
-                self.refuse_subscription(transport, state, &sub.sub_id)
+                self.refuse_subscription(transport, state, &sub.sub_id, SUBSCRIPTION_REFUSED)
                     .await
             }
             CatchupWait::Ready(WaveEnd::Failed(error)) => Err(error),
@@ -11008,11 +11292,9 @@ where
         let event = record.event();
         // A truncate replays as a patchset with no operations, so applying it would leave the emptied table populated (R48), and everything after it arrives again in the replacement.
         if event.kind() == EventKind::Truncate {
-            let table = self.event_table(event);
+            let reason = resync_reason(record, self.event_table(event));
             for (at, _) in reached {
-                members[at].end(WaveEnd::Resync(FullResyncReason::TableTruncated {
-                    table: table.clone(),
-                }));
+                members[at].end(WaveEnd::Resync(reason.clone()));
             }
             return;
         }
@@ -11329,8 +11611,9 @@ where
     /// the shared re-execution bound, because that path holds the
     /// materializer lock.
     ///
-    /// `resync` goes out once the answer exists and ahead of it, so a client
-    /// replacing an answer drops the old one only for a new one.
+    /// `resync` goes out once the answer exists and ahead of its column
+    /// declaration and rows, so a client replacing an answer drops the old
+    /// one only for a new one.
     async fn subscribe_computed<T: Transport>(
         &self,
         transport: &mut T,
@@ -11348,6 +11631,21 @@ where
                     .refuse_computed_subscribe(transport, sub.sub_id, subscription_id, &err)
                     .await;
             }
+        };
+        let columns = self
+            .materializer
+            .lock()
+            .await
+            .computed_columns(subscription_id);
+        let Some(columns) = columns else {
+            return self
+                .refuse_computed_subscribe(
+                    transport,
+                    sub.sub_id,
+                    subscription_id,
+                    &"computed columns are unavailable",
+                )
+                .await;
         };
 
         self.add_computed_route(
@@ -11367,14 +11665,18 @@ where
                 .await
                 .map_err(transport_err)?;
         }
+        transport
+            .send_control(ControlMessage::AggregateColumns(AggregateColumns {
+                sub_id: sub.sub_id.clone(),
+                columns,
+            }))
+            .await
+            .map_err(transport_err)?;
         for change in changes {
             transport
                 .send_control(ControlMessage::AggregateUpdate(AggregateUpdate {
                     sub_id: sub.sub_id.clone(),
-                    group_key: change.group_key,
-                    group_values_json: change.group_values_json,
-                    result_json: change.result_json,
-                    is_full_result: change.is_full_result,
+                    change: change.change,
                 }))
                 .await
                 .map_err(transport_err)?;
@@ -11588,6 +11890,107 @@ mod tests {
     use crate::timeline::{Position, TimelineHistory};
     use connetto_core::Cursor;
     use subql::{PgCommitPosition, PgLsn, PgXid};
+
+    /// A write to a table the drift guard refused is rejected as a schema
+    /// mismatch, which names nothing about the table (R107 decision 11, R38).
+    #[test]
+    fn a_write_to_a_refused_table_is_a_schema_mismatch() {
+        let refused = crate::materializer::MaterializerError::Refused(
+            subql::patchset::ApplyError::RefusedTable {
+                table: "docs".to_owned(),
+                reasons: vec![subql::Incompatibility::Unpublished],
+            },
+        );
+        assert_eq!(
+            super::reject_reason(&refused),
+            connetto_core::messages::MutationRejectReason::SchemaMismatch
+        );
+    }
+
+    /// A membership term over a table its bare name does not reach is refused
+    /// before any read, since the seed, the mirror and the replica name the
+    /// table bare. Off the search path the bare name reaches nothing, beside a
+    /// public twin it reaches the twin, and a search path naming another schema
+    /// first shadows a table declared without one. The server's own builder
+    /// refuses such a catalog at boot, so the materializer here takes its
+    /// translator directly, as a manager built over a caller's own materializer
+    /// does.
+    #[test]
+    fn a_membership_table_its_bare_name_misses_is_refused() {
+        const DOCS: &str = "CREATE TABLE docs (id BIGINT PRIMARY KEY, project_id BIGINT NOT NULL);";
+        const ORG: &str = "CREATE SCHEMA org;\nCREATE TABLE org.project_members (project_id BIGINT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (project_id, user_id));";
+        const PUBLIC: &str = "CREATE TABLE project_members (project_id BIGINT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (project_id, user_id));";
+        const ORG_FIRST: &str = "SET search_path TO org, public;";
+        const READER: &str = "app_reader";
+        let term = |column: &str, member_table: &str| {
+            format!(
+                "{column} IN (SELECT project_id FROM {member_table} WHERE user_id = current_app_user())"
+            )
+        };
+        let member_tables = |ddl: &str, filter: &str| {
+            let translator = rls2fga::translator::TranslatorBuilder::new(
+                connetto_schema::deployment::<String>(READER)
+                    .expect("the test deployment's description holds"),
+            )
+            .with_min_confidence(rls2fga::types::ConfidenceLevel::B)
+            .build();
+            let materializer = crate::materializer::Materializer::builder(ddl)
+                .with_translator(translator)
+                .with_caller(
+                    crate::materializer::CallerMappings::of::<String>(READER)
+                        .expect("the test deployment's description holds"),
+                )
+                .build()
+                .expect("the catalog parses");
+            let pg_sql = materializer
+                .translate_subscription_sql(&format!("SELECT * FROM docs WHERE {filter}"))
+                .expect("the caller function reverse translates");
+            let terms = materializer
+                .describe_terms(1, &pg_sql, &[], None, Vec::new())
+                .expect("the membership term describes");
+            let member_tables = super::member_tables_of(&terms, materializer.catalog());
+            (terms.len(), member_tables)
+        };
+        for (ddl, member_table, refused) in [
+            (
+                format!("{DOCS}\n{ORG}"),
+                "org.project_members",
+                "org.project_members",
+            ),
+            (
+                format!("{DOCS}\n{PUBLIC}\n{ORG}"),
+                "org.project_members",
+                "org.project_members",
+            ),
+            (
+                format!("{DOCS}\n{PUBLIC}\n{ORG_FIRST}\n{ORG}"),
+                "public.project_members",
+                "project_members",
+            ),
+        ] {
+            match member_tables(&ddl, &term("project_id", member_table)).1 {
+                Err(SubscribeRefusal::MembershipTableUnreachable(table)) => {
+                    assert_eq!(table, refused);
+                }
+                other => panic!("expected {member_table} refused over {ddl}, got {other:?}"),
+            }
+        }
+        // Two terms over the one reached table share its single entry.
+        let (described, reached) = member_tables(
+            &format!("{DOCS}\n{PUBLIC}\n{ORG}"),
+            &format!(
+                "{} AND {}",
+                term("project_id", "project_members"),
+                term("id", "project_members")
+            ),
+        );
+        assert_eq!(described, 2, "both terms describe");
+        let reached = reached.expect("the table the bare name reaches is watched");
+        let [watched] = &reached[..] else {
+            panic!("one membership table, got {reached:?}");
+        };
+        assert_eq!(watched.table, "project_members");
+    }
 
     /// Bytes released by a sent patch make room again, and an overflow stays final even once the queue drains.
     #[test]
@@ -11878,6 +12281,49 @@ mod tests {
         assert!(concerns(&caller(Some("alice"), &[]), &holder));
         assert!(concerns(&caller(None, &["key:a"]), &holder));
         assert!(concerns(&caller(None, &[]), &holder));
+    }
+
+    #[test]
+    fn aggregate_budget_counts_typed_values_and_payloads() {
+        use super::{AggregateChange, AggregateUpdate, OUTBOUND_ITEM_BYTES, Outbound, SqliteValue};
+
+        let row = vec![
+            SqliteValue::Null,
+            SqliteValue::Integer(7),
+            SqliteValue::Real(1.5),
+            SqliteValue::Text("text".to_owned()),
+            SqliteValue::Blob(vec![1, 2, 3]),
+        ];
+        let row_bytes =
+            u64::try_from(5 * std::mem::size_of::<SqliteValue>() + 7).expect("row size fits");
+        let base = OUTBOUND_ITEM_BYTES + 4;
+        let update = |change| {
+            Outbound::Aggregate(AggregateUpdate {
+                sub_id: "stat".to_owned(),
+                change,
+            })
+        };
+        assert_eq!(
+            update(AggregateChange::Upsert {
+                key: vec![1, 2],
+                row: row.clone(),
+            })
+            .budgeted(),
+            base + 2 + row_bytes,
+        );
+        assert_eq!(
+            update(AggregateChange::Replace { rows: vec![row] }).budgeted(),
+            base + row_bytes
+                + u64::try_from(std::mem::size_of::<Vec<SqliteValue>>()).expect("vector size fits"),
+        );
+        assert_eq!(
+            update(AggregateChange::Remove { key: vec![1, 2] }).budgeted(),
+            base + 2,
+        );
+        assert_eq!(
+            update(AggregateChange::Replace { rows: Vec::new() }).budgeted(),
+            base,
+        );
     }
 
     /// The failed connect that opened the episode is itself one of the

@@ -391,7 +391,19 @@ where
             "serializing the user id for the replica name: {err}"
         ))
     })?;
-    let digest = Sha256::digest(&canonical);
+    Ok(name_of_canonical(prefix, &canonical))
+}
+
+/// The replica name of the stored account `account`, which is what
+/// [`encode_identity`] wrote, the same bytes [`replica_db_name`] hashes.
+#[cfg(feature = "native-auth")]
+pub(crate) fn replica_name_of_account(prefix: &str, account: &str) -> String {
+    name_of_canonical(prefix, account.as_bytes())
+}
+
+/// `prefix`, a dash and the leading hex digits of the digest of `canonical`.
+fn name_of_canonical(prefix: &str, canonical: &[u8]) -> String {
+    let digest = Sha256::digest(canonical);
     let mut name = String::with_capacity(prefix.len() + 1 + DIGEST_HEX_LEN);
     name.push_str(prefix);
     name.push('-');
@@ -401,7 +413,7 @@ where
         name.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
         name.push(char::from_digit(u32::from(byte & 0x0f), 16).unwrap_or('0'));
     }
-    Ok(name)
+    name
 }
 
 /// The credential-store record naming the account this device last signed in

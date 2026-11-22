@@ -664,6 +664,26 @@ impl NativeAuthenticator {
             .clone()
     }
 
+    /// Every account the refresh store holds a credential for.
+    pub(crate) async fn stored_accounts(&self) -> Result<Vec<String>, ClientError> {
+        self.store.accounts().await
+    }
+
+    /// This authenticator's server and store addressing `account`, so the
+    /// session of a stored account that is not the live one can be revoked.
+    pub(crate) fn for_account(&self, account: String) -> Self {
+        Self {
+            server_base: self.server_base.clone(),
+            login_base: self.login_base.clone(),
+            provider: self.provider.clone(),
+            store: Arc::clone(&self.store),
+            account: std::sync::Mutex::new(Some(account)),
+            opener: Arc::clone(&self.opener),
+            claimed: None,
+            http: self.http.clone(),
+        }
+    }
+
     /// Clear the stored credential without asking the server, for a session
     /// the server already ended (R105 decision 10). Idempotent.
     pub(crate) async fn forget_credential(&self) -> Result<(), ClientError> {

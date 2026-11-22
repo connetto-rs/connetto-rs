@@ -16,12 +16,10 @@ workspace = true
 
 [features]
 default = ["native-transport"]
-# The native WebSocket transport plus the tokio conveniences built on it:
-# NativeClientBuilder and the client binary. Wasm builds leave this off,
-# inject their own transport, and drive the pump with spawn_local.
+# The native WebSocket transport plus the tokio conveniences built on it,
+# `NativeClientBuilder` among them. Wasm builds leave this off, inject their
+# own transport, and drive the pump with spawn_local.
 native-transport = [
-  "connetto-core/env",
-  "connetto-core/logging",
   "connetto-core/native-transport",
   "tokio/rt",
   "tokio/rt-multi-thread",
@@ -29,11 +27,6 @@ native-transport = [
   "tokio/io-util",
   "dep:getrandom",
 ]
-# Aggregate decode support for the Postgres-only diesel SQL types `Uuid` and
-# `Timestamptz`. Their diesel markers live behind diesel's postgres_backend
-# (no libpq), which the orphan rule forbids a downstream crate from mapping, so
-# they are opt-in here rather than forced on every SQLite-only client.
-postgres-types = ["diesel/postgres_backend"]
 # A bot registering itself over a live connection (R91): the Ed25519
 # signature over the connection's nonce. Native only, like `native-auth`,
 # because ring does not build for the browser's wasm target.
@@ -75,21 +68,10 @@ native-auth = [
   "dep:open",
   "dep:connetto-schema",
   "dep:getrandom",
-  "tokio/signal",
 ]
 # A media port over a bare peer node, for the proofs of a media consumer
 # that runs without an enrolled client. Test builds only.
 test-support = ["peer"]
-
-[[bin]]
-name = "connetto-client"
-path = "src/bin/connetto-client.rs"
-required-features = ["native-transport", "native-auth"]
-
-# The container custody test runs this against a mounted wrap-key file (R71).
-[[example]]
-name = "secret_store_probe"
-required-features = ["native-auth"]
 
 [dependencies]
 # Wire types and framing. The native transports ride the feature above. The
@@ -152,10 +134,8 @@ tokio = { version = "1", default-features = false, features = [
 thiserror.workspace = true
 # The hotspot machine's answer, waited on by the API methods (R76).
 parking_lot = "0.12"
-# Binary error handling (connetto-client bin).
-anyhow.workspace = true
 # Structured logging (R12). The facade only: a library emits and installs no
-# destination, and the binary installs `connetto_core::logging`.
+# destination, and each program installs `connetto_core::logging`.
 tracing = { version = "0.1", default-features = false, features = [
   "std",
   "attributes",
@@ -332,7 +312,7 @@ connetto-core = { workspace = true, features = ["test-support"] }
 # Postgres path now (pg-async), so the harness supplies the fixture. The CDC
 # source stays the SQLite emulator, so reads are Docker-free and only the
 # write-path assertions need Postgres.
-connetto-server = { path = "../connetto-server", features = ["test-seams"] }
+connetto-server = { path = "../connetto-server", features = ["test-seams", "rosetta-uuid"] }
 connetto-test-harness = { path = "../connetto-test-harness" }
 # The loop and handshake tests derive the schema version the server compares
 # against, through the same translated-bundle step the server itself runs.
@@ -364,9 +344,13 @@ pg2sqlite = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main",
 # The watch_fn boxed-row test drives a live query whose row type carries a
 # strongly typed `rosetta_uuid::Uuid` primary key (stored as a SQLite BLOB) and
 # a `bool` column, the same key strategy the demos use, rather than raw bytes.
-# The native-auth test additionally serves it as the project's typed user id
-# across the token endpoint, which needs serde both ways.
-rosetta-uuid = { version = "0.2.0", features = ["diesel", "sqlite", "serde"] }
+# The native-auth test additionally serves it as the project's typed user id,
+# stored as a Postgres `uuid` on the server and carried across the token
+# endpoint, which needs serde both ways.
+rosetta-uuid = { version = "0.2.0", features = ["diesel", "sqlite", "postgres", "serde"] }
+# The typed aggregate proof watches the maximum of a `timestamptz` column
+# decoded into `rosetta_utc::TimestampUTC`.
+rosetta-utc = { version = "0.2.0", features = ["diesel", "sqlite"] }
 # The native-auth test serves connetto-server's auth router on a real port and
 # drives the browser round-trip with a redirect-following-disabled HTTP client.
 axum = { workspace = true }

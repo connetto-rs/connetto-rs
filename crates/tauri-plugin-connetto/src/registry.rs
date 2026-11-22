@@ -36,6 +36,9 @@ pub(crate) trait Answering: Send {
 
     /// Wait until the answer changes.
     fn changed(&mut self) -> Boxed<'_, Result<(), ClientError>>;
+
+    /// The id of the watch the feed follows.
+    fn sub_id(&self) -> &str;
 }
 
 /// A feed answered whole.
@@ -51,6 +54,10 @@ where
 
     fn changed(&mut self) -> Boxed<'_, Result<(), ClientError>> {
         Box::pin(self.0.changed())
+    }
+
+    fn sub_id(&self) -> &str {
+        self.0.sub_id()
     }
 }
 
@@ -77,6 +84,10 @@ where
 
     fn changed(&mut self) -> Boxed<'_, Result<(), ClientError>> {
         Box::pin(self.feed.changed())
+    }
+
+    fn sub_id(&self) -> &str {
+        self.feed.sub_id()
     }
 }
 

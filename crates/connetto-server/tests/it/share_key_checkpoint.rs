@@ -20,7 +20,7 @@ impl SnapshotSource for SnapshotAtLogPosition {
     async fn estimate(
         &self,
         sql: &str,
-        binds: &[connetto_core::messages::BindValue],
+        binds: &[connetto_core::messages::SqliteValue],
         caller: &Principal,
     ) -> Result<SnapshotEstimate, Self::Error> {
         self.inner.estimate(sql, binds, caller).await
@@ -29,7 +29,7 @@ impl SnapshotSource for SnapshotAtLogPosition {
     async fn snapshot_page(
         &self,
         sql: &str,
-        binds: &[connetto_core::messages::BindValue],
+        binds: &[connetto_core::messages::SqliteValue],
         caller: &Principal,
         page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {

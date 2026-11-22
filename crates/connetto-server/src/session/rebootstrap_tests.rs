@@ -5,8 +5,8 @@ use std::time::Duration;
 use connetto_core::SessionId;
 use connetto_core::auth::{CapabilitySubject, Principal};
 use connetto_core::messages::{
-    ControlMessage, FullResyncReason, Ping, SUBSCRIPTION_REFUSED, Subscribe, SubscriptionSpec,
-    Unsubscribe,
+    AggregateChange, ColumnType, ControlMessage, FullResyncReason, Ping, SUBSCRIPTION_REFUSED,
+    SqliteValue, Subscribe, SubscriptionSpec, Unsubscribe,
 };
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
@@ -127,15 +127,26 @@ async fn subscribe(
         .expect("subscribe");
 }
 
-async fn answer(client: &mut LoopbackTransport, expected: impl Into<serde_json::Value>) {
+/// Read the statistic's column declaration. A per-viewer statistic is
+/// answered by a re-read, which subql leaves untyped, so its one output is
+/// declared `ANY`.
+async fn columns(client: &mut LoopbackTransport) {
+    let ControlMessage::AggregateColumns(columns) = next_control(client).await else {
+        panic!("expected aggregate columns");
+    };
+    assert_eq!(columns.sub_id, LABEL);
+    assert_eq!(columns.columns, vec![ColumnType::Any]);
+}
+
+async fn answer(client: &mut LoopbackTransport, expected: SqliteValue) {
     let ControlMessage::AggregateUpdate(answer) = next_control(client).await else {
         panic!("expected aggregate answer");
     };
     assert_eq!(answer.sub_id, LABEL);
-    let actual: serde_json::Value =
-        serde_json::from_str(answer.result_json.as_deref().expect("aggregate body"))
-            .expect("aggregate JSON");
-    assert_eq!(actual, expected.into());
+    let AggregateChange::Replace { rows } = answer.change else {
+        panic!("expected scalar replacement");
+    };
+    assert_eq!(rows, vec![vec![expected]]);
 }
 
 async fn swap(manager: &Manager, state: &mut State, key: &str) {
@@ -204,7 +215,8 @@ async fn a_queued_rebootstrap_cannot_resurrect_an_unsubscribed_label() {
         "SELECT COUNT(*) FROM notes",
     )
     .await;
-    answer(&mut client, 2).await;
+    columns(&mut client).await;
+    answer(&mut client, SqliteValue::Integer(2)).await;
     swap(&manager, &mut state, "key:b").await;
     let job = queued(&mut state.outbound_rx).await;
     unsubscribe(&manager, &mut server, &mut state).await;
@@ -224,7 +236,8 @@ async fn a_queued_rebootstrap_cannot_replace_a_new_subscription_using_the_label(
         "SELECT COUNT(*) FROM notes",
     )
     .await;
-    answer(&mut client, 2).await;
+    columns(&mut client).await;
+    answer(&mut client, SqliteValue::Integer(2)).await;
     swap(&manager, &mut state, "key:b").await;
     let job = queued(&mut state.outbound_rx).await;
     unsubscribe(&manager, &mut server, &mut state).await;
@@ -235,7 +248,8 @@ async fn a_queued_rebootstrap_cannot_replace_a_new_subscription_using_the_label(
         "SELECT SUM(amount) FROM notes",
     )
     .await;
-    answer(&mut client, "30").await;
+    columns(&mut client).await;
+    answer(&mut client, SqliteValue::Text("30".to_owned())).await;
     assert_no_job_output(&manager, &mut server, &mut client, &mut state, job).await;
     swap(&manager, &mut state, "key:c").await;
     let job = queued(&mut state.outbound_rx).await;
@@ -249,7 +263,8 @@ async fn a_queued_rebootstrap_cannot_replace_a_new_subscription_using_the_label(
         next_control(&mut client).await,
         ControlMessage::FullResyncRequired(_)
     ));
-    answer(&mut client, "40").await;
+    columns(&mut client).await;
+    answer(&mut client, SqliteValue::Text("40".to_owned())).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -265,7 +280,8 @@ async fn repeated_key_changes_replace_a_pending_statistic_once_under_the_current
         "SELECT SUM(amount) FROM notes",
     )
     .await;
-    answer(&mut client, "10").await;
+    columns(&mut client).await;
+    answer(&mut client, SqliteValue::Text("10".to_owned())).await;
     swap(&manager, &mut state, "key:b").await;
     let first = queued(&mut state.outbound_rx).await;
     swap(&manager, &mut state, "key:c").await;
@@ -278,9 +294,10 @@ async fn repeated_key_changes_replace_a_pending_statistic_once_under_the_current
     let ControlMessage::FullResyncRequired(notice) = next_control(&mut client).await else {
         panic!("replacement must invalidate the old answer");
     };
+    columns(&mut client).await;
     assert_eq!(notice.sub_id, LABEL);
     assert_eq!(notice.reason, FullResyncReason::AuthorizationChange);
-    answer(&mut client, "40").await;
+    answer(&mut client, SqliteValue::Text("40".to_owned())).await;
     while let Ok(job) = state.outbound_rx.try_recv() {
         assert_no_job_output(&manager, &mut server, &mut client, &mut state, job).await;
     }
@@ -299,7 +316,8 @@ async fn a_failed_rebootstrap_releases_its_label_for_a_new_subscription() {
         "SELECT COUNT(*) FROM notes",
     )
     .await;
-    answer(&mut client, 2).await;
+    columns(&mut client).await;
+    answer(&mut client, SqliteValue::Integer(2)).await;
     swap(&manager, &mut state, "key:b").await;
     let job = queued(&mut state.outbound_rx).await;
     fixture
@@ -326,7 +344,8 @@ async fn a_failed_rebootstrap_releases_its_label_for_a_new_subscription() {
         "SELECT SUM(amount) FROM notes",
     )
     .await;
-    answer(&mut client, "30").await;
+    columns(&mut client).await;
+    answer(&mut client, SqliteValue::Text("30".to_owned())).await;
 }
 
 async fn row_snapshot(client: &mut LoopbackTransport) {

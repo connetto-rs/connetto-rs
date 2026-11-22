@@ -175,6 +175,11 @@ mod truncate_resync;
 
 mod two_majors;
 
+mod typed_statistics;
+
+#[cfg(feature = "native-auth")]
+mod unsynced_live;
+
 mod uuid_rls_default;
 
 #[cfg(feature = "native-auth")]

@@ -112,7 +112,7 @@ Row-level security cannot supply the previous-version answer, because the answer
 
 The previous version comes from the change log, which requires `REPLICA IDENTITY FULL` on the tables the publication carries, because `DEFAULT` records only the primary key columns and nothing at all when a table has no primary key. The preflight artifact `PreviousImages` checks it at startup and names every table to fix, scoped to the publication rather than the database, because connetto keeps its own bookkeeping tables in the same database and replicates none of them.
 
-A table altered after startup refuses to serve. The condition is permanent for that table, so the change path does not hold the event and retry. `SessionError::ChangeStreamUnusable` escapes the reconnect loop, every connection is closed and the process exits, and the restart meets the startup refusal naming the table.
+A table whose replica identity is weakened after startup is refused, and every other table keeps serving. The drift guard reports the change, so the table's events never reach the change path, its subscriptions and every subscription whose policy reads it are closed, and a write to it is answered `SchemaMismatch`. The table stays refused until the process restarts, and the restart meets the startup refusal naming the table.
 
 Reconnect catchup re-answers per client from connetto's own oplog rather than from the change stream, and the oplog stores the whole change event, so the previous image survives the round trip.
 
@@ -180,7 +180,7 @@ File metadata is authorized as an ordinary row on the files table, by the same p
 
 The content path binds the caller the same way the data path does, at four places. The ticket mint, where the session checks the file's visibility on the reader pool before it mints anything, and the file server's serve recheck, its needed-hashes answer and its commit dedup check. In each, the caller is bound under the names the deployment's policies read, by [`connetto_file_server::CallerSettings`] and `bind_caller` in [caller.rs](../../crates/connetto-file-server/src/caller.rs), so a caller whose rights come from a share key is answered on its keys and a caller with a login on its login. The ticket carries the caller, so the checks after the mint run on what the ticket says rather than on what the connection says. The ticket model itself is in [18-file-handling.md](18-file-handling.md#the-wire-tickets-and-the-mint).
 
-Every fetch rechecks the file's visibility to the ticket's caller, so a revoked share or grant denies at once. A ticket does outlive the session that minted it, so a revoked or ended session can still read through one until it expires, [G5](../../plans/master-implementation-plan.md#g5). Binding the ticket to its session is planned in [R109](../../plans/master-implementation-plan.md#r109-content-tickets-bound-to-their-session).
+Every fetch rechecks the file's visibility to the ticket's caller, so a revoked share or grant denies at once. A ticket minted under a login also dies with its session, because every ticketed request and the mint ask the auth store whether that session is still live, [18-file-handling.md](18-file-handling.md#the-wire-tickets-and-the-mint).
 
 ## When the authorization service is unreachable
 

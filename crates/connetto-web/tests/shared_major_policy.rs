@@ -7,7 +7,10 @@ use connetto_client::{
     ClientBuilder, ClientError, ClientEvent, ConnettoConnection, ContentPlace, Custody, FirstThen,
     Gate, Grant, HeldCredential, Located, ReplicaKey, ReplicaPlace, SyncSchema, UnsyncedWrite,
 };
-use connetto_core::messages::{AggregateUpdate, ControlMessage, SnapshotEnd, SubscriptionSpec};
+use connetto_core::messages::{
+    AggregateChange, AggregateColumns, AggregateUpdate, ColumnType, ControlMessage, SnapshotEnd,
+    SqliteValue, SubscriptionSpec,
+};
 use connetto_core::schema::{SchemaBundle, SharedLayout};
 use connetto_core::test_support::FakeTransport;
 use connetto_core::traits::{ReplicaKeyStore, Transport};
@@ -141,25 +144,6 @@ diesel::table! {
 }
 
 diesel::table! {
-    /// The rested aggregate answers, cleared with the resume state.
-    #[sql_name = "_connetto_aggregates"]
-    aggregates (query_id, binds, group_key) {
-        /// The query row the value belongs to.
-        query_id -> Integer,
-        /// The subscription's binds.
-        binds -> Binary,
-        /// The group key, empty for a scalar.
-        group_key -> Binary,
-        /// The group values, when there are any.
-        group_values_json -> Nullable<Text>,
-        /// The `JSON` the server pushed.
-        result_json -> Text,
-        /// When the value was last written.
-        updated_at -> BigInt,
-    }
-}
-
-diesel::table! {
     /// The registered query specs a lifetime change keeps.
     #[sql_name = "_connetto_query"]
     query (id) {
@@ -185,6 +169,15 @@ diesel::table! {
         /// Its grace in seconds.
         grace_secs -> Integer,
     }
+}
+
+/// The resting table of every statistic the replica rests.
+fn rested_tables(conn: &mut SqliteConnection) -> Vec<String> {
+    diesel::dsl::sql::<diesel::sql_types::Text>(
+        "SELECT name FROM sqlite_master WHERE name LIKE '\\_connetto\\_stat\\_%' ESCAPE '\\'",
+    )
+    .load(conn)
+    .expect("list the resting tables")
 }
 
 /// One queued entry's stored bytes, chain hash and capture major.
@@ -423,12 +416,15 @@ async fn seeded_run(
             sub_id: "resume".to_owned(),
             cursor: Cursor::new(RESUME_CURSOR.to_vec()),
         })),
+        IncomingFrame::Control(ControlMessage::AggregateColumns(AggregateColumns {
+            sub_id: "statistic".to_owned(),
+            columns: vec![ColumnType::Integer],
+        })),
         IncomingFrame::Control(ControlMessage::AggregateUpdate(AggregateUpdate {
             sub_id: "statistic".to_owned(),
-            group_key: None,
-            group_values_json: None,
-            result_json: Some("42".to_owned()),
-            is_full_result: true,
+            change: AggregateChange::Replace {
+                rows: vec![vec![SqliteValue::Integer(42)]],
+            },
         })),
     ]))
     .await
@@ -839,11 +835,8 @@ async fn a_replaced_shared_cache_clears_resume_state_but_keeps_pending_work() {
         "the replay cursor is cleared: {meta_row:?}"
     );
     assert_eq!(
-        aggregates::table
-            .count()
-            .get_result::<i64>(&mut *conn.conn())
-            .expect("count the rested values"),
-        0,
+        rested_tables(&mut *conn.conn()),
+        Vec::<String>::new(),
         "the rested statistic is cleared"
     );
     let subs: Vec<(String, Option<String>)> = subscription::table
@@ -925,11 +918,15 @@ async fn a_same_generation_reopen_keeps_the_accounts_resume_state() {
         RESUME_CURSOR.to_vec(),
         "the replay cursor survives the reopen"
     );
-    let rested: String = aggregates::table
-        .select(aggregates::result_json)
-        .first(&mut *conn.conn())
-        .expect("read the rested value");
-    assert_eq!(rested, "42", "the rested statistic survives the reopen");
+    let tables = rested_tables(&mut *conn.conn());
+    let [table] = tables.as_slice() else {
+        panic!("the statistic rests in one table: {tables:?}");
+    };
+    let rested: i64 =
+        diesel::dsl::sql::<diesel::sql_types::BigInt>(&format!("SELECT c0 FROM \"{table}\""))
+            .get_result(&mut *conn.conn())
+            .expect("read the rested value");
+    assert_eq!(rested, 42, "the rested statistic survives the reopen");
     let subs: Vec<(String, Option<String>)> = subscription::table
         .select((subscription::id, subscription::pin_name))
         .load(&mut *conn.conn())

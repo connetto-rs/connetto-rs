@@ -13,6 +13,8 @@ use connetto_core::messages::{
 };
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{ContentTicketSigner, IncomingFrame, Transport};
+use connetto_core::traits::{GrantCheckFuture, HandleError, HandshakeAuthority};
+use connetto_core::{LivenessFuture, LivenessUnknown, SessionId, SessionLiveness};
 use connetto_server::{
     AbuseConfig, InMemoryOplog, LoopbackTransport, ManagerBuilder, Materializer, NoConnector,
     PageSpec, RequestGuard, SessionError, SessionManager, SnapshotEstimate, SnapshotPage,
@@ -75,7 +77,7 @@ impl SnapshotSource for NeverSnapshot {
     async fn estimate(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &connetto_core::Principal,
     ) -> Result<SnapshotEstimate, Self::Error> {
         Ok(SnapshotEstimate {
@@ -91,7 +93,7 @@ impl SnapshotSource for NeverSnapshot {
     async fn snapshot_page(
         &self,
         _select_sql: &str,
-        _binds: &[connetto_core::messages::BindValue],
+        _binds: &[connetto_core::messages::SqliteValue],
         _caller: &connetto_core::Principal,
         _page: &PageSpec,
     ) -> Result<SnapshotPage, Self::Error> {
@@ -459,13 +461,35 @@ pub(crate) fn build_manager_named_setting<
     signer: S,
     user_setting: &str,
 ) -> Arc<TicketManager<S>> {
+    build_manager_answering(
+        reader_pool,
+        roster,
+        guard,
+        signer,
+        user_setting,
+        Arc::new(TestGrantChecker),
+    )
+}
+
+/// [`build_manager_named_setting`] whose grants and session liveness
+/// `authority` answers.
+pub(crate) fn build_manager_answering<
+    S: ContentTicketSigner + core::marker::Send + core::marker::Sync + 'static,
+>(
+    reader_pool: Pool<AsyncPgConnection>,
+    roster: RosterAuth,
+    guard: Arc<RequestGuard<String>>,
+    signer: S,
+    user_setting: &str,
+    authority: Arc<dyn HandshakeAuthority>,
+) -> Arc<TicketManager<S>> {
     ManagerBuilder::new(
         Materializer::builder(PG_DDL)
             .build()
             .expect("build materializer"),
         NeverSnapshot,
         roster,
-        Arc::new(TestGrantChecker),
+        authority,
         NoConnector,
         pg_write_target::<ConnettoDefaults>(reader_pool, PG_DDL)
             .expect("build write target")
@@ -474,6 +498,41 @@ pub(crate) fn build_manager_named_setting<
     .with_guard(guard)
     .with_signer(signer)
     .build()
+}
+
+/// [`TestGrantChecker`]'s grants, with every login session it is asked about
+/// answered by `live`: `Ok(false)` for a session that ended, `Err` for a
+/// store that cannot answer. Every question is counted.
+pub(crate) struct AnsweringAuthority {
+    pub(crate) live: Result<bool, LivenessUnknown>,
+    pub(crate) asked: Arc<std::sync::Mutex<usize>>,
+}
+
+impl SessionLiveness for AnsweringAuthority {
+    fn session_is_live(&self, _session_id: SessionId) -> LivenessFuture<'_> {
+        *self
+            .asked
+            .lock()
+            .expect("the question counter's mutex is never poisoned") += 1;
+        Box::pin(core::future::ready(self.live.clone()))
+    }
+}
+
+/// The checker [`AnsweringAuthority`] delegates its grants and handles to.
+static CHECKER: TestGrantChecker = TestGrantChecker;
+
+impl HandshakeAuthority for AnsweringAuthority {
+    fn check_grant<'a>(&'a self, grant: &'a Grant) -> GrantCheckFuture<'a> {
+        CHECKER.check_grant(grant)
+    }
+
+    fn mint_handle(&self, session_id: SessionId) -> Result<String, HandleError> {
+        CHECKER.mint_handle(session_id)
+    }
+
+    fn read_handle(&self, blob: &str) -> Result<SessionId, HandleError> {
+        CHECKER.read_handle(blob)
+    }
 }
 
 /// Build a session manager whose guard the caller chooses.

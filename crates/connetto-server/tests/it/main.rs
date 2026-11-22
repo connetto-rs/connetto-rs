@@ -16,6 +16,8 @@ mod bots_client;
 
 mod builder_coverage;
 
+mod catalog_reads;
+
 mod ticket_shared;
 
 mod ticket_budget;
@@ -24,17 +26,22 @@ mod ticket_mint;
 
 mod ticket_carried;
 
+mod ticket_session;
+
+mod ticket_logout;
+
 mod audit_catalog;
 
 mod audit_producers;
+
+mod auth_hooks;
+mod auth_hooks_events;
 
 mod audit_table;
 
 mod courier_audit;
 
 mod auth_retry;
-
-mod authorization_facts;
 
 mod authentication;
 
@@ -54,7 +61,7 @@ mod deployment_schema;
 
 mod device_identity;
 
-mod e2e;
+mod drift_refusal;
 
 mod enrolment;
 
@@ -141,8 +148,6 @@ mod share_key_clock;
 mod share_key_reach;
 mod share_key_terms;
 mod share_keys;
-
-mod restore;
 
 mod slot_watch;
 

@@ -12,6 +12,7 @@ mod preflight;
 mod quotas;
 mod restore;
 mod serve;
+mod session_bound;
 mod sweep;
 mod ticket;
 mod upload;

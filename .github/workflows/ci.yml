@@ -345,10 +345,8 @@ jobs:
       matrix:
         include:
           - name: server
-            packages: -p connetto-server
-            # The e2e tests spawn both binaries from the test profile's target dir,
-            # and neither cargo test nor nextest builds another package's bin.
-            bins: -p connetto-server -p connetto-client
+            packages: -p connetto-server -p connetto-demo-tools
+            bins: ''
           - name: client
             packages: -p connetto-client
             bins: ''
@@ -364,6 +362,7 @@ jobs:
               -p connetto-schema
               -p connetto-ca
               -p connetto-test-harness
+              -p connetto-demo-stack
               -p connetto-dioxus
               -p connetto-yew
               -p tauri-plugin-connetto
@@ -371,9 +370,9 @@ jobs:
               -p connetto-peer
               -p connetto-exchange
               -p connetto-demo-support
-            # The offline-exchange proof names the server binary, so the rest
+            # The offline-exchange proof names the demo server, so the rest
             # shard compiles it beside its test binaries.
-            bins: -p connetto-server
+            bins: -p connetto-demo-tools
     steps:
       - uses: actions/checkout@v7
 
@@ -401,11 +400,12 @@ jobs:
       - name: Install stable toolchain
         uses: $/.github/actions/install-rust
 
-      # dbus-daemon backs the fake Secret portal the client suite starts.
-      - name: Install keyring helpers
+      # dbus-daemon backs the fake Secret portal the client suite starts, and
+      # the server links libpq for the drift guard's live catalog reads.
+      - name: Install keyring helpers and libpq
         run: |
           sudo apt-get update
-          sudo apt-get -o DPkg::Lock::Timeout=300 install -y keyutils dbus gnome-keyring libdbus-1-dev pkg-config
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y keyutils dbus gnome-keyring libdbus-1-dev libpq-dev pkg-config
 
       # --all-features turns on connetto-dioxus's desktop feature.
       - name: Install desktop dependencies
@@ -429,7 +429,7 @@ jobs:
         env:
           # The offline-exchange proof reads the binary the build step
           # compiled, so the test does not build a server of its own.
-          CONNETTO_SERVER_BIN: ${{ matrix.name == 'rest' && format('{0}/target/{1}/connetto-server', github.workspace, github.event_name == 'pull_request' && 'testfast' || 'release') || '' }}
+          CONNETTO_SERVER_BIN: ${{ matrix.name == 'rest' && format('{0}/target/{1}/demo-server', github.workspace, github.event_name == 'pull_request' && 'testfast' || 'release') || '' }}
         run: keyctl session -- cargo +stable nextest run --cargo-profile "$CARGO_TEST_PROFILE" --all-features --test-threads 4 ${{ matrix.packages }}
 
       - name: Prune target cache
@@ -501,10 +501,10 @@ jobs:
       - name: Install stable toolchain
         uses: $/.github/actions/install-rust
 
-      - name: Install keyring helpers
+      - name: Install keyring helpers and libpq
         run: |
           sudo apt-get update
-          sudo apt-get -o DPkg::Lock::Timeout=300 install -y keyutils dbus gnome-keyring libdbus-1-dev pkg-config
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y keyutils dbus gnome-keyring libdbus-1-dev libpq-dev pkg-config
 
       - uses: taiki-e/install-action@nextest
 
@@ -612,13 +612,13 @@ jobs:
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get -o DPkg::Lock::Timeout=300 install -y libdbus-1-dev pkg-config
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y libdbus-1-dev libpq-dev pkg-config
 
       - name: Build the browser stack
         run: |
           cargo +stable run \
             --profile "$CARGO_TEST_PROFILE" \
-            -p connetto-test-harness \
+            -p connetto-demo-stack \
             --bin connetto-browser-stack \
             -- \
             --build-only browser-bins
@@ -628,7 +628,7 @@ jobs:
         run: |
           cargo +stable build \
             --profile "$CARGO_TEST_PROFILE" \
-            -p connetto-test-harness \
+            -p connetto-demo-stack \
             --bin connetto-demo-stack \
             --bin connetto-android-proof
           mkdir android-bins
@@ -730,6 +730,11 @@ jobs:
       - name: Mark the prebuilt binaries executable
         run: chmod +x browser-bins/*
 
+      - name: Install the libpq the prebuilt server links
+        run: |
+          sudo apt-get update
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y libpq5
+
       - name: Install stable browser toolchain with the wasm target
         uses: $/.github/actions/install-rust
         with:
@@ -747,7 +752,7 @@ jobs:
 
       - name: Run browser suites
         env:
-          CONNETTO_SERVER_BIN: ${{ github.workspace }}/browser-bins/connetto-server
+          CONNETTO_SERVER_BIN: ${{ github.workspace }}/browser-bins/demo-server
           CONNETTO_TOPOLOGY_BIN: ${{ github.workspace }}/browser-bins/verified-topology
         run: browser-bins/connetto-browser-stack --shard ${{ matrix.shard }}/4
 
@@ -827,6 +832,11 @@ jobs:
       - name: Mark the prebuilt binaries executable
         run: chmod +x browser-bins/* android-bins/*
 
+      - name: Install the libpq the prebuilt server links
+        run: |
+          sudo apt-get update
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y libpq5
+
       - name: Install stable toolchain with the emulator's target
         uses: $/.github/actions/install-rust
         with:
@@ -884,7 +894,7 @@ jobs:
       # The Keystore gate (R52) needs a secure lock screen, so the run sets a throwaway PIN and types it.
       - name: Walk the proof on the emulator
         env:
-          CONNETTO_SERVER_BIN: ${{ github.workspace }}/browser-bins/connetto-server
+          CONNETTO_SERVER_BIN: ${{ github.workspace }}/browser-bins/demo-server
         run: |
           adb -s emulator-5554 shell locksettings set-pin 2580
           android-bins/connetto-demo-stack android-bins/connetto-android-proof --serial emulator-5554 --unlock-pin 2580 --app tauri --apk examples/tauri-leptos-demo/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk

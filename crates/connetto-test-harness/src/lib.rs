@@ -18,10 +18,11 @@ use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::CallerMappings;
 use connetto_server::openfga::{Counted, FgaAuth, StoreUpkeep};
 use connetto_server::{
-    InMemoryOplog, LoopbackTransport, ManagerBuilder, Materializer, NoSigner, OAuthEndpoints,
-    OAuthProviderConfig, OidcProviderConfig, PgReadConnector, PgSnapshotSource, ReconnectEvent,
-    ReconnectPolicy, RequestGuard, RlsAuth, RlsAuthError, RuntimeWritableCatalog, SessionConfig,
-    SessionManager, loopback, pg_write_target,
+    AuthConfig, AuthHooks, AuthService, DbAuthStore, DefaultAuthHooks, InMemoryOplog,
+    LoopbackTransport, ManagerBuilder, Materializer, NoSigner, OAuthEndpoints, OAuthProviderConfig,
+    OidcProviderConfig, PgReadConnector, PgSnapshotSource, ReconnectEvent, ReconnectPolicy,
+    RefreshLifetimes, RequestGuard, RlsAuth, RlsAuthError, RuntimeWritableCatalog, SessionConfig,
+    SessionManager, TokenAuthority, loopback, pg_write_target,
 };
 use diesel::sql_query;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -35,10 +36,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::Postgres;
 use subql::visibility::openfga::OpenFgaError;
 use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
-use subql::{
-    ParserDB, PgChangeEvent, PgCommitPosition, PgLsn, PgStreamingCdcSource, PgStreamingConfig,
-    PgXid,
-};
+use subql::{PgChangeEvent, PgCommitPosition, PgLsn, PgStreamingConfig, PgXid};
 use testcontainers::core::logs::LogFrame;
 use testcontainers::core::wait::HttpWaitStrategy;
 use testcontainers::core::{CmdWaitFor, ExecCommand, IntoContainerPort, WaitFor};
@@ -61,9 +59,11 @@ pub mod peer_proof;
 pub mod relay;
 pub mod roster;
 pub mod router;
+pub mod server_fixture;
 pub mod stack;
 pub mod standby;
 pub mod star;
+pub mod wire_tables;
 
 mod container_slot;
 pub use container_slot::{CONTAINER_SLOTS, ContainerSlot, container_slot};
@@ -681,7 +681,7 @@ impl MockOauth {
         .with_name_pointer("/name")
     }
 
-    /// Environment variables consumed by `connetto-server`.
+    /// Environment variables consumed by `demo-server`.
     #[must_use]
     pub fn env_pairs(&self, name: &str, redirect_url: &str) -> Vec<(String, String)> {
         let prefix = env_prefix(name);
@@ -1431,19 +1431,93 @@ impl Fixture {
     /// Create the database auth store's tables in the reference shape
     /// (`11-authentication.md`), for a server run with `CONNETTO_AUTH=database`.
     pub async fn provision_auth_tables(&self) {
-        self.setup(&[
+        self.provision_auth_tables_over("TEXT").await;
+    }
+
+    /// Create the auth tables in the reference shape with `user_id` of the
+    /// Postgres type `user_id_type`, for a schema whose `Id` maps to it.
+    pub async fn provision_auth_tables_over(&self, user_id_type: &str) {
+        let sessions = format!(
             "CREATE TABLE connetto_sessions (\
-             session_id UUID PRIMARY KEY, user_id TEXT NOT NULL, \
+             session_id UUID PRIMARY KEY, user_id {user_id_type} NOT NULL, \
              current_refresh_hash BYTEA NOT NULL, idle_deadline TIMESTAMPTZ NOT NULL, \
              absolute_deadline TIMESTAMPTZ NOT NULL, revoked BOOLEAN NOT NULL DEFAULT FALSE, \
              created_at TIMESTAMPTZ NOT NULL, refreshed_at TIMESTAMPTZ, \
-             provider TEXT NOT NULL, issuer TEXT NOT NULL)",
+             provider TEXT NOT NULL, issuer TEXT NOT NULL)"
+        );
+        self.setup(&[
+            sessions.as_str(),
             "CREATE TABLE connetto_provider_tokens (\
              session_id UUID PRIMARY KEY REFERENCES connetto_sessions (session_id) ON DELETE CASCADE, \
              issuer TEXT NOT NULL, access_token TEXT NOT NULL, refresh_token TEXT, \
              expires_at TIMESTAMPTZ)",
         ])
         .await;
+    }
+
+    /// Create the auth tables and build the database auth store over them in
+    /// the default schema, enforcing `lifetimes` and resolving identity to a
+    /// deterministic UUID v5 string over `(issuer, subject)`.
+    pub async fn auth_store(
+        &self,
+        lifetimes: RefreshLifetimes,
+    ) -> Arc<DbAuthStore<ConnettoDefaults>> {
+        self.auth_store_with(lifetimes, Arc::new(DefaultAuthHooks))
+            .await
+    }
+
+    /// [`auth_store`](Self::auth_store) running `hooks` at each auth event.
+    pub async fn auth_store_with(
+        &self,
+        lifetimes: RefreshLifetimes,
+        hooks: Arc<dyn AuthHooks<ConnettoDefaults>>,
+    ) -> Arc<DbAuthStore<ConnettoDefaults>> {
+        self.provision_auth_tables().await;
+        Arc::new(DbAuthStore::new(self.admin.clone(), lifetimes, hooks))
+    }
+
+    /// Create the auth and enrolment tables and an auth service over them
+    /// running `hooks`, the service a device enrolment's transactions join.
+    ///
+    /// # Panics
+    ///
+    /// When a table cannot be created or the token keypair cannot be
+    /// generated.
+    pub async fn enrolment_auth(
+        &self,
+        hooks: Arc<dyn AuthHooks<ConnettoDefaults>>,
+    ) -> Arc<AuthService<ConnettoDefaults>> {
+        let config = AuthConfig::default();
+        let store = self
+            .auth_store_with(config.refresh_lifetimes(), hooks)
+            .await;
+        stack::provision_enrolment_tables(self).await;
+        Arc::new(AuthService::new(
+            Arc::new(TokenAuthority::generate(&config).expect("generate the token keypair")),
+            store,
+            Arc::new(RequestGuard::default()),
+        ))
+    }
+
+    /// Record `session` as a live session of `user`, the session a device
+    /// enrolling during it names, without a sign-in.
+    pub async fn live_session(&self, user: &str, session: connetto_core::SessionId) {
+        self.exec(&format!(
+            "INSERT INTO connetto_sessions (session_id, user_id, current_refresh_hash, \
+             idle_deadline, absolute_deadline, created_at, provider, issuer) \
+             VALUES ('{session}', '{user}', '\\x00', now() + interval '1 day', \
+             now() + interval '30 days', now(), 'test', 'https://issuer.example')",
+            session = session.as_uuid(),
+            user = user.replace('\'', "''"),
+        ))
+        .await;
+    }
+
+    /// Fail every later statement of the auth store, the way a database
+    /// outage does, by moving its sessions table out of reach.
+    pub async fn break_auth_store(&self) {
+        self.exec("ALTER TABLE connetto_sessions RENAME TO connetto_sessions_unreachable")
+            .await;
     }
 
     /// Put each published table in full previous-image mode, then create the publication, slot and oplog table.
@@ -1800,6 +1874,8 @@ pub struct ServerConfig {
     replication_tables: Vec<String>,
     /// The signer the session loop calls when a client requests a content ticket.
     signer: BoxSigner,
+    /// How often the drift guard re-reads every table's live shape.
+    drift_reconciliation: Duration,
 }
 
 impl ServerConfig {
@@ -1817,6 +1893,7 @@ impl ServerConfig {
             caller: None,
             replication_tables: Vec::new(),
             signer: BoxSigner::noop(),
+            drift_reconciliation: Duration::from_secs(60),
         }
     }
 
@@ -1866,6 +1943,14 @@ impl ServerConfig {
     #[must_use]
     pub fn with_replication(mut self, tables: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.replication_tables = tables.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// How often the drift guard re-reads every table's live shape, so a test
+    /// can see a change no row has carried yet without waiting a minute.
+    #[must_use]
+    pub fn with_drift_reconciliation(mut self, every: Duration) -> Self {
+        self.drift_reconciliation = every;
         self
     }
 
@@ -1997,6 +2082,7 @@ pub async fn spawn_server(
         caller,
         replication_tables,
         signer,
+        drift_reconciliation,
     } = config;
     if !replication_tables.is_empty() {
         let admin_pool = pool_for(&admin_url).await;
@@ -2050,6 +2136,7 @@ pub async fn spawn_server(
         &pg_ddl,
         Arc::clone(&manager),
         Arc::clone(&restarts),
+        drift_reconciliation,
     );
 
     Server {
@@ -2064,19 +2151,31 @@ fn spawn_ingest_task(
     pg_ddl: &str,
     manager: Arc<HarnessManager>,
     restarts: Arc<AtomicU64>,
+    drift_reconciliation: Duration,
 ) -> JoinHandle<()> {
     let catalog_ddl = engine_ddl(pg_ddl);
     tokio::spawn(async move {
         let connect = |resume: connetto_server::ResumePoint| {
-            let (url, ddl) = (admin_url.clone(), catalog_ddl.clone());
+            let (url, ddl, manager) =
+                (admin_url.clone(), catalog_ddl.clone(), Arc::clone(&manager));
             async move {
-                let catalog = ParserDB::parse::<PostgreSqlDialect>(&ddl)
-                    .map_err(|err| format!("parsing catalog DDL: {err:?}"))?;
-                let config = PgStreamingConfig::new(url, SLOT.to_owned(), PUBLICATION.to_owned())
-                    .start(resume.get());
-                PgStreamingCdcSource::connect(config, catalog)
+                let config =
+                    PgStreamingConfig::new(url.clone(), SLOT.to_owned(), PUBLICATION.to_owned())
+                        .start(resume.get());
+                let source = connetto_server::drift::connect_guarded(
+                    config,
+                    &ddl,
+                    &url,
+                    PUBLICATION,
+                    drift_reconciliation,
+                )
+                .await
+                .map_err(|err| err.to_string())?;
+                manager
+                    .watch_guard(source.refusals())
                     .await
-                    .map_err(|err| format!("opening CDC stream: {err}"))
+                    .map_err(|err| format!("settling earlier refusals: {err}"))?;
+                Ok::<_, String>(source)
             }
         };
         let _ = manager
@@ -2668,6 +2767,24 @@ impl Client {
                 other => panic!("expected snapshot patch or end, got {other:?}"),
             }
         }
+    }
+
+    /// Read a computed subscription's column declaration, the first frame the
+    /// server sends at its registration.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the next control frame is not an `AggregateColumns` for `sub_id`, or when the transport returns a receive error.
+    pub async fn expect_aggregate_columns(
+        &mut self,
+        sub_id: &str,
+    ) -> connetto_core::messages::AggregateColumns {
+        let frame = self.next_control().await;
+        let ControlMessage::AggregateColumns(columns) = frame else {
+            panic!("expected aggregate columns, got {frame:?}");
+        };
+        assert_eq!(columns.sub_id, sub_id, "columns for the wrong subscription");
+        columns
     }
 
     /// Wait for a live patch to arrive, skipping any interleaved control frames

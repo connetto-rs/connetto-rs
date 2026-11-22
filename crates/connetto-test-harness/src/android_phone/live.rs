@@ -19,9 +19,35 @@ pub struct Subscriptions {
     pub in_flight: HashMap<Subscription, u64>,
     /// The descriptor name of each subscription.
     pub specs: HashMap<Subscription, String>,
+    /// The live handle each open subscription follows.
+    pub holds: HashMap<Subscription, String>,
+    /// Every live handle a page subscription has followed.
+    pub page_handles: HashSet<String>,
+    /// The wire watches each live handle or pin of the client holds.
+    pub attached: HashMap<String, HashSet<String>>,
 }
 
 impl Subscriptions {
+    /// The wire watches the open page subscriptions hold, leaving out every
+    /// watch a holder outside the page also holds, such as the account-name
+    /// watch the application core keeps for itself.
+    #[must_use]
+    pub fn page_watches(&self) -> HashSet<String> {
+        let wires_of = |handle: &String| self.attached.get(handle).into_iter().flatten();
+        let kept: HashSet<&String> = self
+            .attached
+            .keys()
+            .filter(|holder| !self.page_handles.contains(*holder))
+            .flat_map(wires_of)
+            .collect();
+        self.holds
+            .values()
+            .flat_map(wires_of)
+            .filter(|wire| !kept.contains(wire))
+            .cloned()
+            .collect()
+    }
+
     /// Apply one native event in log order.
     fn take(&mut self, event: &Value) -> Result<()> {
         match event["message"].as_str() {
@@ -32,6 +58,17 @@ impl Subscriptions {
             Some("watch released") => {
                 self.watches
                     .remove(event["sub_id"].as_str().context("watch id")?);
+            }
+            Some("watch attached") => {
+                self.attached
+                    .entry(event["holder"].as_str().context("watch holder")?.to_owned())
+                    .or_default()
+                    .insert(
+                        event["wire_id"]
+                            .as_str()
+                            .context("wire watch id")?
+                            .to_owned(),
+                    );
             }
             _ => {}
         }
@@ -44,6 +81,11 @@ impl Subscriptions {
                     subscription,
                     event["spec"].as_str().context("spec name")?.to_owned(),
                 );
+            }
+            Some("subscription watching") => {
+                let handle = event["handle"].as_str().context("live handle")?;
+                self.page_handles.insert(handle.to_owned());
+                self.holds.insert(subscription, handle.to_owned());
             }
             Some("message sent") => {
                 self.open.insert(subscription.clone());
@@ -67,6 +109,7 @@ impl Subscriptions {
             Some("subscription ending") => {
                 self.open.remove(&subscription);
                 self.in_flight.remove(&subscription);
+                self.holds.remove(&subscription);
             }
             _ => {}
         }
@@ -188,7 +231,9 @@ impl LiveTrace {
         if let Ok(event) = serde_json::from_str::<Value>(line)
             && matches!(
                 event["target"].as_str(),
-                Some("tauri_plugin_connetto" | "connetto_tauri_demo::live")
+                Some(
+                    "tauri_plugin_connetto" | "connetto_tauri_demo::live" | "connetto_client::live"
+                )
             )
         {
             self.subscriptions.take(&event)?;
@@ -272,6 +317,41 @@ mod tests {
         assert_eq!(
             trace.subscriptions.in_flight.get(&("main".to_owned(), 2)),
             Some(&2)
+        );
+    }
+
+    /// The page's watches are the wire watches its open subscriptions' live
+    /// handles hold, joined through the client's attachments, so a watch the
+    /// application core holds for itself, also when a page handle shares it,
+    /// and a handle over device-only tables that holds no wire watch stay out.
+    #[test]
+    fn page_watches_leave_out_the_cores_own_watch() {
+        let mut trace = LiveTrace::default();
+        let events = [
+            json!({"target":"connetto_client::live","message":"watch attached","holder":"live-1","wire_id":"wire-1"}),
+            json!({"target":"connetto_tauri_demo::live","message":"watch observed","sub_id":"wire-1"}),
+            json!({"target":"tauri_plugin_connetto","message":"subscription starting","subscription":1,"webview":"main","spec":"orders"}),
+            json!({"target":"connetto_client::live","message":"watch attached","holder":"live-2","wire_id":"wire-2"}),
+            json!({"target":"tauri_plugin_connetto","message":"subscription watching","subscription":1,"webview":"main","handle":"live-2"}),
+            json!({"target":"tauri_plugin_connetto","message":"subscription starting","subscription":2,"webview":"main","spec":"names"}),
+            json!({"target":"connetto_client::live","message":"watch attached","holder":"live-3","wire_id":"wire-1"}),
+            json!({"target":"tauri_plugin_connetto","message":"subscription watching","subscription":2,"webview":"main","handle":"live-3"}),
+            json!({"target":"tauri_plugin_connetto","message":"subscription starting","subscription":3,"webview":"main","spec":"drafts"}),
+            json!({"target":"tauri_plugin_connetto","message":"subscription watching","subscription":3,"webview":"main","handle":"live-4"}),
+            json!({"target":"connetto_tauri_demo::live","message":"watch observed","sub_id":"wire-2"}),
+        ];
+        for event in events {
+            assert!(trace.take_line(&event.to_string()).unwrap());
+        }
+        assert_eq!(
+            trace.subscriptions.page_watches(),
+            HashSet::from(["wire-2".to_owned()])
+        );
+        let ending = json!({"target":"tauri_plugin_connetto","message":"subscription ending","subscription":1,"webview":"main"});
+        assert!(trace.take_line(&ending.to_string()).unwrap());
+        assert!(
+            trace.subscriptions.page_watches().is_empty(),
+            "an ended subscription holds no watch"
         );
     }
 

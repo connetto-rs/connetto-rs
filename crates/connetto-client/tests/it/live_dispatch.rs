@@ -108,14 +108,13 @@ fn live_dispatch_resolves_handle_and_value_types() {
             .select((orders::id, orders::quantity)),
     );
 
-    // Aggregates resolve to LiveValue with the wire-derived value type:
-    // COUNT is an exact integer, SUM maps through diesel's own Numeric
-    // SqlType to Option<f64> (the column type; the fold path now sends
-    // integers or decimal strings, which serde_json coerces into f64),
-    // extremes carry the column's type, all nullable ones as Option.
+    // Aggregates resolve to LiveValue with the caller's value type, which
+    // diesel loads from the query's SQL type. COUNT is BigInt, SUM over a
+    // Double column stays a nullable Double, extremes carry the column's
+    // type, all nullable ones as Option.
     resolves::<_, i64, LiveValue<i64>>(&orders::table.count());
     resolves::<_, Option<f64>, LiveValue<Option<f64>>>(
-        &orders::table.select(dsl::sum(orders::quantity)),
+        &orders::table.select(dsl::sum(orders::price)),
     );
     resolves::<_, Option<f64>, LiveValue<Option<f64>>>(
         &orders::table.select(dsl::max(orders::price)),

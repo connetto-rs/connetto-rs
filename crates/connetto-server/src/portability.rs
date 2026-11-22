@@ -25,7 +25,7 @@ use crate::snapshot::{BinaryRows, attach_binds, page_sql};
 use crate::throttle::ReadLimits;
 use connetto_core::SessionId;
 use connetto_core::auth::{AuthContext, DEFAULT_USER_SETTING, Principal, Subject, VerifiedSession};
-use connetto_core::messages::BindValue;
+use connetto_core::messages::SqliteValue;
 use diesel::QueryableByName;
 use diesel::sql_types::{Bool, Text, Timestamptz};
 use diesel_async::pooled_connection::bb8::{Pool, RunError};
@@ -74,7 +74,7 @@ pub enum PortabilityBind {
     /// identity setting carries.
     Person,
     /// A value fixed at registration.
-    Value(BindValue),
+    Value(SqliteValue),
 }
 
 /// One query a download runs, in the form a subscription takes: SQLite
@@ -413,11 +413,11 @@ struct FileColumns {
 }
 
 /// `binds` with the person put in.
-fn bind_values(binds: &[PortabilityBind], person: &str) -> Vec<BindValue> {
+fn bind_values(binds: &[PortabilityBind], person: &str) -> Vec<SqliteValue> {
     binds
         .iter()
         .map(|bind| match bind {
-            PortabilityBind::Person => BindValue::Text(person.to_owned()),
+            PortabilityBind::Person => SqliteValue::Text(person.to_owned()),
             PortabilityBind::Value(value) => value.clone(),
         })
         .collect()
@@ -596,7 +596,7 @@ fn validate_query(
     >(&pg_sql, &PostgreSqlDialect {}, catalog, &standins, None)
     .map_err(PortabilityError::Compile)?;
     let table_id = compiled.table_id;
-    let table = catalog_helpers::table_name(catalog, table_id)
+    let table = catalog_helpers::table_name::<Postgres, _>(catalog, table_id)
         .ok_or(PortabilityError::Unnamed { table_id })?;
     let key = catalog_helpers::primary_key_columns(catalog, table_id)
         .map_err(PortabilityError::Catalog)?;
@@ -622,7 +622,7 @@ fn validate_query(
         _ => return Err(PortabilityError::Projection),
     };
     let name = |column: ColumnId| {
-        catalog_helpers::column_name(catalog, table_id, column)
+        catalog_helpers::column_name::<Postgres, _>(catalog, table_id, column)
             .ok_or(PortabilityError::Unnamed { table_id })
     };
     Ok(ValidQuery {
@@ -653,7 +653,7 @@ fn query_list_hash(queries: &[PortabilityQuery]) -> String {
     #[derive(serde::Serialize)]
     struct Canonical<'a> {
         sql: &'a str,
-        binds: Vec<Option<&'a BindValue>>,
+        binds: Vec<Option<&'a SqliteValue>>,
         description: &'a str,
         read_as_owner: bool,
         file_column: Option<&'a str>,
@@ -1165,7 +1165,9 @@ mod tests {
                 PortabilityQuery::new("SELECT * FROM notes WHERE about = ?", "other")
                     .binds(vec![PortabilityBind::Person]),
             ],
-            vec![notes().binds(vec![PortabilityBind::Value(BindValue::Text(String::new()))])],
+            vec![notes().binds(vec![PortabilityBind::Value(SqliteValue::Text(
+                String::new(),
+            ))])],
             vec![
                 PortabilityQuery::new("SELECT * FROM notes WHERE kind = ?", "notes")
                     .binds(vec![PortabilityBind::Person]),

@@ -17,18 +17,19 @@ use connetto_core::{
         RetractCause, Retraction, SignedOffer,
     },
     messages::{
-        AckCredits, AggregateUpdate, BindDevice, BotListEntry, BotRegistered, BulkMessage,
-        Challenge, ConflictRow, ControlMessage, CourierAnswer, CourierBody, CourierNotice,
-        CourierNoticeAck, CourierNoticeRow, CourierRange, DeviceAttestation, DeviceRevokedAck,
-        DeviceSummary, DevicesList, DevicesRequest, EnrolChallenge, EnrolChallengeRequest,
-        EnrolGrant, EnrolRefusal, EnrolRefused, EnrolRequest, FatalError, FatalErrorReason,
-        FullResyncReason, FullResyncRequired, Grant, Handshake, HandshakeAck, LivePatch,
-        MutationConflict, MutationHeader, MutationPatch, MutationReject, MutationRejectReason,
-        NonFatalError, PauseCause, Ping, Pong, Provenance, ProvisionalStatus, ProvisionalVerdicts,
-        RateLimited, RegisterBot, ReplaceShareKeys, RetireWriter, RevocationUpdate,
-        RevokeDeviceRequest, ShareKeysReplaced, SignedList, SnapshotBegin, SnapshotEnd,
-        SnapshotPatch, Subscribe, SubscriptionSpec, Unsubscribe, Verdict, WriterAnswer,
-        WriterGrant, WriterOutcome, WriterRef, WriterRequest, WriterSecret,
+        AckCredits, AggregateChange, AggregateColumns, AggregateUpdate, BindDevice, BotListEntry,
+        BotRegistered, BulkMessage, Challenge, ColumnType, ConflictRow, ControlMessage,
+        CourierAnswer, CourierBody, CourierNotice, CourierNoticeAck, CourierNoticeRow,
+        CourierRange, DeviceAttestation, DeviceRevokedAck, DeviceSummary, DevicesList,
+        DevicesRequest, EnrolChallenge, EnrolChallengeRequest, EnrolGrant, EnrolRefusal,
+        EnrolRefused, EnrolRequest, FatalError, FatalErrorReason, FullResyncReason,
+        FullResyncRequired, Grant, Handshake, HandshakeAck, LivePatch, MutationConflict,
+        MutationHeader, MutationPatch, MutationReject, MutationRejectReason, NonFatalError,
+        PauseCause, Ping, Pong, Provenance, ProvisionalStatus, ProvisionalVerdicts, RateLimited,
+        RegisterBot, ReplaceShareKeys, RetireWriter, RevocationUpdate, RevokeDeviceRequest,
+        ShareKeysReplaced, SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch, SqliteValue,
+        Subscribe, SubscriptionSpec, Unsubscribe, Verdict, WriterAnswer, WriterGrant,
+        WriterOutcome, WriterRef, WriterRequest, WriterSecret,
     },
     version::PROTOCOL_VERSION,
 };
@@ -300,32 +301,36 @@ fn mutation_control_frames_round_trip() {
 }
 
 #[test]
-fn aggregate_update_round_trip() {
+fn aggregate_frames_round_trip() {
+    round_trip_control(&ControlMessage::AggregateColumns(AggregateColumns {
+        sub_id: "sub-count".into(),
+        columns: vec![ColumnType::Blob, ColumnType::Integer, ColumnType::Any],
+    }));
     round_trip_control(&ControlMessage::AggregateUpdate(AggregateUpdate {
         sub_id: "sub-count".into(),
-        group_key: Some(b"region=eu".to_vec()),
-        group_values_json: Some(r#"["eu"]"#.into()),
-        result_json: Some(r#"{"count":42}"#.into()),
-        is_full_result: false,
+        change: AggregateChange::Upsert {
+            key: vec![0xff, 0x00],
+            row: vec![
+                SqliteValue::Blob(vec![0xff, 0x00]),
+                SqliteValue::Integer(42),
+                SqliteValue::Null,
+            ],
+        },
+    }));
+    round_trip_control(&ControlMessage::AggregateUpdate(AggregateUpdate {
+        sub_id: "sub-count".into(),
+        change: AggregateChange::Remove {
+            key: vec![0xff, 0x00],
+        },
     }));
     round_trip_control(&ControlMessage::AggregateUpdate(AggregateUpdate {
         sub_id: "sub-total".into(),
-        group_key: None,
-        group_values_json: None,
-        result_json: Some(r#"{"total":9001}"#.into()),
-        is_full_result: true,
-    }));
-}
-
-#[test]
-fn aggregate_removal_round_trip() {
-    // A grouped key leaving the result set: result_json is absent on the wire.
-    round_trip_control(&ControlMessage::AggregateUpdate(AggregateUpdate {
-        sub_id: "sub-count".into(),
-        group_key: Some(b"region=eu".to_vec()),
-        group_values_json: Some(r#"["eu"]"#.into()),
-        result_json: None,
-        is_full_result: false,
+        change: AggregateChange::Replace {
+            rows: vec![
+                vec![SqliteValue::Real(9001.5)],
+                vec![SqliteValue::Text("t".into())],
+            ],
+        },
     }));
 }
 
@@ -353,6 +358,11 @@ fn every_resync_reason() -> Vec<FullResyncReason> {
         // SessionManager::subscribe_row, when the resume cursor lies beyond
         // where its timeline ended in the database's history (R73).
         FullResyncReason::CursorBeyondHistory,
+        // SessionManager catchup, when a missed record says the table was
+        // refused because its live schema drifted from the catalog.
+        FullResyncReason::TableRefused {
+            table: "orders".to_owned(),
+        },
     ];
     for reason in &reasons {
         match reason {
@@ -360,7 +370,8 @@ fn every_resync_reason() -> Vec<FullResyncReason> {
             | FullResyncReason::AuthorizationChange
             | FullResyncReason::SnapshotInterrupted
             | FullResyncReason::CursorBeyondHistory
-            | FullResyncReason::TableTruncated { .. } => {}
+            | FullResyncReason::TableTruncated { .. }
+            | FullResyncReason::TableRefused { .. } => {}
         }
     }
     reasons
@@ -640,6 +651,9 @@ fn every_enrol_refusal() -> Vec<EnrolRefusal> {
         },
         EnrolRefusal::Revoked,
         EnrolRefusal::AttestationRequired,
+        EnrolRefusal::Refused {
+            reason: "the account is closed".into(),
+        },
     ];
     for reason in &all {
         match reason {
@@ -649,7 +663,8 @@ fn every_enrol_refusal() -> Vec<EnrolRefusal> {
             | EnrolRefusal::InvalidRequest
             | EnrolRefusal::OverCeiling { .. }
             | EnrolRefusal::Revoked
-            | EnrolRefusal::AttestationRequired => {}
+            | EnrolRefusal::AttestationRequired
+            | EnrolRefusal::Refused { .. } => {}
         }
     }
     all

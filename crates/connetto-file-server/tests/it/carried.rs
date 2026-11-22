@@ -6,7 +6,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use axum::http::StatusCode;
-use connetto_core::{ContentCarry, SessionId};
+use connetto_core::ContentCarry;
 use connetto_file_core::{ChunkStore, FileId, MemStore, MimeClass, process_file};
 use connetto_file_server::ticket::{TicketPayload, Verb};
 use connetto_file_server::{
@@ -16,7 +16,7 @@ use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::RunQueryDsl;
 use tower::ServiceExt;
 
-use crate::fixture::{Pg, connect_admin, fs_store, identified, make_signer};
+use crate::fixture::{Pg, Sessions, connect_admin, fs_store, identified, make_signer, session_of};
 
 diesel::table! {
     /// The manifest columns a carried upload writes, named here because the
@@ -51,6 +51,7 @@ async fn router_hearing_carries(
         on_carried: Some(Arc::new(move |commit| {
             sink.lock().push(commit);
         })),
+        sessions: Arc::new(Sessions::default()),
         _schema: std::marker::PhantomData,
     })
     .await
@@ -79,10 +80,10 @@ async fn a_carried_upload_is_recorded_for_its_owner_and_heard_once() {
         .expect("the file splits");
     let file_id: FileId = manifest.file_id();
     let file_hex = format!("{file_id}");
-    let session = SessionId::from_token_hash("bob's session");
+    // The carry is audited under the session bob's ticket names.
+    let session = session_of("bob");
     let carry = ContentCarry {
         owner: "alice".to_owned(),
-        session,
     };
     let ticket = signer
         .mint(&TicketPayload {

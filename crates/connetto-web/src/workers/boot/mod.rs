@@ -518,7 +518,7 @@ where
     services::hold_alive_lock().await;
     report_boot_progress("alive-lock-held");
     let (hub, content_persistent) =
-        services::start_boot_services(&config, &spec, worker, content_root_key).await?;
+        services::start_boot_services(&config, &spec, worker, content_root_key, &key_store).await?;
     // The re-check guards what the gate protects, so it runs once the key
     // actually came from the user's own verification.
     let gated = crate::unlock::custody() == connetto_core::custody::Custody::Verified;

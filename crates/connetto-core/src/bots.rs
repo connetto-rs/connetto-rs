@@ -214,6 +214,12 @@ impl BotRegistryIdSql for diesel::sql_types::Uuid {
     const ID_SQL_TYPE: &'static str = "UUID";
 }
 
+#[cfg(feature = "rosetta-uuid")]
+impl BotRegistryIdSql for rosetta_uuid::sql_types::Uuid {
+    const DDL: &'static str = REGISTRY_DDL_UUID;
+    const ID_SQL_TYPE: &'static str = "UUID";
+}
+
 /// The five bot registry tables' diesel `table!` definitions, one column list
 /// parameterized by the backend's SQL types.
 ///

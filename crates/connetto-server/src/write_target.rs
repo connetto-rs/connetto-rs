@@ -38,6 +38,7 @@ use subql::{NoRefusals, ParserDB};
 
 use crate::audit::ConnettoAuditSchema;
 use crate::capability::CallerBinding;
+use crate::catalog_shapes::CatalogShapes;
 use crate::schema::ConnettoSchema;
 use crate::writer_schema::{
     ConnettoWriterSchema, SettlePath, SettledOutcome, SettledRow, WriterRow, writer_secret_hash,
@@ -207,6 +208,9 @@ pub(crate) struct SettleSpec<Id> {
 pub struct PgWriteTarget<D> {
     pool: Pool<AsyncPgConnection>,
     catalog: ParserDB,
+    /// Every catalog table's columns, which a settled conflict's re-read
+    /// projects.
+    shapes: CatalogShapes,
     /// The setting a policy reads the caller's identity from.
     user_setting: std::sync::Arc<str>,
     /// The deployment's writer schema, carried only in the type system so
@@ -219,17 +223,21 @@ pub struct PgWriteTarget<D> {
 ///
 /// # Errors
 ///
-/// [`MaterializerError::Catalog`] when the DDL does not parse.
+/// [`MaterializerError::Catalog`] when the DDL does not parse or cannot name
+/// a table's columns.
 pub fn pg_write_target<D: ConnettoSchema>(
     pool: Pool<AsyncPgConnection>,
     pg_ddl: &str,
 ) -> Result<PgWriteTarget<D>, MaterializerError> {
     let catalog = ParserDB::parse::<PostgreSqlDialect>(pg_ddl)
         .map_err(|err| MaterializerError::Catalog(format!("{err:?}")))?;
+    let shapes =
+        CatalogShapes::of(&catalog).map_err(|err| MaterializerError::Catalog(err.to_string()))?;
     Ok(PgWriteTarget {
         user_setting: connetto_core::auth::DEFAULT_USER_SETTING.into(),
         pool,
         catalog,
+        shapes,
         _writers: PhantomData,
     })
 }
@@ -270,7 +278,16 @@ async fn apply_upload(
 ) -> Result<usize, CommitError> {
     let adapter = PgAdapter::new(catalog)
         .map_err(|e| CommitError::Probe(MaterializerError::Catalog(e.to_string())))?;
-    Ok(apply_diffset_bytes_async_with_catalog(catalog, bytes, &NoRefusals, conn, &adapter).await?)
+    Ok(
+        apply_diffset_bytes_async_with_catalog::<subql::backend::Postgres, _, _, _, _, _>(
+            catalog,
+            bytes,
+            &NoRefusals,
+            conn,
+            &adapter,
+        )
+        .await?,
+    )
 }
 
 /// Whether Postgres refused a statement with `42501` (`insufficient_privilege`).
@@ -429,7 +446,8 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
     }
 
     /// The current row a re-answered settled conflict reads fresh, under the
-    /// caller's RLS context on the reader pool.
+    /// caller's RLS context on the reader pool. A table this deployment's
+    /// catalog no longer declares is refused before a connection is taken.
     pub(crate) async fn settled_conflict_row<Key: CapabilityKey>(
         &self,
         caller: &Principal<D::Id, Key>,
@@ -438,6 +456,10 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
         pk_columns: &[String],
         pk_values: &[crate::writer_schema::StoredValue],
     ) -> Result<Option<ServerRow>, WriteError> {
+        let select_list = self
+            .shapes
+            .select_list_named(&self.catalog, table)
+            .map_err(|err| WriteError::Backend(err.to_string()))?;
         let mut conn = self.pool.get().await.map_err(pool_failure)?;
         CallerBinding::of(caller, std::sync::Arc::clone(&self.user_setting))
             .apply(&mut conn)
@@ -445,6 +467,7 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
             .map_err(WriteError::from)?;
         crate::materializer::read_settled_conflict_row(
             &mut conn,
+            select_list,
             table,
             version_column,
             pk_columns,
@@ -847,9 +870,54 @@ fn commit_failure(err: CommitError) -> WriteError {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommitError, MaterializerError, WriteError, commit_failure};
+    use super::{CommitError, MaterializerError, WriteError, commit_failure, pg_write_target};
+    use crate::catalog_shapes::{unconnected_pool, unresolvable_key_column, unresolvable_key_ddl};
+    use crate::defaults::ConnettoDefaults;
     use crate::reexec::coded_error;
+    use crate::writer_schema::StoredValue;
+    use connetto_core::SessionId;
+    use connetto_core::auth::Principal;
     use diesel::result::{DatabaseErrorKind, Error};
+
+    #[tokio::test]
+    async fn a_catalog_with_an_unresolvable_key_refuses_the_write_target() {
+        let refusal =
+            pg_write_target::<ConnettoDefaults>(unconnected_pool(), &unresolvable_key_ddl())
+                .err()
+                .map(|err| err.to_string());
+        assert_eq!(
+            refusal,
+            Some(MaterializerError::Catalog(unresolvable_key_column()).to_string())
+        );
+    }
+
+    /// A settled conflict stored under an earlier deployment can name a table
+    /// this deployment's catalog no longer declares. Its re-read is refused as
+    /// the schema mismatch, before the reader pool is asked for a connection.
+    #[tokio::test]
+    async fn a_settled_conflict_on_an_undeclared_table_is_refused_before_reading() {
+        let target = pg_write_target::<ConnettoDefaults>(
+            unconnected_pool(),
+            "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT);",
+        )
+        .expect("the catalog loads");
+        let caller =
+            Principal::<String, String>::unidentified(SessionId::from_uuid(uuid::Uuid::nil()));
+        let result = target
+            .settled_conflict_row(
+                &caller,
+                "gone",
+                "edited_at",
+                &["id".to_owned()],
+                &[StoredValue::Integer(1)],
+            )
+            .await;
+        let expected = MaterializerError::SchemaMismatch("gone".to_owned()).to_string();
+        assert!(
+            matches!(&result, Err(WriteError::Backend(message)) if *message == expected),
+            "{result:?}"
+        );
+    }
 
     fn db_error(kind: DatabaseErrorKind, message: &str) -> Error {
         Error::DatabaseError(kind, Box::new(message.to_owned()))

@@ -18,7 +18,7 @@ use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::ops::RangeInclusive;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime};
 
 use axum::Router;
@@ -28,13 +28,12 @@ use tokio::net::TcpListener;
 use tower_http::cors::{AllowCredentials, AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
 use crate::audit::{AuthOp, ConnettoAuditSchema, MintedKey, pg_audit_hook, record_awaited};
-use crate::authn::schema::ConnettoStoreSchema;
+use crate::authn::schema::{ConnettoStoreSchema, Desc};
 use crate::ban::ConnettoBanSchema;
 use crate::bots::{ConnettoBotSchema, InstalledApp, pg_bot_registry};
 use crate::defaults::ConnettoDefaults;
 use crate::device_cert::{
-    ConnettoEnrolmentSchema, Device, DeviceCertConfig, DeviceEnrolment, FirstEnrolment,
-    FirstEnrolmentHook, StatusList, pg_enrolment_store,
+    ConnettoEnrolmentSchema, Device, DeviceCertConfig, DeviceEnrolment, EnrolmentError, StatusList,
 };
 use crate::manager_builder::ManagerBuilder;
 use crate::materializer::Materializer;
@@ -59,6 +58,7 @@ use connetto_core::device_cert::KeyId;
 use connetto_core::messages::{ContentVerb, FatalErrorReason};
 use connetto_core::traits::{ContentTicketSigner, HandshakeAuthority};
 use connetto_core::{Major, SchemaVersion};
+use diesel_async::AsyncConnection as _;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
@@ -68,16 +68,17 @@ use rls2fga::translator::Translator;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::Postgres;
 use subql::visibility::openfga::OpenFgaPolicy;
-use subql::{ParserDB, PgStreamingCdcSource, PgStreamingConfig};
+use subql::{ParserDB, PgStreamingConfig};
 use tokio::io::AsyncWrite;
 
 use crate::{
-    AbuseConfig, Artifact, AuthConfig, AuthService, CallerMappings, CookieSameSite, DbAuthStore,
-    DefaultUuidResolver, GenericOidcProvider, IdentityProvider, IdentityResolver, LivenessError,
-    LoginRequest, OidcProviderConfig, PgReadConnector, PgSnapshotSource, PgWriteTarget,
-    ProviderRegistry, RedirectPolicy, RequestGuard, RlsAuth, RuntimeWritableCatalog,
-    SessionDescriber, SessionId, SessionRecord, SignInHook, SignInNotice, TokenAuthority,
-    VerifiedSession, auth_router, is_loopback_host, pg_ban_store, pg_write_target, preflight,
+    AbuseConfig, Artifact, AuthConfig, AuthHooks, AuthService, AuthStoreError, BanError, BanFuture,
+    BannedSessions, CallerMappings, CommittedNotice, CookieSameSite, DbAuthStore, DefaultAuthHooks,
+    EndCause, GenericOidcProvider, IdentityProvider, LivenessError, LoginRequest,
+    OidcProviderConfig, PgReadConnector, PgSnapshotSource, PgWriteTarget, ProviderRegistry,
+    RedirectPolicy, RequestGuard, RlsAuth, RuntimeWritableCatalog, SessionDescriber, SessionId,
+    SessionRecord, TokenAuthority, VerifiedSession, auth_router, is_loopback_host, pg_ban_store,
+    pg_write_target, preflight,
 };
 
 /// The id-type marker a deployment's bot registry tables are declared with.
@@ -94,13 +95,6 @@ pub const WRITER_SWEEP_CADENCE: Duration = Duration::from_secs(60);
 
 /// The file-serving half of the assembled server.
 pub use content::{ContentBuildError, ContentSettings, StoreSpec};
-
-/// The auth service the assembled server runs, over the database store of
-/// the deployment's auth tables.
-type Service<D> = AuthService<DbAuthStore<D>>;
-
-/// The application's session descriptor the deployment's schema declares.
-type Desc<D> = <<D as ConnettoSchema>::Auth as ConnettoStoreSchema>::Descriptor;
 
 /// The type the deployment's audit table stores a shared row's key as.
 type RowKey<D> = <<D as ConnettoSchema>::Audit as ConnettoAuditSchema>::RowKey;
@@ -618,18 +612,18 @@ pub enum SettleError {
 /// Why reconnecting the change stream could not open a source.
 #[derive(Debug, Error)]
 pub enum StreamConnectError {
-    /// The catalog DDL did not parse.
-    #[error("parsing catalog DDL: {0}")]
-    Catalog(String),
     /// The change feed could not be checked.
     #[error(transparent)]
     Check(#[from] StreamCheckError),
     /// The cluster and slot could not be settled.
     #[error(transparent)]
     Settle(#[from] SettleError),
-    /// The CDC stream would not open.
-    #[error("opening the CDC stream: {0}")]
-    Open(String),
+    /// The guarded CDC stream would not open.
+    #[error(transparent)]
+    Guard(#[from] crate::drift::GuardConnectError),
+    /// The refusals an earlier process persisted could not be settled.
+    #[error("settling earlier refusals: {0}")]
+    Refusals(#[source] SessionError),
 }
 
 /// Why [`ServerBuilder::serve`] stopped.
@@ -787,7 +781,7 @@ where
     D: ConnettoSchema,
 {
     manager: Arc<ServerManager<D>>,
-    service: Arc<Service<D>>,
+    service: Arc<AuthService<D>>,
     pool: PgPool,
     lag_watch: Option<BackgroundTask>,
     sweep: Option<BackgroundTask>,
@@ -886,6 +880,17 @@ pub enum SessionsError {
     Writers(String),
 }
 
+impl SessionsError {
+    /// The error of a transaction joining the auth store and the enrolment
+    /// table, the auth store's own when it or a hook failed.
+    fn of_transaction(err: EnrolmentError) -> Self {
+        match err {
+            EnrolmentError::Auth(err) => Self::Auth(err.into()),
+            other => Self::Devices(other),
+        }
+    }
+}
+
 impl<D> ServerHandle<D>
 where
     D: ConnettoSchema,
@@ -977,40 +982,57 @@ where
     }
 
     /// End `user`'s session `session`, recording `ended_by_owner`, and answer
-    /// what it left behind. When a device enrolled during it, its key is
-    /// revoked first and the device is closed with `DeviceRevoked`. A session
-    /// that is not `user`'s or not live ends nothing, and the answer is
-    /// empty.
+    /// what it left behind. Every device key enrolled during it is revoked in
+    /// the same transaction, and each such device is closed with
+    /// `DeviceRevoked`. A session that is not `user`'s or not live ends
+    /// nothing, and the answer is empty.
     ///
     /// # Errors
     ///
-    /// [`SessionsError`] when the auth store, the enrolment table, the issuer
-    /// or the audit and registry tables fail.
+    /// [`SessionsError`] when the auth store, the application's hooks, the
+    /// enrolment table, the issuer or the audit and registry tables fail.
     pub async fn end_session(
         &self,
         user: &D::Id,
         session: SessionId,
     ) -> Result<Ended<D::Id, RowKey<D>>, SessionsError> {
-        let owned = self
-            .service
-            .sessions_of(user)
-            .await?
-            .iter()
-            .any(|record| record.session_id == session);
-        if !owned {
+        let Some(enrolment) = self.manager.device_enrolment() else {
+            let ended = if self.service.end_session(user, session).await? {
+                vec![session]
+            } else {
+                Vec::new()
+            };
+            return self.left_behind(user, ended).await;
+        };
+        let store = self.service.store();
+        let mut conn = store.pool().get().await.map_err(EnrolmentError::Pool)?;
+        let (ended, keys) = conn
+            .transaction::<_, EnrolmentError, _>(async move |transaction| {
+                if !store
+                    .end_owned_in(transaction, user, session, EndCause::EndedByOwner)
+                    .await?
+                {
+                    return Ok((false, Vec::new()));
+                }
+                let keys = enrolment
+                    .revoke_keys_in(transaction, user, Some(session))
+                    .await?;
+                Ok((true, keys))
+            })
+            .await
+            .map_err(SessionsError::of_transaction)?;
+        if !ended {
             return Ok(Ended::nothing());
         }
-        for device in self.live_devices_of(user).await? {
-            if device.session == session {
-                self.manager.revoke_device_of(user, device.key).await?;
-            }
-        }
-        let ended = if self.service.end_session(user, session).await? {
-            vec![session]
-        } else {
-            Vec::new()
-        };
-        self.left_behind(user, ended).await
+        let announced = self.announce_keys(enrolment, user, &keys).await;
+        self.service.ended_elsewhere(
+            user,
+            &[session],
+            AuthOp::EndedByOwner,
+            EndCause::EndedByOwner,
+        );
+        announced?;
+        self.left_behind(user, vec![session]).await
     }
 
     /// End every session of `user`, recording `ended_all`, and answer what
@@ -1122,11 +1144,36 @@ where
         })
     }
 
-    /// `user`'s devices whose keys are not revoked.
+    /// `user`'s devices whose keys are not revoked, none when no enrolment is
+    /// installed.
     async fn live_devices_of(&self, user: &D::Id) -> Result<Vec<Device>, SessionsError> {
-        let mut devices = self.manager.devices_of(user).await?;
+        let Some(enrolment) = self.manager.device_enrolment() else {
+            return Ok(Vec::new());
+        };
+        let mut devices = enrolment.enrolled(user).await?;
         devices.retain(|device| device.revoked_at.is_none());
         Ok(devices)
+    }
+
+    /// Publish the list naming `keys` of `user`, revoked in a committed
+    /// transaction, close each one's device with `DeviceRevoked` and tell
+    /// [`committed`](crate::AuthHooks::committed) of each.
+    async fn announce_keys(
+        &self,
+        enrolment: &DeviceEnrolment<D>,
+        user: &D::Id,
+        keys: &[(KeyId, SessionId)],
+    ) -> Result<(), SessionsError> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let lists = enrolment.after_keys_revoked(user, keys).await?;
+        for (_, session) in keys {
+            self.manager
+                .announce_revocation(*session, lists.clone())
+                .await;
+        }
+        Ok(())
     }
 
     /// Record that the application erased `person`'s data, once its erasure
@@ -1209,25 +1256,53 @@ where
     /// Sign the person out everywhere, the step the erasure recipe runs
     /// before it deletes the person's rows (chapter 20).
     ///
-    /// Every live session the person holds is revoked first, each live
-    /// connection closed with `SessionRevoked` and each revocation recorded as
-    /// `session_revoked`, and then every device key the person's account
-    /// enrolled, which publishes the revocation and closes that device's
-    /// connection.
+    /// One transaction ends every live session the person holds, revokes
+    /// every device key the person's account enrolled and runs
+    /// [`person_erased`](crate::AuthHooks::person_erased). Once it commits,
+    /// each live connection is closed with `SessionRevoked` and each
+    /// revocation recorded as `session_revoked`, and the revocation list is
+    /// published, closing each revoked device's connection.
     ///
     /// # Errors
     ///
-    /// [`SessionsError`] when the auth store, the enrolment table or the
-    /// issuer fails.
+    /// [`SessionsError`] when the auth store, the application's hooks, the
+    /// enrolment table or the issuer fails. A hook's error leaves every
+    /// session and key standing.
     pub async fn end_person(&self, person: &D::Id) -> Result<PersonEnded, SessionsError> {
-        let sessions = self.service.revoke_person(person).await?;
-        let devices = self.live_devices_of(person).await?;
-        for device in &devices {
-            self.manager.revoke_device_of(person, device.key).await?;
-        }
+        let store = self.service.store();
+        let enrolment = self.manager.device_enrolment();
+        let mut conn = store.pool().get().await.map_err(EnrolmentError::Pool)?;
+        let (sessions, keys) = conn
+            .transaction::<_, EnrolmentError, _>(async move |transaction| {
+                let sessions = store
+                    .end_all_of_in(transaction, person, None, EndCause::Erased)
+                    .await?;
+                let keys = match enrolment {
+                    Some(enrolment) => enrolment.revoke_keys_in(transaction, person, None).await?,
+                    None => Vec::new(),
+                };
+                store
+                    .hooks()
+                    .person_erased(transaction, person)
+                    .await
+                    .map_err(AuthStoreError::Hook)?;
+                Ok((sessions, keys))
+            })
+            .await
+            .map_err(SessionsError::of_transaction)?;
+        self.service
+            .ended_elsewhere(person, &sessions, AuthOp::SessionRevoked, EndCause::Erased);
+        let announced = match enrolment {
+            Some(enrolment) => self.announce_keys(enrolment, person, &keys).await,
+            None => Ok(()),
+        };
+        store.hooks().committed(CommittedNotice::PersonErased {
+            person: person.clone(),
+        });
+        announced?;
         Ok(PersonEnded {
             sessions: u64::try_from(sessions.len()).unwrap_or(u64::MAX),
-            devices: u64::try_from(devices.len()).unwrap_or(u64::MAX),
+            devices: u64::try_from(keys.len()).unwrap_or(u64::MAX),
         })
     }
 }
@@ -1265,6 +1340,7 @@ pub struct ServerBuilder<D: ConnettoSchema = ConnettoDefaults> {
     oplog_table: String,
     owner_pool_size: u32,
     slot_lag_watch: Duration,
+    drift_reconciliation: Duration,
     sunset: Option<time::OffsetDateTime>,
     courier: bool,
     oplog_config: OplogConfig,
@@ -1284,19 +1360,17 @@ pub struct ServerBuilder<D: ConnettoSchema = ConnettoDefaults> {
     content: Option<ContentSettings>,
     device_identity: Option<DeviceCertConfig>,
     portability: Option<PortabilityList>,
-    resolver: Resolver<D::Id>,
+    hooks: Hooks<D>,
     describer: Option<Describer<Desc<D>>>,
-    sign_in: Option<OnSignIn<D::Id, Desc<D>>>,
     deployment_schema: PhantomData<fn() -> D>,
 }
 
-/// The identity resolver a login maps its verified claims through, opaque to
-/// the builder's `Debug`.
-struct Resolver<Id>(Arc<dyn IdentityResolver<Id = Id>>);
+/// The application's auth hooks, opaque to the builder's `Debug`.
+struct Hooks<D: ConnettoSchema>(Arc<dyn AuthHooks<D>>);
 
-impl<Id> fmt::Debug for Resolver<Id> {
+impl<D: ConnettoSchema> fmt::Debug for Hooks<D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Resolver(..)")
+        f.write_str("Hooks(..)")
     }
 }
 
@@ -1404,19 +1478,11 @@ impl<Desc> fmt::Debug for Describer<Desc> {
     }
 }
 
-/// The application's sign-in callback, opaque to the builder's `Debug`.
-struct OnSignIn<Id, Desc>(SignInHook<Id, Desc>);
-
-impl<Id, Desc> fmt::Debug for OnSignIn<Id, Desc> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("OnSignIn(..)")
-    }
-}
-
-/// The application's two sign-in callbacks, handed to the auth service.
-struct AuthHooks<D: ConnettoSchema> {
+/// What the auth service runs of the application's and the server's at each
+/// sign-in.
+struct SignInWiring<D: ConnettoSchema> {
+    hooks: Arc<dyn AuthHooks<D>>,
     describer: Option<Describer<Desc<D>>>,
-    sign_in: Option<SignInHook<D::Id, Desc<D>>>,
     /// The server's one audit sink, so every recorder's rows land in the
     /// order the server emitted them.
     audit: crate::audit::AuditHook<D::Id>,
@@ -1443,6 +1509,7 @@ impl ServerBuilder {
             oplog_table: "connetto_oplog".to_owned(),
             owner_pool_size: 10,
             slot_lag_watch: Duration::from_secs(60),
+            drift_reconciliation: Duration::from_secs(60),
             sunset: None,
             courier: false,
             oplog_config: OplogConfig::default(),
@@ -1462,9 +1529,8 @@ impl ServerBuilder {
             content: None,
             device_identity: None,
             portability: None,
-            resolver: Resolver(Arc::new(DefaultUuidResolver)),
+            hooks: Hooks(Arc::new(DefaultAuthHooks)),
             describer: None,
-            sign_in: None,
             deployment_schema: PhantomData,
         }
     }
@@ -1475,12 +1541,12 @@ where
     D: ConnettoSchema,
 {
     /// Serve over the deployment's own tables, named by `E`, in place of
-    /// [`ConnettoDefaults`], resolving each login to `E`'s user id through
-    /// `resolver`.
+    /// [`ConnettoDefaults`], running `hooks` at each auth event, whose
+    /// [`user_for`](AuthHooks::user_for) answers `E`'s user id.
     #[must_use]
     pub fn deployment_schema<E: ConnettoSchema>(
         self,
-        resolver: Arc<dyn IdentityResolver<Id = E::Id>>,
+        hooks: Arc<dyn AuthHooks<E>>,
     ) -> ServerBuilder<E> {
         let Self {
             database,
@@ -1492,6 +1558,7 @@ where
             oplog_table,
             owner_pool_size,
             slot_lag_watch,
+            drift_reconciliation,
             sunset,
             courier,
             oplog_config,
@@ -1511,9 +1578,8 @@ where
             content,
             device_identity,
             portability,
-            resolver: _,
+            hooks: _,
             describer: _,
-            sign_in: _,
             deployment_schema: _,
         } = self;
         ServerBuilder {
@@ -1526,6 +1592,7 @@ where
             oplog_table,
             owner_pool_size,
             slot_lag_watch,
+            drift_reconciliation,
             sunset,
             courier,
             oplog_config,
@@ -1545,19 +1612,18 @@ where
             content,
             device_identity,
             portability,
-            resolver: Resolver(resolver),
+            hooks: Hooks(hooks),
             describer: None,
-            sign_in: None,
             deployment_schema: PhantomData,
         }
     }
 
-    /// Resolve each login's verified claims to the deployment's user id
-    /// through `resolver`, which owns minting and linking rows in the
-    /// deployment's users table. Defaults to [`DefaultUuidResolver`].
+    /// Run `hooks` at each auth event, inside the transaction that records
+    /// it. Defaults to [`DefaultAuthHooks`] on [`ConnettoDefaults`], and
+    /// [`deployment_schema`](Self::deployment_schema) takes its own.
     #[must_use]
-    pub fn identity_resolver(mut self, resolver: Arc<dyn IdentityResolver<Id = D::Id>>) -> Self {
-        self.resolver = Resolver(resolver);
+    pub fn auth_hooks(mut self, hooks: Arc<dyn AuthHooks<D>>) -> Self {
+        self.hooks = Hooks(hooks);
         self
     }
 
@@ -1594,6 +1660,14 @@ where
     #[must_use]
     pub fn slot_lag_watch(mut self, every: Duration) -> Self {
         self.slot_lag_watch = every;
+        self
+    }
+
+    /// How often the drift guard re-reads every table's live shape between
+    /// schema messages, catching a change no row has carried yet.
+    #[must_use]
+    pub fn drift_reconciliation(mut self, every: Duration) -> Self {
+        self.drift_reconciliation = every;
         self
     }
 
@@ -1773,19 +1847,6 @@ where
         self
     }
 
-    /// Tell `hook` of each sign-in and each device key's first enrolment, so
-    /// the application can notify the person (R105 decision 9). Set it after
-    /// [`deployment_schema`](Self::deployment_schema), which starts from
-    /// none.
-    #[must_use]
-    pub fn on_sign_in(
-        mut self,
-        hook: impl Fn(SignInNotice<D::Id, Desc<D>>) + Send + Sync + 'static,
-    ) -> Self {
-        self.sign_in = Some(OnSignIn(Arc::new(hook)));
-        self
-    }
-
     /// Assemble the server from the named collaborators.
     ///
     /// Everything is built, checked and wired here so no setting is applied
@@ -1824,6 +1885,7 @@ where
             oplog_table,
             owner_pool_size,
             slot_lag_watch,
+            drift_reconciliation,
             sunset,
             courier,
             oplog_config,
@@ -1843,9 +1905,8 @@ where
             content,
             device_identity,
             portability,
-            resolver,
+            hooks,
             describer,
-            sign_in,
             deployment_schema: _,
         } = self;
         let schema = schema.with_devices(device_identity.is_some());
@@ -1889,7 +1950,7 @@ where
         {
             tracing::warn!(
                 days_left = expiring.left.as_secs() / 86_400,
-                "the device certificate issuer expires soon, sign a new one with connetto-ca"
+                "the device certificate issuer expires soon, sign a new one with connetto_ca::sign_issuer"
             );
         }
 
@@ -1955,19 +2016,17 @@ where
         let connector = PgReadConnector::with_session_setup(reexec_pool.clone());
         let engine_connector = PgReadConnector::with_session_setup(reexec_pool.clone());
         let guard = build_guard::<D>(&pool, reader_reserve.gate(), &throttle, abuse, bans);
-        let sign_in = sign_in.map(|OnSignIn(hook)| hook);
         let download_reader = reader_pool.clone();
         let audit = pg_audit_hook::<D>(pool.clone());
         let (service, registry) = build_auth::<D>(
             &pool,
-            resolver.0,
             Arc::clone(&guard),
             providers,
             &keys,
             &auth_config,
-            AuthHooks {
+            SignInWiring {
+                hooks: hooks.0,
                 describer,
-                sign_in: sign_in.clone(),
                 audit: Arc::clone(&audit),
             },
         )
@@ -1980,7 +2039,10 @@ where
             &schema,
             &publication,
             content,
-            audit,
+            content::FileHooks {
+                audit,
+                sessions: Arc::clone(&authority) as Arc<dyn connetto_core::SessionLiveness>,
+            },
         )
         .await?;
         completion.sweep = reader.sweep.as_ref().map(BackgroundTask::completion);
@@ -2003,6 +2065,7 @@ where
             slot,
             publication,
             pg_ddl: schema.engine_ddl::<D>(),
+            drift_reconciliation,
         };
         let file_router = reader.file_router;
         let sweep = reader.sweep;
@@ -2051,9 +2114,8 @@ where
             .build()
         };
         wire_manager(&manager, &service, &guard, &pool, &feed).await?;
-        let status = device_identity.map(|config| {
-            install_device_identity::<D>(&manager, &service, &pool, config, sign_in.clone())
-        });
+        let status =
+            device_identity.map(|config| install_device_identity::<D>(&manager, &service, config));
 
         Ok(assemble_parts(
             Arc::clone(&manager),
@@ -2210,67 +2272,21 @@ async fn require_cap_policies<D: ConnettoSchema>(
     Ok(())
 }
 
-/// Enrol devices under `config` into the deployment's enrolment tables on the
-/// owner pool, and revoke in the auth store the session a revoked device last
-/// enrolled with, so its live connection closes and it cannot enrol again.
+/// Enrol devices under `config` into the deployment's enrolment tables,
+/// whose writes join the auth store's transactions and run the application's
+/// hooks.
 fn install_device_identity<D: ConnettoSchema>(
     manager: &ServerManager<D>,
-    service: &Arc<Service<D>>,
-    pool: &PgPool,
+    service: &Arc<AuthService<D>>,
     config: DeviceCertConfig,
-    sign_in: Option<SignInHook<D::Id, Desc<D>>>,
 ) -> BackgroundTask {
-    let revoking = Arc::clone(service);
     // The status list's fetch task starts with the server and stops with it.
     let list = StatusList::new(config.android_status().clone());
     let status = BackgroundTask::new(list.spawn());
-    let enrolment = DeviceEnrolment::new(config, pg_enrolment_store::<D>(pool.clone()))
-        .with_session_revoker(Arc::new(move |session| {
-            let service = Arc::clone(&revoking);
-            Box::pin(async move {
-                if let Err(err) = service.revoke(session).await {
-                    tracing::warn!(error = %err, "a revoked device's session was not revoked");
-                }
-            })
-        }));
-    let enrolment = match sign_in {
-        Some(hook) => enrolment.with_first_enrolment_hook(tell_first_enrolment(service, hook)),
-        None => enrolment,
-    };
-    let enrolment = enrolment.with_status_list(list);
+    let enrolment = DeviceEnrolment::new(config, Arc::clone(service)).with_status_list(list);
     // The manager was built a moment ago, so nothing installed one before.
     let _ = manager.install_device_enrolment(Arc::new(enrolment));
     status
-}
-
-/// Tell the application of a key's first enrolment with the session it
-/// enrolled during, read on a spawned task since the hook fires inside the
-/// enrolment.
-fn tell_first_enrolment<D: ConnettoSchema>(
-    service: &Arc<Service<D>>,
-    hook: SignInHook<D::Id, Desc<D>>,
-) -> FirstEnrolmentHook<D::Id> {
-    let service = Arc::clone(service);
-    Arc::new(move |first: FirstEnrolment<D::Id>| {
-        let service = Arc::clone(&service);
-        let hook = Arc::clone(&hook);
-        tokio::spawn(async move {
-            match service.session_record(first.session).await {
-                Ok(Some(session)) => hook(SignInNotice::DeviceEnrolled {
-                    session,
-                    key: first.key,
-                    device: first.descriptor,
-                    at: first.at,
-                }),
-                Ok(None) => {
-                    tracing::warn!("a device enrolled during a session the store does not hold");
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "a first enrolment went untold");
-                }
-            }
-        });
-    })
 }
 
 /// Check what the change stream needs, then set up the reconnect log and the
@@ -2354,7 +2370,7 @@ fn build_guard<D: ConnettoSchema>(
     let guard = RequestGuard::new(*throttle, abuse).with_reader_gate(reader_gate);
     let guard = if bans {
         tracing::info!("banning identities that cross an abuse threshold");
-        guard.with_bans(pg_ban_store::<D>(pool.clone()))
+        guard.with_bans(pool.clone(), pg_ban_store::<D>())
     } else {
         guard
     };
@@ -2365,50 +2381,69 @@ fn build_guard<D: ConnettoSchema>(
 /// persisted keypair.
 async fn build_auth<D: ConnettoSchema>(
     pool: &PgPool,
-    resolver: Arc<dyn IdentityResolver<Id = D::Id>>,
     guard: Arc<RequestGuard<D::Id>>,
     providers: Providers,
     keys: &TokenKeys,
     config: &AuthConfig,
-    hooks: AuthHooks<D>,
-) -> Result<(Arc<Service<D>>, Arc<ProviderRegistry>), BuildError> {
-    let store = DbAuthStore::<D>::new(pool.clone(), config.refresh_lifetimes(), resolver);
+    wiring: SignInWiring<D>,
+) -> Result<(Arc<AuthService<D>>, Arc<ProviderRegistry>), BuildError> {
+    let store = DbAuthStore::<D>::new(pool.clone(), config.refresh_lifetimes(), wiring.hooks);
     let authority = TokenAuthority::from_ed_pem(&keys.private, &keys.public, config)
         .map_err(BuildError::TokenKeys)?;
     let registry = Arc::new(providers.registry().await?);
     let service = AuthService::new(Arc::new(authority), Arc::new(store), guard)
         .with_registry(Arc::clone(&registry));
-    let service = Arc::new(match hooks.describer {
+    let service = Arc::new(match wiring.describer {
         Some(Describer(describer)) => service.with_session_describer(describer),
         None => service,
     });
-    if let Some(hook) = hooks.sign_in {
-        service.set_sign_in_hook(hook);
-    }
     // The same sink on both, because a ban is detected in the guard and
     // every other access change is produced here.
-    service.guard().set_audit_hook(Arc::clone(&hooks.audit));
-    service.set_audit_hook(hooks.audit);
-    // A ban ends every session of the banned identity (R105 decision 8). The
-    // guard holds the hook and the service holds the guard, so the hook
-    // reaches the service through a weak handle rather than a cycle.
-    let banned = Arc::downgrade(&service);
-    service.guard().set_ban_hook(Arc::new(move |user: D::Id| {
-        let Some(service) = banned.upgrade() else {
-            return;
-        };
-        tokio::spawn(async move {
-            match service.end_banned(&user).await {
-                Ok(ended) => {
-                    tracing::warn!(user = %user, ended = ended.len(), "the ban ended every session");
-                }
-                Err(error) => {
-                    tracing::error!(%error, user = %user, "the ban's sessions could not be ended");
-                }
-            }
-        });
-    }));
+    service.guard().set_audit_hook(Arc::clone(&wiring.audit));
+    service.set_audit_hook(wiring.audit);
+    // A ban ends every session of the banned identity in its own transaction
+    // (R105 decision 8). The guard holds the sessions' ender and the service
+    // holds the guard, so the ender reaches the service through a weak handle
+    // rather than a cycle.
+    service
+        .guard()
+        .set_banned_sessions(Arc::new(ServiceBans(Arc::downgrade(&service))));
     Ok((service, registry))
+}
+
+/// Ends a banned identity's sessions through the auth service, held weakly
+/// since the service holds the guard that holds this.
+struct ServiceBans<D: ConnettoSchema>(Weak<AuthService<D>>);
+
+impl<D: ConnettoSchema> BannedSessions<D::Id> for ServiceBans<D> {
+    fn end<'a>(
+        &'a self,
+        transaction: &'a mut AsyncPgConnection,
+        user_id: &'a D::Id,
+    ) -> BanFuture<'a, Vec<SessionId>> {
+        Box::pin(async move {
+            let Some(service) = self.0.upgrade() else {
+                return Ok(Vec::new());
+            };
+            service
+                .store()
+                .end_all_of_in(transaction, user_id, None, EndCause::Banned)
+                .await
+                .map_err(BanError::new)
+        })
+    }
+
+    fn ended(&self, user_id: &D::Id, sessions: &[SessionId]) {
+        if let Some(service) = self.0.upgrade() {
+            service.ended_elsewhere(
+                user_id,
+                sessions,
+                crate::audit::AuthOp::EndedByBan,
+                EndCause::Banned,
+            );
+        }
+        tracing::warn!(user = %user_id, ended = sessions.len(), "the ban ended every session");
+    }
 }
 
 /// The reader pool's consumers: the file half, its sweep and the snapshot
@@ -2420,7 +2455,7 @@ async fn build_reader_side<D: ConnettoSchema>(
     schema: &ServerSchema,
     publication: &str,
     content: Option<ContentSettings>,
-    audit: crate::audit::AuditHook<D::Id>,
+    hooks: content::FileHooks<D::Id>,
 ) -> Result<ReaderSide, BuildError> {
     let content::FileHalf {
         signer,
@@ -2432,7 +2467,7 @@ async fn build_reader_side<D: ConnettoSchema>(
         &database.owner_url,
         &database.reader_url,
         reader_pool_size,
-        audit,
+        hooks,
     )
     .await?;
     let snapshot = PgSnapshotSource::from_ddl(pool.clone(), &schema.engine_ddl::<D>())?
@@ -2618,6 +2653,7 @@ async fn build_write_side<D: ConnettoSchema>(
         .with_audit_schema::<D::Audit>()
         .with_write_catalog(writable)
         .with_translator(translated.translator().clone())
+        .with_policy_reads(translated.policy_reads())
         .with_caller(CallerMappings::of::<String>(&schema.reader_role)?)
         .with_read_connector(engine_connector)
         .build()?;
@@ -2701,7 +2737,7 @@ fn log_reconnect(event: &ReconnectEvent<'_>) {
 /// and trim the log (R70 decisions 5, 10 and 18).
 async fn settle_epoch<D: ConnettoSchema>(
     manager: &ServerManager<D>,
-    service: &Service<D>,
+    service: &AuthService<D>,
     pool: &PgPool,
     check: StreamCheck,
     found: crate::epoch::Found,
@@ -2731,7 +2767,7 @@ async fn settle_epoch<D: ConnettoSchema>(
 /// settlement.
 async fn wire_manager<D: ConnettoSchema>(
     manager: &Arc<ServerManager<D>>,
-    service: &Service<D>,
+    service: &AuthService<D>,
     guard: &Arc<RequestGuard<D::Id>>,
     pool: &PgPool,
     feed: &Feed,
@@ -2767,6 +2803,7 @@ struct Feed {
     slot: String,
     publication: String,
     pg_ddl: String,
+    drift_reconciliation: Duration,
 }
 
 /// The two pools the write side takes over.
@@ -2812,24 +2849,23 @@ struct WriteSide<D: ConnettoSchema> {
 /// session before returning a terminal outcome.
 fn change_stream<D: ConnettoSchema>(
     manager: Arc<ServerManager<D>>,
-    service: Arc<Service<D>>,
+    service: Arc<AuthService<D>>,
     pool: PgPool,
     feed: Feed,
     policy: ReconnectPolicy,
 ) -> ChangeStream {
     Box::pin(async move {
         let connect = |resume: ResumePoint| {
-            let (url, slot, publication, ddl) = (
+            let (url, slot, publication, ddl, every) = (
                 feed.database_url.clone(),
                 feed.slot.clone(),
                 feed.publication.clone(),
                 feed.pg_ddl.clone(),
+                feed.drift_reconciliation,
             );
             let (pool, manager, service) =
                 (pool.clone(), Arc::clone(&manager), Arc::clone(&service));
             async move {
-                let catalog = ParserDB::parse::<PostgreSqlDialect>(&ddl)
-                    .map_err(|err| StreamConnectError::Catalog(format!("{err:?}")))?;
                 let check = manager.check_before_stream(&url, &pool, &slot).await?;
                 settle_epoch(
                     &manager,
@@ -2841,10 +2877,15 @@ fn change_stream<D: ConnettoSchema>(
                 .await?;
                 // Read after the checks, which clear it on a changed timeline
                 // or a skipped stretch.
-                let config = PgStreamingConfig::new(url, slot, publication).start(resume.get());
-                PgStreamingCdcSource::connect(config, catalog)
+                let config = PgStreamingConfig::new(url.clone(), slot, publication.clone())
+                    .start(resume.get());
+                let source =
+                    crate::drift::connect_guarded(config, &ddl, &url, &publication, every).await?;
+                manager
+                    .watch_guard(source.refusals())
                     .await
-                    .map_err(|err| StreamConnectError::Open(err.to_string()))
+                    .map_err(StreamConnectError::Refusals)?;
+                Ok::<_, StreamConnectError>(source)
             }
         };
         match manager
@@ -2863,6 +2904,7 @@ fn change_stream<D: ConnettoSchema>(
             // No restart of the stream changes what the deployment fixed (R6 decision 4).
             Err(
                 err @ (SessionError::ChangeStreamUnusable(_)
+                | SessionError::DriftUnserved(_)
                 | SessionError::AuthorizationUnanswerable { .. }),
             ) => {
                 close_every_session(&manager).await;
@@ -2890,7 +2932,7 @@ struct StreamWiring {
 /// The assembled server's parts, the three routers and the change stream.
 fn assemble_parts<D: ConnettoSchema>(
     manager: Arc<ServerManager<D>>,
-    service: Arc<Service<D>>,
+    service: Arc<AuthService<D>>,
     pool: PgPool,
     portability: Option<Arc<PortabilityState>>,
     registry: Arc<ProviderRegistry>,
@@ -2982,6 +3024,7 @@ mod tests {
     fn identified(user_id: &str) -> connetto_core::auth::ContentCaller {
         connetto_core::auth::ContentCaller::new(
             Some(user_id.to_owned()),
+            Some(connetto_core::SessionId::from_token_hash(user_id)),
             None,
             connetto_core::BOT_LIST_WILDCARD.to_owned(),
         )

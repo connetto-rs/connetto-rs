@@ -106,6 +106,7 @@ pub(crate) async fn forward(
             },
         }
     };
+    tracing::debug!(target: "tauri_plugin_connetto", subscription, webview = sent.webview, handle = feed.sub_id(), "subscription watching");
     match feed.answer() {
         Ok(answer) => sent.send(answer),
         Err(failure) => return sent.fail(&failure),

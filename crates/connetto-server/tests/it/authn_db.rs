@@ -1,14 +1,14 @@
 //! Needs Docker: the fixture starts its own Postgres.
 //!
-//! Exercises [`DbAuthStore`]: identity resolution through the resolver,
+//! Exercises [`DbAuthStore`]: identity resolution through the default hooks,
 //! session creation and liveness, how a session began and when it last
 //! refreshed, rotating refresh with reuse detection, and revocation.
 
 use std::time::Duration;
 
 use connetto_server::{
-    AuthConfig, AuthStore, AuthStoreError, DbAuthStore, DefaultUuidResolver, ResolvedIdentity,
-    RetainedProviderToken, SessionOrigin,
+    AuthConfig, AuthStoreError, DbAuthStore, DefaultAuthHooks, EndCause, IssuedSession,
+    ResolvedIdentity, RetainedProviderToken, SessionOrigin,
 };
 use connetto_test_harness::Fixture;
 use diesel::sql_query;
@@ -41,13 +41,12 @@ async fn reset_auth_tables(pool: &Pool<AsyncPgConnection>) {
     }
 }
 
-/// Build the database store over the default schema, resolving identity to a
-/// deterministic UUID v5 (the in-memory default resolver, run against Postgres).
+/// Build the default-schema store with deterministic UUID v5 identity resolution.
 fn build_store(pool: &Pool<AsyncPgConnection>) -> DbAuthStore<ConnettoDefaults> {
     DbAuthStore::new(
         pool.clone(),
         AuthConfig::default().refresh_lifetimes(),
-        std::sync::Arc::new(DefaultUuidResolver),
+        std::sync::Arc::new(DefaultAuthHooks),
     )
 }
 
@@ -70,6 +69,16 @@ fn origin() -> SessionOrigin<()> {
     }
 }
 
+/// Sign `subject` in on `store`, retaining no provider token and reading no
+/// ban list.
+async fn sign_in(store: &DbAuthStore<ConnettoDefaults>, subject: &str) -> IssuedSession {
+    store
+        .sign_in(&identity(subject), origin(), None, None)
+        .await
+        .expect("sign in")
+        .0
+}
+
 /// Every way a session is revoked forgets its retained provider tokens, the
 /// only copy connetto can reach (R105 decision 5).
 #[tokio::test]
@@ -86,14 +95,10 @@ async fn db_store_forgets_the_provider_tokens_of_every_revoked_session() {
     };
     let mut sessions = Vec::new();
     for subject in ["revoked", "owned", "others", "stolen", "restored"] {
-        let issued = store
-            .create_session(&identity(subject), origin())
+        let (issued, _) = store
+            .sign_in(&identity(subject), origin(), Some(&token), None)
             .await
-            .expect("create");
-        store
-            .set_retained_provider_token(issued.session_id, &token)
-            .await
-            .expect("retain");
+            .expect("sign in retaining the provider token");
         sessions.push(issued);
     }
     let [revoked, owned, others, stolen, restored] = sessions.as_slice() else {
@@ -101,18 +106,22 @@ async fn db_store_forgets_the_provider_tokens_of_every_revoked_session() {
     };
 
     store
-        .revoke_session(revoked.session_id)
+        .revoke_session(revoked.session_id, EndCause::Revoked)
         .await
         .expect("revoke");
     assert!(
         store
-            .end_owned(&owned.context.user_id, owned.session_id)
+            .end_owned(
+                &owned.context.user_id,
+                owned.session_id,
+                EndCause::EndedByOwner
+            )
             .await
             .expect("end")
     );
     assert_eq!(
         store
-            .end_all_of(&others.context.user_id, None)
+            .end_all_of(&others.context.user_id, None, EndCause::EndedAll)
             .await
             .expect("end all"),
         vec![others.session_id]
@@ -164,17 +173,9 @@ async fn db_store_lists_and_ends_one_persons_sessions() {
     let store = build_store(fixture.admin());
     let mut frank = Vec::new();
     for _ in 0..4 {
-        frank.push(
-            store
-                .create_session(&identity("frank"), origin())
-                .await
-                .expect("create"),
-        );
+        frank.push(sign_in(&store, "frank").await);
     }
-    let grace = store
-        .create_session(&identity("grace"), origin())
-        .await
-        .expect("create");
+    let grace = sign_in(&store, "grace").await;
     let mut conn = fixture.admin().get().await.expect("connection");
     sql_query(
         "UPDATE connetto_sessions SET idle_deadline = now() - interval '1 minute' \
@@ -206,10 +207,7 @@ async fn db_store_records_how_a_session_began_and_when_it_last_refreshed() {
     let fixture = Fixture::acquire().await;
     reset_auth_tables(fixture.admin()).await;
     let store = build_store(fixture.admin());
-    let issued = store
-        .create_session(&identity("iris"), origin())
-        .await
-        .expect("create");
+    let issued = sign_in(&store, "iris").await;
 
     let began = store
         .session_record(issued.session_id)
@@ -261,15 +259,9 @@ async fn db_store_creates_resolves_rotates_and_revokes() {
     let store = build_store(fixture.admin());
 
     // Two logins for the same (issuer, subject) resolve to one deployment-owned
-    // user id through the deterministic resolver, and each is its own live session.
-    let first = store
-        .create_session(&identity("frank"), origin())
-        .await
-        .expect("first");
-    let second = store
-        .create_session(&identity("frank"), origin())
-        .await
-        .expect("second");
+    // user id through the default hooks, and each is its own live session.
+    let first = sign_in(&store, "frank").await;
+    let second = sign_in(&store, "frank").await;
     assert_eq!(
         first.context.user_id, second.context.user_id,
         "same identity resolves to one user id",
@@ -312,7 +304,7 @@ async fn db_store_creates_resolves_rotates_and_revokes() {
             .expect("live")
     );
     store
-        .revoke_session(second.session_id)
+        .revoke_session(second.session_id, EndCause::Revoked)
         .await
         .expect("revoke");
     assert!(
@@ -330,10 +322,7 @@ async fn db_store_retains_and_replaces_provider_tokens() {
     let fixture = Fixture::acquire().await;
     reset_auth_tables(fixture.admin()).await;
     let store = build_store(fixture.admin());
-    let issued = store
-        .create_session(&identity("grace"), origin())
-        .await
-        .expect("create");
+    let issued = sign_in(&store, "grace").await;
 
     // No retained token yet.
     assert!(
@@ -417,10 +406,7 @@ async fn db_store_refuses_a_session_whose_deadline_lapsed_in_the_database() {
     let fixture = Fixture::acquire().await;
     reset_auth_tables(fixture.admin()).await;
     let store = build_store(fixture.admin());
-    let issued = store
-        .create_session(&identity("harry"), origin())
-        .await
-        .expect("create");
+    let issued = sign_in(&store, "harry").await;
 
     // Backdate both deadlines a minute into the past, the way only the
     // database clock can. The clock expression is SQL the typed DSL cannot
@@ -460,10 +446,7 @@ async fn db_store_holds_a_session_past_its_idle_deadline_dead() {
     let fixture = Fixture::acquire().await;
     reset_auth_tables(fixture.admin()).await;
     let store = build_store(fixture.admin());
-    let issued = store
-        .create_session(&identity("iris"), origin())
-        .await
-        .expect("create");
+    let issued = sign_in(&store, "iris").await;
     let mut conn = fixture.admin().get().await.expect("connection");
     sql_query(
         "UPDATE connetto_sessions SET idle_deadline = now() - interval '1 minute' \

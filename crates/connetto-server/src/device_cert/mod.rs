@@ -29,17 +29,16 @@ pub use attestation::{
 };
 #[doc(hidden)]
 pub use connetto_core::device_cert::{KeyId, Revoked};
-pub(crate) use enrolment::PendingChallenge;
 pub use enrolment::{
-    Device, DeviceEnrolment, Enrolment, EnrolmentError, EnrolmentFuture, EnrolmentStore,
-    FirstEnrolment, FirstEnrolmentHook, KeyRecord, MemoryEnrolments, RandomSource, Recorded,
-    Revocation, RevokeError, SessionRevoker,
+    Device, DeviceEnrolment, Enrolment, EnrolmentError, KeyRecord, RandomSource, Recorded,
+    Revocation, RevokeError,
 };
+pub(crate) use enrolment::{KeyRevoked, PendingChallenge};
 #[doc(hidden)]
 pub use schema::__key_id;
 pub use schema::{
-    ConnettoEnrolmentSchema, DeviceRow, KeyFacts, NewCertificate, NewEnrolment, Renewal, Statement,
-    pg_enrolment_store,
+    ConnettoEnrolmentSchema, DeviceRow, EnrolmentStore, KeyFacts, NewCertificate, NewEnrolment,
+    Renewal, Statement,
 };
 
 /// The issuer, the lifetimes it grants, and the attestation the server
@@ -111,7 +110,9 @@ pub enum ConfigError {
         ceiling: Duration,
     },
     /// The issuer's certificate has expired, so it can issue nothing.
-    #[error("the device certificate issuer has expired, sign a new one with connetto-ca")]
+    #[error(
+        "the device certificate issuer has expired, sign a new one with connetto_ca::sign_issuer"
+    )]
     IssuerExpired,
 }
 
@@ -172,7 +173,7 @@ impl DeviceCertConfig {
         self
     }
 
-    /// A list the root signed offline with `connetto-ca revoke-issuer`,
+    /// A list the root signed offline with `connetto_ca::revoke_issuer`,
     /// published beside the issuers' own lists.
     #[must_use]
     pub fn with_root_list(mut self, list: SignedList) -> Self {

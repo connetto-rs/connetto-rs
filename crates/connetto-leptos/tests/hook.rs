@@ -11,7 +11,8 @@ use connetto_client::{
     LiveSpec, LiveValue, SyncSchema, Watchable,
 };
 use connetto_core::messages::{
-    AggregateUpdate, ControlMessage, HandshakeAck, Subscribe, WriterGrant,
+    AggregateChange, AggregateColumns, AggregateUpdate, ColumnType, ControlMessage, HandshakeAck,
+    SqliteValue, Subscribe, WriterGrant,
 };
 use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, MaybeSend, Transport};
@@ -246,14 +247,21 @@ fn sub_id_of(subscribed: &[Subscribe], pick: impl Fn(&str) -> bool) -> String {
     id
 }
 
+/// The server's declaration of an aggregate subscription's column types.
+fn columns(sub_id: &str, columns: Vec<ColumnType>) -> ControlMessage {
+    ControlMessage::AggregateColumns(AggregateColumns {
+        sub_id: sub_id.to_owned(),
+        columns,
+    })
+}
+
 /// The server's push of the scalar `value`.
 fn scalar(sub_id: &str, value: i64) -> ControlMessage {
     ControlMessage::AggregateUpdate(AggregateUpdate {
         sub_id: sub_id.to_owned(),
-        group_key: None,
-        group_values_json: None,
-        result_json: Some(value.to_string()),
-        is_full_result: true,
+        change: AggregateChange::Replace {
+            rows: vec![vec![SqliteValue::Integer(value)]],
+        },
     })
 }
 
@@ -261,10 +269,13 @@ fn scalar(sub_id: &str, value: i64) -> ControlMessage {
 fn group(sub_id: &str, quantity: i32, count: i64) -> ControlMessage {
     ControlMessage::AggregateUpdate(AggregateUpdate {
         sub_id: sub_id.to_owned(),
-        group_key: Some(quantity.to_be_bytes().to_vec()),
-        group_values_json: Some(format!("[{quantity}]")),
-        result_json: Some(count.to_string()),
-        is_full_result: true,
+        change: AggregateChange::Upsert {
+            key: quantity.to_be_bytes().to_vec(),
+            row: vec![
+                SqliteValue::Integer(i64::from(quantity)),
+                SqliteValue::Integer(count),
+            ],
+        },
     })
 }
 
@@ -388,6 +399,11 @@ async fn use_live_follows_rows_scalars_and_groups() {
         query.contains("COUNT") && !query.contains("GROUP BY")
     });
     let groups_sub = sub_id_of(&subscribed, |query| query.contains("GROUP BY"));
+    server.say(columns(&count_sub, vec![ColumnType::Integer]));
+    server.say(columns(
+        &groups_sub,
+        vec![ColumnType::Integer, ColumnType::Integer],
+    ));
     server.say(scalar(&count_sub, 1));
     server.say(group(&groups_sub, 2, 1));
     until_text(&host, "first12x1").await;

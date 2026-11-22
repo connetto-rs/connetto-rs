@@ -14,11 +14,13 @@ use std::time::Duration;
 use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection};
 use connetto_core::Cursor;
 use connetto_core::messages::{
-    AggregateUpdate, BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired,
-    HandshakeAck, SnapshotBegin, SnapshotEnd, SnapshotPatch,
+    AggregateChange, AggregateColumns, AggregateUpdate, BulkMessage, ColumnType, ControlMessage,
+    FullResyncReason, FullResyncRequired, HandshakeAck, SnapshotBegin, SnapshotEnd, SnapshotPatch,
+    SqliteValue,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{LoopbackTransport, loopback};
+use connetto_test_harness::wire_tables::orders_table;
 use diesel::prelude::*;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 
@@ -43,26 +45,6 @@ diesel::table! {
     }
 }
 
-diesel::table! {
-    /// The client's resting table for server-computed values, read back to assert
-    /// what a full-resync clear left behind.
-    #[sql_name = "_connetto_aggregates"]
-    rested (query_id, binds, group_key) {
-        /// The query-text row id.
-        query_id -> diesel::sql_types::Integer,
-        /// The canonical binds blob.
-        binds -> diesel::sql_types::Binary,
-        /// The opaque group key, or the empty blob for a scalar.
-        group_key -> diesel::sql_types::Binary,
-        /// The decoded group values, or NULL.
-        group_values_json -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
-        /// The value body.
-        result_json -> diesel::sql_types::Text,
-        /// The as-of time.
-        updated_at -> diesel::sql_types::BigInt,
-    }
-}
-
 #[derive(Queryable, Selectable, Debug, PartialEq, Clone)]
 #[diesel(table_name = orders)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
@@ -78,11 +60,7 @@ struct Order {
 fn snapshot_payload(rows: &[(i64, i64)]) -> Vec<u8> {
     let mut patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new();
     for &(id, quantity) in rows {
-        let table = SimpleTable::new(
-            "orders",
-            &[("id", ""), ("price", ""), ("quantity", ""), ("status", "")],
-            &[0],
-        );
+        let table = orders_table();
         let insert = Insert::<_, String, Vec<u8>>::from(table)
             .set(0, Value::Integer(id))
             .expect("set id")
@@ -229,21 +207,36 @@ async fn full_resync_drops_rows_deleted_during_the_outage() {
     );
 }
 
-/// Send one grouped aggregate frame for `group_key` carrying `result`.
+/// Declare the answer columns of the grouped statistic `sub_id`, a text
+/// group and an integer count.
+async fn send_columns(server: &mut LoopbackTransport, sub_id: &str) {
+    let _ = server
+        .send_control(ControlMessage::AggregateColumns(AggregateColumns {
+            sub_id: sub_id.to_owned(),
+            columns: vec![ColumnType::Text, ColumnType::Integer],
+        }))
+        .await;
+}
+
+/// Send one grouped aggregate frame upserting `group` with `count` under
+/// the stored key `key`.
 async fn send_aggregate(
     server: &mut LoopbackTransport,
     sub_id: &str,
-    group_key: &[u8],
-    group_values: &str,
-    result: &str,
+    key: &[u8],
+    group: &str,
+    count: i64,
 ) {
     let _ = server
         .send_control(ControlMessage::AggregateUpdate(AggregateUpdate {
             sub_id: sub_id.to_owned(),
-            group_key: Some(group_key.to_vec()),
-            group_values_json: Some(group_values.to_owned()),
-            result_json: Some(result.to_owned()),
-            is_full_result: true,
+            change: AggregateChange::Upsert {
+                key: key.to_vec(),
+                row: vec![
+                    SqliteValue::Text(group.to_owned()),
+                    SqliteValue::Integer(count),
+                ],
+            },
         }))
         .await;
 }
@@ -280,31 +273,38 @@ fn aggregate_resync_server() -> LoopbackTransport {
                 _ => return,
             }
         }
-        send_aggregate(&mut server, AGG_SUB, b"a", "[\"a\"]", "10").await;
-        send_aggregate(&mut server, AGG_SUB, b"b", "[\"b\"]", "20").await;
+        send_columns(&mut server, AGG_SUB).await;
+        send_aggregate(&mut server, AGG_SUB, b"a", "a", 10).await;
+        send_aggregate(&mut server, AGG_SUB, b"b", "b", 20).await;
         let _ = server
             .send_control(ControlMessage::FullResyncRequired(FullResyncRequired {
                 sub_id: AGG_SUB.to_owned(),
                 reason: FullResyncReason::AuthorizationChange,
             }))
             .await;
-        send_aggregate(&mut server, AGG_SUB, b"a", "[\"a\"]", "10").await;
+        send_aggregate(&mut server, AGG_SUB, b"a", "a", 10).await;
         while let Ok(Some(_)) = server.recv().await {}
     });
     client_end
 }
 
-/// Every rested group key, ordered by stored key.
+/// Every rested group key of the one statistic the replica rests, ordered by
+/// stored key.
 fn rested_groups<T>(conn: &mut ConnettoConnection<T>) -> Vec<Vec<u8>>
 where
     T: Transport,
     T::Error: core::fmt::Display,
 {
-    rested::table
-        .order(rested::group_key.asc())
-        .select(rested::group_key)
-        .load(conn.conn())
-        .expect("read the resting table")
+    let table: String = diesel::dsl::sql::<diesel::sql_types::Text>(
+        "SELECT name FROM sqlite_master WHERE name LIKE '\\_connetto\\_stat\\_%' ESCAPE '\\'",
+    )
+    .get_result(conn.conn())
+    .expect("the statistic rests in one table");
+    diesel::dsl::sql::<diesel::sql_types::Binary>(&format!(
+        "SELECT key FROM \"{table}\" ORDER BY key"
+    ))
+    .load(conn.conn())
+    .expect("read the resting table")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -388,8 +388,9 @@ fn aggregate_resync_live_server(
                 _ => return,
             }
         };
-        send_aggregate(&mut server, &sub_id, b"a", "[\"a\"]", "10").await;
-        send_aggregate(&mut server, &sub_id, b"b", "[\"b\"]", "20").await;
+        send_columns(&mut server, &sub_id).await;
+        send_aggregate(&mut server, &sub_id, b"a", "a", 10).await;
+        send_aggregate(&mut server, &sub_id, b"b", "b", 20).await;
         // Both groups are up, so the test orders the resync notice.
         let _ = bootstrap_seen.await;
         let _ = server
@@ -400,7 +401,7 @@ fn aggregate_resync_live_server(
             .await;
         // The test observed the emptied map, so order the re-bootstrap.
         let _ = cleared_seen.await;
-        send_aggregate(&mut server, &sub_id, b"a", "[\"a\"]", "10").await;
+        send_aggregate(&mut server, &sub_id, b"a", "a", 10).await;
         while let Ok(Some(_)) = server.recv().await {}
     });
     client_end
@@ -431,7 +432,7 @@ async fn full_resync_clears_the_watched_aggregate_handle() {
     let mut events = client.client().events();
     let mut groups = client
         .client()
-        .watch_groups::<_, Option<String>, i64>(
+        .watch_groups::<_, String, i64>(
             orders::table
                 .group_by(orders::status)
                 .select((orders::status, diesel::dsl::count_star())),
@@ -472,11 +473,11 @@ async fn full_resync_clears_the_watched_aggregate_handle() {
             .expect("the re-bootstrap timed out")
             .expect("the pump is driving the connection");
     }
-    let mut keys: Vec<Option<String>> = groups.map().keys().cloned().collect();
+    let mut keys: Vec<String> = groups.map().keys().cloned().collect();
     keys.sort();
     assert_eq!(
         keys,
-        vec![Some("a".to_owned())],
+        vec!["a".to_owned()],
         "only the re-bootstrapped group rests"
     );
 }

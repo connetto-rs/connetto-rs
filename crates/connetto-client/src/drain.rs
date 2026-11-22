@@ -31,6 +31,7 @@ use connetto_core::messages::{
 use connetto_core::messages::{WriterAnswer, WriterOutcome};
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Backoff, Major, RetryPolicy, SchemaVersion};
+use core::sync::atomic::Ordering;
 use core::time::Duration;
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
@@ -276,6 +277,18 @@ where
     T: Transport,
     T::Error: core::fmt::Display,
 {
+    /// Forget what the drain wire was bound to and had in flight, which
+    /// moves its sent writes back to queued in the unsynced snapshot.
+    fn unbind_drain(&mut self) {
+        self.drain.unbind();
+        self.unsynced_moved.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the drain wire sent `writer`'s held `seq` and awaits its answer.
+    pub(crate) fn drain_sent(&self, writer: &WriterRef, seq: u64) -> bool {
+        self.drain.writer.as_ref() == Some(writer) && self.drain.in_flight.contains(&seq)
+    }
+
     /// Load the oldest held batch and owe a dial for it at once.
     pub(crate) fn load_drain(&mut self) -> Result<(), ClientError> {
         let build = self.config.schema_major;
@@ -330,7 +343,7 @@ where
     pub fn cancel_drain_dial(&mut self, timer: DrainTimer) {
         if self.drain.batch.is_some() && self.drain.armed == timer.armed {
             self.drain.wire = None;
-            self.drain.unbind();
+            self.unbind_drain();
             self.drain.back_off();
         }
     }
@@ -560,7 +573,7 @@ where
             Ok(ack) => {
                 self.drain.dial = timer.armed;
                 self.drain.wire = Some(transport);
-                self.drain.unbind();
+                self.unbind_drain();
                 self.drain.authorization = DrainAuthorization::Current(self.share_key_generation);
                 self.drain_bound(major, writer, request, ack).await
             }
@@ -882,6 +895,7 @@ where
                 return Ok(());
             }
             self.drain.in_flight.insert(seq);
+            self.unsynced_moved.store(true, Ordering::Relaxed);
         }
         self.after_drain_settle(major).await
     }
@@ -935,7 +949,7 @@ where
     /// writer once nothing of the major is left on its own or can still go up.
     async fn after_drain_settle(&mut self, major: Major) -> Result<(), ClientError> {
         if !self.holds_major(major) {
-            if (self.config.held_content.count)(&mut self.db, major)? > 0 {
+            if (self.config.content_hooks.count)(&mut self.db, major)? > 0 {
                 // The content layer's held files still ask for tickets on this wire.
                 return Ok(());
             }
@@ -1005,7 +1019,7 @@ where
         }
         let files = {
             let _suspended = ExemptWrites::raise(&self.write_flags);
-            crate::majors::forget_batch(&mut self.db, major, self.config.held_content)?
+            crate::majors::forget_batch(&mut self.db, major, self.config.content_hooks)?
         };
         let mut device_retired = false;
         for writer in hit {
@@ -1105,12 +1119,12 @@ where
         let Some(major) = self.draining_major() else {
             return Ok(());
         };
-        if self.holds_major(major) || (self.config.held_content.count)(&mut self.db, major)? > 0 {
+        if self.holds_major(major) || (self.config.content_hooks.count)(&mut self.db, major)? > 0 {
             return Ok(());
         }
         {
             let _suspended = ExemptWrites::raise(&self.write_flags);
-            crate::majors::forget_batch(&mut self.db, major, self.config.held_content)?;
+            crate::majors::forget_batch(&mut self.db, major, self.config.content_hooks)?;
         }
         // A range riding the shared wire settles on it after the batch's
         // own writes, so its wire stands (R78 decision 47).
@@ -1158,7 +1172,7 @@ where
         if let Some(mut wire) = self.drain.wire.take() {
             let _ = wire.close().await;
         }
-        self.drain.unbind();
+        self.unbind_drain();
         if self.drain.batch.is_some() && self.drain.timer.is_none() {
             self.drain.back_off();
         }
@@ -1166,7 +1180,7 @@ where
             return;
         };
         if self.holds_major(major)
-            || (self.config.held_content.count)(&mut self.db, major).unwrap_or(0) > 0
+            || (self.config.content_hooks.count)(&mut self.db, major).unwrap_or(0) > 0
         {
             self.notices
                 .push_back(ClientEvent::Held(HeldWork::WireLost { major }));
@@ -1429,7 +1443,7 @@ where
             FatalErrorReason::MajorMismatch { .. } => self.lose_major(major).await,
             FatalErrorReason::SessionRevoked => {
                 self.drain.wire = None;
-                self.drain.unbind();
+                self.unbind_drain();
                 self.drain.timer = None;
                 Ok(())
             }
@@ -1504,7 +1518,7 @@ where
         let Some(major) = self.draining_major() else {
             return Ok(false);
         };
-        Ok((self.config.held_content.count)(&mut self.db, major)? > 0)
+        Ok((self.config.content_hooks.count)(&mut self.db, major)? > 0)
     }
 
     /// The total held files across every held major (R31), the pending-work
@@ -1528,7 +1542,7 @@ where
                 .ok_or_else(|| {
                     ClientError::Session(format!("a held batch records major {stored}"))
                 })?;
-            total = total.saturating_add((self.config.held_content.count)(&mut self.db, major)?);
+            total = total.saturating_add((self.config.content_hooks.count)(&mut self.db, major)?);
         }
         Ok(total)
     }

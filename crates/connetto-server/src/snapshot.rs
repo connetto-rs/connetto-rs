@@ -229,13 +229,14 @@ mod pg {
         ColumnId, DatabaseLike, ParserDB, PgCommitPosition, PgLsn, TableId, catalog_helpers,
     };
 
-    use connetto_core::messages::BindValue;
+    use connetto_core::messages::SqliteValue;
     use connetto_core::{Cursor, Principal};
 
     use super::{
         RowSource, SnapshotError, SourceRow, page_sql, projection_exposes, table_from_select,
     };
     use crate::capability::CallerBinding;
+    use crate::catalog_shapes::CatalogShapes;
     use crate::key_filter::KeyFilter;
     use crate::session::{
         PageKey, PageSpec, SnapshotEstimate, SnapshotPage, SnapshotSource, TermSeedRead,
@@ -248,6 +249,8 @@ mod pg {
     pub struct PgSnapshotSource<DB = ParserDB> {
         pool: Pool<AsyncPgConnection>,
         catalog: DB,
+        /// Every catalog table's columns, which a row read projects.
+        shapes: CatalogShapes,
         /// The setting a policy reads the caller's identity from.
         user_setting: std::sync::Arc<str>,
         /// The publication the change stream reads, when the deployment named
@@ -261,19 +264,15 @@ mod pg {
         ///
         /// # Errors
         ///
-        /// [`SnapshotError::Catalog`] when the DDL does not parse.
+        /// [`SnapshotError::Catalog`] when the DDL does not parse or cannot
+        /// name a table's columns.
         pub fn from_ddl(
             pool: Pool<AsyncPgConnection>,
             pg_ddl: &str,
         ) -> Result<Self, SnapshotError> {
             let catalog = ParserDB::parse::<PostgreSqlDialect>(pg_ddl)
                 .map_err(|err| SnapshotError::Catalog(format!("{err:?}")))?;
-            Ok(Self {
-                pool,
-                catalog,
-                user_setting: connetto_core::auth::DEFAULT_USER_SETTING.into(),
-                publication: None,
-            })
+            Self::new(pool, catalog)
         }
     }
 
@@ -296,19 +295,6 @@ mod pg {
             self.publication = Some(publication.into());
             self
         }
-
-        /// Build over a connection pool and an existing catalog.
-        ///
-        /// Not `const`: the default identity setting is a shared string, which
-        /// cannot be built in a constant. This runs once at startup.
-        pub fn new(pool: Pool<AsyncPgConnection>, catalog: DB) -> Self {
-            Self {
-                pool,
-                catalog,
-                user_setting: connetto_core::auth::DEFAULT_USER_SETTING.into(),
-                publication: None,
-            }
-        }
     }
 
     /// One page's read, resolved: the table it names, the key it resumes on,
@@ -328,12 +314,30 @@ mod pg {
     }
 
     impl<DB: DatabaseLike> PgSnapshotSource<DB> {
+        /// Build over a connection pool and an existing catalog.
+        ///
+        /// # Errors
+        ///
+        /// [`SnapshotError::Catalog`] when the catalog cannot name a table's
+        /// columns.
+        pub fn new(pool: Pool<AsyncPgConnection>, catalog: DB) -> Result<Self, SnapshotError> {
+            let shapes = CatalogShapes::of(&catalog)
+                .map_err(|err| SnapshotError::Catalog(err.to_string()))?;
+            Ok(Self {
+                pool,
+                catalog,
+                shapes,
+                user_setting: connetto_core::auth::DEFAULT_USER_SETTING.into(),
+                publication: None,
+            })
+        }
+
         /// Resolve one page's read: the key it orders and resumes on, and the
         /// wrap around the subscription's own query.
         fn plan_page<'a>(
             &self,
             select_sql: &str,
-            binds: &[BindValue],
+            binds: &[SqliteValue],
             page: &PageSpec,
         ) -> Result<PagePlan<'a>, SnapshotError> {
             let table = table_from_select(select_sql)?;
@@ -345,7 +349,9 @@ mod pg {
                 catalog_helpers::primary_key_columns(&self.catalog, table_id).unwrap_or_default();
             let names: Vec<String> = key
                 .iter()
-                .filter_map(|column| catalog_helpers::column_name(&self.catalog, table_id, *column))
+                .filter_map(|column| {
+                    catalog_helpers::column_name::<Postgres, _>(&self.catalog, table_id, *column)
+                })
                 .collect();
             // A wrap can only name what the inner query returns, so a
             // projection without the key is read as one capped page and
@@ -582,13 +588,13 @@ mod pg {
 
     /// Attach the wire binds to `query` in placeholder order, each with its
     /// natural Postgres type.
-    pub(crate) fn attach_binds(query: Boxed<'_>, binds: Vec<BindValue>) -> Boxed<'_> {
+    pub(crate) fn attach_binds(query: Boxed<'_>, binds: Vec<SqliteValue>) -> Boxed<'_> {
         binds.into_iter().fold(query, |query, bind| match bind {
-            BindValue::Null => query.bind::<Nullable<Text>, _>(None::<String>),
-            BindValue::Integer(value) => query.bind::<BigInt, _>(value),
-            BindValue::Real(value) => query.bind::<Double, _>(value),
-            BindValue::Text(value) => query.bind::<Text, _>(value),
-            BindValue::Blob(bytes) => query.bind::<Binary, _>(bytes),
+            SqliteValue::Null => query.bind::<Nullable<Text>, _>(None::<String>),
+            SqliteValue::Integer(value) => query.bind::<BigInt, _>(value),
+            SqliteValue::Real(value) => query.bind::<Double, _>(value),
+            SqliteValue::Text(value) => query.bind::<Text, _>(value),
+            SqliteValue::Blob(bytes) => query.bind::<Binary, _>(bytes),
         })
     }
 
@@ -617,27 +623,12 @@ mod pg {
             let Some(filter) = filter else {
                 return Ok(None);
             };
-            let arity = catalog_helpers::table_arity(&self.catalog, table_id).unwrap_or_default();
-            let mut columns = Vec::with_capacity(arity);
-            for ordinal in 0..arity {
-                let Ok(column) = ColumnId::try_from(ordinal) else {
-                    return Ok(None);
-                };
-                let Some(name) = catalog_helpers::column_name(&self.catalog, table_id, column)
-                else {
-                    return Ok(None);
-                };
-                columns.push(quote_ident(&name));
-            }
-            if columns.is_empty() {
-                return Ok(None);
-            }
             // Raw SQL for the same reason the read filter is: the table and its
             // columns come from the deployment's runtime DDL, so no `table!`
-            // schema names them.
+            // schema names them. The projection is the catalog's columns.
             let sql = format!(
                 "SELECT {} FROM {} WHERE {}",
-                columns.join(", "),
+                self.shapes.select_list(table_id),
                 quote_ident(table),
                 filter.predicate(),
             );
@@ -697,7 +688,7 @@ mod pg {
         async fn estimate(
             &self,
             select_sql: &str,
-            binds: &[BindValue],
+            binds: &[SqliteValue],
             caller: &Principal<Id, Key>,
         ) -> Result<SnapshotEstimate, Self::Error> {
             let table = table_from_select(select_sql)?;
@@ -772,7 +763,7 @@ mod pg {
         async fn snapshot_page(
             &self,
             select_sql: &str,
-            binds: &[BindValue],
+            binds: &[SqliteValue],
             caller: &Principal<Id, Key>,
             page: &PageSpec,
         ) -> Result<SnapshotPage, Self::Error> {
@@ -1022,7 +1013,19 @@ mod pg {
 
 #[cfg(test)]
 mod tests {
-    use super::{page_sql, projection_exposes};
+    use super::{PgSnapshotSource, SnapshotError, page_sql, projection_exposes};
+    use crate::catalog_shapes::{unconnected_pool, unresolvable_key_column, unresolvable_key_ddl};
+
+    #[tokio::test]
+    async fn a_catalog_with_an_unresolvable_key_refuses_the_snapshot_source() {
+        let refusal = PgSnapshotSource::from_ddl(unconnected_pool(), &unresolvable_key_ddl())
+            .err()
+            .map(|err| err.to_string());
+        assert_eq!(
+            refusal,
+            Some(SnapshotError::Catalog(unresolvable_key_column()).to_string())
+        );
+    }
 
     /// A page is cut by a keyset comparison, never by an offset, because the
     /// cost of an offset grows with the page's position: measured at 703 ms for

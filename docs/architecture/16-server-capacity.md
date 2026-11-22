@@ -12,7 +12,7 @@ Each connection's queued outbound frames are bounded by its send budget, which [
 
 ## The three pools
 
-The server builds three Postgres pools through `build_pool` in [mod.rs](../../crates/connetto-server/src/builder/mod.rs), a bb8 pool over the `diesel_async` engine. The sizes are settings, and the binary reads them from the environment.
+The server builds three Postgres pools through `build_pool` in [mod.rs](../../crates/connetto-server/src/builder/mod.rs), a bb8 pool over the `diesel_async` engine. The sizes are settings, and the demo's `demo-server` reads them from the environment.
 
 | Pool | Purpose | Environment variable | Default |
 |---|---|---|---|
@@ -24,7 +24,7 @@ The **owner pool** carries the authentication store, audit writes and every read
 
 The **re-execution pool** connects as the reader role and carries the computed reads that run under a caller's binding, the session's scalar and seed first answers and the engine-driven re-reads. It is a pool of their own, sized at the owner pool's, so a re-execution hold never reaches the gated reader pool the reserve splits. It is the reader role so the caller's policies scope the rows a read answers.
 
-The **reader pool** connects as a role that row-level security does apply to, and the binary refuses to start without it. It carries everything a caller's own request touches. Every visibility question, every snapshot read, every mutation apply, and the durable watermark read the handshake performs before it can complete.
+The **reader pool** connects as a role that row-level security does apply to, and `demo-server` refuses to start without it. It carries everything a caller's own request touches. Every visibility question, every snapshot read, every mutation apply, and the durable watermark read the handshake performs before it can complete.
 
 The reader pool is therefore the contended resource, and what contends for it is callers rather than connetto's own background work.
 

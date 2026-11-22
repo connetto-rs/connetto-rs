@@ -155,6 +155,8 @@ sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", 
 pg_walstream = { git = "https://github.com/isdaniel/pg-walstream", branch = "main" }
 # Until a sql-values release carries PostgreSQL's bpchar, which rls2fga main uses.
 sql-values = { git = "https://github.com/connetto-rs/sql-values", branch = "main" }
+# subql main follows sqlite-diff-rs main for its float4 storage form.
+sqlite-diff-rs = { git = "https://github.com/connetto-rs/sqlite-diff-rs", branch = "main" }
 # R51, until both are released: the keychain store's shared authentication
 # (apple-native-keyring-store #26) on security-framework's typed
 # authentication context (#263 and #264, on upstream main). Pinned by rev,

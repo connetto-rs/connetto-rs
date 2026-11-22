@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use connetto_core::device_cert::KeyId;
-use connetto_core::messages::{BindValue, ControlMessage, FatalError, FatalErrorReason};
+use connetto_core::messages::{ControlMessage, FatalError, FatalErrorReason, SqliteValue};
 use connetto_server::builder::{
     BuildError, ContentSettings, Database, OidcProvider, OpenFga, ServerBuilder, ServerSchema,
     StoreSpec, TokenKeys,
@@ -41,9 +41,11 @@ use uuid::Uuid;
 
 use super::builder_coverage::apply_content_deployment;
 use super::device_identity::{challenge_nonce, enrol_request};
-use super::e2e::{PG_SERIAL, exec, mint_tokens, reset_audit_table, signing_keys, with_user_url};
 use super::enrolment::{device_key, rooted_issuer};
 use super::lifecycle::{admin_pool, next_control, wait_ready};
+use connetto_test_harness::server_fixture::{
+    PG_SERIAL, exec, mint_tokens, reset_audit_table, signing_keys, with_user_url,
+};
 
 /// The schema document declares no RLS, the policies document carries it.
 const PG_DDL: &str = "-- connetto:major 1\n\
@@ -871,7 +873,7 @@ async fn an_owner_query_failing_at_read_time_fails_the_download() {
                 "SELECT * FROM mod_notes WHERE id / ? = 1",
                 "notes divided by zero",
             )
-            .binds(vec![PortabilityBind::Value(BindValue::Integer(0))])
+            .binds(vec![PortabilityBind::Value(SqliteValue::Integer(0))])
             .read_as_owner(),
         );
 
@@ -1355,7 +1357,7 @@ async fn a_download_binds_fixed_values_and_keeps_each_value_typed() {
             "SELECT id, owner, body, score, avatar FROM records WHERE score >= ?",
             "scored records",
         )
-        .binds(vec![PortabilityBind::Value(BindValue::Real(1.0))]),
+        .binds(vec![PortabilityBind::Value(SqliteValue::Real(1.0))]),
     );
 
     let (builder, _idp, _keys) = portability_builder(&fixture, list).await;
@@ -2098,7 +2100,8 @@ async fn end_person_fails_when_the_session_store_cannot_answer() {
 }
 
 /// A sign-out whose enrolment table cannot be read fails rather than report
-/// that the person enrolled no device.
+/// that the person enrolled no device, and leaves the person's sessions
+/// standing, since the erasure is one transaction.
 #[tokio::test]
 async fn end_person_fails_when_the_enrolments_cannot_be_read() {
     let _keyring = isolated_session_keyring();
@@ -2128,7 +2131,7 @@ async fn end_person_fails_when_the_enrolments_cannot_be_read() {
         "the failure is the enrolment table's: {err}"
     );
     assert!(
-        session_revoked(&pool, session).await,
-        "the sessions, revoked first, stay revoked"
+        !session_revoked(&pool, session).await,
+        "the failed erasure rolls the session revocation back"
     );
 }

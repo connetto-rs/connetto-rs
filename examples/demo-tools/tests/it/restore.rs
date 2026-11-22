@@ -1,0 +1,696 @@
+//! R70 step 2: a client whose replica is ahead of a server restored to an
+//! earlier point, once per restore method (R70 decision 3).
+//!
+//! The real server and client binaries run as in `e2e.rs`. The client syncs
+//! three rows, the deployment takes a backup, two more rows reach the client,
+//! and the server is stopped and its database restored from the backup. A
+//! restarted server then takes one new row, the client logs in again and
+//! relaunches on the replica it holds, and it is read back. The decided outcome
+//! leaves the client holding exactly what the restored server holds, and no
+//! refresh token from before the restore still works (R70 decisions 4, 5 and 10).
+
+use std::path::Path;
+use std::time::Duration;
+
+use diesel::{ExpressionMethods, QueryDsl};
+use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use diesel_async::pooled_connection::bb8::Pool;
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
+
+use connetto_test_harness::server_fixture::{
+    Authorization, NO_POLICIES, PG_DDL, PG_SERIAL, QUERY, mint_refresh_token, mint_token, orders,
+    reset_fixture, with_user_url,
+};
+use connetto_test_harness::{Fixture, PUBLICATION, SLOT, provision_cap_policies};
+use openidconnect::reqwest;
+
+use super::e2e::{
+    ChildGuard, Ports, ReplicaDir, build_auth_stack, open_replica, restart_server,
+    spawn_client_env, spawn_server_cfg, start_server, wait_for_rows,
+};
+
+/// How the deployment backs up and restores.
+#[derive(Clone, Copy, Debug)]
+enum Method {
+    /// `pg_basebackup`, then recovery to the backup's consistent point, which
+    /// promotes onto a new timeline, as a second cluster.
+    PointInTime,
+    /// `pg_dumpall --globals-only` and `pg_dump`, restored into a freshly
+    /// initialised second cluster.
+    FreshCluster,
+    /// `pg_dump`, restored with `--clean` into the cluster it was taken from.
+    SameCluster,
+}
+
+/// The backup half, taken while the server runs.
+const BASE_BACKUP: &str = "rm -rf /tmp/base && pg_basebackup -D /tmp/base -X stream -c fast";
+
+/// Recovery to the base backup's consistent point on the spare port.
+/// `restore_command` is required for targeted recovery, and every segment it
+/// needs is already in `pg_wal` because the backup streamed it. `wal_level`
+/// is repeated because the primary took it on its command line, which a base
+/// backup does not carry.
+const RECOVER_TO_BACKUP: &str = "touch /tmp/base/recovery.signal && \
+     printf \"port = 5433\\nwal_level = logical\\nrecovery_target = 'immediate'\\nrecovery_target_action = 'promote'\\nrestore_command = 'false'\\n\" \
+       >> /tmp/base/postgresql.auto.conf && \
+     chmod 700 /tmp/base && \
+     pg_ctl -D /tmp/base -l /tmp/pitr.log -w -t 60 start && \
+     until [ \"$(psql -p 5433 -At -c 'SELECT pg_is_in_recovery()')\" = f ]; do sleep 0.2; done";
+
+/// A fresh cluster on the spare port, with the dump restored into it.
+const RESTORE_INTO_FRESH: &str = "rm -rf /tmp/fresh && \
+     initdb -D /tmp/fresh -U postgres --auth=trust >/dev/null && \
+     echo 'host all all all trust' >> /tmp/fresh/pg_hba.conf && \
+     pg_ctl -D /tmp/fresh -l /tmp/fresh.log -w -t 60 \
+       -o \"-p 5433 -c listen_addresses='*' -c wal_level=logical -c fsync=off\" start && \
+     psql -p 5433 -d postgres -q -f \"$DUMP_DIR/globals.sql\" >/dev/null 2>&1 || true; \
+     pg_restore -p 5433 -d postgres \"$DUMP_DIR/db.dump\"";
+
+/// The application launching on its replica.
+fn launch(ws: &str, db: &Path, token: &str) -> ChildGuard {
+    spawn_client_env(
+        ws,
+        db,
+        "restore-client",
+        PG_DDL,
+        NO_POLICIES,
+        "orders",
+        QUERY,
+        token,
+        None,
+    )
+}
+
+/// What the run observed.
+#[derive(Debug)]
+#[expect(dead_code, reason = "the demonstration reports through Debug")]
+struct Observation {
+    method: Method,
+    /// Order ids the client held just before the restore.
+    client_before: Vec<i32>,
+    /// Slots the restored cluster held before the operator recreated one.
+    slots_after_restore: i64,
+    /// Order ids the restored server holds, new row included.
+    server_after: Vec<i32>,
+    /// Order ids the client holds once it has had time to converge.
+    client_after: Vec<i32>,
+    /// The restored cluster's timeline.
+    timeline: i64,
+    /// Whether the restored cluster reports the system identifier the backed-up one did.
+    same_system_identifier: bool,
+    /// What `/auth/refresh` answers the holder's current refresh token, which
+    /// was rotated after the backup.
+    holder_refresh_after_restore: u16,
+    /// What it answers a refresh token rotated away after the backup, the one
+    /// a thief would hold.
+    stale_refresh_after_restore: u16,
+}
+
+/// Order ids in the client's replica, empty while it cannot be opened.
+fn client_ids(db_path: &Path) -> Vec<i32> {
+    let Some(mut conn) = open_replica(db_path) else {
+        return Vec::new();
+    };
+    diesel::RunQueryDsl::load(
+        orders::table.select(orders::id).order(orders::id),
+        &mut conn,
+    )
+    .unwrap_or_default()
+}
+
+async fn server_ids(pool: &Pool<AsyncPgConnection>) -> Vec<i32> {
+    let mut conn = pool.get().await.expect("admin connection");
+    orders::table
+        .select(orders::id)
+        .order(orders::id)
+        .load(&mut conn)
+        .await
+        .expect("read the server's orders")
+}
+
+async fn insert_order(pool: &Pool<AsyncPgConnection>, id: i32) {
+    let mut conn = pool.get().await.expect("admin connection");
+    diesel::insert_into(orders::table)
+        .values((
+            orders::id.eq(id),
+            orders::price.eq(1.0),
+            orders::quantity.eq(1),
+            orders::status.eq("restore"),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("insert an order");
+}
+
+async fn pool_for(url: &str) -> Pool<AsyncPgConnection> {
+    Pool::builder()
+        .build(AsyncDieselConnectionManager::<AsyncPgConnection>::new(url))
+        .await
+        .expect("build pool")
+}
+
+/// Present a refresh token, returning the status and the rotated token.
+async fn refresh(auth_base: &str, token: &str) -> (u16, Option<String>) {
+    let response = reqwest::Client::new()
+        .post(format!("{auth_base}/auth/refresh"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(serde_json::json!({ "refresh_token": token }).to_string())
+        .send()
+        .await
+        .expect("POST /auth/refresh");
+    let status = response.status().as_u16();
+    let body: serde_json::Value = response.json().await.unwrap_or_default();
+    (
+        status,
+        body["refresh_token"].as_str().map(ToOwned::to_owned),
+    )
+}
+
+/// Restore the backup `method` took, recreate the slot as an operator must,
+/// and return where the restored database listens, how many slots it held
+/// before the recreation, its timeline and its system identifier.
+async fn restore(
+    fixture: &Fixture,
+    method: Method,
+    primary_url: String,
+) -> (String, i64, i64, String) {
+    let (target_url, port_flag) = match method {
+        Method::PointInTime => {
+            fixture.shell(RECOVER_TO_BACKUP).await;
+            (fixture.spare_url().to_owned(), "-p 5433")
+        }
+        Method::FreshCluster => {
+            fixture.shell(RESTORE_INTO_FRESH).await;
+            (fixture.spare_url().to_owned(), "-p 5433")
+        }
+        Method::SameCluster => {
+            fixture.restore_same_cluster().await;
+            (primary_url, "")
+        }
+    };
+    let read = |sql: &'static str| {
+        let script = format!("psql {port_flag} -d postgres -At -c '{sql}'");
+        async move {
+            fixture
+                .shell(&script)
+                .await
+                .trim()
+                .parse::<i64>()
+                .expect("an integer")
+        }
+    };
+    let slots = read("SELECT count(*) FROM pg_replication_slots").await;
+    let timeline = read("SELECT timeline_id FROM pg_control_checkpoint()").await;
+    let identifier = system_identifier(fixture, port_flag).await;
+    // The same-cluster restore recreated its own slot, so the two spare
+    // clusters alone wait for the operator's recreation.
+    match method {
+        Method::SameCluster => {}
+        Method::PointInTime | Method::FreshCluster => {
+            fixture
+                .shell(&format!(
+                    "psql {port_flag} -d postgres -q -c \"SELECT pg_create_logical_replication_slot('{SLOT}', 'pgoutput')\" \
+                     -c \"SELECT 1 FROM pg_publication WHERE pubname = '{PUBLICATION}'\""
+                ))
+                .await;
+        }
+    }
+    (target_url, slots, timeline, identifier)
+}
+
+/// The system identifier of the cluster `port_flag` names, as Postgres prints it.
+async fn system_identifier(fixture: &Fixture, port_flag: &str) -> String {
+    fixture
+        .shell(&format!(
+            "psql {port_flag} -d postgres -At -c 'SELECT system_identifier FROM pg_control_system()'"
+        ))
+        .await
+        .trim()
+        .to_owned()
+}
+
+/// Take the backup, then move past it on every front the restore rewinds. Two
+/// rows reach the client, the holder rotates its refresh token, and a second
+/// session rotates away the token that `stale` still names. Returns the
+/// holder's rotated token and the client's rows.
+async fn back_up_then_advance(
+    fixture: &Fixture,
+    method: Method,
+    primary: &Pool<AsyncPgConnection>,
+    auth_base: &str,
+    holder: String,
+    stale: &str,
+    db: &Path,
+) -> (String, Vec<i32>) {
+    match method {
+        Method::PointInTime => fixture.shell(BASE_BACKUP).await,
+        Method::FreshCluster | Method::SameCluster => fixture.dump_backup().await,
+    };
+    insert_order(primary, 4).await;
+    insert_order(primary, 5).await;
+    let (status, rotated) = refresh(auth_base, &holder).await;
+    assert_eq!(status, 200, "the holder rotates after the backup");
+    let (status, _) = refresh(auth_base, stale).await;
+    assert_eq!(
+        status, 200,
+        "and so does the session whose old token goes stale"
+    );
+    assert_eq!(
+        wait_for_rows(db, 5, Duration::from_secs(30)).await,
+        5,
+        "the client passes the backup"
+    );
+    (rotated.expect("a rotated refresh token"), client_ids(db))
+}
+
+/// The primary with the `orders` fixture, the auth tables and three rows.
+async fn seeded_primary(fixture: &Fixture, url: &str) -> Pool<AsyncPgConnection> {
+    let primary = pool_for(url).await;
+    reset_fixture(&primary, fixture).await;
+    fixture.provision_auth_tables().await;
+    insert_order(&primary, 2).await;
+    insert_order(&primary, 3).await;
+    primary
+}
+
+async fn demonstrate(method: Method) -> Observation {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+
+    let fixture = Fixture::acquire_restorable().await;
+    let primary_url = fixture.admin_url().to_owned();
+    let primary = seeded_primary(&fixture, &primary_url).await;
+
+    let auth_stack = build_auth_stack().await;
+    let authorization = Authorization::provision(&fixture, NO_POLICIES).await;
+    let secs = Duration::from_secs(30);
+
+    let reader = with_user_url(&primary_url, "app_reader", "app_reader");
+    let spawn_on = |database_url: &str, reader: &str, ports: Ports, auth_pairs: &[(&str, &str)]| {
+        spawn_server_cfg(
+            database_url,
+            &ports.bind(),
+            PG_DDL,
+            "orders",
+            Some(reader),
+            &authorization,
+            auth_pairs,
+        )
+    };
+    let (server, ports) = start_server(&auth_stack, secs, |ports, auth_pairs| {
+        spawn_on(&primary_url, &reader, ports, auth_pairs)
+    })
+    .await;
+    let (ws, auth_base) = (ports.ws(), ports.auth_base());
+    let (token, _) = mint_token(&auth_base).await;
+    let holder = mint_refresh_token(&auth_base).await;
+    let stale = mint_refresh_token(&auth_base).await;
+
+    let mut dir = ReplicaDir::new();
+    let db = dir.replica("restore-client.db");
+    let client = launch(&ws, &db, &token);
+    assert_eq!(
+        wait_for_rows(&db, 3, secs).await,
+        3,
+        "the client syncs the seed"
+    );
+
+    let (holder, client_before) =
+        back_up_then_advance(&fixture, method, &primary, &auth_base, holder, &stale, &db).await;
+
+    // A client binary exits when its server goes away, so the restart below is
+    // the application relaunching on the replica it already holds.
+    drop(client);
+    drop(server);
+    let backed_up_identifier = system_identifier(&fixture, "").await;
+    let (target_url, slots_after_restore, timeline, restored_identifier) =
+        restore(&fixture, method, primary_url).await;
+
+    let restored = pool_for(&target_url).await;
+    let reader = with_user_url(&target_url, "app_reader", "app_reader");
+    let _server = restart_server(&auth_stack, ports, secs, |ports, auth_pairs| {
+        spawn_on(&target_url, &reader, ports, auth_pairs)
+    })
+    .await;
+    let (holder_refresh_after_restore, _) = refresh(&auth_base, &holder).await;
+    let (stale_refresh_after_restore, _) = refresh(&auth_base, &stale).await;
+    insert_order(&restored, 6).await;
+    let (token, _) = mint_token(&auth_base).await;
+    let _client = launch(&ws, &db, &token);
+    // No count to wait for, since which count is right is what is being
+    // observed, so the client gets a fixed time to catch up or resync.
+    tokio::time::sleep(Duration::from_secs(15)).await;
+
+    Observation {
+        method,
+        client_before,
+        slots_after_restore,
+        server_after: server_ids(&restored).await,
+        client_after: client_ids(&db),
+        timeline,
+        same_system_identifier: backed_up_identifier == restored_identifier,
+        holder_refresh_after_restore,
+        stale_refresh_after_restore,
+    }
+}
+
+/// Every restore method leaves the client matching the server and every refresh token from before it refused.
+fn assert_recovered(observed: &Observation) {
+    assert_eq!(
+        observed.client_after, observed.server_after,
+        "the client resyncs to what the restored server holds: {observed:#?}"
+    );
+    assert_eq!(
+        (
+            observed.holder_refresh_after_restore,
+            observed.stale_refresh_after_restore
+        ),
+        (401, 401),
+        "the restore revoked every session: {observed:#?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs Docker and the release demo-server and demo-client binaries"]
+async fn a_point_in_time_restore_resyncs_clients_and_revokes_sessions() {
+    let observed = demonstrate(Method::PointInTime).await;
+    assert!(observed.same_system_identifier, "{observed:#?}");
+    assert_eq!(observed.timeline, 2, "{observed:#?}");
+    assert_recovered(&observed);
+}
+
+#[tokio::test]
+#[ignore = "needs Docker and the release demo-server and demo-client binaries"]
+async fn a_dump_into_a_fresh_cluster_resyncs_clients_and_revokes_sessions() {
+    let observed = demonstrate(Method::FreshCluster).await;
+    assert!(
+        !observed.same_system_identifier,
+        "only the identifier tells this restore apart: {observed:#?}"
+    );
+    assert_eq!(observed.timeline, 1, "{observed:#?}");
+    assert_recovered(&observed);
+}
+
+#[tokio::test]
+#[ignore = "needs Docker and the release demo-server and demo-client binaries"]
+async fn a_dump_into_the_same_cluster_resyncs_clients_and_revokes_sessions() {
+    let observed = demonstrate(Method::SameCluster).await;
+    assert!(observed.same_system_identifier, "{observed:#?}");
+    assert_recovered(&observed);
+}
+
+/// The application launching on its replica and pushing `write`.
+fn launch_writing(ws: &str, db: &Path, token: &str, write: &str) -> ChildGuard {
+    spawn_client_env(
+        ws,
+        db,
+        "restore-client",
+        PG_DDL,
+        NO_POLICIES,
+        "orders",
+        QUERY,
+        token,
+        Some(write),
+    )
+}
+
+/// An order the client inserts locally and pushes.
+fn local_order(id: i32) -> String {
+    format!("INSERT INTO orders (id, price, quantity, status) VALUES ({id}, 1.0, 1, 'mine')")
+}
+
+/// A replica's `(writer, sequence)` rows.
+type WriterRows = Vec<(String, i64)>;
+
+/// The client's writer rows as `(id, next_seq)` and its pending entries as
+/// `(writer, seq)`, absent while the replica cannot be read.
+fn client_writer_state(db_path: &Path) -> Option<(WriterRows, WriterRows)> {
+    #[derive(diesel::QueryableByName)]
+    struct Seq {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        writer: String,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        seq: i64,
+    }
+    let mut conn = open_replica(db_path)?;
+    let mut read = |sql: &str| -> Option<WriterRows> {
+        Some(
+            diesel::RunQueryDsl::load::<Seq>(diesel::sql_query(sql), &mut conn)
+                .ok()?
+                .into_iter()
+                .map(|row| (row.writer, row.seq))
+                .collect(),
+        )
+    };
+    Some((
+        read("SELECT id AS writer, next_seq AS seq FROM _connetto_writers ORDER BY id")?,
+        read("SELECT writer, seq FROM _connetto_pending ORDER BY writer, seq")?,
+    ))
+}
+
+/// Poll the server until it holds every order in `ids`.
+async fn wait_for_server(pool: &Pool<AsyncPgConnection>, ids: &[i32]) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let held = server_ids(pool).await;
+        if ids.iter().all(|id| held.contains(id)) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the server never held {ids:?}, it holds {held:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Poll `holds` until it is true, for at most 30 seconds.
+async fn eventually(what: &str, mut holds: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !holds() {
+        assert!(std::time::Instant::now() < deadline, "never true: {what}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Whether the replica at `db` holds no pending entry.
+fn settled(db: &Path) -> bool {
+    client_writer_state(db).is_some_and(|(_, pending)| pending.is_empty())
+}
+
+/// The issued number writer the replica at `db` holds.
+fn number_of(db: &Path) -> u64 {
+    let (writers, _) = client_writer_state(db).expect("read the replica's writers");
+    writers
+        .iter()
+        .find_map(|(id, _)| {
+            id.strip_prefix("number:")?
+                .parse::<u64>()
+                .ok()
+                .filter(|number| *number != 0)
+        })
+        .expect("the replica holds an issued number")
+}
+
+/// R70 step 2's frontier leg (decisions 21 and 22) with R78's re-send
+/// (decisions 17 and 22): a server restored to an earlier point holds one
+/// client's number below what that client saw settled, and issues another
+/// client's number again to a third. The client whose number stands re-sends
+/// the run it retained, so its write acknowledged after the backup comes
+/// back and it keeps its number. The client whose number the restore never
+/// knew moves its queue to a fresh number and its write acknowledged after
+/// the backup stays lost.
+#[tokio::test]
+#[ignore = "needs Docker and the release demo-server and demo-client binaries"]
+async fn a_restore_takes_a_retained_run_back_and_moves_unknown_numbers() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+
+    let fixture = Fixture::acquire_restorable().await;
+    let primary_url = fixture.admin_url().to_owned();
+    let primary = seeded_primary(&fixture, &primary_url).await;
+    let auth_stack = build_auth_stack().await;
+    let authorization = Authorization::provision(&fixture, NO_POLICIES).await;
+    let secs = Duration::from_secs(30);
+    let reader = with_user_url(&primary_url, "app_reader", "app_reader");
+    let spawn_on = |database_url: &str, reader: &str, ports: Ports, auth_pairs: &[(&str, &str)]| {
+        spawn_server_cfg(
+            database_url,
+            &ports.bind(),
+            PG_DDL,
+            "orders",
+            Some(reader),
+            &authorization,
+            auth_pairs,
+        )
+    };
+    let (server, ports) = start_server(&auth_stack, secs, |ports, auth_pairs| {
+        spawn_on(&primary_url, &reader, ports, auth_pairs)
+    })
+    .await;
+    let (ws, auth_base) = (ports.ws(), ports.auth_base());
+    // One login per client, since a second connection presenting the same
+    // grant supersedes the first.
+    let (token, _) = mint_token(&auth_base).await;
+    let (token_b, _) = mint_token(&auth_base).await;
+
+    let mut dir = ReplicaDir::new();
+    let early = dir.replica("issued-before.db");
+    let late = dir.replica("issued-after.db");
+
+    // Client A is issued its number and settles order 10 before the backup.
+    let a = launch_writing(&ws, &early, &token, &local_order(10));
+    wait_for_server(&primary, &[10]).await;
+    drop(a);
+    fixture.dump_backup().await;
+
+    // After the backup A settles order 11, and client B is issued its number
+    // and settles order 20.
+    let a = launch_writing(&ws, &early, &token, &local_order(11));
+    let b = launch_writing(&ws, &late, &token_b, &local_order(20));
+    wait_for_server(&primary, &[11, 20]).await;
+    eventually("A and B settle", || settled(&early) && settled(&late)).await;
+    drop((a, b));
+    let a_before = number_of(&early);
+    let b_before = number_of(&late);
+    drop(server);
+
+    let (target_url, _, _, _) = restore(&fixture, Method::SameCluster, primary_url).await;
+    let restored = pool_for(&target_url).await;
+    let reader = with_user_url(&target_url, "app_reader", "app_reader");
+    let _server = restart_server(&auth_stack, ports, secs, |ports, auth_pairs| {
+        spawn_on(&target_url, &reader, ports, auth_pairs)
+    })
+    .await;
+
+    // A brand-new client of the same account arrives first, and the restored
+    // server issues it B's number again, the sequence having rewound with the
+    // rows.
+    let fresh = dir.replica("fresh-after-restore.db");
+    let (token_c, _) = mint_token(&auth_base).await;
+    let c = launch_writing(&ws, &fresh, &token_c, &local_order(30));
+    wait_for_server(&restored, &[30]).await;
+    eventually("C settles", || settled(&fresh)).await;
+    drop(c);
+    let c_number = number_of(&fresh);
+    assert_eq!(
+        c_number, b_before,
+        "the restored server issued B's number again"
+    );
+
+    // Both log in again, as a restore revoked every session. A finds its
+    // number held below what it saw settled and re-sends the run it retained.
+    // B finds its number unknown under its own secret, so it moves its queue
+    // to a fresh number and its first attach fails, a driven client having no
+    // redial of its own.
+    let (token_a, _) = mint_token(&auth_base).await;
+    let (token_b, _) = mint_token(&auth_base).await;
+    let mut a = launch_writing(&ws, &early, &token_a, &local_order(12));
+    let mut b = launch_writing(&ws, &late, &token_b, &local_order(21));
+    wait_for_server(&restored, &[11, 12]).await;
+    eventually("B ends on its first attach", || b.exited().is_some()).await;
+
+    // The relaunch is B's redial, asking for a fresh number and writing.
+    let mut b = launch_writing(&ws, &late, &token_b, &local_order(21));
+    wait_for_server(&restored, &[21]).await;
+    eventually("A and B settle", || settled(&early) && settled(&late)).await;
+    assert!(a.exited().is_none(), "A keeps running");
+    assert!(b.exited().is_none(), "B keeps running");
+    let (a_after, b_after) = (number_of(&early), number_of(&late));
+    assert_eq!(a_after, a_before, "A keeps the number the restore rewound");
+    assert_ne!(b_after, b_before, "B moved off its reissued number");
+    assert!(
+        b_after != a_after && b_after != c_number,
+        "B writes under a number of its own, A {a_after}, B {b_after}, C {c_number}"
+    );
+
+    let held = server_ids(&restored).await;
+    assert!(
+        held.contains(&11),
+        "A's write acknowledged after the backup came back, the server holds {held:?}"
+    );
+    assert!(
+        !held.contains(&20),
+        "B's write under a number the backup never knew stays lost, the server holds {held:?}"
+    );
+    eventually("A holds its restored write", || {
+        client_ids(&early).contains(&11)
+    })
+    .await;
+}
+
+/// A membership-guarded schema, so the change path asks the authorization
+/// store about `docs` rows from facts derived from `project_members`.
+const MEMBERSHIP_DDL: &str = "-- connetto:major 1\nCREATE TABLE docs (id BIGINT PRIMARY KEY, project_id BIGINT NOT NULL);\n\
+     CREATE TABLE project_members (project_id BIGINT NOT NULL, user_id TEXT NOT NULL, \
+     PRIMARY KEY (project_id, user_id));";
+const MEMBERSHIP_POLICIES: &str = "ALTER TABLE docs ENABLE ROW LEVEL SECURITY;\n\
+     CREATE POLICY docs_members ON docs FOR ALL USING (project_id IN \
+     (SELECT project_id FROM project_members WHERE user_id = current_setting('app.user_id', true)));";
+
+#[tokio::test]
+#[ignore = "R70 step 2 demonstration, prints what a restore does and asserts nothing"]
+async fn authorization_facts_across_a_restore() {
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire_restorable().await;
+    let url = fixture.admin_url().to_owned();
+    fixture
+        .setup(&[
+            MEMBERSHIP_DDL,
+            MEMBERSHIP_POLICIES,
+            "CREATE ROLE app_reader LOGIN PASSWORD 'app_reader'",
+            "GRANT USAGE ON SCHEMA public TO app_reader",
+            "GRANT SELECT ON docs, project_members TO app_reader",
+            "GRANT SELECT ON auth_events TO app_reader",
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled, \
+             _connetto_session_writers TO app_reader",
+            "INSERT INTO project_members VALUES (1, 'alice')",
+        ])
+        .await;
+    // The server refuses a synced table not held to the bot cap, so the
+    // generated cap rules go in beside the schema and its policies, as a
+    // deployment applies them.
+    provision_cap_policies(fixture.admin(), MEMBERSHIP_DDL, MEMBERSHIP_POLICIES).await;
+    fixture
+        .start_replication(&["docs", "project_members"])
+        .await;
+    fixture.provision_auth_tables().await;
+    let authorization = Authorization::provision(&fixture, MEMBERSHIP_POLICIES).await;
+    let reader = with_user_url(&url, "app_reader", "app_reader");
+    let secs = Duration::from_secs(30);
+    let auth_stack = build_auth_stack().await;
+    let spawn = |ports: Ports, auth_pairs: &[(&str, &str)]| {
+        spawn_server_cfg(
+            &url,
+            &ports.bind(),
+            MEMBERSHIP_DDL,
+            "",
+            Some(&reader),
+            &authorization,
+            auth_pairs,
+        )
+    };
+    let (server, ports) = start_server(&auth_stack, secs, spawn).await;
+    let alice_at_boot = authorization.await_tuples("alice").await;
+
+    fixture.dump_backup().await;
+    fixture
+        .exec("INSERT INTO project_members VALUES (1, 'mallory')")
+        .await;
+    let mallory_granted = authorization.await_tuples("mallory").await;
+
+    drop(server);
+    fixture.restore_same_cluster().await;
+    let _server = restart_server(&auth_stack, ports, secs, spawn).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    eprintln!(
+        "alice at boot: {alice_at_boot:?}\nmallory granted after the backup: {mallory_granted:?}\n\
+         mallory in the restored database: {}\nmallory in the store after the restored boot: {:?}",
+        fixture
+            .shell("psql -d postgres -At -c \"SELECT count(*) FROM project_members WHERE user_id = 'mallory'\"")
+            .await
+            .trim(),
+        authorization.tuples_naming("mallory").await,
+    );
+}

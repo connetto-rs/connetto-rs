@@ -11,8 +11,10 @@
 //!
 //! Needs Docker, because the fixture starts its own Postgres.
 
-use super::e2e::{NO_POLICIES, PG_DDL, PG_SERIAL, exec, reset_fixture, with_user_url};
 use connetto_server::preflight::{self, Artifact, PreflightError};
+use connetto_test_harness::server_fixture::{
+    NO_POLICIES, PG_DDL, PG_SERIAL, exec, reset_fixture, with_user_url,
+};
 use connetto_test_harness::{self, Fixture, pool_for, provision_cap_policies};
 use diesel::QueryableByName;
 use diesel::sql_query;

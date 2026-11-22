@@ -2,24 +2,27 @@
 //!
 //! Phase 1 of the relay-parity plan makes aggregate subscriptions transparent
 //! through the browser relay hub. The hub forwards the worker client's
-//! `ClientEvent::Aggregate` back down to the owning tab as an
-//! `AggregateUpdate`, so the event MUST carry every field the wire message
-//! does, not just the JSON payload. The server has emitted grouped deltas
-//! since the R82 adoption (proven end to end in connetto-server's
-//! `grouped_wire.rs`), and this test pins the client's decode alone with a
-//! hand-crafted frame over a loopback, so a decode regression cannot hide
+//! `ClientEvent::AggregateColumns` and `ClientEvent::Aggregate` back down to
+//! the owning tab as the frames they mirror, so each event MUST carry every
+//! field its wire message does. The server has emitted grouped deltas since
+//! the R82 adoption (proven end to end in connetto-server's
+//! `grouped_wire.rs`), and this test pins the client's decode alone with
+//! hand-crafted frames over a loopback, so a decode regression cannot hide
 //! behind the server's construction.
 
 use connetto_client::{ClientBuilder, ClientEvent};
 use connetto_core::Cursor;
-use connetto_core::messages::{AggregateUpdate, ControlMessage, HandshakeAck};
+use connetto_core::messages::{
+    AggregateChange, AggregateColumns, AggregateUpdate, ColumnType, ControlMessage, HandshakeAck,
+    SqliteValue,
+};
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{LoopbackTransport, loopback};
 
 const SQLITE_DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY, quantity INTEGER);";
 
-/// Complete the wire handshake as a fake server, then push one aggregate
-/// update carrying a group key and a delta (not-full) flag.
+/// Complete the wire handshake as a fake server, then push the columns of a
+/// grouped answer and one update to it.
 fn aggregate_pusher(update: AggregateUpdate) -> LoopbackTransport {
     let (mut fake_server, client_end) = loopback();
     tokio::spawn(async move {
@@ -45,6 +48,12 @@ fn aggregate_pusher(update: AggregateUpdate) -> LoopbackTransport {
             }))
             .await;
         let _ = fake_server
+            .send_control(ControlMessage::AggregateColumns(AggregateColumns {
+                sub_id: update.sub_id.clone(),
+                columns: vec![ColumnType::Text, ColumnType::Integer],
+            }))
+            .await;
+        let _ = fake_server
             .send_control(ControlMessage::AggregateUpdate(update))
             .await;
         while let Ok(Some(_)) = fake_server.recv().await {}
@@ -52,17 +61,16 @@ fn aggregate_pusher(update: AggregateUpdate) -> LoopbackTransport {
     client_end
 }
 
-// The decoded event mirrors the wire AggregateUpdate field for field, so a
-// relay can rebuild a faithful frame, including a grouped delta the direct
-// server never emits today.
+// The decoded events mirror the wire frames field for field, so a relay can
+// rebuild faithful frames, the declared columns first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn aggregate_update_decodes_group_key_and_delta_flag() {
+async fn aggregate_update_decodes_columns_and_keyed_row() {
     let transport = aggregate_pusher(AggregateUpdate {
         sub_id: "by-region".to_owned(),
-        group_key: Some(b"region=eu".to_vec()),
-        group_values_json: Some("[\"eu\"]".to_owned()),
-        result_json: Some("{\"count\":3}".to_owned()),
-        is_full_result: false,
+        change: AggregateChange::Upsert {
+            key: b"region=eu".to_vec(),
+            row: vec![SqliteValue::Text("eu".to_owned()), SqliteValue::Integer(3)],
+        },
     });
     let mut conn = ClientBuilder::new(
         super::support::bundle(SQLITE_DDL),
@@ -84,29 +92,34 @@ async fn aggregate_update_decodes_group_key_and_delta_flag() {
         conn.pump_one().await.expect("pump"),
         ClientEvent::SyncStatus(connetto_client::SyncStatus::Connected)
     );
-    let event = conn.pump_one().await.expect("pump");
     assert_eq!(
-        event,
+        conn.pump_one().await.expect("pump"),
+        ClientEvent::AggregateColumns {
+            sub_id: "by-region".to_owned(),
+            columns: vec![ColumnType::Text, ColumnType::Integer],
+        },
+    );
+    assert_eq!(
+        conn.pump_one().await.expect("pump"),
         ClientEvent::Aggregate {
             sub_id: "by-region".to_owned(),
-            result_json: Some("{\"count\":3}".to_owned()),
-            group_key: Some(b"region=eu".to_vec()),
-            group_values_json: Some("[\"eu\"]".to_owned()),
-            is_full_result: false,
+            change: AggregateChange::Upsert {
+                key: b"region=eu".to_vec(),
+                row: vec![SqliteValue::Text("eu".to_owned()), SqliteValue::Integer(3)],
+            },
         },
     );
 }
 
-// A removal frame (result_json: None) decodes faithfully so a relay can
-// forward the key-departure signal to the tab.
+// A removal frame decodes faithfully so a relay can forward the key-departure
+// signal to the tab.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn aggregate_removal_decodes_as_none() {
+async fn aggregate_removal_decodes_as_remove() {
     let transport = aggregate_pusher(AggregateUpdate {
         sub_id: "by-region".to_owned(),
-        group_key: Some(b"region=eu".to_vec()),
-        group_values_json: Some("[\"eu\"]".to_owned()),
-        result_json: None,
-        is_full_result: false,
+        change: AggregateChange::Remove {
+            key: b"region=eu".to_vec(),
+        },
     });
     let mut conn = ClientBuilder::new(
         super::support::bundle(SQLITE_DDL),
@@ -125,15 +138,17 @@ async fn aggregate_removal_decodes_as_none() {
         conn.pump_one().await.expect("pump"),
         ClientEvent::SyncStatus(connetto_client::SyncStatus::Connected)
     );
-    let event = conn.pump_one().await.expect("pump");
+    assert!(matches!(
+        conn.pump_one().await.expect("pump"),
+        ClientEvent::AggregateColumns { .. }
+    ));
     assert_eq!(
-        event,
+        conn.pump_one().await.expect("pump"),
         ClientEvent::Aggregate {
             sub_id: "by-region".to_owned(),
-            result_json: None,
-            group_key: Some(b"region=eu".to_vec()),
-            group_values_json: Some("[\"eu\"]".to_owned()),
-            is_full_result: false,
+            change: AggregateChange::Remove {
+                key: b"region=eu".to_vec(),
+            },
         },
     );
 }

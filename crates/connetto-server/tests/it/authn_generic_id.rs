@@ -1,19 +1,26 @@
-//! The in-memory auth store is generic over the developer's distributed id
-//! type. This drives it with `rosetta_uuid::Uuid` (the demo id) to prove the
-//! resolved `AuthContext::user_id` is the typed value, not a string, and that
-//! the same verified identity resolves to one id across logins while rotation
-//! and revocation carry the typed id through.
+//! The database auth store preserves a typed `rosetta_uuid::Uuid` user id, the
+//! id type the demos share between the client's SQLite replica and the
+//! server's Postgres tables, across login, rotation, and revocation.
 
 use std::sync::Arc;
 
 use connetto_server::{
-    AuthConfig, AuthStore, IdentityResolver, InMemoryAuthStore, ResolveFuture, ResolvedIdentity,
+    AuthConfig, AuthHooks, DbAuthStore, EndCause, HookFuture, IssuedSession, ResolvedIdentity,
     VerifiedClaims,
 };
+use connetto_test_harness::Fixture;
+use diesel_async::AsyncPgConnection;
 use rosetta_uuid::Uuid;
 
+connetto_server::connetto_schema! {
+    pub struct TypedSchema;
+    id: Uuid => rosetta_uuid::sql_types::Uuid,
+    audit_row_key: Uuid => rosetta_uuid::sql_types::Uuid,
+    audit_ddl: connetto_server::connetto_audit_ddl!("UUID", "UUID"),
+}
+
 /// A fixed namespace for the deterministic `(issuer, subject)` to `Uuid`
-/// mapping, standing in for the developer's `IdentityResolver`.
+/// mapping, standing in for the developer's `AuthHooks::user_for`.
 const NS: uuid::Uuid = uuid::Uuid::from_u128(0x2b7e_1516_28ae_d2a6_abf7_1588_09cf_4f3c);
 
 fn identity(subject: &str) -> ResolvedIdentity {
@@ -35,20 +42,20 @@ fn origin() -> connetto_server::SessionOrigin<()> {
     }
 }
 
-/// The deterministic v5 uuid over `issuer|subject`, mapped into the demo
-/// `rosetta_uuid::Uuid`.
+/// The deterministic v5 UUID over `issuer|subject`.
 fn expected_id(subject: &str) -> Uuid {
     uuid::Uuid::new_v5(&NS, format!("https://issuer.example|{subject}").as_bytes()).into()
 }
 
-/// The typed resolver: the in-memory stand-in for a developer's
-/// [`IdentityResolver`] over a typed distributed id.
-struct TypedResolver;
+/// Resolves verified identities to typed UUIDs.
+struct TypedHooks;
 
-impl IdentityResolver for TypedResolver {
-    type Id = Uuid;
-
-    fn resolve<'a>(&'a self, claims: &'a VerifiedClaims) -> ResolveFuture<'a, Uuid> {
+impl AuthHooks<TypedSchema> for TypedHooks {
+    fn user_for<'a>(
+        &'a self,
+        _transaction: &'a mut AsyncPgConnection,
+        claims: &'a VerifiedClaims,
+    ) -> HookFuture<'a, Uuid> {
         let id: Uuid = uuid::Uuid::new_v5(
             &NS,
             format!("{}|{}", claims.issuer, claims.subject).as_bytes(),
@@ -58,23 +65,33 @@ impl IdentityResolver for TypedResolver {
     }
 }
 
-fn store() -> InMemoryAuthStore<Uuid> {
-    let config = AuthConfig::default();
-    InMemoryAuthStore::<Uuid>::with_resolver(config.refresh_lifetimes(), Arc::new(TypedResolver))
+async fn store() -> (Fixture, DbAuthStore<TypedSchema>) {
+    let fixture = Fixture::acquire().await;
+    fixture.provision_auth_tables_over("UUID").await;
+    let store = DbAuthStore::new(
+        fixture.admin().clone(),
+        AuthConfig::default().refresh_lifetimes(),
+        Arc::new(TypedHooks),
+    );
+    (fixture, store)
+}
+
+/// Sign `subject` in on `store`, retaining no provider token and reading no
+/// ban list.
+async fn sign_in(store: &DbAuthStore<TypedSchema>, subject: &str) -> IssuedSession<Uuid> {
+    store
+        .sign_in(&identity(subject), origin(), None, None)
+        .await
+        .expect("sign in")
+        .0
 }
 
 #[tokio::test]
-async fn in_memory_store_carries_a_typed_user_id() {
-    let store = store();
+async fn database_store_carries_a_typed_user_id() {
+    let (_fixture, store) = store().await;
 
-    let first = store
-        .create_session(&identity("dave"), origin())
-        .await
-        .expect("first session");
-    let second = store
-        .create_session(&identity("dave"), origin())
-        .await
-        .expect("second session");
+    let first = sign_in(&store, "dave").await;
+    let second = sign_in(&store, "dave").await;
 
     // The resolved user id is the typed value, not a string, and the same
     // verified identity resolves to one id across logins.
@@ -84,21 +101,15 @@ async fn in_memory_store_carries_a_typed_user_id() {
     assert_ne!(first.session_id, second.session_id, "distinct sessions");
 
     // A different identity resolves to a different typed id.
-    let other = store
-        .create_session(&identity("erin"), origin())
-        .await
-        .expect("other session");
+    let other = sign_in(&store, "erin").await;
     assert_ne!(other.context.user_id, first.context.user_id);
 }
 
 #[tokio::test]
 async fn typed_id_survives_rotation_and_revocation() {
-    let store = store();
+    let (_fixture, store) = store().await;
 
-    let issued = store
-        .create_session(&identity("frank"), origin())
-        .await
-        .expect("create");
+    let issued = sign_in(&store, "frank").await;
     assert!(
         store
             .session_is_live(issued.session_id)
@@ -114,7 +125,7 @@ async fn typed_id_survives_rotation_and_revocation() {
     assert_ne!(rotated.refresh_token, issued.refresh_token, "token rotates");
 
     store
-        .revoke_session(issued.session_id)
+        .revoke_session(issued.session_id, EndCause::Revoked)
         .await
         .expect("revoke");
     assert!(
@@ -125,15 +136,11 @@ async fn typed_id_survives_rotation_and_revocation() {
     );
 }
 
-/// The in-memory store records how a session began and stamps each refresh,
-/// as the database store does.
+/// The database store records how a session began and stamps each refresh.
 #[tokio::test]
-async fn in_memory_store_records_how_a_session_began() {
-    let store = store();
-    let issued = store
-        .create_session(&identity("gina"), origin())
-        .await
-        .expect("create");
+async fn database_store_records_how_a_session_began() {
+    let (_fixture, store) = store().await;
+    let issued = sign_in(&store, "gina").await;
 
     let began = store
         .session_record(issued.session_id)
@@ -160,25 +167,15 @@ async fn in_memory_store_records_how_a_session_began() {
     assert!(refreshed >= began.created_at);
 }
 
-/// The in-memory store keeps the list-and-end contract the database store
-/// keeps.
+/// The database store lists and ends only the typed user's sessions.
 #[tokio::test]
-async fn in_memory_store_lists_and_ends_one_persons_sessions() {
-    let store = store();
+async fn database_store_lists_and_ends_one_persons_sessions() {
+    let (_fixture, store) = store().await;
     let mut hana = Vec::new();
     for _ in 0..3 {
-        hana.push(
-            store
-                .create_session(&identity("hana"), origin())
-                .await
-                .expect("create")
-                .session_id,
-        );
+        hana.push(sign_in(&store, "hana").await.session_id);
     }
-    let ivan = store
-        .create_session(&identity("ivan"), origin())
-        .await
-        .expect("create");
+    let ivan = sign_in(&store, "ivan").await;
     super::session_contract::ends_only_the_persons_sessions(
         &store,
         &expected_id("hana"),

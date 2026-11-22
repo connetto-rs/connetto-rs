@@ -112,7 +112,12 @@ async fn connect(
 }
 
 /// The typed grouped query every test watches: one count per status.
-fn by_status() -> impl diesel::query_builder::QueryFragment<diesel::sqlite::Sqlite> {
+fn by_status() -> impl diesel::query_builder::Query<
+    SqlType = (
+        diesel::sql_types::Nullable<diesel::sql_types::Text>,
+        diesel::sql_types::BigInt,
+    ),
+> + diesel::query_builder::QueryFragment<diesel::sqlite::Sqlite> {
     orders::table
         .group_by(orders::status)
         .select((orders::status, diesel::dsl::count_star()))
@@ -316,9 +321,9 @@ async fn a_restart_reads_the_last_synced_map_from_the_resting_table() {
     pump.await.expect("second pump ends");
 }
 
-/// One answer row of the top-orders window, decoded from the whole answer's
-/// object by column name.
-#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+/// One answer row of the top-orders window, loaded through diesel from the
+/// window's `(id, status)` columns in select order.
+#[derive(Debug, Clone, PartialEq, diesel::Queryable)]
 struct TopOrder {
     id: i64,
     status: Option<String>,

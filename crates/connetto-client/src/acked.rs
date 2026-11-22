@@ -21,11 +21,15 @@ pub(crate) const ACKED_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_acked \
      (writer TEXT NOT NULL, seq INTEGER NOT NULL, changeset BLOB NOT NULL, \
       entry_hash BLOB NOT NULL, prov_writer TEXT, prov_seq INTEGER, prov_secret BLOB, \
       major INTEGER, refused BLOB, acked_at INTEGER NOT NULL, version BLOB, \
-      PRIMARY KEY (writer, seq))";
+      dismissed_at INTEGER, PRIMARY KEY (writer, seq))";
 
 /// The bundle hash column a table made before it holds none of (R78
 /// decision 26).
 pub(crate) const VERSION_COLUMN: &str = "ALTER TABLE _connetto_acked ADD COLUMN version BLOB";
+
+/// The dismissal column a table made before it holds none of.
+pub(crate) const DISMISSED_COLUMN: &str =
+    "ALTER TABLE _connetto_acked ADD COLUMN dismissed_at INTEGER";
 
 diesel::table! {
     /// The entries the server answered for good, kept for a restore.
@@ -53,6 +57,9 @@ diesel::table! {
         /// The bundle hash of the build that captured it, which an older
         /// major's server is presented with.
         version -> Nullable<Binary>,
+        /// When the application dismissed the entry's refusal, in seconds of
+        /// the replica's clock, absent until it does.
+        dismissed_at -> Nullable<BigInt>,
     }
 }
 
@@ -69,6 +76,85 @@ pub(crate) struct AckedEntry {
     pub(crate) major: Option<Major>,
     /// That build's bundle hash.
     pub(crate) version: Option<SchemaVersion>,
+}
+
+/// One refused entry the application has not dismissed.
+pub(crate) struct Refusal {
+    /// The writer it was queued under.
+    pub(crate) writer: WriterRef,
+    /// Its sequence under the writer.
+    pub(crate) seq: u64,
+    /// The application schema major that captured it.
+    pub(crate) major: Option<Major>,
+    /// The refusal it settled with.
+    pub(crate) refused: PriorRefusal,
+    /// The captured changeset.
+    pub(crate) changeset: Vec<u8>,
+}
+
+/// A retained refused entry as stored: writer, sequence, major, refusal and
+/// changeset.
+type RefusalRow = (String, i64, Option<i64>, Option<Vec<u8>>, Vec<u8>);
+
+/// Every refused entry the application has not dismissed, oldest answer
+/// first.
+pub(crate) fn refusals(db: &mut SqliteConnection) -> Result<Vec<Refusal>, ClientError> {
+    let rows: Vec<RefusalRow> = _connetto_acked::table
+        .filter(_connetto_acked::refused.is_not_null())
+        .filter(_connetto_acked::dismissed_at.is_null())
+        .order((
+            _connetto_acked::acked_at.asc(),
+            _connetto_acked::writer.asc(),
+            _connetto_acked::seq.asc(),
+        ))
+        .select((
+            _connetto_acked::writer,
+            _connetto_acked::seq,
+            _connetto_acked::major,
+            _connetto_acked::refused,
+            _connetto_acked::changeset,
+        ))
+        .load(db)?;
+    rows.into_iter()
+        .map(|(writer, seq, major, refused, changeset)| {
+            let writer = crate::writer_from_id(&writer).ok_or_else(|| {
+                ClientError::Session(format!("a retained entry names an unknown writer {writer}"))
+            })?;
+            let refused = serde_json::from_slice(refused.as_deref().unwrap_or_default())
+                .map_err(|err| ClientError::Session(format!("a refusal does not decode: {err}")))?;
+            Ok(Refusal {
+                writer,
+                seq: u64::try_from(seq).map_err(|_| {
+                    ClientError::Session(format!("a retained entry has a negative sequence {seq}"))
+                })?,
+                major: major
+                    .and_then(|major| u32::try_from(major).ok())
+                    .and_then(Major::new),
+                refused,
+                changeset,
+            })
+        })
+        .collect()
+}
+
+/// Mark `writer`'s refused entry `seq` dismissed at `now`. Nothing changes
+/// for an entry that is not retained, was applied, or was dismissed before.
+pub(crate) fn dismiss(
+    db: &mut SqliteConnection,
+    writer: &WriterRef,
+    seq: u64,
+    now: i64,
+) -> Result<(), ClientError> {
+    diesel::update(
+        _connetto_acked::table
+            .filter(_connetto_acked::writer.eq(writer_id(writer)))
+            .filter(_connetto_acked::seq.eq(seq_storage(seq)?))
+            .filter(_connetto_acked::refused.is_not_null())
+            .filter(_connetto_acked::dismissed_at.is_null()),
+    )
+    .set(_connetto_acked::dismissed_at.eq(now))
+    .execute(db)?;
+    Ok(())
 }
 
 /// Keep `writer`'s entry `seq`, answered as `settled` says, at `now`, then
