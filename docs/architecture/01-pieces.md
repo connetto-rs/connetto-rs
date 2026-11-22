@@ -158,7 +158,7 @@ One Cargo workspace holds the crates, and each publishes independently so a down
 | `examples/demo-support` | The schema rows, wording and browser pieces the browser demos share |
 | `examples/demo-tools` | The demo's executables over the libraries, the sync server and client, the schema, certificate authority and identity provider tools, and the custody probe |
 
-Planned in [R103](../../plans/master-implementation-plan.md#r103-the-bot-runtime-and-template), the bot runtime and template, and in [R104](../../plans/master-implementation-plan.md#r104-the-demos-for-apps-and-bots) the two demo bots built from it.
+Planned in [R103](../../plans/master-implementation-plan.md#r103-the-bot-runtime-and-template), the bot runtime and template, and in [R104](../../plans/master-implementation-plan.md#r104-the-bot-screens-and-template-bots) the two demo bots built from it.
 
 The separate workspaces build their own lockfiles:
 
