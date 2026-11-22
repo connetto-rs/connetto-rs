@@ -104,6 +104,7 @@ struct SwapLog {
     replaced_acks: RefCell<Vec<String>>,
     major: Cell<Option<connetto_core::Major>>,
     hold_handshake: Cell<bool>,
+    ticket_grants: Cell<u32>,
 }
 
 impl SwapLog {
@@ -310,6 +311,14 @@ impl Transport for Upstream {
         } else {
             self.incoming.next().await
         };
+        if matches!(
+            &frame,
+            Some(IncomingFrame::Control(ControlMessage::ContentTicketGrant(
+                _
+            )))
+        ) {
+            self.log.ticket_grants.set(self.log.ticket_grants.get() + 1);
+        }
         // Record the swap's answer only when the worker actually receives it.
         if let Some(IncomingFrame::Control(ControlMessage::ShareKeysReplaced(ack))) = &frame {
             self.log
@@ -1671,6 +1680,7 @@ fn held_peer(peers: &RefCell<Vec<HeldPeer>>, hold_attach: bool) -> Upstream {
     reason = "keeps both replica majors and the hub lifetime in one scope"
 )]
 async fn held_major_file_after_expiry(hold_attach: bool) {
+    connetto_web::logging::init_console();
     let serial = locks::hold_lock(DB_ALIVE_LOCK).await;
     let name = if hold_attach {
         "skd-held-attach"
@@ -1869,7 +1879,11 @@ async fn held_major_file_after_expiry(hold_attach: bool) {
     );
     assert!(
         drained,
-        "the file settles under major 1, hub ended {ended:?}"
+        "the file settles under major 1, hub ended {ended:?}, uploads {}, grants {}, tickets {:?}, peers {}",
+        uploaded.borrow().len(),
+        drain.log.ticket_grants.get(),
+        drain.tickets.borrow(),
+        peers.borrow().len(),
     );
     assert_eq!(uploaded.borrow().as_slice(), &[photo.to_vec()]);
     assert_eq!(drain.tickets.borrow().as_slice(), request_id.as_slice());
