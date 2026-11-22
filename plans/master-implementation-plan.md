@@ -67,8 +67,8 @@ Docker-gated Postgres tests and headless Chrome may both be run freely.
 | [R80](#r80-peer-sync-in-every-demo) | in progress | R108 slice 3 and R118 slices 1 to 7, for slice 3 and every slice after it | The camp flow in every native-capable demo on Android, iOS, iPadOS, macOS and Linux, the demo's schema on connetto-schema with generated models, and the grown phone and home runs. Windows is outside it |  | [#550](https://github.com/connetto-rs/connetto-rs/pull/550), [#560](https://github.com/connetto-rs/connetto-rs/pull/560) |
 | [R107](#r107-schema-changes-under-running-servers) | in progress | subql's rules signal (slice 3) | The expand and contract procedure with the sunset, the table refusal when a running server notices a change, the two-model boot check, and a server that follows the live rules |  | [#369](https://github.com/connetto-rs/connetto-rs/pull/369), [#397](https://github.com/connetto-rs/connetto-rs/pull/397), [#581](https://github.com/connetto-rs/connetto-rs/pull/581), [#596](https://github.com/connetto-rs/connetto-rs/pull/596) |
 | [R107-MySQL](#r107-mysql-refused-tables-on-mysql-and-mariadb) | not started |  | subql's drift guard on MySQL and MariaDB, through a Maxwell change source and a live read over `my_diesel` |  |  |
-| [R108](#r108-caller-kinds-as-database-roles) | in progress | sql-traits answering the caller contract, privileges and effective policies for both translators, and rls2fga translating R107's live model, for slices 2 to 5. R99, for the bot kinds | Caller kinds as database roles, every startup refusal before OpenFGA, five flat kind roles switched per transaction, grants per kind read from the live database, and a client copy per kind |  |  |
-| [R118](#r118-connetto-on-the-standard-schema) | not started | R108 slices 3 and 6, for slices 5 to 8 | connetto translating and serving connetto-schema per kind, its core modelling bots and agents and its connetto layer holding every connetto table, share keys on share links, the verified email bound, and connetto-schema as the one bot registry |  |  |
+| [R108](#r108-caller-kinds-as-database-roles) | in progress | sql-traits' privileges and effective policies for both translators, and rls2fga translating R107's live model, for slices 3 to 5. R99, for the bot kinds | Caller kinds as database roles, every startup refusal before OpenFGA, five flat kind roles switched per transaction, grants per kind read from the live database, and a client copy per kind |  | [#498](https://github.com/connetto-rs/connetto-rs/pull/498), [#609](https://github.com/connetto-rs/connetto-rs/pull/609), [#614](https://github.com/connetto-rs/connetto-rs/pull/614) |
+| [R118](#r118-connetto-on-the-standard-schema) | not started | R108 slice 3, for slices 5 to 8 | connetto translating and serving connetto-schema per kind, its core modelling bots and agents and its connetto layer holding every connetto table, share keys on share links, the verified email bound, and connetto-schema as the one bot registry |  |  |
 | [R110](#r110-a-session-bound-by-provider-staleness) | not started |  | Session lifetime bounded by the time since the identity provider last confirmed the user, replacing the fixed idle window and ceiling |  |  |
 | [R111](#r111-a-durable-replica-where-opfs-is-refused) | blocked | the JSPI IndexedDB VFS upstream in `sqlite-wasm-rs` | A durable browser replica on IndexedDB through JSPI where OPFS is refused, memory kept only where JSPI is missing |  |  |
 | [R112](#r112-an-apple-peer-to-peer-link) | not started |  | A link between Apple devices over Apple's peer-to-peer Wi-Fi, for an all-Apple group with no hotspot host and no shared network, after its gate run and open points |  |  |
@@ -1232,7 +1232,7 @@ Every caller reaches Postgres through connetto's one reader role, and a policy t
 3. **The kind roles.** Steps 3 to 5. Blocked on sql-traits' privileges and effective policies, both translators adopting them, and R107's live load and marker row.
 4. **The client copy per kind.** Step 6. Needs slice 3.
 5. **Refusing what a kind lacks.** Step 7. Needs slices 3 and 4.
-6. **Unset settings bound empty.** Step 8. Needs slice 2 and not the kind roles, so it may land before slice 3.
+6. **Unset settings bound empty.** Step 8. Merged as [#614](https://github.com/connetto-rs/connetto-rs/pull/614).
 
 ### Steps
 
@@ -1259,7 +1259,7 @@ A deployment can name connetto's kinds in its policies and grant each kind its o
 
 **Status.** NOT STARTED. Designed with the maintainer on 2026-11-22 while R80's move onto connetto-schema was designed, fourteen decisions below, in eight slices.
 
-**Blocked on** R108 slice 3, the five kind roles, and R108 slice 6, unset settings bound empty, for slices 5 to 8, which serve connetto-schema. Slices 1 to 4 are blocked on nothing.
+**Blocked on** R108 slice 3, the five kind roles, for slices 5 to 8, which serve connetto-schema. Slices 1 to 4 are blocked on nothing.
 
 **Changes state.** Client tables, none of connetto's, every replica connection gaining pg2sqlite's JSONB functions and collation. Server tables, every table connetto-server and connetto-file-server ship as DDL text moves into connetto-schema, the registry into its core and the rest into its connetto layer (decisions 12 and 13). Wire messages, a share key rendered as a bare `share_links` id (decision 2), and registration with a code naming an existing app (decision 11). Archive format, none.
 
