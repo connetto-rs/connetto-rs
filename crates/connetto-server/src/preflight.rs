@@ -86,6 +86,23 @@ pub enum Artifact<'a> {
     /// neither a superuser nor `BYPASSRLS`, so such a read would come back
     /// short and the rows it missed would be lost without an error.
     ReadInFull(&'a str),
+    /// The role every connection must both log in as and act as, compared
+    /// with `session_user` and `current_user`.
+    ///
+    /// A role setting (`ALTER ROLE ... SET role`) switches `current_user` on
+    /// every connection of the login role, and the policies and grants that
+    /// bind a statement are those of `current_user`, so a connection matching
+    /// on its login role alone could still run under another role's rules.
+    ActingRole(&'a str),
+    /// A table, by name, resolved through the connection's own `search_path`,
+    /// whose policies and grants must bind the connecting role.
+    ///
+    /// Postgres skips a table's policies for its owner unless the table forces
+    /// row-level security, and the owner holds every privilege on the table,
+    /// so a role that owns the table or inherits its owner's privileges
+    /// (`pg_has_role(owner, 'USAGE')`) reads and writes around the rules both
+    /// translators model.
+    PolicyBoundTable(&'a str),
 }
 
 /// What a probe found.
@@ -107,6 +124,13 @@ enum Found {
     Filtered(String),
     /// The connecting role lacks schema usage or table read permission.
     ReadDenied(String),
+    /// The connection logs in or acts as another role than the one required.
+    OtherRole {
+        session_user: String,
+        current_user: String,
+    },
+    /// The connecting role owns the table or inherits its owner's privileges.
+    OwnerPrivileges { role: String, owner: String },
 }
 
 impl Artifact<'_> {
@@ -115,7 +139,8 @@ impl Artifact<'_> {
         match self {
             Self::ReplicationSlot(_) => "replication slot",
             Self::Publication(_) | Self::PreviousImages { .. } => "publication",
-            Self::Table(_) | Self::ReadInFull(_) => "table",
+            Self::Table(_) | Self::ReadInFull(_) | Self::PolicyBoundTable(_) => "table",
+            Self::ActingRole(_) => "role",
             Self::PublishedTable { .. } => "replicated table",
             Self::CappedTable(_) => "synced table",
             Self::TableColumn { .. } => "column",
@@ -125,10 +150,14 @@ impl Artifact<'_> {
     /// The name the deployment gave it.
     const fn name(&self) -> &str {
         match self {
-            Self::ReplicationSlot(name) | Self::Publication(name) | Self::Table(name) => name,
+            Self::ReplicationSlot(name)
+            | Self::Publication(name)
+            | Self::Table(name)
+            | Self::ActingRole(name) => name,
             Self::PublishedTable { table, .. }
             | Self::CappedTable(table)
             | Self::ReadInFull(table)
+            | Self::PolicyBoundTable(table)
             | Self::TableColumn { table, .. } => table,
             Self::PreviousImages { publication } => publication,
         }
@@ -294,6 +323,42 @@ impl Artifact<'_> {
                     Some(_) => Found::Fit,
                 });
             }
+            Self::ActingRole(expected) => {
+                // Diesel has no constructor for the `SESSION_USER` and
+                // `CURRENT_USER` value expressions.
+                let (session_user, current_user) = diesel::select((
+                    diesel::dsl::sql::<Text>("SESSION_USER::text"),
+                    diesel::dsl::sql::<Text>("CURRENT_USER::text"),
+                ))
+                .get_result::<(String, String)>(conn)
+                .await?;
+                return Ok(if session_user == *expected && current_user == *expected {
+                    Found::Fit
+                } else {
+                    Found::OtherRole {
+                        session_user,
+                        current_user,
+                    }
+                });
+            }
+            Self::PolicyBoundTable(table) => {
+                let role = diesel::dsl::sql::<Text>("CURRENT_USER::text");
+                let held = pg_class::table
+                    .filter(pg_class::oid.nullable().eq(to_regclass(table)))
+                    .select((
+                        pg_has_role(pg_class::relowner, "USAGE"),
+                        pg_get_userbyid(pg_class::relowner),
+                        role,
+                    ))
+                    .get_result::<(bool, String, String)>(conn)
+                    .await
+                    .optional()?;
+                return Ok(match held {
+                    None => Found::Absent,
+                    Some((true, owner, role)) => Found::OwnerPrivileges { role, owner },
+                    Some((false, ..)) => Found::Fit,
+                });
+            }
             Self::ReplicationSlot(_) => {
                 "SELECT EXISTS (SELECT 1 FROM pg_replication_slots \
                  WHERE slot_name = $1 AND database = current_database()) AS present"
@@ -336,6 +401,8 @@ diesel::table! {
         relname -> Text,
         /// Namespace identity.
         relnamespace -> Oid,
+        /// Owning role identity.
+        relowner -> Oid,
     }
 }
 
@@ -369,6 +436,17 @@ diesel::define_sql_function! {
 diesel::define_sql_function! {
     /// Whether the connecting role holds a schema privilege.
     fn has_schema_privilege(schema: diesel::sql_types::Oid, privilege: Text) -> Bool;
+}
+
+diesel::define_sql_function! {
+    /// Whether the connecting role holds a role's privileges, as `USAGE`
+    /// asks, or its membership, as `MEMBER` asks.
+    fn pg_has_role(role: diesel::sql_types::Oid, privilege: Text) -> Bool;
+}
+
+diesel::define_sql_function! {
+    /// The name of a role.
+    fn pg_get_userbyid(role: diesel::sql_types::Oid) -> Text;
 }
 
 /// Why the server refused to start.
@@ -463,6 +541,33 @@ pub enum PreflightError {
         /// The connecting database role.
         role: String,
     },
+    /// A connection logs in or acts as another role than the required one.
+    #[error(
+        "the connection logs in as role {session_user} and acts as role {current_user}, \
+         but must log in and act as role {expected}"
+    )]
+    ActingAs {
+        /// The role the connection must log in and act as.
+        expected: String,
+        /// The role the connection logged in as.
+        session_user: String,
+        /// The role the connection acts as.
+        current_user: String,
+    },
+    /// The connecting role owns a table or inherits its owner's privileges,
+    /// so the table's policies and grants do not bind it.
+    #[error(
+        "role {role} owns table {table} or inherits the privileges of its owner {owner}, \
+         so the table's policies and grants do not bind it"
+    )]
+    OwnerPrivileges {
+        /// The table whose policies must bind the role.
+        table: String,
+        /// The connecting database role.
+        role: String,
+        /// The table's owner.
+        owner: String,
+    },
 }
 
 #[derive(QueryableByName)]
@@ -531,6 +636,10 @@ struct ReadAccess {
 /// [`PreflightError::ReadFiltered`] naming a table row-level security filters
 /// for the connecting role,
 /// [`PreflightError::ReadDenied`] naming a table the connecting role cannot select,
+/// [`PreflightError::ActingAs`] naming the roles a connection logs in and acts
+/// as when either is not the required one,
+/// [`PreflightError::OwnerPrivileges`] naming a table the connecting role owns
+/// or whose owner's privileges it inherits,
 /// [`PreflightError::Probe`] when the check could not be answered, and
 /// [`PreflightError::Pool`] when no connection was available.
 pub async fn require(
@@ -583,6 +692,23 @@ pub async fn require(
                 return Err(PreflightError::ReadDenied {
                     table: artifact.name().to_owned(),
                     role,
+                });
+            }
+            Found::OtherRole {
+                session_user,
+                current_user,
+            } => {
+                return Err(PreflightError::ActingAs {
+                    expected: artifact.name().to_owned(),
+                    session_user,
+                    current_user,
+                });
+            }
+            Found::OwnerPrivileges { role, owner } => {
+                return Err(PreflightError::OwnerPrivileges {
+                    table: artifact.name().to_owned(),
+                    role,
+                    owner,
                 });
             }
         }

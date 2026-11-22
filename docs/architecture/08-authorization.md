@@ -79,7 +79,7 @@ A policy scoped `TO` a named role is refused by this translation at startup, bec
 
 ### At snapshot time
 
-The snapshot query runs on a pool whose role is subject to row-level security, with the caller bound, so only rows that pass the policy enter the snapshot. Postgres does not apply policies to a superuser or to the table owner, and the reference binary refuses to start without a separate reader connection, so snapshots never run on the owner pool.
+The snapshot query runs on a pool whose role is subject to row-level security, with the caller bound, so only rows that pass the policy enter the snapshot. Postgres does not apply policies to a superuser or to the table owner, and the reference binary refuses to start without a separate reader connection, so snapshots never run on the owner pool. Startup also refuses a reader connection whose `session_user` or `current_user` is not the reader role the roles document creates, and a reader role that owns a synced table or inherits its owner's privileges, since neither is bound by the rules both translators model.
 
 The facts behind the authorization store are read on the owner pool instead, because the reader role sees too little for them. The boot load [`connetto_server::openfga::Translated::load_into`], the boot reconcile [`connetto_server::openfga::Translated::reconcile_store`], and the change path's re-runs each take a [`connetto_server::openfga::FactSource`], named for the owner pool it wraps, because a membership table's own read policy hides every member but the caller, so reader-role reads would be lost from the store.
 
