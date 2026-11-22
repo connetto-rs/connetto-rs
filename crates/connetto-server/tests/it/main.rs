@@ -110,6 +110,8 @@ mod preflight_owner_rls;
 
 mod preflight_previous_image;
 
+mod preflight_reader_role;
+
 mod preflight_oplog_payload;
 
 mod provider;

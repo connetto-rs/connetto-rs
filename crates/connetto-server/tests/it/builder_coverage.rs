@@ -2436,6 +2436,62 @@ async fn an_audit_reader_filtered_by_row_security_refuses_startup() {
     }
 }
 
+#[tokio::test]
+async fn a_reader_url_acting_as_another_role_refuses_startup() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+    exec(&pool, "CREATE ROLE reader_switched NOLOGIN").await;
+    exec(
+        &pool,
+        "GRANT reader_switched TO app_reader WITH INHERIT FALSE",
+    )
+    .await;
+    exec(&pool, "ALTER ROLE app_reader SET role = 'reader_switched'").await;
+    let (builder, _idp, _keys) = builder_over(&fixture, 0).await;
+    match refused(
+        builder.build().await,
+        "the reader URL must act as the reader role",
+    ) {
+        BuildError::Preflight(PreflightError::ActingAs {
+            expected,
+            session_user,
+            current_user,
+        }) => {
+            assert_eq!(expected, "app_reader");
+            assert_eq!(session_user, "app_reader");
+            assert_eq!(current_user, "reader_switched");
+        }
+        other => panic!("unexpected startup result {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_reader_owning_a_synced_table_refuses_startup() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+    exec(&pool, "ALTER TABLE orders OWNER TO app_reader").await;
+    let (builder, _idp, _keys) = builder_over(&fixture, 0).await;
+    match refused(
+        builder.build().await,
+        "the synced table's policies must bind the reader",
+    ) {
+        BuildError::Preflight(PreflightError::OwnerPrivileges { table, role, owner }) => {
+            assert_eq!(table, "orders");
+            assert_eq!(role, "app_reader");
+            assert_eq!(owner, "app_reader");
+        }
+        other => panic!("unexpected startup result {other:?}"),
+    }
+}
+
 /// A refused build finishes its background loops before returning.
 #[tokio::test]
 async fn a_build_refusal_stops_the_background_loops_it_started() {

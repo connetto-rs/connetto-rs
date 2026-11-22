@@ -768,18 +768,19 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
 
     let auth_stack = build_auth_stack().await;
 
-    // The server applies writes as `app_writer`, which is subject to the policy.
+    // The server applies writes as the reader role `app_reader`, which is
+    // subject to the policy.
     for stmt in [
         "DROP TABLE IF EXISTS owned CASCADE",
         "DROP TABLE IF EXISTS _connetto_settled",
         "DROP TABLE IF EXISTS _connetto_writers",
-        "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_writer') \
-         THEN CREATE ROLE app_writer LOGIN PASSWORD 'app_writer'; END IF; END $$",
+        "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_reader') \
+         THEN CREATE ROLE app_reader LOGIN PASSWORD 'app_reader'; END IF; END $$",
         "CREATE TABLE owned (id INT PRIMARY KEY, owner TEXT, body TEXT)",
         "ALTER TABLE owned ENABLE ROW LEVEL SECURITY",
         "CREATE POLICY owned_p ON owned USING (owner = current_setting('app.user_id', true))",
-        "GRANT USAGE ON SCHEMA public TO app_writer",
-        "GRANT SELECT, INSERT, UPDATE, DELETE ON owned TO app_writer",
+        "GRANT USAGE ON SCHEMA public TO app_reader",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON owned TO app_reader",
     ] {
         exec(&admin, stmt).await;
     }
@@ -787,15 +788,15 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
     exec(
         &admin,
         "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled, \
-         _connetto_session_writers TO app_writer",
+         _connetto_session_writers TO app_reader",
     )
     .await;
     provision_cap_policies(&admin, OWNED_PG_DDL, OWNED_POLICIES).await;
     fixture.start_replication(&["owned"]).await;
     fixture.provision_auth_tables().await;
-    exec(&admin, "GRANT SELECT ON auth_events TO app_writer").await;
+    exec(&admin, "GRANT SELECT ON auth_events TO app_reader").await;
 
-    let reader_url = with_user_url(&url, "app_writer", "app_writer");
+    let reader_url = with_user_url(&url, "app_reader", "app_reader");
 
     let authorization = Authorization::provision(&fixture, OWNED_POLICIES).await;
     let secs = Duration::from_secs(20);

@@ -1979,7 +1979,8 @@ where
 
         let pool = build_pool(&database.owner_url, owner_pool_size).await?;
         require_schema_tables::<D>(&pool, bans, device_identity.is_some()).await?;
-        require_cap_policies::<D>(&pool, &schema.pg_ddl).await?;
+        let synced = synced_tables::<D>(&schema.pg_ddl)?;
+        require_cap_policies(&pool, &synced).await?;
         let (oplog, lag_watch) = prepare_change_log(
             &pool,
             &slot,
@@ -1993,6 +1994,7 @@ where
         completion.lag_watch = lag_watch.as_ref().map(BackgroundTask::completion);
         let reader_pool_size = reader_reserve.total();
         let reader_pool = build_pool(&database.reader_url, reader_pool_size).await?;
+        require_reader_role(&reader_pool, &schema.reader_role, &synced).await?;
         if portability
             .as_ref()
             .is_some_and(ValidatedList::needs_owner_snapshot)
@@ -2249,26 +2251,51 @@ async fn require_schema_tables<D: ConnettoSchema>(
     Ok(())
 }
 
+/// The tables the cap and the reader checks cover.
+///
+/// The same table list the generator walks, [`connetto_schema::schema_tables`]
+/// over the schema document with the registry tables connetto appends to it.
+fn synced_tables<D: ConnettoSchema>(pg_ddl: &str) -> Result<Vec<String>, BuildError> {
+    let combined = connetto_schema::with_registry::<<D::Bots as ConnettoBotSchema>::IdSql>(pg_ddl);
+    Ok(connetto_schema::schema_tables(&combined)?)
+}
+
 /// Refuse a deployment whose synced tables are not held to the bot cap.
 ///
-/// Walks the same table list the generator walks, [`connetto_schema::schema_tables`]
-/// over the schema document, and asks Postgres for each whether it carries
-/// row-level security and the four `AS RESTRICTIVE` cap policies. Those are
-/// applied by the deployment from the generated cap document, and connetto
-/// creates no server objects of its own, so a table not capped is a
-/// deployment omission rather than something connetto can fix.
-async fn require_cap_policies<D: ConnettoSchema>(
-    pool: &PgPool,
-    pg_ddl: &str,
-) -> Result<(), BuildError> {
-    // The cap reaches the registry tables connetto appends to the document.
-    let combined = connetto_schema::with_registry::<<D::Bots as ConnettoBotSchema>::IdSql>(pg_ddl);
-    let tables = connetto_schema::schema_tables(&combined)?;
-    let required: Vec<Artifact<'_>> = tables
+/// Asks Postgres for each synced table whether it carries row-level security
+/// and the four `AS RESTRICTIVE` cap policies. Those are applied by the
+/// deployment from the generated cap document, and connetto creates no server
+/// objects of its own, so a table not capped is a deployment omission rather
+/// than something connetto can fix.
+async fn require_cap_policies(pool: &PgPool, synced: &[String]) -> Result<(), BuildError> {
+    let required: Vec<Artifact<'_>> = synced
         .iter()
-        .map(|t| Artifact::CappedTable(t.as_str()))
+        .map(|table| Artifact::CappedTable(table.as_str()))
         .collect();
     preflight::require(pool, &required).await?;
+    Ok(())
+}
+
+/// Refuse a reader URL that is not the reader role, or a reader role the
+/// policies and grants of a synced table do not bind.
+///
+/// Both translators model the rules that bind the reader role, so a reader
+/// connection that logs in or acts as another role, or a reader that owns a
+/// synced table or inherits its owner's privileges, would read and write
+/// around them.
+async fn require_reader_role(
+    reader_pool: &PgPool,
+    reader_role: &str,
+    synced: &[String],
+) -> Result<(), BuildError> {
+    let required: Vec<Artifact<'_>> = std::iter::once(Artifact::ActingRole(reader_role))
+        .chain(
+            synced
+                .iter()
+                .map(|table| Artifact::PolicyBoundTable(table.as_str())),
+        )
+        .collect();
+    preflight::require(reader_pool, &required).await?;
     Ok(())
 }
 
