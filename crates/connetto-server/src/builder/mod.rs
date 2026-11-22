@@ -313,6 +313,7 @@ pub struct ServerSchema {
     pg_roles: String,
     reader_role: String,
     devices: bool,
+    unset: connetto_core::auth::UnsetSettings,
 }
 
 impl ServerSchema {
@@ -332,6 +333,7 @@ impl ServerSchema {
             pg_roles: pg_roles.into(),
             reader_role: reader_role.into(),
             devices: false,
+            unset: connetto_core::auth::UnsetSettings::ALWAYS_BOUND,
         }
     }
 
@@ -344,6 +346,7 @@ impl ServerSchema {
             &self.pg_roles,
             &self.reader_role,
         )
+        .with_unset_settings(self.unset)
     }
 
     /// Hold the device enrolment table in the catalog, the device identity
@@ -351,6 +354,17 @@ impl ServerSchema {
     #[must_use]
     pub fn with_devices(mut self, devices: bool) -> Self {
         self.devices = devices;
+        self
+    }
+
+    /// Declare which caller settings the deployment's policies may find unset,
+    /// the declaration the client build passed to
+    /// [`connetto_schema::emit`]. The server binds `''` for an absent caller
+    /// half declared so, and the two sides advertise one schema version only
+    /// when they agree.
+    #[must_use]
+    pub const fn with_unset_settings(mut self, unset: connetto_core::auth::UnsetSettings) -> Self {
+        self.unset = unset;
         self
     }
 
@@ -1965,13 +1979,14 @@ where
                         "",
                         documents.roles(),
                         documents.reader_role(),
-                    ),
+                    )
+                    .with_unset_settings(schema.unset),
                 )?;
                 crate::portability::validate(
                     list,
                     &schema.engine_ddl::<D>(),
                     &replica,
-                    &CallerMappings::of::<String>(&schema.reader_role)?,
+                    &CallerMappings::of::<String>(&schema.reader_role, schema.unset)?,
                     serves_content,
                 )
             })
@@ -2055,6 +2070,7 @@ where
                     pool.clone(),
                     guard.read_limits(Tier::Identified),
                     reader.files.take(),
+                    schema.unset,
                 )
                 .map(Arc::new)
             })
@@ -2494,11 +2510,13 @@ async fn build_reader_side<D: ConnettoSchema>(
         &database.owner_url,
         &database.reader_url,
         reader_pool_size,
+        schema.unset,
         hooks,
     )
     .await?;
     let snapshot = PgSnapshotSource::from_ddl(pool.clone(), &schema.engine_ddl::<D>())?
-        .with_publication(publication);
+        .with_publication(publication)
+        .with_unset_settings(schema.unset);
     Ok(ReaderSide {
         pool,
         signer,
@@ -2681,21 +2699,27 @@ async fn build_write_side<D: ConnettoSchema>(
         .with_write_catalog(writable)
         .with_translator(translated.translator().clone())
         .with_policy_reads(translated.policy_reads())
-        .with_caller(CallerMappings::of::<String>(&schema.reader_role)?)
+        .with_caller(CallerMappings::of::<String>(
+            &schema.reader_role,
+            schema.unset,
+        )?)
         .with_read_connector(engine_connector)
         .build()?;
     // The second opinion reads as the reader role, so it takes its pool before the write target consumes it.
     let second = if second_opinion {
         Some(
             RlsAuth::<D::Id, String>::from_ddl(pools.reader.clone(), &schema.engine_ddl::<D>())
-                .map_err(|err| BuildError::SecondOpinion(err.to_string()))?,
+                .map_err(|err| BuildError::SecondOpinion(err.to_string()))?
+                .with_unset_settings(schema.unset),
         )
     } else {
         None
     };
-    let write = pg_write_target::<D>(pools.reader, &schema.engine_ddl::<D>())?;
+    let write = pg_write_target::<D>(pools.reader, &schema.engine_ddl::<D>())?
+        .with_unset_settings(schema.unset);
     // Move-out withdrawals read on the owner pool, where the membership that ended no longer hides the rows (R27 decision 6).
-    let withdrawals = PgSnapshotSource::from_ddl(pools.owner.clone(), &schema.engine_ddl::<D>())?;
+    let withdrawals = PgSnapshotSource::from_ddl(pools.owner.clone(), &schema.engine_ddl::<D>())?
+        .with_unset_settings(schema.unset);
     // A changed policy makes an existing replica stale, so a client holding one is told through the advertised version.
     let bundle = connetto_schema::translate::<String, <D::Bots as ConnettoBotSchema>::IdSql>(
         schema.documents(),

@@ -40,6 +40,9 @@ use std::path::Path;
 use connetto_core::bots::BotRegistryIdSql;
 
 use connetto_core::auth::CapabilityKey;
+/// The declaration of which caller settings may be unset, which build
+/// scripts pass to `emit`, re-exported beside [`Documents`].
+pub use connetto_core::auth::UnsetSettings;
 /// The registry id markers build scripts and other diesel-free callers pass
 /// for `emit` and `translate`, re-exported beside [`translate`].
 pub use connetto_core::bots::{TextIds, UuidIds};
@@ -451,36 +454,60 @@ pub fn shared_tables<Id: BotRegistryIdSql>(
 /// reader role the server logs in as and acts as, and the three session
 /// settings connetto binds on every request.
 ///
-/// The server binds every setting on every request, a half the caller does
-/// not hold taking [`connetto_core::auth::absent_marker`], so each is declared
-/// always set. The caller's identity is declared text, since an anonymous
-/// caller binds the marker, which no other type would read.
+/// The server binds every setting on every request. A half the caller does
+/// not hold takes [`connetto_core::auth::absent_marker`], and the setting is
+/// declared always set, unless `unset` declares a request may leave it unset,
+/// when the half binds `''`. The bot list is always held. The caller's
+/// identity is declared text, since an anonymous caller of a deployment that
+/// keeps the user setting always bound binds the marker, which no other type
+/// would read, unless `unset` declares it a `uuid` that may be unset.
 ///
 /// # Errors
 ///
 /// [`SchemaError::Deployment`] when the description cannot hold, which only a
 /// capability key whose setting name collides with another setting reaches.
-pub fn deployment<K: CapabilityKey>(reader_role: &str) -> Result<Deployment, SchemaError> {
+pub fn deployment<K: CapabilityKey>(
+    reader_role: &str,
+    unset: UnsetSettings,
+) -> Result<Deployment, SchemaError> {
     let set = |separator: char| SettingValue::Set {
         element: DataType::Text,
         packing: SetPacking::Delimited(separator.to_string()),
+    };
+    let presence = |setting: SessionSetting, may_be_unset: bool| {
+        if may_be_unset {
+            setting.may_be_unset()
+        } else {
+            setting
+        }
     };
     Ok(Deployment::new(
         reader_role,
         [reader_role],
         [
-            SessionSetting::value(
-                connetto_core::auth::DEFAULT_USER_SETTING,
-                SettingValue::Caller(DataType::Text),
-            )?,
-            SessionSetting::value(K::SETTING, set(K::SEPARATOR))?,
+            presence(
+                SessionSetting::value(
+                    connetto_core::auth::DEFAULT_USER_SETTING,
+                    SettingValue::Caller(if unset.user_is_uuid() {
+                        DataType::Uuid
+                    } else {
+                        DataType::Text
+                    }),
+                )?,
+                unset.user_may_be_unset(),
+            ),
+            presence(
+                SessionSetting::value(K::SETTING, set(K::SEPARATOR))?,
+                unset.subjects_may_be_unset(),
+            ),
             SessionSetting::value(BOT_LIST_SETTING, set(BOT_LIST_SEPARATOR))?,
         ],
     )?)
 }
 
-/// A deployment's three Postgres source documents and the role connetto
-/// reads and writes as, which the roles document creates.
+/// A deployment's three Postgres source documents, the role connetto reads
+/// and writes as, which the roles document creates, and which caller
+/// settings a request may leave unset.
 ///
 /// The roles document holds the deployment's `CREATE ROLE` statements and
 /// its grants on the tables the schema declares, and both translators read
@@ -492,11 +519,12 @@ pub struct Documents<'a> {
     policies: &'a str,
     roles: &'a str,
     reader_role: &'a str,
+    unset_settings: UnsetSettings,
 }
 
 impl<'a> Documents<'a> {
     /// The schema, the policies and the roles documents, and the reader role
-    /// the roles document creates.
+    /// the roles document creates, with both caller settings always bound.
     #[must_use]
     pub const fn new(
         schema: &'a str,
@@ -509,7 +537,17 @@ impl<'a> Documents<'a> {
             policies,
             roles,
             reader_role,
+            unset_settings: UnsetSettings::ALWAYS_BOUND,
         }
+    }
+
+    /// The same documents, declaring which caller settings a request may
+    /// leave unset, for policies that read them through
+    /// `NULLIF(current_setting(.., true), '')`.
+    #[must_use]
+    pub const fn with_unset_settings(mut self, unset_settings: UnsetSettings) -> Self {
+        self.unset_settings = unset_settings;
+        self
     }
 
     /// The schema document.
@@ -534,6 +572,12 @@ impl<'a> Documents<'a> {
     #[must_use]
     pub const fn reader_role(&self) -> &'a str {
         self.reader_role
+    }
+
+    /// Which caller settings a request may leave unset.
+    #[must_use]
+    pub const fn unset_settings(&self) -> UnsetSettings {
+        self.unset_settings
     }
 }
 
@@ -598,7 +642,7 @@ fn translated<K: CapabilityKey, Id: BotRegistryIdSql>(
 ) -> Result<SchemaBundle, SchemaError> {
     let schema_sql = with_registry::<Id>(documents.schema);
     let policies_sql = documents.policies;
-    let options = replica_options::<K>(documents.reader_role)?;
+    let options = replica_options::<K>(documents.reader_role, documents.unset_settings)?;
     let mut translator = parsed_documents(&without_references(&schema_sql)?, "")?;
     let cap = cap_policies_inner(&schema_sql, policies_sql)?;
     // In the order a migration applies them: a role exists before a policy
@@ -634,7 +678,8 @@ fn translated<K: CapabilityKey, Id: BotRegistryIdSql>(
         None::<&str>,
     )?
     .with_connection_ddl(connection_ddl)
-    .with_shared_tables(shared.iter().cloned());
+    .with_shared_tables(shared.iter().cloned())
+    .with_unset_settings(documents.unset_settings);
     if !shared.is_empty() {
         let shared_options =
             options.with_attached_tables("connetto_shared", shared.iter().cloned());
@@ -944,6 +989,7 @@ pub fn emit<K: CapabilityKey, Id: BotRegistryIdSql>(
     policies: &Path,
     roles: &Path,
     reader_role: &str,
+    unset_settings: UnsetSettings,
     tier: Option<&TierSource>,
     shared: &[&str],
 ) -> Result<(), SchemaError> {
@@ -951,6 +997,7 @@ pub fn emit<K: CapabilityKey, Id: BotRegistryIdSql>(
     emit_to::<K, Id>(
         [schema, policies, roles],
         reader_role,
+        unset_settings,
         tier,
         shared,
         Path::new(&out_dir),
@@ -967,6 +1014,7 @@ pub fn emit<K: CapabilityKey, Id: BotRegistryIdSql>(
 pub(crate) fn emit_to<K: CapabilityKey, Id: BotRegistryIdSql>(
     sources: [&Path; 3],
     reader_role: &str,
+    unset_settings: UnsetSettings,
     tier: Option<&TierSource>,
     shared: &[&str],
     out_dir: &Path,
@@ -985,7 +1033,8 @@ pub(crate) fn emit_to<K: CapabilityKey, Id: BotRegistryIdSql>(
     ];
     let cap = cap_policies::<Id>(&schema_sql, &policies_sql)?;
     let mut bundle = translate_shared::<K, Id>(
-        Documents::new(&schema_sql, &policies_sql, &roles_sql, reader_role),
+        Documents::new(&schema_sql, &policies_sql, &roles_sql, reader_role)
+            .with_unset_settings(unset_settings),
         shared,
     )?;
     if let Some(tier) = tier {
@@ -1025,8 +1074,9 @@ fn options() -> Pg2SqliteOptions {
 /// As [`deployment`].
 pub fn replica_options<K: CapabilityKey>(
     reader_role: &str,
+    unset_settings: UnsetSettings,
 ) -> Result<Pg2SqliteOptions, SchemaError> {
-    Ok(query_options::<K>(reader_role)?.with_acting_role(reader_role))
+    Ok(query_options::<K>(reader_role, unset_settings)?.with_acting_role(reader_role))
 }
 
 /// The pg2sqlite options a client's query reverse translates under on the
@@ -1040,9 +1090,12 @@ pub fn replica_options<K: CapabilityKey>(
 /// # Errors
 ///
 /// As [`deployment`].
-pub fn query_options<K: CapabilityKey>(reader_role: &str) -> Result<Pg2SqliteOptions, SchemaError> {
+pub fn query_options<K: CapabilityKey>(
+    reader_role: &str,
+    unset_settings: UnsetSettings,
+) -> Result<Pg2SqliteOptions, SchemaError> {
     Ok(options()
-        .with_deployment(deployment::<K>(reader_role)?)
+        .with_deployment(deployment::<K>(reader_role, unset_settings)?)
         .with_session_variable(SessionVariableMapping::new(
             connetto_core::auth::DEFAULT_USER_SETTING,
             CALLER_FUNCTION,
@@ -1282,6 +1335,7 @@ fn render(bundle: &SchemaBundle, cap: &str) -> String {
     };
     let views = borrowed_slice(bundle.policy_views());
     let shared = borrowed_slice(bundle.shared_tables());
+    let unset = unset_settings_expression(bundle.unset_settings());
     let layout = match bundle.shared_layout() {
         Some(layout) => {
             // An `Option` either way, so the const's type never depends on
@@ -1336,6 +1390,7 @@ fn render(bundle: &SchemaBundle, cap: &str) -> String {
          .expect(\"the build step translated this bundle\")\n\
          .with_shared_tables(SHARED_TABLES.iter().copied())\n\
          .with_connection_ddl(CONNECTION_DDL)\n\
+         .with_unset_settings({unset})\n\
          {history};\n\
          if let Some((both_fresh, main_fresh, shared_fresh, reopen)) = SHARED_LAYOUT {{\n\
              bundle = bundle.with_shared_layout(\n\
@@ -1361,6 +1416,20 @@ fn borrowed_slice(names: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("&[{names}]")
+}
+
+/// The `bundle()` expression naming which caller settings may be unset.
+fn unset_settings_expression(unset: UnsetSettings) -> String {
+    let mut expression = "connetto_core::auth::UnsetSettings::ALWAYS_BOUND".to_owned();
+    if unset.user_is_uuid() {
+        expression.push_str(".with_uuid_user()");
+    } else if unset.user_may_be_unset() {
+        expression.push_str(".with_user()");
+    }
+    if unset.subjects_may_be_unset() {
+        expression.push_str(".with_subjects()");
+    }
+    expression
 }
 
 /// The `bundle()` code that attaches the tier history a build with a tier
@@ -1620,8 +1689,11 @@ mod tests {
     /// deployment's own schema and policies.
     #[test]
     fn the_derived_views_are_the_views_sqlite_builds() {
-        let options = replica_options::<String>(connetto_demo_deployment::READER_ROLE)
-            .expect("the demo deployment's description holds");
+        let options = replica_options::<String>(
+            connetto_demo_deployment::READER_ROLE,
+            UnsetSettings::ALWAYS_BOUND,
+        )
+        .expect("the demo deployment's description holds");
         let translator = parsed_documents(
             connetto_demo_deployment::SCHEMA_SQL,
             connetto_demo_deployment::POLICIES_SQL,
@@ -1858,6 +1930,53 @@ mod tests {
         Documents::new(schema, policies, ROLES, READER)
     }
 
+    /// Both caller settings always bound, the declaration most tests build.
+    const ALWAYS: UnsetSettings = UnsetSettings::ALWAYS_BOUND;
+
+    /// A table keyed on a `uuid` owner, with a public flag every caller reads.
+    const UUID_OWNER_SCHEMA: &str = "-- connetto:major 1\nCREATE TABLE owned \
+                                     (id INT PRIMARY KEY, owner UUID, public BOOLEAN NOT NULL);";
+
+    /// The policy a deployment writes when it reads the user setting through
+    /// `NULLIF` and casts it to the owner's type.
+    const UUID_OWNER_POLICIES: &str = "ALTER TABLE owned ENABLE ROW LEVEL SECURITY; \
+         CREATE POLICY owned_p ON owned FOR ALL USING \
+           (public OR owner = NULLIF(current_setting('app.user_id', true), '')::uuid);";
+
+    #[test]
+    fn a_uuid_identity_that_may_be_unset_reads_as_owner_or_nobody_on_the_replica() {
+        let unset = UnsetSettings::ALWAYS_BOUND.with_uuid_user();
+        let bundle = translate::<String, TextIds>(
+            documents(UUID_OWNER_SCHEMA, UUID_OWNER_POLICIES).with_unset_settings(unset),
+        )
+        .expect("a policy reading the user setting through NULLIF translates");
+        assert_eq!(
+            bundle.unset_settings(),
+            unset,
+            "the bundle carries what the build declared"
+        );
+        for (caller, expected) in [
+            (unset.absent_user(), "2"),
+            ("00000000-0000-0000-0000-000000000001", "1,2"),
+        ] {
+            let mut conn = SqliteConnection::establish(":memory:").expect("open the replica");
+            register_replica_functions(&mut conn, caller, BOT_LIST_WILDCARD);
+            conn.batch_execute(bundle.replica_ddl())
+                .expect("the replica DDL applies");
+            conn.batch_execute(
+                "INSERT INTO owned (id, owner, public) VALUES \
+                 (1, X'00000000000000000000000000000001', 0), (2, NULL, 1)",
+            )
+            .expect("the exempt writes land");
+            let visible = diesel::select(diesel::dsl::sql::<diesel::sql_types::Text>(
+                "(SELECT group_concat(id) FROM (SELECT id FROM owned ORDER BY id))",
+            ))
+            .get_result::<String>(&mut conn)
+            .expect("the read of the policy view succeeds");
+            assert_eq!(visible, expected, "the caller {caller:?}");
+        }
+    }
+
     /// The source documents a build step reads, the schema source declaring
     /// `major`, written under `dir`: the schema, policies and roles documents,
     /// then the tier source. The last result is the DDL the same tier source
@@ -1901,7 +2020,8 @@ mod tests {
         let (sources, _, _) = emit_inputs(dir.path(), 1);
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).expect("the output directory writes");
-        emit_to::<String, TextIds>(paths(&sources), READER, None, &[], &out).expect("emits");
+        emit_to::<String, TextIds>(paths(&sources), READER, ALWAYS, None, &[], &out)
+            .expect("emits");
         let rendered =
             std::fs::read_to_string(out.join("connetto-schema.rs")).expect("the bundle file");
         assert!(
@@ -1930,7 +2050,7 @@ mod tests {
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).expect("the output directory writes");
         let source = TierSource::new(&tier, &history);
-        emit_to::<String, TextIds>(paths(&sources), READER, Some(&source), &[], &out)
+        emit_to::<String, TextIds>(paths(&sources), READER, ALWAYS, Some(&source), &[], &out)
             .expect("emits with the history");
         let rendered =
             std::fs::read_to_string(out.join("connetto-schema.rs")).expect("the bundle file");
@@ -1955,8 +2075,9 @@ mod tests {
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).expect("the output directory writes");
         let source = TierSource::new(&tier, dir.path().join("absent"));
-        let err = emit_to::<String, TextIds>(paths(&sources), READER, Some(&source), &[], &out)
-            .expect_err("an absent history directory refuses");
+        let err =
+            emit_to::<String, TextIds>(paths(&sources), READER, ALWAYS, Some(&source), &[], &out)
+                .expect_err("an absent history directory refuses");
         match err {
             SchemaError::MissingHistoryDir { dir: reported } => {
                 assert_eq!(reported, dir.path().join("absent"));
@@ -1981,8 +2102,9 @@ mod tests {
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).expect("the output directory writes");
         let source = TierSource::new(&tier, &history);
-        let err = emit_to::<String, TextIds>(paths(&sources), READER, Some(&source), &[], &out)
-            .expect_err("a stale export refuses");
+        let err =
+            emit_to::<String, TextIds>(paths(&sources), READER, ALWAYS, Some(&source), &[], &out)
+                .expect_err("a stale export refuses");
         match err {
             SchemaError::StaleExport { major, path, .. } => {
                 assert_eq!(major, 1);
@@ -2002,8 +2124,9 @@ mod tests {
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).expect("the output directory writes");
         let source = TierSource::new(&tier, &history);
-        let err = emit_to::<String, TextIds>(paths(&sources), READER, Some(&source), &[], &out)
-            .expect_err("a missing export refuses");
+        let err =
+            emit_to::<String, TextIds>(paths(&sources), READER, ALWAYS, Some(&source), &[], &out)
+                .expect_err("a missing export refuses");
         match err {
             SchemaError::MissingExport { major, path, .. } => {
                 assert_eq!(major, 1);
@@ -2026,8 +2149,9 @@ mod tests {
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).expect("the output directory writes");
         let source = TierSource::new(&tier, &history);
-        let err = emit_to::<String, TextIds>(paths(&sources), READER, Some(&source), &[], &out)
-            .expect_err("a gap refuses");
+        let err =
+            emit_to::<String, TextIds>(paths(&sources), READER, ALWAYS, Some(&source), &[], &out)
+                .expect_err("a gap refuses");
         match err {
             SchemaError::HistoryGap { dir, missing, .. } => {
                 assert_eq!(dir, history);
@@ -2209,12 +2333,14 @@ mod tests {
         std::fs::create_dir_all(&out).expect("the output directory writes");
         let source = TierSource::new(&tier, &history);
         std::fs::remove_file(&tier).expect("the source deletes");
-        let err = emit_to::<String, TextIds>(paths(&sources), READER, Some(&source), &[], &out)
-            .expect_err("a missing tier source refuses");
+        let err =
+            emit_to::<String, TextIds>(paths(&sources), READER, ALWAYS, Some(&source), &[], &out)
+                .expect_err("a missing tier source refuses");
         assert!(matches!(err, SchemaError::Io(_)));
         std::fs::write(&tier, "not a Postgres document").expect("the source writes");
-        let err = emit_to::<String, TextIds>(paths(&sources), READER, Some(&source), &[], &out)
-            .expect_err("an untranslatable tier source refuses");
+        let err =
+            emit_to::<String, TextIds>(paths(&sources), READER, ALWAYS, Some(&source), &[], &out)
+                .expect_err("an untranslatable tier source refuses");
         assert!(matches!(err, SchemaError::Translate(_)));
     }
 
@@ -2234,11 +2360,11 @@ mod tests {
         }
 
         assert!(matches!(
-            deployment::<OnIdentity>(READER),
+            deployment::<OnIdentity>(READER, ALWAYS),
             Err(SchemaError::Deployment(_))
         ));
         assert!(matches!(
-            query_options::<OnIdentity>(READER),
+            query_options::<OnIdentity>(READER, ALWAYS),
             Err(SchemaError::Deployment(_))
         ));
         assert!(matches!(
@@ -2256,11 +2382,11 @@ mod tests {
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).expect("the output directory writes");
         std::fs::write(&sources[2], "CREATE ROLE someone_else LOGIN;").expect("the roles write");
-        let err = emit_to::<String, TextIds>(paths(&sources), READER, None, &[], &out)
+        let err = emit_to::<String, TextIds>(paths(&sources), READER, ALWAYS, None, &[], &out)
             .expect_err("a roles document without the reader refuses");
         assert!(err.to_string().contains(READER), "{err}");
         std::fs::remove_file(&sources[2]).expect("the roles source deletes");
-        let err = emit_to::<String, TextIds>(paths(&sources), READER, None, &[], &out)
+        let err = emit_to::<String, TextIds>(paths(&sources), READER, ALWAYS, None, &[], &out)
             .expect_err("a missing roles document refuses");
         assert!(matches!(err, SchemaError::Io(_)));
     }
@@ -2282,7 +2408,8 @@ mod tests {
         let source = TierSource::new(&tier, &history);
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).expect("the output directory writes");
-        let result = emit_to::<String, TextIds>(paths(&sources), READER, Some(&source), &[], &out);
+        let result =
+            emit_to::<String, TextIds>(paths(&sources), READER, ALWAYS, Some(&source), &[], &out);
         std::fs::set_permissions(
             &history,
             std::os::unix::fs::PermissionsExt::from_mode(0o755),
@@ -2303,7 +2430,7 @@ mod tests {
             std::env::var("OUT_DIR").is_err(),
             "cargo leaves OUT_DIR unset for tests"
         );
-        let err = emit::<String, TextIds>(schema, policies, roles, READER, None, &[])
+        let err = emit::<String, TextIds>(schema, policies, roles, READER, ALWAYS, None, &[])
             .expect_err("without OUT_DIR the entry point refuses");
         assert!(matches!(err, SchemaError::MissingOutDir));
     }
@@ -2316,14 +2443,14 @@ mod tests {
         let out = dir.path().join("out");
         std::fs::create_dir_all(out.join("connetto-cap-policies.sql"))
             .expect("the blocking directory writes");
-        let err = emit_to::<String, TextIds>(paths(&sources), READER, None, &[], &out)
+        let err = emit_to::<String, TextIds>(paths(&sources), READER, ALWAYS, None, &[], &out)
             .expect_err("a directory where the cap file should be refuses");
         assert!(matches!(err, SchemaError::Io(_)));
         let out = dir.path().join("out2");
         std::fs::create_dir_all(&out).expect("the output directory writes");
         std::fs::create_dir_all(out.join("connetto-schema.rs"))
             .expect("the blocking directory writes");
-        let err = emit_to::<String, TextIds>(paths(&sources), READER, None, &[], &out)
+        let err = emit_to::<String, TextIds>(paths(&sources), READER, ALWAYS, None, &[], &out)
             .expect_err("a directory where the bundle file should be refuses");
         assert!(matches!(err, SchemaError::Io(_)));
     }

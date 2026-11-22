@@ -1223,12 +1223,12 @@ Every caller reaches Postgres through connetto's one reader role, and a policy t
 9. **The client copy is translated once per kind.** pg2sqlite builds each kind's copy from sql-traits' answers for that kind, so the copy keeps the policies that apply to the kind, memberships included, and each table takes the kind's privileges, omitting a table it cannot read and making read-only one it cannot write. Each replica file holds one kind only, since an anonymous caller runs in memory and signing in opens the file named from the identity, so the build emits a bundle per kind and the client picks its own. `current_user` evaluates to the kind role's name, as PostgreSQL defines it after `SET ROLE`.
 10. **Each check tells OpenFGA the caller's kind**. The kind belongs to the connection, not to the person, since one share key may be held by an anonymous and by a signed-in caller. So no kind is stored as a fact. Each check carries the caller's kind as a contextual tuple, the pattern of OpenFGA's token-claims guide, which `BatchCheck` accepts per item, and connetto's local answers take the kind as an input in the same way.
 11. **The deployment's migration creates the kind roles.** connetto applies no server DDL (R107 decision 9), so a missing kind role refuses startup.
-12. **connetto binds `''` for a setting that may be unset.** connetto's absent marker `connetto:absent:<hex>` fails a `uuid` cast, so on connetto-schema every anonymous caller and every caller without a share key would fail on Postgres 18. connetto binds `''` for every setting the deployment description declares may be unset, which Postgres and connetto-schema read as absent through `NULLIF`, and keeps the marker only for settings declared always bound.
+12. **connetto binds `''` for a setting that may be unset.** connetto's absent marker `connetto:absent:<hex>` fails a `uuid` cast, so on connetto-schema every anonymous caller and every caller without a share key would fail on Postgres 18. connetto binds `''` for every setting the deployment description declares may be unset, which Postgres and connetto-schema read as absent through `NULLIF`, and keeps the marker only for settings declared always bound. A deployment may also declare an identity that may be unset a `uuid`, since rls2fga translates a `uuid` cast of the identity only for a value declared that type, which connetto-schema's policies need.
 
 ### Slices
 
 1. **Refusals before OpenFGA.** Step 1. Merged.
-2. **One deployment description.** Step 2, in two pull requests. The first builds the description from the roles document and hands it to both translators, and waits on subql's follow-up to rls2fga's acting roles, which every check now states. The second is the preflight refusals of the reader role.
+2. **One deployment description.** Step 2, in two pull requests. The first builds the description from the roles document and hands it to both translators, and waits on subql's follow-up to rls2fga's acting roles, which every check now states. The second is the preflight refusals of the reader role. Merged as [#498](https://github.com/connetto-rs/connetto-rs/pull/498) and [#609](https://github.com/connetto-rs/connetto-rs/pull/609).
 3. **The kind roles.** Steps 3 to 5. Blocked on sql-traits' privileges and effective policies, both translators adopting them, and R107's live load and marker row.
 4. **The client copy per kind.** Step 6. Needs slice 3.
 5. **Refusing what a kind lacks.** Step 7. Needs slices 3 and 4.
@@ -1243,7 +1243,7 @@ Every caller reaches Postgres through connetto's one reader role, and a policy t
 5. The server translates with each kind's live privileges, every check, remote and local, carries the caller's kind per decision 10, and a marker row reloads grants and memberships with the policies.
 6. `connetto_schema` translates once per kind, the generated bundle carries one entry per kind, and the client opens its replica with the bundle of its kind.
 7. The subscription and write refusals of decision 8, and the client's error for a table its copy lacks.
-8. The deployment description declares, per setting, whether it may be unset, and `CallerBinding` binds `''` for an unset setting so declared and the absent marker for one declared always bound (decision 12).
+8. The deployment description declares, per setting, whether it may be unset, and for the identity whether it is a `uuid`, and `CallerBinding` binds `''` for an unset setting so declared and the absent marker for one declared always bound (decision 12).
 
 ### Proof
 

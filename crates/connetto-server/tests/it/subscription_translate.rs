@@ -304,8 +304,11 @@ fn the_subject_set_reach_reverses_to_the_membership_it_came_from() {
     let materializer: Materializer<_, _, NoConnector> = Materializer::builder(DDL)
         .with_write_catalog(RuntimeWritableCatalog::default())
         .with_caller(
-            CallerMappings::of::<String>(connetto_test_harness::FIXTURE_READER)
-                .expect("the deployment description builds"),
+            CallerMappings::of::<String>(
+                connetto_test_harness::FIXTURE_READER,
+                connetto_core::auth::UnsetSettings::ALWAYS_BOUND,
+            )
+            .expect("the deployment description builds"),
         )
         .with_read_connector(NoConnector)
         .build()

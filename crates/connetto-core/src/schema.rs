@@ -30,6 +30,8 @@ use core::num::NonZeroU32;
 
 use serde::{Deserialize, Serialize};
 
+use crate::auth::UnsetSettings;
+
 /// The replica's local name for `current_setting('app.user_id')`, which the
 /// identity arm of every deployment policy compares against.
 pub const CALLER_FUNCTION: &str = "current_app_user";
@@ -184,6 +186,7 @@ pub struct SchemaBundle {
     connection_ddl: String,
     major: Major,
     tier_history: TierHistory,
+    unset_settings: UnsetSettings,
 }
 
 /// The generated structural step of one local-tier boundary, from the major
@@ -374,6 +377,7 @@ impl SchemaBundle {
             shared_layout: None,
             connection_ddl: String::new(),
             major,
+            unset_settings: UnsetSettings::ALWAYS_BOUND,
         })
     }
 
@@ -428,6 +432,22 @@ impl SchemaBundle {
         self.connection_ddl = ddl.into();
         self
     }
+
+    /// Return a copy of this bundle declaring which caller settings a request
+    /// may leave unset, the declaration the build translated under. The
+    /// client binds an unheld half from it, so it is part of the version.
+    #[must_use]
+    pub const fn with_unset_settings(mut self, unset_settings: UnsetSettings) -> Self {
+        self.unset_settings = unset_settings;
+        self
+    }
+
+    /// Which caller settings a request may leave unset.
+    #[must_use]
+    pub const fn unset_settings(&self) -> UnsetSettings {
+        self.unset_settings
+    }
+
     /// Return a copy of this bundle carrying the local tier's history, the
     /// generated structural step of every boundary from the oldest exported
     /// major up to this bundle's (R31).
@@ -525,7 +545,10 @@ impl SchemaBundle {
     ///    physical, joined with NULs,
     /// 5. the policy views, lowercased and sorted, joined with NULs,
     /// 6. [`CALLER_FUNCTION`],
-    /// 7. [`SUBJECTS_FUNCTION`].
+    /// 7. [`SUBJECTS_FUNCTION`],
+    /// 8. the user setting's declaration, `0` always bound, `1` may be unset,
+    ///    `uuid` may be unset and a `uuid` when set,
+    /// 9. whether the subjects setting may be unset, `1` or `0`.
     ///
     /// The length prefixes are what keep the encoding unambiguous under
     /// concatenation, so one field gaining the text another lost cannot keep
@@ -550,6 +573,8 @@ impl SchemaBundle {
             views.as_str(),
             CALLER_FUNCTION,
             SUBJECTS_FUNCTION,
+            user_field(self.unset_settings),
+            presence_field(self.unset_settings.subjects_may_be_unset()),
         ] {
             field_into(&mut hasher, field);
         }
@@ -620,6 +645,20 @@ fn field_into(hasher: &mut sha2::Sha256, field: &str) {
         .expect("a schema document longer than u64::MAX bytes does not fit in any address space");
     hasher.update(len.to_be_bytes());
     hasher.update(field.as_bytes());
+}
+
+/// A setting's declared presence as one hash field.
+const fn presence_field(may_be_unset: bool) -> &'static str {
+    if may_be_unset { "1" } else { "0" }
+}
+
+/// The user setting's declaration as one hash field.
+const fn user_field(unset: UnsetSettings) -> &'static str {
+    if unset.user_is_uuid() {
+        "uuid"
+    } else {
+        presence_field(unset.user_may_be_unset())
+    }
 }
 
 /// The policy pairs as one hash field, lowercased, sorted, logical then
@@ -845,6 +884,15 @@ mod tests {
             ["orders"],
             None::<&str>,).expect("the source declares major 1")
             .version(),
+            reference()
+                .with_unset_settings(UnsetSettings::ALWAYS_BOUND.with_user())
+                .version(),
+            reference()
+                .with_unset_settings(UnsetSettings::ALWAYS_BOUND.with_subjects())
+                .version(),
+            reference()
+                .with_unset_settings(UnsetSettings::ALWAYS_BOUND.with_uuid_user())
+                .version(),
         ];
         assert_ne!(base, varied[0], "the schema source is part of the version");
         assert_ne!(
@@ -854,6 +902,18 @@ mod tests {
         assert_ne!(base, varied[2], "the replica DDL is part of the version");
         assert_ne!(base, varied[3], "the policy pairs are part of the version");
         assert_ne!(base, varied[4], "the policy views are part of the version");
+        assert_ne!(
+            base, varied[5],
+            "whether the user setting may be unset is part of the version"
+        );
+        assert_ne!(
+            base, varied[6],
+            "whether the subjects setting may be unset is part of the version"
+        );
+        assert_ne!(
+            varied[5], varied[7],
+            "whether the identity is a uuid is part of the version"
+        );
     }
 
     #[test]
@@ -1025,6 +1085,8 @@ mod tests {
             "orders\u{0}orders_rls_violations",
             CALLER_FUNCTION,
             SUBJECTS_FUNCTION,
+            "0",
+            "0",
         ]);
         assert_eq!(bundle.version().hash(), &expected[..]);
     }

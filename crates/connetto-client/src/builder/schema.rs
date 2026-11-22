@@ -161,6 +161,13 @@ impl SyncSchema {
         self.bundle.connection_ddl()
     }
 
+    /// Which caller settings the deployment's policies may find unset, which
+    /// decides what an absent caller half renders as on the replica.
+    #[must_use]
+    pub fn unset_settings(&self) -> connetto_core::auth::UnsetSettings {
+        self.bundle.unset_settings()
+    }
+
     /// The same schema as a relay tab's mirror runs it, both tiers in the
     /// main schema.
     ///

@@ -21,7 +21,7 @@ use std::time::{Duration, SystemTime};
 
 use connetto_core::SessionId;
 use connetto_core::auth::{
-    CapabilityKey, CapabilitySubject, ContentCaller, Principal, absent_marker,
+    CapabilityKey, CapabilitySubject, ContentCaller, DEFAULT_USER_SETTING, Principal, UnsetSettings,
 };
 use diesel::sql_types::{Bool, Text};
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
@@ -140,6 +140,40 @@ pub(crate) fn meter_key<Id: Display, Key: CapabilityKey>(
         .unwrap_or_else(|| run.to_string())
 }
 
+/// How a deployment's policies read the caller: the setting naming the
+/// identity, and which of the identity and the subjects may be left unset.
+///
+/// One value for every path that binds a caller, so the snapshot, the write
+/// and the visibility check cannot disagree on either.
+#[derive(Debug, Clone)]
+pub(crate) struct BindingSettings {
+    user: Arc<str>,
+    unset: UnsetSettings,
+}
+
+impl Default for BindingSettings {
+    fn default() -> Self {
+        Self {
+            user: DEFAULT_USER_SETTING.into(),
+            unset: UnsetSettings::ALWAYS_BOUND,
+        }
+    }
+}
+
+impl BindingSettings {
+    /// The same settings, reading the identity from `user`.
+    pub(crate) fn with_user(mut self, user: Arc<str>) -> Self {
+        self.user = user;
+        self
+    }
+
+    /// The same settings, `unset` naming the ones a caller may leave unset.
+    pub(crate) const fn with_unset(mut self, unset: UnsetSettings) -> Self {
+        self.unset = unset;
+        self
+    }
+}
+
 /// The caller rendered for one RLS transaction, under the setting names this
 /// deployment binds them to.
 ///
@@ -149,47 +183,55 @@ pub(crate) fn meter_key<Id: Display, Key: CapabilityKey>(
 /// visibility check cannot answer differently about what the caller holds.
 pub(crate) struct CallerBinding {
     caller: ContentCaller,
-    user_setting: Arc<str>,
+    settings: BindingSettings,
     setting: &'static str,
     separator: char,
     bot_list: String,
 }
 
 impl CallerBinding {
-    /// Render `caller` under the deployment's key binding, naming the identity
-    /// setting `user_setting`.
+    /// Render `caller` under the deployment's key binding and `settings`.
     pub(crate) fn of<Id: Display, Key: CapabilityKey>(
         caller: &Principal<Id, Key>,
-        user_setting: Arc<str>,
+        settings: &BindingSettings,
     ) -> Self {
         Self {
             caller: rendered_caller(caller),
-            user_setting,
+            settings: settings.clone(),
             setting: Key::SETTING,
             separator: Key::SEPARATOR,
             bot_list: bot_list_for(caller),
         }
     }
 
-    /// Bind all three values for the rest of the transaction, in one statement.
-    ///
-    /// All the settings are always bound, a half the caller does not hold
-    /// taking [`absent_marker`], and the bot list the one value
-    /// [`bot_list_for`] reads for the caller. Leaving one unbound would read
-    /// as `''` rather than NULL to the next caller on a pooled connection,
-    /// which is the blank identity chapter 08 forbids.
-    pub(crate) async fn apply(self, conn: &mut AsyncPgConnection) -> diesel::QueryResult<()> {
-        let user_setting = self.user_setting.to_string();
-        let subjects = self
-            .caller
-            .packed_subjects(self.separator)
-            .unwrap_or_else(|| absent_marker().to_owned());
+    /// The identity and the packed subjects to bind, a half the caller does
+    /// not hold taking the value its declaration reads as absent.
+    fn values(&self) -> (String, String) {
+        let unset = self.settings.unset;
         let user = self
             .caller
             .identity()
-            .map_or_else(|| absent_marker().to_owned(), ToOwned::to_owned);
+            .unwrap_or_else(|| unset.absent_user())
+            .to_owned();
+        let subjects = self
+            .caller
+            .packed_subjects(self.separator)
+            .unwrap_or_else(|| unset.absent_subjects().to_owned());
+        (user, subjects)
+    }
+
+    /// Bind all three values for the rest of the transaction, in one statement.
+    ///
+    /// All the settings are always bound. A half the caller does not hold
+    /// takes `''` when the deployment declared it may be unset, and the
+    /// absent marker otherwise. The bot list is the one value
+    /// [`bot_list_for`] reads for the caller. Leaving one unbound would read
+    /// as `''` to the next caller on a pooled connection, which a policy not
+    /// declared to expect it must never see.
+    pub(crate) async fn apply(self, conn: &mut AsyncPgConnection) -> diesel::QueryResult<()> {
+        let (user, subjects) = self.values();
         diesel::select((
-            set_config(user_setting, user, true),
+            set_config(self.settings.user.to_string(), user, true),
             set_config(self.setting, subjects, true),
             set_config(connetto_core::BOT_LIST_SETTING, self.bot_list, true),
         ))
@@ -208,16 +250,9 @@ impl CallerBinding {
         fn quoted(value: &str) -> String {
             value.replace('\'', "''")
         }
-        let marker = absent_marker();
-        let subjects = self
-            .caller
-            .packed_subjects(self.separator)
-            .unwrap_or_else(|| marker.to_owned());
+        let (user, subjects) = self.values();
         [
-            (
-                &*self.user_setting,
-                self.caller.identity().unwrap_or(marker),
-            ),
+            (&*self.settings.user, user.as_str()),
             (self.setting, subjects.as_str()),
             (connetto_core::BOT_LIST_SETTING, self.bot_list.as_str()),
         ]
@@ -768,5 +803,43 @@ mod tests {
             "t:read,t:insert",
             "a caller holding a list carries its own text"
         );
+    }
+
+    /// A caller holding nothing binds `''` for exactly the halves the
+    /// deployment declared may be unset, and the absent marker for the rest.
+    #[test]
+    fn an_absent_half_binds_as_its_declaration_reads_it() {
+        let anonymous: Principal =
+            Principal::unidentified(SessionId::from_uuid(uuid::Uuid::from_bytes([7; 16])));
+        let marker = connetto_core::auth::absent_marker();
+        let bound = |unset: UnsetSettings| {
+            CallerBinding::of(&anonymous, &BindingSettings::default().with_unset(unset))
+                .setup_statements()
+        };
+        let statement =
+            |setting: &str, value: &str| format!("SELECT set_config('{setting}', '{value}', true)");
+        for (unset, user, subjects) in [
+            (UnsetSettings::ALWAYS_BOUND, marker, marker),
+            (UnsetSettings::ALWAYS_BOUND.with_user(), "", marker),
+            (UnsetSettings::ALWAYS_BOUND.with_subjects(), marker, ""),
+            (
+                UnsetSettings::ALWAYS_BOUND.with_user().with_subjects(),
+                "",
+                "",
+            ),
+        ] {
+            assert_eq!(
+                bound(unset),
+                [
+                    statement(DEFAULT_USER_SETTING, user),
+                    statement(<String as CapabilityKey>::SETTING, subjects),
+                    statement(
+                        connetto_core::BOT_LIST_SETTING,
+                        connetto_core::BOT_LIST_WILDCARD
+                    ),
+                ],
+                "{unset:?}"
+            );
+        }
     }
 }

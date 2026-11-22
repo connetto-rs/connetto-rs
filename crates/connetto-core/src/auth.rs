@@ -45,6 +45,115 @@ pub fn absent_marker() -> &'static str {
     &MARKER
 }
 
+/// Which of the caller's two settings the deployment declares a request may
+/// leave unset, so a caller not holding that half binds `''` instead of
+/// [`absent_marker`], and whether the identity is a `uuid`.
+///
+/// The marker fails any cast a policy applies to the setting, a `uuid` cast
+/// among them, so a deployment whose policies read a setting through
+/// `NULLIF(current_setting(.., true), '')` declares it may be unset, and
+/// Postgres and the replica both read the `''` as absent. Both settings are
+/// always bound by default. The bot list is always held, so it has no flag.
+///
+/// An identity declared a `uuid` lets a policy compare it with a `uuid`
+/// column through a cast, which the translators accept only for a value
+/// declared canonical for the type. Only an identity that may be unset can be
+/// declared so, since the marker an always bound identity takes is no `uuid`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct UnsetSettings {
+    user: UserSetting,
+    subjects: bool,
+}
+
+/// How the deployment declares the identity setting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+enum UserSetting {
+    /// Always bound, text.
+    #[default]
+    AlwaysBound,
+    /// May be unset, text.
+    MayBeUnset,
+    /// May be unset, a canonical `uuid` when set.
+    UuidMayBeUnset,
+}
+
+impl UnsetSettings {
+    /// Both settings always bound, an unheld half taking [`absent_marker`].
+    pub const ALWAYS_BOUND: Self = Self {
+        user: UserSetting::AlwaysBound,
+        subjects: false,
+    };
+
+    /// The same declaration, with the user setting a request may leave unset.
+    /// An identity already declared a `uuid` stays one.
+    #[must_use]
+    pub const fn with_user(self) -> Self {
+        Self {
+            user: match self.user {
+                UserSetting::UuidMayBeUnset => UserSetting::UuidMayBeUnset,
+                UserSetting::AlwaysBound | UserSetting::MayBeUnset => UserSetting::MayBeUnset,
+            },
+            ..self
+        }
+    }
+
+    /// The same declaration, with the user setting a request may leave unset
+    /// and holding a canonical `uuid` whenever it is set, which every identity
+    /// the deployment resolves must then be.
+    #[must_use]
+    pub const fn with_uuid_user(self) -> Self {
+        Self {
+            user: UserSetting::UuidMayBeUnset,
+            ..self
+        }
+    }
+
+    /// The same declaration, with the subjects setting a request may leave
+    /// unset.
+    #[must_use]
+    pub const fn with_subjects(self) -> Self {
+        Self {
+            subjects: true,
+            ..self
+        }
+    }
+
+    /// Whether a request may leave the user setting unset.
+    #[must_use]
+    pub const fn user_may_be_unset(&self) -> bool {
+        !matches!(self.user, UserSetting::AlwaysBound)
+    }
+
+    /// Whether the user setting holds a `uuid` whenever it is set.
+    #[must_use]
+    pub const fn user_is_uuid(&self) -> bool {
+        matches!(self.user, UserSetting::UuidMayBeUnset)
+    }
+
+    /// Whether a request may leave the subjects setting unset.
+    #[must_use]
+    pub const fn subjects_may_be_unset(&self) -> bool {
+        self.subjects
+    }
+
+    /// The value the user setting takes for a caller holding no identity.
+    #[must_use]
+    pub fn absent_user(&self) -> &'static str {
+        absent_value(self.user_may_be_unset())
+    }
+
+    /// The value the subjects setting takes for a caller holding no key.
+    #[must_use]
+    pub fn absent_subjects(&self) -> &'static str {
+        absent_value(self.subjects)
+    }
+}
+
+/// `''` for a setting that may be unset, [`absent_marker`] otherwise.
+fn absent_value(may_be_unset: bool) -> &'static str {
+    if may_be_unset { "" } else { absent_marker() }
+}
+
 /// Session-scoped identity: a user id and nothing else.
 ///
 /// Tenant and role belong in the authorization model rather than on the

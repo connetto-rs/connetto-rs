@@ -645,8 +645,9 @@ impl Translated {
             .map_err(|err| SetupError::Catalog(err.to_string()))?;
         let catalog = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(&sql)
             .map_err(|err| SetupError::Catalog(err.to_string()))?;
-        let deployment = connetto_schema::deployment::<Key>(documents.reader_role())
-            .map_err(|err| SetupError::Catalog(err.to_string()))?;
+        let deployment =
+            connetto_schema::deployment::<Key>(documents.reader_role(), documents.unset_settings())
+                .map_err(|err| SetupError::Catalog(err.to_string()))?;
         let translator = rls2fga::translator::TranslatorBuilder::new(deployment)
             .with_min_confidence(rls2fga::types::ConfidenceLevel::B)
             .build();
@@ -2604,7 +2605,13 @@ mod tests {
             true,
         );
         assert!(matches!(refused, Err(super::SetupError::Catalog(_))));
-        assert!(crate::CallerMappings::of::<OnIdentity>("app_reader").is_err());
+        assert!(
+            crate::CallerMappings::of::<OnIdentity>(
+                "app_reader",
+                connetto_core::auth::UnsetSettings::ALWAYS_BOUND,
+            )
+            .is_err()
+        );
     }
 
     /// A share written as a row of a join table, whose facts travel as a query

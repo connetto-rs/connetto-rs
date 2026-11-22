@@ -772,8 +772,11 @@ pub async fn term_over_owner_fixture(fixture: &Fixture) -> Server {
 /// Never, since the fixture deployment's description holds.
 #[must_use]
 pub fn caller_mapping() -> CallerMappings {
-    CallerMappings::of::<String>(crate::FIXTURE_READER)
-        .expect("the fixture deployment's description holds")
+    CallerMappings::of::<String>(
+        crate::FIXTURE_READER,
+        connetto_core::auth::UnsetSettings::ALWAYS_BOUND,
+    )
+    .expect("the fixture deployment's description holds")
 }
 
 async fn provision(fixture: &Fixture, shape: PolicyShape) -> Server {

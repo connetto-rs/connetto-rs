@@ -9681,11 +9681,10 @@ where
         &self,
         state: &SessionState<Id, Key>,
     ) -> Option<crate::reexec::ConnettoReadSetup> {
-        let binding =
-            crate::capability::CallerBinding::of(&state.principal, self.target.user_setting());
-        // Both settings are bound either way, an unheld half taking the absent
-        // marker, so what decides the offer is what the caller holds rather
-        // than how many statements the binding renders.
+        let binding = crate::capability::CallerBinding::of(&state.principal, self.target.binding());
+        // Both settings are bound either way, an unheld half taking the value
+        // its declaration reads as absent, so what decides the offer is what
+        // the caller holds rather than how many statements the binding renders.
         binding.binds_a_caller().then(|| {
             crate::reexec::ConnettoReadSetup::of(ReadBudget::new(
                 self.guard.reexec_budget().timeout,
@@ -11929,16 +11928,22 @@ mod tests {
         };
         let member_tables = |ddl: &str, filter: &str| {
             let translator = rls2fga::translator::TranslatorBuilder::new(
-                connetto_schema::deployment::<String>(READER)
-                    .expect("the test deployment's description holds"),
+                connetto_schema::deployment::<String>(
+                    READER,
+                    connetto_core::auth::UnsetSettings::ALWAYS_BOUND,
+                )
+                .expect("the test deployment's description holds"),
             )
             .with_min_confidence(rls2fga::types::ConfidenceLevel::B)
             .build();
             let materializer = crate::materializer::Materializer::builder(ddl)
                 .with_translator(translator)
                 .with_caller(
-                    crate::materializer::CallerMappings::of::<String>(READER)
-                        .expect("the test deployment's description holds"),
+                    crate::materializer::CallerMappings::of::<String>(
+                        READER,
+                        connetto_core::auth::UnsetSettings::ALWAYS_BOUND,
+                    )
+                    .expect("the test deployment's description holds"),
                 )
                 .build()
                 .expect("the catalog parses");

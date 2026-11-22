@@ -135,6 +135,31 @@ fn builder_schema(
     pg_policies: &str,
     writable: &str,
 ) -> ServerBuilder {
+    builder_with(
+        fixture,
+        port,
+        idp,
+        fga,
+        ServerSchema::new(
+            pg_ddl.to_owned(),
+            pg_policies.to_owned(),
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
+        writable,
+    )
+}
+
+/// [`builder_schema`] over a whole `schema`, for a test that declares more of
+/// it than its documents.
+fn builder_with(
+    fixture: &Fixture,
+    port: u16,
+    idp: &MockOauth,
+    fga: (&str, &str),
+    schema: ServerSchema,
+    writable: &str,
+) -> ServerBuilder {
     let url = fixture.admin_url().to_owned();
     let reader = with_user_url(&url, "app_reader", "app_reader");
     let keys = TempDir::new().expect("a key dir");
@@ -154,12 +179,7 @@ fn builder_schema(
     );
     ServerBuilder::new(
         Database::new(url, reader),
-        ServerSchema::new(
-            pg_ddl.to_owned(),
-            pg_policies.to_owned(),
-            connetto_test_harness::FIXTURE_ROLES,
-            connetto_test_harness::FIXTURE_READER,
-        ),
+        schema,
         token,
         OpenFga::new(fga.0.to_owned(), fga.1.to_owned()),
     )
@@ -1301,6 +1321,149 @@ async fn a_per_viewer_statistic_keeps_the_viewers_rows_over_the_production_wirin
         "bob's second row moves his statistic"
     );
     fence_still_answers(&mut alice, "count", 1).await;
+    stream.abort();
+    http.abort();
+}
+
+/// A table owned through a `uuid`, whose policy reads the identity through
+/// `NULLIF` so a caller holding none compares against NULL.
+const UUID_OWNED_PG_DDL: &str = "-- connetto:major 1\n\
+     CREATE TABLE uuid_owned (id INT PRIMARY KEY, owner UUID, body TEXT);";
+
+/// The policy a deployment writes when the identity may be unset.
+const UUID_OWNED_POLICIES: &str = "ALTER TABLE uuid_owned ENABLE ROW LEVEL SECURITY;\n\
+     CREATE POLICY uuid_owned_p ON uuid_owned \
+     USING (owner = NULLIF(current_setting('app.user_id', true), '')::uuid);";
+
+/// The number of rows the snapshot of `sub_id` delivers.
+async fn snapshot_count(client: &mut WebSocketTransport<TcpStream>, sub_id: &str) -> usize {
+    client
+        .send_control(ControlMessage::Subscribe(Subscribe {
+            sub_id: sub_id.to_owned(),
+            spec: SubscriptionSpec::new("SELECT * FROM uuid_owned"),
+        }))
+        .await
+        .expect("send the subscription");
+    match next_control(client).await {
+        ControlMessage::SnapshotBegin(snapshot) if snapshot.sub_id == sub_id => {}
+        other => panic!("the snapshot opened with {other:?} instead"),
+    }
+    let mut rows = 0;
+    loop {
+        let frame = tokio::time::timeout(BOUND, client.recv())
+            .await
+            .expect("the transport answers")
+            .expect("the transport stays open");
+        match frame {
+            Some(IncomingFrame::Bulk(BulkMessage::SnapshotPatch(patch))) => {
+                let raw = zstd::decode_all(patch.patchset_zstd.as_slice())
+                    .expect("decompress the patchset");
+                // An empty page carries no header to tell the two formats apart.
+                rows += match sqlite_diff_rs::ParsedDiffSet::parse(&raw).expect("parse the page") {
+                    sqlite_diff_rs::ParsedDiffSet::Patchset(set) => set.iter().count(),
+                    sqlite_diff_rs::ParsedDiffSet::Changeset(set) => set.iter().count(),
+                };
+            }
+            Some(IncomingFrame::Control(ControlMessage::SnapshotEnd(end))) => {
+                assert_eq!(end.sub_id, sub_id);
+                return rows;
+            }
+            other => panic!("expected a page or the end of the read, got {other:?}"),
+        }
+    }
+}
+
+/// A deployment declaring the identity may be unset reads a caller holding
+/// none as `''`, so its policy's `NULLIF(..)::uuid` compares against NULL and
+/// answers no row where the absent marker would fail the cast. The same
+/// documents without the declaration refuse to build, since the policy then
+/// reads a setting that is always bound as if it were not.
+#[tokio::test]
+async fn an_identity_declared_unset_reads_an_anonymous_caller_as_nobody() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+
+    let idp = MockOauth::start().await;
+    let (_channel, store) = fixture.fga_store().await;
+    let alice_id =
+        connetto_server::authn::identity::deterministic_uuid(idp.issuer(), "alice").to_string();
+    for stmt in [
+        "DROP TABLE IF EXISTS uuid_owned CASCADE",
+        "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_reader') \
+         THEN CREATE ROLE app_reader LOGIN PASSWORD 'app_reader'; END IF; END $$",
+        UUID_OWNED_PG_DDL,
+        "GRANT USAGE ON SCHEMA public TO app_reader",
+        "GRANT SELECT ON uuid_owned TO app_reader",
+        "GRANT SELECT ON auth_events TO app_reader",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled, \
+         _connetto_session_writers TO app_reader",
+        &format!("INSERT INTO uuid_owned VALUES (1, '{alice_id}', 'alice seed')"),
+    ] {
+        exec(&pool, stmt).await;
+    }
+    for stmt in UUID_OWNED_POLICIES.split_inclusive(';') {
+        exec(&pool, stmt).await;
+    }
+    provision_cap_policies(&pool, UUID_OWNED_PG_DDL, UUID_OWNED_POLICIES).await;
+    fixture.start_replication(&["uuid_owned"]).await;
+    fixture.provision_auth_tables().await;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a listener");
+    let port = listener.local_addr().expect("local address").port();
+    let fga_url = fixture.fga_url().await.to_owned();
+    let schema = ServerSchema::new(
+        UUID_OWNED_PG_DDL,
+        UUID_OWNED_POLICIES,
+        connetto_test_harness::FIXTURE_ROLES,
+        connetto_test_harness::FIXTURE_READER,
+    );
+    refused(
+        builder_with(
+            &fixture,
+            port,
+            &idp,
+            (&fga_url, &store),
+            schema.clone(),
+            "uuid_owned",
+        )
+        .build()
+        .await,
+        "a NULLIF over an always-bound identity",
+    );
+    let builder = builder_with(
+        &fixture,
+        port,
+        &idp,
+        (&fga_url, &store),
+        schema
+            .with_unset_settings(connetto_core::auth::UnsetSettings::ALWAYS_BOUND.with_uuid_user()),
+        "uuid_owned",
+    );
+    let base = format!("http://127.0.0.1:{port}");
+    let parts = builder.build().await.expect("the deployment assembles");
+    let stream = tokio::spawn(parts.change_stream);
+    let http = tokio::spawn(async move { axum::serve(listener, parts.router).await });
+    wait_ready(&base).await;
+
+    let addr = format!("127.0.0.1:{port}");
+    let mut anonymous = anonymous_session(&addr, "nobody").await;
+    assert_eq!(
+        snapshot_count(&mut anonymous, "anonymous").await,
+        0,
+        "a caller holding no identity reads no owned row, and the read succeeds"
+    );
+    let (alice_access, minted_alice, _) = mint_tokens(&base, "alice").await;
+    assert_eq!(minted_alice, alice_id);
+    let mut alice = live_session_as(&addr, &alice_access, "alice-uuid").await;
+    assert_eq!(
+        snapshot_count(&mut alice, "alice").await,
+        1,
+        "alice reads the row she owns"
+    );
     stream.abort();
     http.abort();
 }
