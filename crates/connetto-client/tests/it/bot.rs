@@ -9,7 +9,7 @@ use connetto_client::bot::{Registration, register};
 use connetto_client::{ClientBuilder, ClientError, ClientEvent, SyncSchema};
 use connetto_core::messages::{
     BotListEntry, BotRegistered, BulkMessage, Challenge, ControlMessage, FatalErrorReason,
-    HandshakeAck, SnapshotBegin, SnapshotEnd, SnapshotPatch, bot_registration_message,
+    HandshakeAck, SnapshotPatch, bot_registration_message,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, SchemaBundle, loopback};
@@ -18,7 +18,7 @@ use ring::rand::SystemRandom;
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use uuid::Uuid;
 
-use super::support::{Once, labelled_order_payload};
+use super::support::Once;
 
 const DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY, label TEXT);";
 /// The major line the schema source declares.
@@ -83,26 +83,7 @@ fn challenged_server() -> LoopbackTransport {
             .expect("ack the handshake");
         while let Ok(Some(frame)) = server.recv().await {
             if let IncomingFrame::Control(ControlMessage::Subscribe(sub)) = frame {
-                server
-                    .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
-                        sub_id: sub.sub_id.clone(),
-                    }))
-                    .await
-                    .expect("snapshot begin");
-                server
-                    .send_bulk(BulkMessage::SnapshotPatch(SnapshotPatch {
-                        sub_id: sub.sub_id.clone(),
-                        patchset_zstd: labelled_order_payload(1),
-                    }))
-                    .await
-                    .expect("snapshot patch");
-                server
-                    .send_control(ControlMessage::SnapshotEnd(SnapshotEnd {
-                        sub_id: sub.sub_id.clone(),
-                        cursor: Cursor::new(vec![1]),
-                    }))
-                    .await
-                    .expect("snapshot end");
+                super::support::send_seed_snapshot(&mut server, &sub.sub_id).await;
             }
         }
     });
