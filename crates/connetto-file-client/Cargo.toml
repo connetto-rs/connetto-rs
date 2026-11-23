@@ -145,6 +145,7 @@ web-sys = { version = "0.3", features = [
 ] }
 
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dev-dependencies]
+connetto-core = { workspace = true, features = ["logging"] }
 connetto-test-harness = { path = "../connetto-test-harness" }
 connetto-file-server = { path = "../connetto-file-server" }
 connetto-server = { path = "../connetto-server", features = ["test-seams"] }

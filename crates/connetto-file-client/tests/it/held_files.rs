@@ -291,6 +291,7 @@ async fn connect_pumped(
     device: &str,
     dir: &std::path::Path,
 ) -> Result<(Core, CorePump), ClientError> {
+    connetto_core::logging::install(std::io::stdout, "connetto_client::builder=debug");
     let held = credential(device);
     ClientBuilder::new(schema, router.dialer())
         .with_content(Content::new())
