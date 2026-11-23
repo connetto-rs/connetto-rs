@@ -15,8 +15,9 @@ homepage.workspace = true
 workspace = true
 
 [dependencies]
-# The shape reader the generated boundaries are diffed with needs SQLite.
-connetto-core = { workspace = true, features = ["sqlite-shape"] }
+# The shape reader the generated boundaries are diffed with needs SQLite, and
+# the validation connection registers the `jsonb` set every replica has.
+connetto-core = { workspace = true, features = ["sqlite-shape", "sqlite-jsonb"] }
 # Tracked on main, the same way the other root crates track it.
 pg2sqlite = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main", default-features = false, features = ["std"] }
 # The deployment description both translators read, built once here.

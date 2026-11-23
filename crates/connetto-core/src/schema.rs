@@ -144,6 +144,27 @@ pub const BOT_LIST_WILDCARD: &str = "*";
 /// which the application registers on every replica connection it opens.
 pub const UUID_FUNCTION: &str = "uuidv4";
 
+/// The function a translated `jsonb` value passes through, answering the text
+/// PostgreSQL prints for it.
+pub const JSONB_FUNCTION: &str = "connetto_jsonb";
+
+/// The function a translated `->>` or `#>>` calls, answering the text it
+/// extracts as PostgreSQL does.
+pub const JSONB_TEXT_FUNCTION: &str = "connetto_jsonb_text";
+
+/// The collation a translated `jsonb` column declares, ordering documents as
+/// `jsonb`'s btree operator class does.
+pub const JSONB_COLLATION: &str = "connetto_jsonb";
+
+/// pg2sqlite's `jsonb` functions and collation under [`JSONB_FUNCTION`],
+/// [`JSONB_TEXT_FUNCTION`] and [`JSONB_COLLATION`], the set the translation
+/// names and every replica connection registers.
+#[cfg(feature = "sqlite-jsonb")]
+#[must_use]
+pub fn jsonb_functions() -> pg2sqlite_runtime::JsonbFunctions {
+    pg2sqlite_runtime::JsonbFunctions::new(JSONB_FUNCTION, JSONB_TEXT_FUNCTION, JSONB_COLLATION)
+}
+
 /// The table the RLS translation's monitoring triggers write violations to.
 pub const AUDIT_TABLE: &str = "rls_audit";
 

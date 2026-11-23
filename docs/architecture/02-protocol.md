@@ -86,6 +86,8 @@ The `schema_version` in `HandshakeAck` hashes the whole translated bundle. [`con
 
 Both sides derive it through one build step. An application's build script runs [`connetto_translate::emit`] over its sources, and `connetto-server` runs [`connetto_translate::translate`] over its own at startup with the pg2sqlite it was built with. Two builds whose sources match but whose translations differ, from two pg2sqlite revisions for instance, therefore present different versions, and the client refuses the handshake as [`connetto_client::ClientError::SchemaOutdated`]. The version rides the ack's one `schema_version` field.
 
+The step prints every warning pg2sqlite raises as a `cargo::warning`, and the server logs the same warnings at startup. A warning that the replica keeps less than PostgreSQL does, a type downgrade, a key column the reader cannot read or a table no policy lets the reader read, refuses the build unless the deployment passes a [`connetto_translate::Acknowledgements`] naming its [`connetto_translate::WarningPlace`] with a reason. An acknowledgement whose place holds no such warning refuses the build too, as an unfulfilled `#[expect]` does. A warning about what the replica leaves to the server is shown only, because the server stays the judge of it, and the server refuses no warning.
+
 A client always declares a version, because the builders take a `SyncSchema` built from a bundle and give no way to leave it out. A server that declares none still skips the check.
 
 ## The application schema major

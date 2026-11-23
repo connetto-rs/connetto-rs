@@ -16,6 +16,7 @@ fn main() {
         std::path::Path::new("../deployment/roles.sql"),
         "connetto_reader",
         connetto_translate::UnsetSettings::ALWAYS_BOUND,
+        &connetto_translate::Acknowledgements::new(),
         Some(&connetto_translate::TierSource::new(
             "frontend.sql",
             "tier_history",

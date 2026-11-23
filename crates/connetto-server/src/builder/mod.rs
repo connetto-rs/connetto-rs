@@ -2685,9 +2685,14 @@ async fn build_write_side<D: ConnettoSchema>(
     let withdrawals = PgSnapshotSource::from_ddl(pools.owner.clone(), &schema.engine_ddl::<D>())?
         .with_unset_settings(schema.unset);
     // A changed policy makes an existing replica stale, so a client holding one is told through the advertised version.
-    let bundle = connetto_translate::translate::<String, <D::Bots as ConnettoBotSchema>::IdSql>(
-        schema.documents(),
-    )?;
+    let connetto_translate::TranslationReport { bundle, warnings } =
+        connetto_translate::translate_with_report::<String, <D::Bots as ConnettoBotSchema>::IdSql>(
+            schema.documents(),
+        )?;
+    // The client build printed these, and the boot shows the operator the same.
+    for warning in warnings {
+        tracing::warn!(%warning, "the replica translation raised a warning");
+    }
     let facts = FactSource::owner(pools.owner);
     let (auth, upkeep) =
         crate::rules::install_authorization::<D::Id>(&translated, &facts, openfga, &mut None)
