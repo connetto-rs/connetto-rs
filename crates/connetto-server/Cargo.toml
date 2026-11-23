@@ -15,6 +15,7 @@ homepage.workspace = true
 workspace = true
 
 [dependencies]
+arc-swap = { workspace = true }
 connetto-core = { workspace = true, features = ["native-transport", "diesel-pg", "device-cert"] }
 # Derives the schema version it presents at handshake, hashing the translated
 # bundle rather than the source documents alone.

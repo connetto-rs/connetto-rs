@@ -30,7 +30,7 @@ const PLAIN: &str = "plain";
 
 /// Reports the deployment's key-gated tables.
 struct ModelUpkeep {
-    key_tables: Vec<String>,
+    key_tables: Arc<[String]>,
 }
 
 impl StoreUpkeep for ModelUpkeep {
@@ -41,8 +41,8 @@ impl StoreUpkeep for ModelUpkeep {
         Box::pin(async { Ok(Vec::new()) })
     }
 
-    fn key_tables(&self) -> &[String] {
-        &self.key_tables
+    fn key_tables(&self) -> Arc<[String]> {
+        Arc::clone(&self.key_tables)
     }
 }
 
@@ -115,7 +115,7 @@ fn manager(fixture: &Fixture, clock: &ExpiryClock) -> Manager {
             .expect("build write target"),
     )
     .with_upkeep(Arc::new(ModelUpkeep {
-        key_tables: vec![GATED.to_owned()],
+        key_tables: Arc::from([GATED.to_owned()]),
     }))
     .with_session(clock.session_config())
     .build()

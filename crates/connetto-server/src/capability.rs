@@ -594,7 +594,7 @@ impl<P, R, Id> CapabilityIssuer<P, R, Id> {
             table: table.to_owned(),
         };
         let row = row.ok_or_else(unauthorized)?;
-        let view = ValuesRow::new(row.table_id, &row.values);
+        let view = ValuesRow::new(self.rows.catalog(), row.table_id, &row.values);
         let watchers = [Arc::new(caller.clone())];
         let mut verdicts = Vec::new();
         Verdict::reset(&mut verdicts, watchers.len());

@@ -969,7 +969,11 @@ pub async fn start_replication_on(pool: &Pool<AsyncPgConnection>, tables: &[&str
     )
     .await;
     provision_writers(pool).await;
+    exec(pool, connetto_server::epoch::POLICY_CHANGES_DDL).await;
     let mut published: Vec<&str> = tables.to_vec();
+    if !published.contains(&connetto_server::epoch::POLICY_CHANGES_TABLE) {
+        published.push(connetto_server::epoch::POLICY_CHANGES_TABLE);
+    }
     for registry in connetto_core::bots::REGISTRY_TABLES {
         if !published.contains(registry) {
             published.push(registry);
@@ -1200,6 +1204,7 @@ impl Fixture {
         provision_audit(&admin).await;
         provision_bot_tables(&admin).await;
         exec(&admin, connetto_server::epoch::EPOCH_DDL).await;
+        exec(&admin, connetto_server::epoch::POLICY_CHANGES_DDL).await;
         Self {
             admin_url,
             admin,
@@ -2087,7 +2092,7 @@ pub async fn spawn_server(
     if !replication_tables.is_empty() {
         let admin_pool = pool_for(&admin_url).await;
         let table_refs: Vec<&str> = replication_tables.iter().map(String::as_str).collect();
-        start_replication_on(&admin_pool, &table_refs).await;
+        Box::pin(start_replication_on(&admin_pool, &table_refs)).await;
     }
     // The materializer alone reads the policies beside the engine catalog, because a folded read rule reads the policy text the engine holds.
     let upkeep = auth.upkeep();
@@ -2158,7 +2163,7 @@ fn spawn_ingest_task(
         let connect = |resume: connetto_server::ResumePoint| {
             let (url, ddl, manager) =
                 (admin_url.clone(), catalog_ddl.clone(), Arc::clone(&manager));
-            async move {
+            Box::pin(async move {
                 let config =
                     PgStreamingConfig::new(url.clone(), SLOT.to_owned(), PUBLICATION.to_owned())
                         .start(resume.get());
@@ -2172,11 +2177,16 @@ fn spawn_ingest_task(
                 .await
                 .map_err(|err| err.to_string())?;
                 manager
+                    .follow_live_rules(Arc::clone(source.rules().database()))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let source = source.start().await.map_err(|error| error.to_string())?;
+                manager
                     .watch_guard(source.refusals())
                     .await
                     .map_err(|err| format!("settling earlier refusals: {err}"))?;
                 Ok::<_, String>(source)
-            }
+            })
         };
         let _ = manager
             .ingest_with_reconnect(connect, &ReconnectPolicy::default(), |event| {

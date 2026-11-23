@@ -118,8 +118,10 @@ parking_lot = "0.12"
 tempfile = "3"
 
 [dev-dependencies]
-# The peer exchange proof names a timestamptz value for the order it writes.
-chrono = "0.4"
+# The peer exchange proof writes the order's timestamptz as the canonical UTC
+# text the replica holds.
+jiff = "1"
+rosetta-utc = { version = "0.2.0", features = ["diesel", "sqlite"] }
 # The camp media proof runs a content client over each device's replica.
 connetto-file-client = { path = "../connetto-file-client", features = ["peer"] }
 # The camp media proof builds and stages through the demo's own photo

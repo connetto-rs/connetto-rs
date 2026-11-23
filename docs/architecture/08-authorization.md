@@ -51,7 +51,7 @@ The executors split by the shape of the question.
 | Change delivery | point check, twice per row per subscriber | OpenFGA |
 | Write | point check, once per operation | OpenFGA |
 
-The change and write executors are [`connetto_server::openfga::FgaAuth`], which composes subql's `RowPolicy` over `OpenFgaPolicy` behind one shared index built at startup, so the boot guard and the change path cannot hold two opinions about the same policies. The visibility trait `subql::visibility::VisibilityPolicy` is defined in subql, which holds the replication connection. It is consulted at the change dispatch [`connetto_server::session::SessionManager::dispatch_event`], the catchup replay `catch_up_row` in [session.rs](../../crates/connetto-server/src/session.rs), the write loop `handle_mutation` in the same file, and the mint [`connetto_server::capability::CapabilityIssuer::issue`]. All four ask one question naming the watchers, and a failure denies one watcher rather than the event.
+The change and write executors are [`connetto_server::openfga::FgaAuth`], which composes `subql`'s `RowPolicy` over `OpenFgaPolicy` behind a shared authorization generation. Each decision holds one generation containing its model, shapes, subject naming and grant reach. The visibility trait `subql::visibility::VisibilityPolicy` is consulted at change dispatch, catch-up replay, mutation handling and capability minting, and a failure denies one watcher rather than the event.
 
 ### Why the snapshot stays on row-level security
 
@@ -63,13 +63,21 @@ It is safe only because `rls2fga` compiles both executors from one source. A pol
 
 Two upstream invariants guard the same seam. An exclusion that `rls2fga` emits never subtracts something derived from the object's own row, and the catchup reasoning depends on it. And a translated attribute condition earns a wildcard subject only when the value it compares against is a literal, which is the one way a compiled policy can widen rather than narrow.
 
-### The startup refusals
+### Following live rules
 
-A policy the translator cannot read stops the server at boot, on a note whose severity is `diverges_from_database` rather than on the narrower unhandled report. A policy reading a table the publication does not carry also stops it, through [`connetto_server::preflight::Artifact::PublishedTable`], because the change-path executor learns about permission changes only from the replication stream and a stale policy would answer confidently and wrongly. `rls2fga` reports the complete set of tables each policy reads, so this is a set comparison that can name the missing table. A third refusal belongs to the replica half of the translation and is stated below.
+The server translates the live database's policies, reached helpers and table and column grants at boot and whenever the drift guard reports a change. It writes the model, reconciles its facts and swaps the authorization generation and policy readers before dispatching the next event. Subscriptions reading affected tables receive `FullResyncReason::AuthorizationChange` and a replacement snapshot under the new rules.
+
+The guard reads rules at every connection, relation message, reconciliation interval and published marker event. Helper migrations mark their transaction through `connetto_policy_changes`, with the optional event trigger described in [chapter 20](20-deployment.md#live-authorization-migrations). A returning client whose cursor predates a followed change receives the same authorization replacement.
+
+Each rules change records its affected tables in the major's reconnect log, and returning clients with cursors predating that record receive `AuthorizationChange`. The log also stores a fingerprint of each table's translated rules. A boot compares the live rules' fingerprints with the stored ones, so a policy changed while no server ran is recorded the same way. A table without a stored fingerprint compares against its translation from the schema documents.
+
+The schema documents are translated at startup and an unsupported document refuses the boot. Unsupported live rules refuse their table and every table whose policies read it, with `SUBSCRIPTION_REFUSED_SCHEMA`, while other tables keep serving. Refusals persist until a restart judges those tables again.
 
 ## The third executor
 
 The client's local SQLite replica carries the policy too, translated from the same Postgres policy text by `pg2sqlite`, which turns each policy-bearing table into a backing table, a view carrying the logical name, triggers, an audit table and a violations view. The two-executors argument extends to a third, since `pg2sqlite` compiles from the same policy text, though it widens the surface on which the executors can disagree.
+
+The client's copy keeps the rules it was built with until the application updates. Every running server follows the live rules, including servers serving an older schema major.
 
 Triggers in a SQLite file protect nothing from whoever owns the file, and [14-at-rest-encryption.md](14-at-rest-encryption.md#what-is-encrypted) already concedes the unlocked machine. What they buy is three things. A write the server would reject is refused locally before it is queued. A row that reached the replica through a server-side defect does not surface to the application. And the same query returns the same rows locally and remotely. That last promise has an untested seam, because no test runs one policy text through both translators, and [G8](../../plans/master-implementation-plan.md#g8) names the missing test.
 

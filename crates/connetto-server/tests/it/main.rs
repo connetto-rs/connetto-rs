@@ -86,6 +86,7 @@ mod failover;
 mod idle_limit;
 mod inprocess_loop;
 mod lifecycle;
+mod live_rules;
 mod logging;
 mod loopback_session;
 

@@ -20,6 +20,8 @@ A deployment holds state in three places. Its Postgres cluster, the stores besid
 | The generated cap document, the four `AS RESTRICTIVE` bot cap policies per synced and registry table | Generated from `CONNETTO_PG_DDL` and `CONNETTO_PG_POLICIES` by the build step ([`connetto_translate::cap_policies`]) and applied by the deployment's migration | Yes | Refused by `require_cap_policies` in [builder/mod.rs](../../crates/connetto-server/src/builder/mod.rs) (`Artifact::CappedTable` per table, naming the missing rule). A session's value in `app.bot_list` carries a bot's declared tables and verbs, and the `*` wildcard for a person |
 | The reconnect log, `connetto_oplog`, its last commit, `connetto_oplog_commit`, and its transaction index, `connetto_oplog_xids` | `CONNETTO_OPLOG_TABLE`, with `_commit` and `_xids` appended for the other two | Yes | All three refused by [`connetto_server::preflight::require`] (`Artifact::Table`), and a log table without the compressed patch or a commit table without `xid_horizon` is refused naming the absent column (`Artifact::TableColumn`) |
 | `connetto_epoch`, the cluster the deployment last served from | [`connetto_server::epoch::EPOCH_DDL`] | Yes, which is what lets a restore into another cluster be seen | Refused by [`connetto_server::preflight::require`] (`Artifact::Table`) |
+| `connetto_policy_changes`, the published rules-change marker | [`connetto_server::epoch::POLICY_CHANGES_DDL`] | Yes | Required through `Artifact::Table`, `Artifact::PublishedTable` and `Artifact::PreviousImages` |
+| The optional rules-change event trigger | [`connetto_server::epoch::POLICY_CHANGES_TRIGGER_DDL`], installed by a superuser | Yes | Optional, reconciliation reads rules without it |
 | The publication and its previous images | `CONNETTO_PUBLICATION` | Yes | Required through `Artifact::Publication` and `Artifact::PreviousImages`. `Artifact::PublishedTable` requires every policy dependency, audit table, `_connetto_writers`, `_connetto_settled` and, with device identity, `connetto_device_enrolments` |
 | The logical replication slot | `CONNETTO_SLOT` | **No**, under every method | Refused (`Artifact::ReplicationSlot`) |
 | The file server's `_cfs_*` tables and functions | [`connetto_file_server::DEPLOYMENT_DDL`] | Yes | Refused by `connetto_file_server::preflight` |
@@ -74,6 +76,24 @@ The deployment moves a major in five ordered steps, each of which leaves the old
 **5. Run the contract**, which only removes. It drops the old columns, the old tables and the expand's trigger, which the new major's catalog never declares. Nothing the old major served is changed before this step, and the new major's server never reads what the contract removes.
 
 **A constraint change on a table both majors serve needs a stop.** Making a shared column `NOT NULL` or nullable, retyping it under its own name, or adding or dropping a `CHECK` on such a table, a `CHECK` on a new column included, leaves no live shape that matches both catalogs, because each server refuses any difference in nullability, type or checks. Such a change runs with the new major's server started only after the old one is off. The expand runs, the old major's sunset passes and its servers go off, the change and the contract run, and then the new major's server starts. No client of either major is served between the old server stopping and the new one starting.
+
+### Live authorization migrations
+
+Every running major follows the live policies, reached helpers and table and column grants. A supported change replaces affected subscriptions under the new rules with `FullResyncReason::AuthorizationChange`, and an unsupported live rule refuses its table and its policy readers while other tables keep serving. The client's local rules remain those of its application build.
+
+The deployment applies [`connetto_server::epoch::POLICY_CHANGES_DDL`] and publishes `public.connetto_policy_changes` in every major's publication. The constant creates a singleton row with `singleton BOOLEAN` and `changed BOOLEAN`, seeds it and sets `REPLICA IDENTITY FULL`. A helper migration marks its own transaction with this statement.
+
+```sql
+UPDATE public.connetto_policy_changes
+SET changed = NOT changed
+WHERE singleton;
+```
+
+A superuser can install [`connetto_server::epoch::POLICY_CHANGES_TRIGGER_DDL`] once. Its `connetto_policy_changes_trigger` runs at `ddl_command_end` for `CREATE FUNCTION`, `ALTER FUNCTION`, `DROP FUNCTION`, `ALTER ROUTINE`, `DROP ROUTINE`, `GRANT` and `REVOKE`, using the schema-qualified `SECURITY DEFINER` function `public.connetto_mark_policy_changes` with `search_path = pg_catalog`. The marker update commits with the migration, so the server follows it before later streamed rows.
+
+Without a trigger or an explicit marker update, the next drift reconciliation reads the helper change. Reconciliation defaults to one minute and is configurable through `ServerBuilder::drift_reconciliation`. Event triggers do not mark role-membership changes.
+
+Rules-change records belong to each major's reconnect log. A client returning from before a recorded runtime change receives `AuthorizationChange`. Retiring a major removes this state with its other reconnect-log artifacts.
 
 ## Erasing a person
 

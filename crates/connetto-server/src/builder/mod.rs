@@ -37,15 +37,12 @@ use crate::device_cert::{
 };
 use crate::manager_builder::ManagerBuilder;
 use crate::materializer::Materializer;
-use crate::openfga::{
-    Counted, FactSource, FgaAuth, ModelState, ModelSubject, SetupError, Translated,
-};
+use crate::openfga::{Counted, FactSource, FgaAuth, SetupError, Translated};
 use crate::oplog::{OplogConfig, PgOplog};
 use crate::portability::{
     DataRequestError, DataRequester, DownloadReceipt, PersonEnded, PortabilityError,
     PortabilityList, PortabilityState, ReaderCheckError, ValidatedList, reader_in_recovery,
 };
-use crate::reach::GrantReach;
 use crate::reserve::{ReaderGate, ReaderReserve};
 use crate::schema::ConnettoSchema;
 use crate::session::{
@@ -62,12 +59,9 @@ use diesel_async::AsyncConnection as _;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
-use openfga_client::client::OpenFgaServiceClient;
 use openfga_client::tonic::transport::{Channel, Endpoint};
-use rls2fga::translator::Translator;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::Postgres;
-use subql::visibility::openfga::OpenFgaPolicy;
 use subql::{ParserDB, PgStreamingConfig};
 use tokio::io::AsyncWrite;
 
@@ -429,7 +423,7 @@ pub const DEFAULT_AUTH_CALL_BUDGET: Duration = Duration::from_secs(5);
 #[derive(Clone, Debug)]
 pub struct OpenFga {
     url: String,
-    store: String,
+    pub(crate) store: String,
     call_budget: Duration,
 }
 
@@ -456,13 +450,21 @@ impl OpenFga {
 
     /// The endpoint every authorization call goes through, each call and each
     /// connection attempt bounded by the call budget.
-    fn endpoint(&self) -> Result<Endpoint, BuildError> {
+    pub(crate) fn endpoint(&self) -> Result<Endpoint, SetupError> {
         Ok(Channel::from_shared(self.url.clone())
-            .map_err(|err| {
-                BuildError::AuthorizationEndpoint(format!("parsing the endpoint: {err}"))
-            })?
+            .map_err(|err| SetupError::Endpoint(format!("parsing the endpoint: {err}")))?
             .timeout(self.call_budget)
             .connect_timeout(self.call_budget))
+    }
+
+    /// A connection to the authorization service.
+    pub(crate) async fn connect(&self) -> Result<Channel, SetupError> {
+        self.endpoint()?.connect().await.map_err(|err| {
+            SetupError::Endpoint(format!(
+                "connecting to the authorization service at {}: {err}",
+                self.url
+            ))
+        })
     }
 }
 
@@ -604,6 +606,12 @@ pub enum BuildError {
     /// The change feed could not be checked before serving.
     #[error(transparent)]
     StreamCheck(#[from] StreamCheckError),
+    /// The boot database rules could not be read.
+    #[error(transparent)]
+    LiveRules(#[from] crate::drift::GuardConnectError),
+    /// The boot authorization generation could not be installed.
+    #[error(transparent)]
+    FollowRules(#[from] SessionError),
     /// The file half refused to build.
     #[error(transparent)]
     Content(#[from] ContentBuildError),
@@ -635,6 +643,9 @@ pub enum StreamConnectError {
     /// The guarded CDC stream would not open.
     #[error(transparent)]
     Guard(#[from] crate::drift::GuardConnectError),
+    /// The live rules could not be followed before streaming.
+    #[error("following live rules: {0}")]
+    Rules(#[source] SessionError),
     /// The refusals an earlier process persisted could not be settled.
     #[error("settling earlier refusals: {0}")]
     Refusals(#[source] SessionError),
@@ -2089,7 +2100,7 @@ where
         let sweep = reader.sweep;
         // Scoped, so the write side's storage ends here rather than staying in
         // the future across the wiring below.
-        let manager = {
+        let (manager, boot_rules) = {
             // Boxed, since it carries every translation across the store writes.
             let write_side = Box::pin(build_write_side::<D>(
                 Pools {
@@ -2097,7 +2108,7 @@ where
                     reader: reader.pool,
                 },
                 &schema,
-                &feed.publication,
+                &feed,
                 &openfga,
                 second_opinion,
                 writable,
@@ -2122,16 +2133,18 @@ where
                     .with_courier(courier),
             )
             .with_upkeep(write_side.upkeep)
+            .with_rules(write_side.rules)
             .with_signer(reader.signer)
             .with_withdrawal_source(write_side.withdrawals)
             .with_bot_registry(pg_bot_registry::<D>(pool.clone()));
-            match write_side.second {
+            let manager = match write_side.second {
                 Some(second) => manager.with_second_opinion(Arc::new(second)),
                 None => manager,
             }
-            .build()
+            .build();
+            (manager, write_side.boot_rules)
         };
-        wire_manager(&manager, &service, &guard, &pool, &feed).await?;
+        wire_manager(&manager, &service, &guard, &pool, &feed, boot_rules).await?;
         let status =
             device_identity.map(|config| install_device_identity::<D>(&manager, &service, config));
 
@@ -2603,6 +2616,10 @@ async fn translate_authorization<D: ConnettoSchema>(
             .iter()
             .map(|table| Artifact::PublishedTable { publication, table }),
     );
+    required.push(Artifact::PublishedTable {
+        publication,
+        table: crate::epoch::POLICY_CHANGES_TABLE,
+    });
     // The owner pool reads the facts off the tables the policies read, and
     // the withdrawals and the bot registry off the synced tables, each for
     // every caller at once, so row-level security must filter none of them.
@@ -2615,69 +2632,8 @@ async fn translate_authorization<D: ConnettoSchema>(
     Ok(translated)
 }
 
-/// The change path's executor, the rules put on the authorization service,
-/// and the facts behind them filled if they are new.
-///
-/// The first write to the service, so every refusal runs before this.
-/// Two clients over one endpoint, questions through [`Counted`] which is
-/// where the counter lives and the setup calls outside it.
-async fn install_authorization<D: ConnettoSchema>(
-    translated: Translated,
-    facts: &FactSource,
-    openfga: &OpenFga,
-) -> Result<(ServerAuth<D::Id>, Translator, GrantReach), BuildError> {
-    let channel = openfga.endpoint()?.connect().await.map_err(|err| {
-        BuildError::AuthorizationEndpoint(format!(
-            "connecting to the authorization service at {}: {err}",
-            openfga.url
-        ))
-    })?;
-
-    let mut setup = OpenFgaServiceClient::new(channel.clone());
-    let model = translated.install_model(&mut setup, &openfga.store).await?;
-    // Both the Written and the Adopted pass use the loader, the uncounted
-    // client keeping boot writes out of the authorization-call counter.
-    let loader = OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
-        translated.shapes_arc(),
-        setup,
-        openfga.store.clone(),
-        model.model(),
-    )
-    .map_err(SetupError::from)?;
-    match &model {
-        ModelState::Written(_) => {
-            let n = translated.load_into(facts, &loader).await?;
-            tracing::info!(
-                model = model.id(),
-                facts = n,
-                "authorization rules are new, loading the facts behind them"
-            );
-        }
-        ModelState::Adopted(_) => {
-            let (added, removed) = translated.reconcile_store(facts, &loader).await?;
-            tracing::info!(
-                model = model.id(),
-                added,
-                removed,
-                "authorization rules already installed, the store reconciled with the database"
-            );
-        }
-    }
-
-    let naming = translated.naming();
-    let (shapes, translator, reach) = translated.into_parts();
-    let delegate = OpenFgaPolicy::new(
-        Arc::clone(&shapes),
-        OpenFgaServiceClient::new(Counted::new(channel)),
-        openfga.store.clone(),
-        model.model(),
-    )
-    .map_err(SetupError::from)?;
-    Ok((FgaAuth::new(shapes, delegate, naming), translator, reach))
-}
-
-/// The manager's write side, the authorization model installed, the
-/// materializer, the second opinion when asked, the upkeep and the write
+/// The manager's write side, the live rules' authorization model installed,
+/// the materializer, the second opinion when asked, the upkeep and the write
 /// target.
 ///
 /// Everything that can refuse the deployment is built before the
@@ -2686,13 +2642,20 @@ async fn install_authorization<D: ConnettoSchema>(
 async fn build_write_side<D: ConnettoSchema>(
     pools: Pools,
     schema: &ServerSchema,
-    publication: &str,
+    feed: &Feed,
     openfga: &OpenFga,
     second_opinion: bool,
     writable: RuntimeWritableCatalog,
     engine_connector: PgReadConnector,
 ) -> Result<WriteSide<D>, BuildError> {
-    let translated = translate_authorization::<D>(&pools.owner, schema, publication).await?;
+    let documents = translate_authorization::<D>(&pools.owner, schema, &feed.publication).await?;
+    // The server runs the live rules, and the documents refuse an
+    // untranslatable start (decision 18).
+    let read =
+        crate::drift::read_rules(&feed.pg_ddl, &feed.database_url, &feed.publication).await?;
+    let (translated, boot_rules) =
+        crate::rules::BootRules::read(documents, Arc::clone(read.database()))
+            .map_err(BuildError::Authorization)?;
     let catalog = schema.catalog::<D>()?;
     // The engine and the upkeep each classify membership against the deployment's policies, so each takes a translator.
     let materializer = Materializer::builder(&catalog)
@@ -2726,17 +2689,31 @@ async fn build_write_side<D: ConnettoSchema>(
         schema.documents(),
     )?;
     let facts = FactSource::owner(pools.owner);
-    let (auth, translator, reach) = install_authorization::<D>(translated, &facts, openfga).await?;
-    let upkeep = auth.upkeep(reach, translator, facts);
+    let (auth, upkeep) =
+        crate::rules::install_authorization::<D::Id>(&translated, &facts, openfga, &mut None)
+            .await
+            .map_err(|error| match error {
+                SetupError::Endpoint(why) => BuildError::AuthorizationEndpoint(why),
+                other => BuildError::Authorization(other),
+            })?;
+    let rules = Arc::new(crate::rules::Coordinator::new(
+        auth.clone(),
+        translated,
+        boot_rules.database(),
+        openfga.clone(),
+        facts,
+    ));
     Ok(WriteSide {
         auth,
         materializer,
         second,
         upkeep,
+        rules,
         write,
         withdrawals,
         version: bundle.version(),
         major: bundle.major(),
+        boot_rules,
     })
 }
 
@@ -2815,14 +2792,15 @@ async fn settle_epoch<D: ConnettoSchema>(
     Ok(())
 }
 
-/// The manager's post-boot wiring, the live-close hooks and the epoch
-/// settlement.
+/// The manager's post-boot wiring, the live-close hooks, the epoch settlement
+/// and the boot's live rules.
 async fn wire_manager<D: ConnettoSchema>(
     manager: &Arc<ServerManager<D>>,
     service: &AuthService<D>,
     guard: &Arc<RequestGuard<D::Id>>,
     pool: &PgPool,
     feed: &Feed,
+    boot_rules: crate::rules::BootRules,
 ) -> Result<(), BuildError> {
     // Revoking a session closes its live connection rather than refusing its next handshake, so the close rides a spawned task.
     let revoke_manager = Arc::clone(manager);
@@ -2846,6 +2824,7 @@ async fn wire_manager<D: ConnettoSchema>(
         .check_before_stream(&feed.database_url, pool, &feed.slot)
         .await?;
     settle_epoch(manager, service, pool, check, crate::epoch::Found::AtBoot).await?;
+    manager.settle_boot_rules(boot_rules).await?;
     Ok(())
 }
 
@@ -2891,10 +2870,13 @@ struct WriteSide<D: ConnettoSchema> {
     materializer: Materializer<ParserDB, RuntimeWritableCatalog, PgReadConnector>,
     second: Option<RlsAuth<D::Id, String>>,
     upkeep: Arc<dyn crate::openfga::StoreUpkeep>,
+    rules: Arc<dyn crate::rules::RulesFollower>,
     write: PgWriteTarget<D>,
     withdrawals: PgSnapshotSource,
     version: SchemaVersion,
     major: Major,
+    /// The boot's read of the live rules, which the manager settles before the stream starts.
+    boot_rules: crate::rules::BootRules,
 }
 
 /// The change-stream future, one reconnecting ingestion that closes every
@@ -2933,6 +2915,11 @@ fn change_stream<D: ConnettoSchema>(
                     .start(resume.get());
                 let source =
                     crate::drift::connect_guarded(config, &ddl, &url, &publication, every).await?;
+                manager
+                    .follow_live_rules(Arc::clone(source.rules().database()))
+                    .await
+                    .map_err(StreamConnectError::Rules)?;
+                let source = source.start().await?;
                 manager
                     .watch_guard(source.refusals())
                     .await
@@ -3031,8 +3018,11 @@ fn assemble_parts<D: ConnettoSchema>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::openfga::ModelSubject;
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
+    use openfga_client::client::OpenFgaServiceClient;
+    use subql::visibility::openfga::OpenFgaPolicy;
     use tower::{Layer, ServiceExt};
 
     #[tokio::test]

@@ -207,98 +207,102 @@ async fn acquire_fixture() -> Fixture {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shared_wave_truncate_replaces_only_the_affected_table() {
-    tokio::time::timeout(Duration::from_secs(90), async {
-        let fixture = Fixture::acquire().await;
-        let ddl = format!("{PG_DDL} {}", PG_DDL.replace("orders", "archived_orders"));
-        let (manager, script, mut events, mut source) = scripted_with_auth(
-            &fixture,
-            SessionConfig::default(),
-            RosterAuth::granting("leader")
-                .and("affected")
-                .and("unaffected"),
-            &ddl,
-        )
-        .await;
-        events.extend(
-            drive(
-                &mut source,
-                &manager,
-                "INSERT INTO archived_orders VALUES (1, 2.0, 7, 'archived')",
+    tokio::time::timeout(
+        Duration::from_secs(90),
+        Box::pin(async {
+            let fixture = Fixture::acquire().await;
+            let ddl = format!("{PG_DDL} {}", PG_DDL.replace("orders", "archived_orders"));
+            let (manager, script, mut events, mut source) = scripted_with_auth(
+                &fixture,
+                SessionConfig::default(),
+                RosterAuth::granting("leader")
+                    .and("affected")
+                    .and("unaffected"),
+                &ddl,
             )
-            .await,
-        );
-        source
-            .execute_sql("DELETE FROM orders WHERE id = 2")
-            .expect("delete marker row");
-        let mut marker = None;
-        while marker.is_none() {
-            let Some(item) = source.next_item().await.expect("read marker") else {
-                break;
-            };
-            marker = item.into_event();
-        }
-        let marker = marker.expect("marker event");
-        let truncate = PgChangeEvent::new(
-            ChangeEvent::truncate(vec![Arc::from("orders")], false, false, Lsn::new(1)),
-            marker.checkpoint().expect("truncate position"),
-        );
-        manager
-            .dispatch_event(&truncate)
-            .await
-            .expect("record truncate");
-        events.extend(
-            drive(
-                &mut source,
-                &manager,
-                "INSERT INTO archived_orders VALUES (2, 3.0, 8, 'later')",
-            )
-            .await,
-        );
-        arm(&script, &[], true, None);
-        let (arrived, release) = hold_page(&script);
-        let mut leader = wave_client(&manager, &script, "leader", cursor_of(&events[0])).await;
-        leader.subscribe(QUERY).await;
-        page_arrived(&arrived).await;
-        let mut affected = wave_client(&manager, &script, "affected", cursor_of(&events[0])).await;
-        affected.subscribe(QUERY).await;
-        let mut unaffected =
-            wave_client(&manager, &script, "unaffected", cursor_of(&events[0])).await;
-        unaffected
-            .subscribe("SELECT * FROM archived_orders WHERE quantity > 0")
             .await;
-        release.notify_one();
-
-        expect_patches_before_truncate(&mut affected.transport, &events[1..3]).await;
-        let ControlMessage::FullResyncRequired(resync) =
-            next_control(&mut affected.transport).await
-        else {
-            panic!("truncate requires a replacement");
-        };
-        assert_eq!(resync.sub_id, "orders");
-        assert_eq!(
-            resync.reason,
-            FullResyncReason::TableTruncated {
-                table: "orders".to_owned()
+            events.extend(
+                drive(
+                    &mut source,
+                    &manager,
+                    "INSERT INTO archived_orders VALUES (1, 2.0, 7, 'archived')",
+                )
+                .await,
+            );
+            source
+                .execute_sql("DELETE FROM orders WHERE id = 2")
+                .expect("delete marker row");
+            let mut marker = None;
+            while marker.is_none() {
+                let Some(item) = source.next_item().await.expect("read marker") else {
+                    break;
+                };
+                marker = item.into_event();
             }
-        );
-        assert!(matches!(
-            next_control(&mut affected.transport).await,
-            ControlMessage::SnapshotBegin(_)
-        ));
-        assert!(matches!(
-            next_bulk(&mut affected.transport).await,
-            BulkMessage::SnapshotPatch(_)
-        ));
-        assert!(matches!(
-            next_control(&mut affected.transport).await,
-            ControlMessage::SnapshotEnd(_)
-        ));
-        expect_idle(&mut affected.transport).await;
-        expect_patches(&mut unaffected.transport, &events[3..]).await;
-        leader.close().await;
-        affected.close().await;
-        unaffected.close().await;
-    })
+            let marker = marker.expect("marker event");
+            let truncate = PgChangeEvent::new(
+                ChangeEvent::truncate(vec![Arc::from("orders")], false, false, Lsn::new(1)),
+                marker.checkpoint().expect("truncate position"),
+            );
+            manager
+                .dispatch_event(&truncate)
+                .await
+                .expect("record truncate");
+            events.extend(
+                drive(
+                    &mut source,
+                    &manager,
+                    "INSERT INTO archived_orders VALUES (2, 3.0, 8, 'later')",
+                )
+                .await,
+            );
+            arm(&script, &[], true, None);
+            let (arrived, release) = hold_page(&script);
+            let mut leader = wave_client(&manager, &script, "leader", cursor_of(&events[0])).await;
+            leader.subscribe(QUERY).await;
+            page_arrived(&arrived).await;
+            let mut affected =
+                wave_client(&manager, &script, "affected", cursor_of(&events[0])).await;
+            affected.subscribe(QUERY).await;
+            let mut unaffected =
+                wave_client(&manager, &script, "unaffected", cursor_of(&events[0])).await;
+            unaffected
+                .subscribe("SELECT * FROM archived_orders WHERE quantity > 0")
+                .await;
+            release.notify_one();
+
+            expect_patches_before_truncate(&mut affected.transport, &events[1..3]).await;
+            let ControlMessage::FullResyncRequired(resync) =
+                next_control(&mut affected.transport).await
+            else {
+                panic!("truncate requires a replacement");
+            };
+            assert_eq!(resync.sub_id, "orders");
+            assert_eq!(
+                resync.reason,
+                FullResyncReason::TableTruncated {
+                    table: "orders".to_owned()
+                }
+            );
+            assert!(matches!(
+                next_control(&mut affected.transport).await,
+                ControlMessage::SnapshotBegin(_)
+            ));
+            assert!(matches!(
+                next_bulk(&mut affected.transport).await,
+                BulkMessage::SnapshotPatch(_)
+            ));
+            assert!(matches!(
+                next_control(&mut affected.transport).await,
+                ControlMessage::SnapshotEnd(_)
+            ));
+            expect_idle(&mut affected.transport).await;
+            expect_patches(&mut unaffected.transport, &events[3..]).await;
+            leader.close().await;
+            affected.close().await;
+            unaffected.close().await;
+        }),
+    )
     .await
     .expect("truncate isolation completed before deadline");
 }

@@ -486,12 +486,23 @@ async fn an_expired_capability_is_refused() {
     );
 }
 
+/// The catalog of the row sources below, whose rows no array column decodes
+/// against.
+static NO_TABLES: std::sync::LazyLock<subql::ParserDB> = std::sync::LazyLock::new(|| {
+    subql::ParserDB::parse::<PostgreSqlDialect>("").expect("the empty catalog parses")
+});
+
 /// A row source that always finds the row, so the lifetime assertions need no
 /// database.
 struct AlwaysFound;
 
 impl RowSource for AlwaysFound {
     type Error = std::convert::Infallible;
+    type Catalog = subql::ParserDB;
+
+    fn catalog(&self) -> &subql::ParserDB {
+        &NO_TABLES
+    }
 
     #[expect(
         clippy::unused_async_trait_impl,
@@ -517,6 +528,11 @@ struct FixedRow(i64);
 
 impl RowSource for FixedRow {
     type Error = std::convert::Infallible;
+    type Catalog = subql::ParserDB;
+
+    fn catalog(&self) -> &subql::ParserDB {
+        &NO_TABLES
+    }
 
     fn read_row(
         &self,

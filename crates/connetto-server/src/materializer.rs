@@ -607,6 +607,8 @@ where
     /// The tables each registered subscription reads, for tearing down every
     /// subscription a refusal reaches.
     reads: HashMap<SubscriptionId, Vec<TableId>>,
+    rules_generation: u64,
+    rules_snapshots: HashMap<SubscriptionId, u64>,
 }
 
 /// How the client's caller functions reverse translate into the session
@@ -705,6 +707,11 @@ impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
             })?;
             private_tables.push((id, *name));
         }
+        if let Some(marker) =
+            catalog_helpers::table_id::<Postgres, _>(&catalog, crate::epoch::POLICY_CHANGES_TABLE)
+        {
+            private_tables.push((marker, crate::epoch::POLICY_CHANGES_TABLE));
+        }
         let policy_readers = PolicyReaders::of(&policy_reads, &catalog);
         let mut engine = SubscriptionEngine::new(catalog.clone(), PostgreSqlDialect {});
         if let Some(translator) = translator {
@@ -723,6 +730,8 @@ impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
             refused: RefusedSet::default(),
             policy_readers,
             reads: HashMap::new(),
+            rules_generation: 0,
+            rules_snapshots: HashMap::new(),
         })
     }
 
@@ -1231,6 +1240,8 @@ where
             );
             self.storage_layouts.insert(subscription_id, layout);
         }
+        self.rules_snapshots
+            .insert(subscription_id, self.rules_generation);
         Ok(match registered.tier {
             Tier::InProcess(served) => match served.aggregate_bootstrap {
                 Some(bootstrap) => Registration::Computed(ComputedCapture {
@@ -1299,6 +1310,7 @@ where
     /// resolves whichever registry holds the id (U7).
     pub fn unregister(&mut self, sub_id: SubscriptionId) -> bool {
         self.reads.remove(&sub_id);
+        self.rules_snapshots.remove(&sub_id);
         self.storage_layouts.remove(&sub_id);
         self.computed_columns.remove(&sub_id);
         self.engine.unregister_subscription(sub_id)
@@ -1356,6 +1368,63 @@ where
             .filter(|(_, reads)| reads.iter().any(|read| ids.contains(read)))
             .map(|(sub_id, _)| *sub_id)
             .collect()
+    }
+
+    /// Replace the access rules and policy readers under the dispatch gate.
+    pub(crate) fn follow_access_rules<R: DatabaseLike + 'static>(
+        &mut self,
+        rules: Arc<R>,
+        policy_reads: &[rls2fga::types::PolicyReads],
+    ) {
+        self.engine.follow_access_rules(rules);
+        self.policy_readers = PolicyReaders::of(policy_reads, &self.catalog);
+        self.rules_generation = self.rules_generation.wrapping_add(1);
+    }
+
+    /// Registrations whose initial read belongs to an earlier generation.
+    pub(crate) fn older_rules_snapshots(&self) -> Vec<SubscriptionId> {
+        self.rules_snapshots
+            .iter()
+            .filter(|(_, generation)| **generation != self.rules_generation)
+            .map(|(subscription, _)| *subscription)
+            .collect()
+    }
+
+    /// Track a replacement read without overwriting an older registration generation.
+    pub(crate) fn begin_rules_snapshot(&mut self, subscription: SubscriptionId) {
+        self.rules_snapshots
+            .entry(subscription)
+            .or_insert(self.rules_generation);
+    }
+
+    /// Finish an initial read and report whether its rules changed.
+    pub(crate) fn finish_rules_snapshot(&mut self, subscription: SubscriptionId) -> bool {
+        self.rules_snapshots
+            .remove(&subscription)
+            .is_some_and(|generation| generation != self.rules_generation)
+    }
+
+    /// Include every policy reader reached transitively by these tables.
+    pub(crate) fn rules_reach(&self, tables: &[String]) -> Vec<String> {
+        let mut reached = tables.to_vec();
+        let mut index = 0;
+        while index < reached.len() {
+            if let Some(table) = catalog_helpers::table_id_for_name::<Postgres, _>(
+                &self.catalog,
+                TargetName::new(&reached[index], true),
+            ) {
+                for reader in self.policy_readers.of_table(table) {
+                    if let Some(name) =
+                        catalog_helpers::table_name::<Postgres, _>(&self.catalog, reader)
+                        && !reached.contains(&name)
+                    {
+                        reached.push(name);
+                    }
+                }
+            }
+            index += 1;
+        }
+        reached
     }
 
     /// Install a fold's seed rows, read by the session through its own
@@ -2172,6 +2241,13 @@ where
 
     /// Whether a client may write `table` at all, judged before its op is planned.
     fn write_target(&self, table: &str) -> Result<(), MaterializerError> {
+        if self.table_id(table).is_ok_and(|identity| {
+            self.audit_tables.iter().any(|(private, name)| {
+                *private == identity && *name == crate::epoch::POLICY_CHANGES_TABLE
+            })
+        }) {
+            return Err(MaterializerError::NotWritable(table.to_owned()));
+        }
         if !self.write.is_writable(table) && !registry_table(table) {
             return Err(MaterializerError::NotWritable(table.to_owned()));
         }
@@ -3486,6 +3562,53 @@ mod membership_term_tests {
 
     use subql::{ChangeEvent, PgCommitPosition, PgLsn, PgXid};
 
+    #[test]
+    fn a_follow_identifies_snapshots_registered_under_older_rules() {
+        let mut materializer = Materializer::builder(SCHEMA).build().expect("catalog");
+        let Registration::Row(subscription) = materializer
+            .register(1, "SELECT * FROM docs")
+            .expect("registration")
+        else {
+            panic!("row registration");
+        };
+        let rules = Arc::new(ParserDB::parse::<PostgreSqlDialect>(SCHEMA).expect("rules catalog"));
+        materializer.follow_access_rules(rules, &[]);
+        materializer.begin_rules_snapshot(subscription);
+        assert_eq!(materializer.older_rules_snapshots(), vec![subscription]);
+        assert!(materializer.finish_rules_snapshot(subscription));
+        assert_eq!(
+            materializer.older_rules_snapshots(),
+            Vec::<SubscriptionId>::new()
+        );
+    }
+
+    #[test]
+    fn a_completed_snapshot_is_not_an_inflight_rules_race() {
+        let mut materializer = Materializer::builder(SCHEMA).build().expect("catalog");
+        let Registration::Row(subscription) = materializer
+            .register(1, "SELECT * FROM docs")
+            .expect("registration")
+        else {
+            panic!("row registration");
+        };
+        assert!(!materializer.finish_rules_snapshot(subscription));
+        let rules = Arc::new(ParserDB::parse::<PostgreSqlDialect>(SCHEMA).expect("rules catalog"));
+        materializer.follow_access_rules(rules, &[]);
+        assert_eq!(
+            materializer.older_rules_snapshots(),
+            Vec::<SubscriptionId>::new()
+        );
+        materializer.begin_rules_snapshot(subscription);
+        assert_eq!(
+            materializer.older_rules_snapshots(),
+            Vec::<SubscriptionId>::new()
+        );
+        let rules = Arc::new(ParserDB::parse::<PostgreSqlDialect>(SCHEMA).expect("rules catalog"));
+        materializer.follow_access_rules(rules, &[]);
+        assert_eq!(materializer.older_rules_snapshots(), vec![subscription]);
+        assert!(materializer.finish_rules_snapshot(subscription));
+    }
+
     /// The motivating pair: a guarded table filtered through a membership.
     const SCHEMA: &str = "CREATE TABLE docs (id BIGINT PRIMARY KEY, project_id BIGINT NOT NULL);\nCREATE TABLE project_members (project_id BIGINT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (project_id, user_id));";
 
@@ -4059,6 +4182,27 @@ mod audit_privacy_tests {
     fn a_missing_audit_declaration_refuses_catalog_construction() {
         let result = private_catalog(ConnettoAudit::CATALOG_DDL).build();
         assert!(matches!(result, Err(MaterializerError::Catalog(_))));
+    }
+
+    #[test]
+    fn policy_marker_subscriptions_are_private() {
+        let materializer = Materializer::builder(crate::epoch::POLICY_CHANGES_DDL)
+            .with_write_catalog(
+                RuntimeWritableCatalog::builder()
+                    .writable(crate::epoch::POLICY_CHANGES_TABLE)
+                    .build(),
+            )
+            .build()
+            .expect("marker catalog");
+        assert!(matches!(
+            materializer.translate_subscription_sql("SELECT * FROM connetto_policy_changes"),
+            Err(MaterializerError::AuditRead(table))
+                if table == crate::epoch::POLICY_CHANGES_TABLE
+        ));
+        assert!(matches!(
+            materializer.write_target(crate::epoch::POLICY_CHANGES_TABLE),
+            Err(MaterializerError::NotWritable(_))
+        ));
     }
 
     #[test]

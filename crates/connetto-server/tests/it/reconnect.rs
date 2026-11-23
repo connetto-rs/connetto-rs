@@ -2279,7 +2279,8 @@ async fn a_fenced_snapshot_replays_a_missed_ceiling_crossing_as_the_unmarked_wit
 /// A `timestamptz` column, the value Postgres holds that the SQLite wire cannot carry.
 const STAMPS_PG: &str = "CREATE TABLE stamps (id INT PRIMARY KEY, at TIMESTAMPTZ NOT NULL);";
 
-/// One insert of order `id` at instant `at`, as the emulator stamps it.
+/// One insert of order `id` at `at`, written as the replica stores the instant,
+/// as the emulator stamps it.
 async fn stamp(source: &mut PgSqliteEmuSource, id: i64, at: &str) -> PgChangeEvent {
     one_change(
         source,
@@ -2302,7 +2303,7 @@ async fn a_fenced_snapshot_that_missed_an_unencodable_transaction_is_refused() {
         RosterAuth::granting("client-a").withholding(WITHHELD_ID),
     );
     let mut source = PgSqliteEmuSource::open_in_memory(STAMPS_PG).expect("open emu source");
-    let held = stamp(&mut source, 1, "2026-01-01 00:00:00+00").await;
+    let held = stamp(&mut source, 1, "2026-01-01 00:00:00.000000+00:00").await;
     let missed = stamp(&mut source, 2, "infinity").await;
     // The value the wire cannot carry, so the fold owes no patch for it and
     // the oplog keeps the event as a marker without a payload.
