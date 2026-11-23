@@ -235,6 +235,13 @@ mod tests {
                 Ok(Value::Missing)
             }
         }
+
+        fn list_at(
+            &self,
+            _column: ColumnId,
+        ) -> Result<subql::backend::ArrayCell<Postgres>, ValueError> {
+            Ok(subql::backend::ArrayCell::Missing)
+        }
     }
 
     fn signed_in(user: &str) -> Arc<Principal> {

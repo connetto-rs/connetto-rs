@@ -8,7 +8,7 @@
 //! The fixture starts its own Postgres, so these need Docker.
 
 use parking_lot::Mutex;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -199,6 +199,24 @@ impl Oplog for FlakyAppend {
     async fn readmit(&self, tables: &[String]) -> Result<(), AppendRefused> {
         self.inner
             .readmit(tables)
+            .await
+            .map_err(|never| match never {})
+    }
+
+    async fn rules_fingerprints(&self) -> Result<BTreeMap<String, String>, AppendRefused> {
+        self.inner
+            .rules_fingerprints()
+            .await
+            .map_err(|never| match never {})
+    }
+
+    async fn record_rules(
+        &self,
+        tables: &[String],
+        fingerprints: &BTreeMap<String, String>,
+    ) -> Result<(), AppendRefused> {
+        self.inner
+            .record_rules(tables, fingerprints)
             .await
             .map_err(|never| match never {})
     }

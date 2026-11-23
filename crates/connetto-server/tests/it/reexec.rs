@@ -265,6 +265,8 @@ async fn reexec_bootstraps_folds_and_retriggers() {
 async fn maximum_timestamptz_uses_replica_text() {
     const DDL: &str = "CREATE TABLE aggregate_stamps (id INT PRIMARY KEY, observed TIMESTAMPTZ);";
     const SEED: &str = "INSERT INTO aggregate_stamps VALUES (1, '2026-09-23 15:42:07.957522+02'), (2, '2026-09-22 13:42:07.957522+00')";
+    // The same rows in the text the replica stores an instant as.
+    const REPLICA_SEED: &str = "INSERT INTO aggregate_stamps VALUES (1, '2026-09-23 13:42:07.957522+00:00'), (2, '2026-09-22 13:42:07.957522+00:00')";
     let fixture = Fixture::acquire().await;
     fixture
         .exec("DROP TABLE IF EXISTS aggregate_stamps CASCADE")
@@ -311,7 +313,7 @@ async fn maximum_timestamptz_uses_replica_text() {
         }
     );
     let mut source = PgSqliteEmuSource::open_in_memory(DDL).expect("source");
-    source.execute_sql(SEED).expect("seed source");
+    source.execute_sql(REPLICA_SEED).expect("seed source");
     source.drain().expect("drain source");
     fixture
         .exec("DELETE FROM aggregate_stamps WHERE id = 1")

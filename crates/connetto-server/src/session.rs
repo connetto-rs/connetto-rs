@@ -1513,7 +1513,9 @@ pub(crate) fn reject_reason(err: &MaterializerError) -> MutationRejectReason {
 
 /// Why a catch-up member reached by the emptying `record` of `table` replaces it.
 fn resync_reason(record: &ChangeRecord, table: String) -> FullResyncReason {
-    if record.is_refusal() {
+    if record.is_rules() {
+        FullResyncReason::AuthorizationChange
+    } else if record.is_refusal() {
         FullResyncReason::TableRefused { table }
     } else {
         FullResyncReason::TableTruncated { table }
@@ -1639,6 +1641,9 @@ enum Outbound {
         /// sibling subscription still claims.
         reason: FullResyncReason,
     },
+    RulesSnapshot {
+        sub_id: String,
+    },
     /// Replace the row registration that still owns a requested reader reservation.
     ReservedResnapshot {
         sub_id: String,
@@ -1750,6 +1755,7 @@ impl Outbound {
                 connetto_core::codec::encode_control(msg).map_or(0, |frame| len_bytes(frame.len())),
             ),
             Self::Resnapshot { sub_id, .. }
+            | Self::RulesSnapshot { sub_id }
             | Self::Refuse { sub_id, .. }
             | Self::ReservedResnapshot { sub_id, .. }
             | Self::Rebootstrap { sub_id, .. } => {
@@ -2639,6 +2645,9 @@ pub struct SessionManager<
     /// answered from facts the change already invalidated, and in the allow
     /// direction no later correction takes the row back.
     upkeep: Option<Arc<dyn crate::openfga::StoreUpkeep>>,
+    rules: Option<Arc<dyn crate::rules::RulesFollower>>,
+    rules_follow: Mutex<()>,
+    rules_closing: tokio::sync::Notify,
     /// A second executor asked about the row as it is now, alongside the one
     /// that delivers, so a divergence between them fails a run.
     ///
@@ -2818,6 +2827,7 @@ pub(crate) fn assemble_manager<Snap, Auth, C, O, D, S>(
     guard: Arc<RequestGuard<D::Id>>,
     config: SessionConfig,
     upkeep: Option<Arc<dyn crate::openfga::StoreUpkeep>>,
+    rules: Option<Arc<dyn crate::rules::RulesFollower>>,
     signer: S,
     withdrawal_source: Option<Snap>,
     second_opinion: Option<Arc<dyn crate::parity::SecondOpinion<D::Id, String>>>,
@@ -2865,6 +2875,9 @@ where
         auth_retry: RetryPolicy::new(),
         read_retry: RetryPolicy::new(),
         upkeep,
+        rules,
+        rules_follow: Mutex::new(()),
+        rules_closing: tokio::sync::Notify::new(),
         second_opinion: second_opinion.map(OnceLock::from).unwrap_or_default(),
         withdrawal_source: withdrawal_source.map(OnceLock::from).unwrap_or_default(),
         device_enrolment: OnceLock::new(),
@@ -3133,6 +3146,7 @@ where
     /// its registration instead of registering into the drained registry.
     pub async fn shutdown(&self) -> usize {
         self.shutting_down.store(true, Ordering::Release);
+        self.rules_closing.notify_waiters();
         self.catchup.changed.notify_one();
         self.close_all(FatalErrorReason::ServerShuttingDown).await
     }
@@ -3150,6 +3164,7 @@ where
         let Some(sunset) = self.config.sunset else {
             return 0;
         };
+        self.rules_closing.notify_waiters();
         let closed = self
             .close_all(FatalErrorReason::Sunset {
                 server,
@@ -4569,7 +4584,7 @@ where
                 continue;
             };
             let row = crate::pk::row_from_wire(self.catalog.as_ref(), table_id, values);
-            let view = ValuesRow::new(table_id, &row);
+            let view = ValuesRow::new(self.catalog.as_ref(), table_id, &row);
             let watchers = [Arc::clone(&route.principal)];
             let mut verdicts = Vec::new();
             let mut asked: u32 = 0;
@@ -5073,12 +5088,247 @@ where
             Some(DriftSignal::Refused { table, reasons }) => {
                 self.refuse_table(table, reasons).await
             }
+            Some(DriftSignal::RulesChanged { database, .. }) => {
+                self.follow_rules(database, true).await
+            }
             Some(DriftSignal::ChangesLost { table }) => Err(SessionError::DriftUnserved(format!(
                 "lost changes of {}",
                 self.table_name(table)
             ))),
             Some(other) => Err(SessionError::DriftUnserved(format!("{other:?}"))),
         }
+    }
+
+    /// Follow a live read before a connect exposes its stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failed translation, service operation or durable write.
+    pub async fn follow_live_rules(
+        &self,
+        database: Arc<crate::rules::LiveDatabase>,
+    ) -> Result<(), SessionError> {
+        self.follow_rules(database, false).await
+    }
+
+    /// Settle the boot's read of the live rules, whose generation the build
+    /// installed, before the stream starts.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::Oplog`] when a refusal or a rules record cannot be written.
+    pub(crate) async fn settle_boot_rules(
+        &self,
+        boot: crate::rules::BootRules,
+    ) -> Result<(), SessionError> {
+        match boot {
+            crate::rules::BootRules::Unplannable { changed } => {
+                let refused = self.materializer.lock().await.rules_reach(&changed);
+                self.refuse_rules_tables(&refused).await
+            }
+            crate::rules::BootRules::Followed {
+                database,
+                refused,
+                fingerprints,
+                documents,
+                policy_reads,
+            } => {
+                let refused = self.materializer.lock().await.rules_reach(&refused);
+                self.refuse_rules_tables(&refused).await?;
+                // The rules changed while no server ran, which only the stored fingerprints
+                // show, and a table without one compares against the documents (decision 22).
+                let stored = self.oplog.rules_fingerprints().await.map_err(oplog_err)?;
+                let changed =
+                    crate::rules::changed_fingerprints(&stored, &documents, &fingerprints);
+                self.record_rules(&changed, &fingerprints).await?;
+                self.materializer
+                    .lock()
+                    .await
+                    .follow_access_rules(database, &policy_reads);
+                Ok(())
+            }
+        }
+    }
+
+    /// Append a rules record for each served table of `changed` and its policy
+    /// readers, store `fingerprints`, and answer the tables recorded.
+    async fn record_rules(
+        &self,
+        changed: &[String],
+        fingerprints: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Vec<String>, SessionError> {
+        let reached: Vec<String> = self
+            .materializer
+            .lock()
+            .await
+            .rules_reach(changed)
+            .into_iter()
+            .filter(|table| !self.refused.holds(table))
+            .collect();
+        self.oplog
+            .record_rules(&reached, fingerprints)
+            .await
+            .map_err(oplog_err)?;
+        Ok(reached)
+    }
+
+    fn rules_are_closing(&self) -> bool {
+        self.shutting_down.load(Ordering::Acquire)
+            || (self.config.schema_major.is_some()
+                && self
+                    .config
+                    .sunset
+                    .is_some_and(|sunset| time::OffsetDateTime::now_utc() >= sunset))
+    }
+
+    async fn follow_rules(
+        &self,
+        database: Arc<crate::rules::LiveDatabase>,
+        retry: bool,
+    ) -> Result<(), SessionError> {
+        let Some(follower) = &self.rules else {
+            return Ok(());
+        };
+        let closing = self.rules_closing.notified();
+        tokio::pin!(closing);
+        closing.as_mut().enable();
+        if self.rules_are_closing() {
+            return Ok(());
+        }
+        let result = tokio::select! {
+            () = &mut closing => Ok(()),
+            result = self.follow_rules_inner(follower.as_ref(), database, retry) => result,
+        };
+        if result.is_err() || self.rules_are_closing() {
+            follower.abandon().await;
+        }
+        result
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the follow stages must finish in order before accepting another source item"
+    )]
+    async fn follow_rules_inner(
+        &self,
+        follower: &dyn crate::rules::RulesFollower,
+        database: Arc<crate::rules::LiveDatabase>,
+        retry: bool,
+    ) -> Result<(), SessionError> {
+        let _following = self.rules_follow.lock().await;
+        if self.rules_are_closing() {
+            return Ok(());
+        }
+        let changed: Vec<String> = follower
+            .changed(&database)
+            .into_iter()
+            .filter(|table| !self.refused.holds(table))
+            .collect();
+        if changed.is_empty() {
+            return Ok(());
+        }
+        let live = match follower.translate(&database, &changed) {
+            Ok(live) => live,
+            Err(error) => {
+                tracing::error!(error = %error, "live authorization rules cannot be planned");
+                let refused = self.materializer.lock().await.rules_reach(&changed);
+                self.refuse_rules_tables(&refused).await?;
+                return Ok(());
+            }
+        };
+        let refused = self.materializer.lock().await.rules_reach(&live.refused);
+        self.refuse_rules_tables(&refused).await?;
+        let mut paused = None;
+        let mut attempt = 0_u32;
+        let replacement = loop {
+            match follower.install(&live.translated).await {
+                Ok(replacement) => break replacement,
+                Err(error) => {
+                    let detail = error.to_string();
+                    let Some(cause) = error.pause_cause() else {
+                        return Err(SessionError::DriftUnserved(detail));
+                    };
+                    if !retry {
+                        return Err(match cause {
+                            PauseCause::DatabaseUnreachable => {
+                                SessionError::ReadUnavailable(detail)
+                            }
+                            _ => SessionError::AuthUnavailable(detail),
+                        });
+                    }
+                    if paused != Some(cause) {
+                        self.broadcast_control(ControlMessage::DeliveryPaused { cause })
+                            .await;
+                        paused = Some(cause);
+                    }
+                    attempt = attempt.saturating_add(1);
+                    let delay = match cause {
+                        PauseCause::DatabaseUnreachable => self.read_retry.backoff(attempt),
+                        _ => self.auth_retry.backoff(attempt),
+                    };
+                    // The retry backoff limits attempts against an unavailable service.
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        };
+        let unserved =
+            |error: crate::openfga::SetupError| SessionError::DriftUnserved(error.to_string());
+        let fingerprints = live.translated.fingerprints().map_err(unserved)?;
+        let reached = self.record_rules(&changed, &fingerprints).await?;
+        let _gate = self.dispatch_gate.lock().await;
+        if self.rules_are_closing() {
+            return Ok(());
+        }
+        let subscriptions = {
+            let mut materializer = self.materializer.lock().await;
+            materializer.follow_access_rules(Arc::clone(&database), live.translated.policy_reads());
+            replacement.install();
+            let mut subscriptions = materializer.subscriptions_reading(&reached);
+            subscriptions.extend(materializer.older_rules_snapshots());
+            subscriptions.sort_unstable();
+            subscriptions.dedup();
+            subscriptions
+        };
+        for route in self.routes.lock().await.values() {
+            if subscriptions.contains(&route.sub_id)
+                && route
+                    .table
+                    .as_ref()
+                    .is_none_or(|table| !self.refused.holds(table))
+            {
+                let _ = route.tx.send(Outbound::RulesSnapshot {
+                    sub_id: route.label.clone(),
+                });
+            }
+        }
+        for subscription in subscriptions {
+            let route = self.computed_routes.lock().await.remove(&subscription);
+            if let Some(route) = route {
+                self.materializer.lock().await.unregister(subscription);
+                let _ = route.tx.send(Outbound::Rebootstrap {
+                    sub_id: route.label,
+                    retired_id: subscription,
+                });
+            }
+        }
+        follower.accept(live.translated, database);
+        if paused.is_some() {
+            self.broadcast_control(ControlMessage::DeliveryResumed)
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn refuse_rules_tables(&self, tables: &[String]) -> Result<(), SessionError> {
+        for name in tables {
+            if let Some(table) = subql::catalog_helpers::table_id_for_name::<Postgres, _>(
+                &*self.catalog,
+                sql_traits::structs::TargetName::new(name, true),
+            ) {
+                self.refuse_table(table, Vec::new()).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Take a new guard's refusals for the stretch before the ingest loop
@@ -6329,6 +6579,26 @@ where
                 self.resnapshot_row(transport, state, &sub_id, &reason, None)
                     .await?;
             }
+            Outbound::RulesSnapshot { sub_id } => {
+                if self.register_again(state, &sub_id, true).await {
+                    self.resnapshot_row(
+                        transport,
+                        state,
+                        &sub_id,
+                        &FullResyncReason::AuthorizationChange,
+                        None,
+                    )
+                    .await?;
+                } else {
+                    self.refuse_subscription(
+                        transport,
+                        state,
+                        &sub_id,
+                        SUBSCRIPTION_REFUSED_SCHEMA,
+                    )
+                    .await?;
+                }
+            }
             Outbound::ReservedResnapshot {
                 sub_id,
                 owner,
@@ -6380,7 +6650,7 @@ where
 
     /// The tables whose read answer depends on the caller's keys, or `None`
     /// when no authorization store reports them.
-    fn key_tables(&self) -> Option<&[String]> {
+    fn key_tables(&self) -> Option<Arc<[String]>> {
         self.upkeep
             .as_deref()
             .map(crate::openfga::StoreUpkeep::key_tables)
@@ -6506,7 +6776,7 @@ where
         let rows = state
             .subs
             .iter()
-            .filter(|(_, row)| key_change_reaches(&row.reg, key_tables))
+            .filter(|(_, row)| key_change_reaches(&row.reg, key_tables.as_deref()))
             .map(|(label, _)| label.clone())
             .collect();
         let computed = state
@@ -6542,7 +6812,7 @@ where
             }
         }
         for label in rows {
-            let instruction = if self.register_again(state, &label).await {
+            let instruction = if self.register_again(state, &label, false).await {
                 if let Some(permit) = &reader_permit {
                     let Some(row) = state.subs.get(&label) else {
                         continue;
@@ -6581,11 +6851,16 @@ where
     /// Register one row subscription again under the session's current caller
     /// when its seed holds the subject set, answering whether it can still be
     /// served.
-    async fn register_again(&self, state: &mut SessionState<Id, Key>, label: &str) -> bool {
+    async fn register_again(
+        &self,
+        state: &mut SessionState<Id, Key>,
+        label: &str,
+        rules_changed: bool,
+    ) -> bool {
         let Some(row) = state.subs.get(label) else {
             return false;
         };
-        if !row.reg.reads_subjects {
+        if !rules_changed && !row.reg.reads_subjects {
             return true;
         }
         let (old_consumer, old_sub) = (row.reg.consumer_id, row.reg.sub_id);
@@ -6598,9 +6873,10 @@ where
         match registered.map(|registered| registered.into_row(consumer_id)) {
             Ok(Ok(mut reg)) => {
                 if let Some(row) = state.subs.get_mut(label) {
-                    // The query is unchanged, so its terms watch the same tables.
-                    reg.member_tables = core::mem::take(&mut row.reg.member_tables);
-                    reg.reads_subjects = true;
+                    if !rules_changed {
+                        reg.member_tables = core::mem::take(&mut row.reg.member_tables);
+                        reg.reads_subjects = true;
+                    }
                     row.reg = reg;
                 }
                 true
@@ -8523,7 +8799,7 @@ where
         for op in &plan.ops {
             let answer = match &op.write {
                 PlannedWrite::Insert { new, assigned } => {
-                    let new = ValuesRow::new(op.table_id, new);
+                    let new = ValuesRow::new(self.catalog.as_ref(), op.table_id, new);
                     self.auth
                         .may_write(
                             RowWrite::Insert {
@@ -8540,8 +8816,8 @@ where
                     assigned,
                     read,
                 } => {
-                    let old = ValuesRow::new(op.table_id, old);
-                    let new = ValuesRow::new(op.table_id, new);
+                    let old = ValuesRow::new(self.catalog.as_ref(), op.table_id, old);
+                    let new = ValuesRow::new(self.catalog.as_ref(), op.table_id, new);
                     self.auth
                         .may_write(
                             RowWrite::Update {
@@ -8555,7 +8831,7 @@ where
                         .await
                 }
                 PlannedWrite::Delete { old, read } => {
-                    let old = ValuesRow::new(op.table_id, old);
+                    let old = ValuesRow::new(self.catalog.as_ref(), op.table_id, old);
                     self.auth
                         .may_write(RowWrite::Delete { old: &old, read }, caller)
                         .await
@@ -9941,7 +10217,7 @@ where
             // A catch-up never shows or hides a row that did not change, so keys
             // that changed since the cursor need the whole set again (R95).
             Resume::At(..)
-                if key_change_reaches(&reg, self.key_tables())
+                if key_change_reaches(&reg, self.key_tables().as_deref())
                     && state.cursor_subjects.as_ref().is_none_or(|subjects| {
                         *subjects != rendered_keys(state.principal.capabilities())
                     }) =>
@@ -10259,6 +10535,10 @@ where
             permit,
             restarted,
         } = start;
+        self.materializer
+            .lock()
+            .await
+            .begin_rules_snapshot(reg.sub_id);
         self.attach_row_route(&sub, state, &reg, None).await;
         // Any read still arriving in pages for this label is abandoned: this
         // call is its replacement.
@@ -10399,8 +10679,8 @@ where
                 let Some(departing) = matched else {
                     continue;
                 };
-                if record.is_refusal() {
-                    refused_table = Some(record.table().to_owned());
+                if record.is_refusal() || record.is_rules() {
+                    refused_table = Some(resync_reason(&record, record.table().to_owned()));
                     break;
                 }
                 if record.event().kind() == EventKind::Truncate {
@@ -10420,15 +10700,9 @@ where
                     }
                 }
             }
-            if let Some(table) = refused_table {
-                self.resnapshot_row(
-                    transport,
-                    state,
-                    &replay.label,
-                    &FullResyncReason::TableRefused { table },
-                    None,
-                )
-                .await?;
+            if let Some(reason) = refused_table {
+                self.resnapshot_row(transport, state, &replay.label, &reason, None)
+                    .await?;
                 continue;
             }
             if truncated || unencodable {
@@ -10553,6 +10827,16 @@ where
             row.delivered = row.delivered.saturating_add(delivered);
             if row.first_delivery.is_none() {
                 row.first_delivery = Some(delivered);
+            }
+            if self
+                .materializer
+                .lock()
+                .await
+                .finish_rules_snapshot(row.reg.sub_id)
+            {
+                let _ = state.outbound.send(Outbound::RulesSnapshot {
+                    sub_id: label.clone(),
+                });
             }
         }
         enqueue_and_flush(
@@ -11680,6 +11964,19 @@ where
                 .await
                 .map_err(transport_err)?;
         }
+        if self
+            .materializer
+            .lock()
+            .await
+            .finish_rules_snapshot(subscription_id)
+        {
+            self.remove_computed_route(subscription_id).await;
+            self.materializer.lock().await.unregister(subscription_id);
+            let _ = state.outbound.send(Outbound::Rebootstrap {
+                sub_id: sub.sub_id.clone(),
+                retired_id: subscription_id,
+            });
+        }
         let rebinds = capture.per_viewer || reads_subjects;
         state.computed_subs.insert(
             sub.sub_id.clone(),
@@ -11889,6 +12186,16 @@ mod tests {
     use crate::timeline::{Position, TimelineHistory};
     use connetto_core::Cursor;
     use subql::{PgCommitPosition, PgLsn, PgXid};
+
+    #[test]
+    fn rules_records_resync_authorization() {
+        let record =
+            crate::oplog::ChangeRecord::rules("docs", PgCommitPosition::new(PgLsn(1), PgXid(1), 1));
+        assert_eq!(
+            super::resync_reason(&record, "docs".to_owned()),
+            connetto_core::messages::FullResyncReason::AuthorizationChange
+        );
+    }
 
     /// A write to a table the drift guard refused is rejected as a schema
     /// mismatch, which names nothing about the table (R107 decision 11, R38).

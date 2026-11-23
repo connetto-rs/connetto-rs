@@ -170,6 +170,8 @@ pub fn engine_ddl<D: ConnettoSchema>(pg_ddl: &str, devices: bool) -> String {
     if !ddl.trim_end().ends_with(';') {
         ddl.push_str("\n;");
     }
+    ddl.push('\n');
+    ddl.push_str(crate::epoch::POLICY_CHANGES_DDL);
     ddl
 }
 

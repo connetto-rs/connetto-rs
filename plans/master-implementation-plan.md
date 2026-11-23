@@ -1018,9 +1018,9 @@ The demo runs on connetto-schema with generated models, and the camp flow runs t
 
 ## R107: schema changes under running servers
 
-**Status.** IN PROGRESS. Slices 1 and 2, the procedure, the sunset and the table refusal, are done. Slice 3, following the live rules, is designed and not started. Eighteen decisions below.
+**Status.** IN PROGRESS. Slices 1 and 2, the procedure, the sunset and the table refusal, are done. Slice 3, following the live rules, is in progress, with its events table below. Twenty-two decisions below.
 
-**Blocked on one subql change, for slice 3.** subql's drift guard judges a table's shape only and yields no signal for a change it accepts. Slice 3 needs it to compare each table's rules, recognise the marker table and yield `DriftSignal::RulesChanged` (decision 14).
+**Blocked on nothing.** subql's drift guard compares each table's rules, recognises the marker table and yields `DriftSignal::RulesChanged` (decision 14, subql #344).
 
 **Changes state.** The handshake acknowledgement gains the major's sunset date, a client event carries it, and a refusal reason names a table refused for a schema change. The oplog store gains a fingerprint of each table's translated rules.
 
@@ -1048,12 +1048,16 @@ R31 makes an application schema change a major version, and R6 decision 4 holds 
 16. **A rules change replaces every subscription over the table.** connetto answers `RulesChanged` before the next event by translating the rules, writing the OpenFGA model, loading its facts and rebuilding decision 10's policy readers. Each subscription over the table then receives R7's notice and replacement with `FullResyncReason::AuthorizationChange`, read under the new rules. Rules change only with migrations, so a full replacement costs little against an incremental diff of every subscription's set.
 17. **Rules the server cannot translate refuse their table.** A live policy rls2fga cannot translate, or translates below the startup threshold, refuses its table through decision 6's path with a reason naming the expression, and the other tables keep flowing. So does a policy that reads a table the server's catalog does not know, since the server cannot keep that policy's facts current. The refusal is persisted and lasts until a restart finds the rules translatable.
 18. **Startup translates the live rules and remembers them.** The server translates the live rules at startup and persists a fingerprint of each table's translated rules in the oplog store beside its refusals. A table whose fingerprint differs from the last process's changed while no server ran, so every cursor older than the restart resyncs it, as a readmission does. Each new guard starts from the rules the server runs, so a reconnect reports only real changes. The documents still build the client's copy and are still translated at startup, which refuses to start on an untranslated one.
+19. **A followed change leaves a record per table.** Each change the server follows, while it runs or across a restart, appends a rules record at the resume position for each changed table and for each table whose policy reads one (decision 10's readers), since a table's live rules hold nothing of another table. A rules record is decision 11's readmission record with `AuthorizationChange` as its reason, so a catch-up from an earlier cursor resyncs the table, and a client offline during the change never keeps rows the new rules hide.
+20. **A failure decision 17 does not name refuses the tables it reaches.** An unplannable model, a rule shape the grant reach cannot follow, an index refusal, a shape whose withdrawals cannot reach the store and a policy reading an unpublished table each refuse the boot when the documents' translation meets them. In the live rules, at boot or while running, each refuses the tables it reaches. A live policy names a column the server's catalog lacks only after an expand the server's major predates, since PostgreSQL refuses to drop a column a policy reads. Such a policy refuses each table whose rule the server decides from a row image holding that column, or binds to a query by a key holding it, every column of a composite subject key included, since the row images the server reads carry only its catalog's columns. A rule the server answers by running its query against the database reads the column there and keeps serving. A note naming a policy reaches the tables with a policy of that name, one naming a function reaches the tables whose rules reach it, and a failure reaching no table refuses every table the change named. The other tables keep flowing. A failure that leaves no translation at all keeps the rules the server runs for every table it did not refuse, since their live rules did not change, and the follow writes no model, fingerprint or rules record.
+21. **A table whose policy reads a refused table is refused with it.** The translation drops the refused table's failing clauses, which narrows every policy reading it, so its readers are refused with it, as decision 10 refuses them for a weakened identity. Their clients receive the schema refusal instead of watching rows vanish.
+22. **A table with no stored fingerprint compares against the documents.** A server before slice 3 ran the documents' translation, so a table without a fingerprint compares its live share against its share of the documents' translation, and only a difference resyncs.
 
 ### Slices
 
 1. **The procedure and the sunset.** Steps 1, 2 and 7. Done.
 2. **Noticing a change.** Steps 3 to 6. Done.
-3. **Following the live rules.** Steps 8 to 12. Blocked on the subql change above.
+3. **Following the live rules.** Steps 8 to 12. Step 8 is done (subql #344).
 
 ### Steps
 
@@ -1069,6 +1073,37 @@ R31 makes an application schema change a major version, and R6 decision 4 holds 
 10. `handle_drift` answers `RulesChanged` by translating, writing the model, loading the facts and rebuilding the policy readers before the next event, then replaces every subscription over the table (decision 16). Rules it cannot translate, and a policy reading a table outside the catalog, refuse the table (decision 17).
 11. Startup translates the live rules, persists each table's rules fingerprint beside the refusals, resyncs cursors older than a changed fingerprint, and hands each new guard the rules it runs (decision 18).
 12. Chapters 08 and 20 state that the server follows the live rules, and chapter 20 gives the marker table and the event trigger.
+
+### Slice 3: events against situations
+
+The table answers every event in every situation, and slice 3 implements every line together. A follow is one sequence of jobs the loop runs to its end before it takes the next item.
+
+1. Translate the read database with the startup translator and its threshold, and index the shapes against the served catalog, so tables keep the engine's numbering.
+2. Refuse, persisted, the tables decisions 17, 20 and 21 name.
+3. Write the model and reconcile the store's facts with it.
+4. In one oplog write, append a rules record for each changed table and for each table whose policy reads one (decision 10's readers) at the resume position, and store every table's fingerprint.
+5. Swap the authorization the manager answers from in one step under the dispatch gate. That is the shapes, the subject naming, the model, the store upkeep, the grant reach, the policy readers and the tables the policies read. The swap advances the rules generation.
+6. Replace with `AuthorizationChange` every live subscription reading a table step 4 recorded, and every subscription whose snapshot an older generation read.
+7. Keep the read as the rules the server runs, which the next connect compares against.
+
+A table's fingerprint is a digest of its share of the translation, its relation shapes, row naming and tuple queries in rls2fga's serialized form. Rules records follow decision 19 and missing fingerprints decision 22.
+
+The situations are Boot (before the first connect), Connect (the connect closure, before the guard's first item), Streaming (the loop between items), Holding (the loop retrying a held event or a held follow after the authorization server or the database could not be reached), Backoff (between a failed stream and the next connect) and Closing (shutdown or the sunset closing every session).
+
+| Event | Boot | Connect | Streaming | Holding | Backoff | Closing |
+|---|---|---|---|---|---|---|
+| The live rules are read | One load of every catalog table, translated beside the documents. An untranslatable document refuses the start, and the read's translation is the first model the server writes | One load on the new reader before the guard takes it | The guard reads | The guard reads | Nothing | Nothing |
+| The read equals the rules the server runs | Unreachable | The guard starts from the read | Unreachable | Unreachable | Unreachable | Unreachable |
+| The read differs from the rules the server runs | Unreachable | Follow, then the guard starts from the read | Unreachable | Unreachable | Unreachable | Unreachable |
+| A stored fingerprint differs from the boot read's | Append the table's rules record and its readers' | Nothing | Nothing | Nothing | Nothing | Nothing |
+| `RulesChanged` | Unreachable | Queued by the guard and taken in Streaming | Follow before the next item | Taken after the held item | Dropped with the source | Dropped |
+| A live rule fails to translate | Refuse its table, persisted, and serve the rest | As Streaming | Refuse at step 2 and follow the rest | As Streaming | Nothing | Nothing |
+| The authorization server or the database is unreachable during a follow | The boot fails, as today | The connect fails into Backoff | Hold with `DeliveryPaused` and retry the follow from its first unfinished step | Retry with backoff | Nothing | Stop retrying |
+| An oplog write fails | The boot fails | The connect fails into Backoff | The stream fails into Backoff, and the next connect reads, compares and follows | As Streaming | Nothing | Nothing |
+| A changed table is already refused | Stays refused | Stays refused | Stays refused and draws no replacement | As Streaming | Nothing | Nothing |
+| A marker event or a reconciliation interval | Nothing | Nothing | The guard reads and may yield `RulesChanged` | As Streaming | Nothing | Nothing |
+| A subscription registers or a catch-up runs | Nothing is served | Served under the rules the server runs | Served under the current generation, and step 6 replaces one an older generation read | As Streaming | Served under the rules the server runs | Refused, as today |
+| Shutdown or the sunset during a follow | Unreachable | Abandon | Abandon, the written records stand, and the next boot compares fingerprints | Abandon | Nothing | Nothing |
 
 ### Proof
 

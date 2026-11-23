@@ -346,6 +346,18 @@ async fn logged(message: &str, field: &str, needle: &str) -> bool {
     true
 }
 
+/// The next frame, bounded, which has to be the bulk frame carrying `what`.
+async fn expect_bulk(client: &mut WebSocketTransport<TcpStream>, what: &str) {
+    let frame = tokio::time::timeout(BOUND, client.recv())
+        .await
+        .expect("the transport answers")
+        .unwrap_or_else(|err| panic!("{what} never arrives: {err}"));
+    assert!(
+        matches!(frame, Some(IncomingFrame::Bulk(_))),
+        "{what} arrives as a patch: {frame:?}"
+    );
+}
+
 /// Wait for the disagreement counter to move past `before` and prove the
 /// divergence's warning named the caller.
 async fn divergence_counted(before: connetto_server::counters::CountersSnapshot, user_id: &str) {
@@ -1126,15 +1138,20 @@ async fn the_oplog_config_bounds_the_reconnect_log() {
     stream.abort();
 }
 
-/// With the second opinion installed, a row the build-time policy and the
-/// live table answer differently about is counted and named, and the
-/// delivery the answering executor allowed still happens. The opinion
-/// counts, it does not block.
+/// The helper the second-opinion test's policy calls, admitting row 1.
+const OPEN_HELPER: &str = "CREATE OR REPLACE FUNCTION public.owned_open(id integer) \
+    RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT id > 0';";
+/// The second-opinion test's policy clause, the owner rule narrowed by [`OPEN_HELPER`].
+const OPEN_POLICY: &str = "owner = current_setting('app.user_id', true) AND public.owned_open(id)";
+
+/// With the second opinion installed, a row the followed rules and the live
+/// table answer differently about is counted and named, and the delivery the
+/// answering executor allowed still happens. The opinion counts, it does not
+/// block.
 ///
-/// The divergence is seeded the way drift gets real. The build translated
-/// the policy as written, the live table's policy is altered after the
-/// build, so the live read hides the row the build-time policy still shows
-/// the watcher.
+/// The update commits ahead of a new helper body in one transaction. A body
+/// change leaves the table's replicated schema alone, so the server answers the
+/// update under the rules it follows while the live read already hides the row.
 #[tokio::test]
 async fn a_second_opinion_divergence_is_counted_not_blocked() {
     let _keyring = isolated_session_keyring();
@@ -1148,6 +1165,12 @@ async fn a_second_opinion_divergence_is_counted_not_blocked() {
     let user_id =
         connetto_server::authn::identity::deterministic_uuid(idp.issuer(), "e2e-user").to_string();
     seed_owned_rls(&pool, &user_id).await;
+    exec(&pool, OPEN_HELPER).await;
+    exec(
+        &pool,
+        &format!("ALTER POLICY owned_p ON owned USING ({OPEN_POLICY})"),
+    )
+    .await;
     fixture.start_replication(&["owned"]).await;
     fixture.provision_auth_tables().await;
 
@@ -1156,13 +1179,17 @@ async fn a_second_opinion_divergence_is_counted_not_blocked() {
         .expect("bind a listener");
     let port = listener.local_addr().expect("local address").port();
     let fga_url = fixture.fga_url().await.to_owned();
+    let policies = format!(
+        "{OPEN_HELPER}\nALTER TABLE owned ENABLE ROW LEVEL SECURITY;\n\
+         CREATE POLICY owned_p ON owned USING ({OPEN_POLICY});"
+    );
     let builder = builder_schema(
         &fixture,
         port,
         &idp,
         (&fga_url, &store),
         OWNED_PG_DDL,
-        OWNED_POLICIES,
+        &policies,
         "owned",
     )
     .second_opinion(true);
@@ -1190,18 +1217,15 @@ async fn a_second_opinion_divergence_is_counted_not_blocked() {
         ControlMessage::SnapshotBegin(snapshot) if snapshot.sub_id == "owned" => {}
         other => panic!("the snapshot opened with {other:?} instead"),
     }
-    let frame = tokio::time::timeout(BOUND, client.recv())
-        .await
-        .expect("the transport answers")
-        .expect("the snapshot row arrives");
-    assert!(
-        matches!(frame, Some(IncomingFrame::Bulk(_))),
-        "the seed row is delivered: {frame:?}"
-    );
+    expect_bulk(&mut client, "the seed row").await;
     match next_control(&mut client).await {
         ControlMessage::SnapshotEnd(snapshot) if snapshot.sub_id == "owned" => {}
         other => panic!("the snapshot closed with {other:?} instead"),
     }
+
+    // The table's relation arrives with this change, not with the transaction below.
+    exec(&pool, "UPDATE owned SET body = 'warm' WHERE id = 1").await;
+    expect_bulk(&mut client, "the first update").await;
 
     let before = connetto_server::counters::snapshot();
     // The capture opens before the drift, so the divergence's record is
@@ -1209,25 +1233,23 @@ async fn a_second_opinion_divergence_is_counted_not_blocked() {
     with_capture(
         "a_second_opinion_divergence_is_counted_not_blocked",
         |_capture| async move {
-            // The live policy drifts from the one the build translated, so the
-            // live table hides the row the build-time policy still shows.
-            exec(&pool, "ALTER POLICY owned_p ON owned USING (false)").await;
-            exec(&pool, "UPDATE owned SET body = 'poked' WHERE id = 1").await;
+            connetto_test_harness::exec(
+                &pool,
+                "BEGIN; \
+                 UPDATE owned SET body = 'poked' WHERE id = 1; \
+                 CREATE OR REPLACE FUNCTION public.owned_open(id integer) \
+                 RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT id > 1'; \
+                 COMMIT",
+            )
+            .await;
             divergence_counted(before, &user_id).await;
         },
     )
     .await;
-    // The opinion does not block delivery. The build-time policy still
-    // allows the row, so the update reaches the watcher even though the
-    // live table now hides it.
-    let frame = tokio::time::timeout(BOUND, client.recv())
-        .await
-        .expect("the transport answers")
-        .expect("the update is delivered");
-    assert!(
-        matches!(frame, Some(IncomingFrame::Bulk(_))),
-        "the update patch arrives: {frame:?}"
-    );
+    // The opinion does not block delivery. The followed rules still allow
+    // the row, so the update reaches the watcher even though the live table
+    // now hides it.
+    expect_bulk(&mut client, "the drifted update").await;
     stream.abort();
     http.abort();
 }

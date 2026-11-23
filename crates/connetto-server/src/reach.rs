@@ -386,12 +386,12 @@ mod tests {
                      AND team_members.member = current_setting('app.user_id', true)));",
     );
 
-    fn reach(shape: (&str, &str)) -> GrantReach {
+    fn reach(shape: (&str, &str)) -> std::sync::Arc<GrantReach> {
         reach_as(shape, connetto_test_harness::FIXTURE_ROLES)
     }
 
     /// The same, with `roles` as the roles document instead of the fixture's.
-    fn reach_as(shape: (&str, &str), roles: &str) -> GrantReach {
+    fn reach_as(shape: (&str, &str), roles: &str) -> std::sync::Arc<GrantReach> {
         Translated::of::<String, crate::defaults::ConnettoDefaults>(
             connetto_translate::Documents::new(
                 shape.0,

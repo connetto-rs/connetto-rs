@@ -51,8 +51,8 @@ impl StoreUpkeep for CountingUpkeep {
         Box::pin(async move { Ok(Vec::new()) })
     }
 
-    fn key_tables(&self) -> &[String] {
-        &[]
+    fn key_tables(&self) -> Arc<[String]> {
+        Arc::from([])
     }
 }
 
@@ -156,8 +156,8 @@ impl StoreUpkeep for FailingUpkeep {
         Box::pin(async move { Err(UpkeepError::Write("the store is unreachable".to_owned())) })
     }
 
-    fn key_tables(&self) -> &[String] {
-        &[]
+    fn key_tables(&self) -> Arc<[String]> {
+        Arc::from([])
     }
 }
 
@@ -223,8 +223,8 @@ impl StoreUpkeep for UnanswerableUpkeep {
         })
     }
 
-    fn key_tables(&self) -> &[String] {
-        &[]
+    fn key_tables(&self) -> Arc<[String]> {
+        Arc::from([])
     }
 }
 

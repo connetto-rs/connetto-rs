@@ -202,6 +202,12 @@ pub trait RowSource<Id = String, Key = String> {
     /// Failure to reach the row, as distinct from not finding one.
     type Error: core::fmt::Display;
 
+    /// The catalog declaring the columns of the rows it reads.
+    type Catalog: sql_traits::prelude::DatabaseLike;
+
+    /// The catalog a view of a row it read decodes the row's cells against.
+    fn catalog(&self) -> &Self::Catalog;
+
     /// The row `key` names in `table`, or [`None`] when the caller sees none.
     async fn read_row(
         &self,
@@ -613,6 +619,11 @@ mod pg {
         Key: CapabilityKey,
     {
         type Error = SnapshotError;
+        type Catalog = DB;
+
+        fn catalog(&self) -> &DB {
+            &self.catalog
+        }
 
         async fn read_row(
             &self,

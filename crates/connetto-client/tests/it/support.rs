@@ -91,8 +91,8 @@ impl StoreUpkeep for KeyIndependentUpkeep {
         Box::pin(async { Ok(Vec::new()) })
     }
 
-    fn key_tables(&self) -> &[String] {
-        &[]
+    fn key_tables(&self) -> Arc<[String]> {
+        Arc::from([])
     }
 }
 

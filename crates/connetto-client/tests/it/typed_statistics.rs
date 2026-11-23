@@ -166,10 +166,11 @@ const POSTGRES: Spelling = Spelling {
     tag: postgres_tag,
 };
 
-/// The emulator runs its statements on SQLite, where both columns are blobs.
+/// The emulator's schema declares the sensor `bytea`, so its literal carries
+/// the uuid's sixteen bytes in `bytea` hex.
 const EMULATOR: Spelling = Spelling {
     sensor: emulator_sensor,
-    tag: emulator_tag,
+    tag: postgres_tag,
 };
 
 fn postgres_sensor(uuid: &str) -> String {
@@ -181,11 +182,7 @@ fn postgres_tag(hex: &str) -> String {
 }
 
 fn emulator_sensor(uuid: &str) -> String {
-    format!("X'{}'", uuid.replace('-', ""))
-}
-
-fn emulator_tag(hex: &str) -> String {
-    format!("X'{hex}'")
+    postgres_tag(&uuid.replace('-', ""))
 }
 
 /// The three seeded readings.

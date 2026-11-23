@@ -214,6 +214,7 @@ pub struct ChangeRecord {
     payload: Option<Vec<u8>>,
     /// Whether this record marks a table serving again after a refusal.
     refused: bool,
+    rules: bool,
 }
 
 impl ChangeRecord {
@@ -237,6 +238,7 @@ impl ChangeRecord {
             event,
             payload: Some(payload),
             refused: false,
+            rules: false,
         }
     }
 
@@ -251,6 +253,7 @@ impl ChangeRecord {
             event,
             payload: None,
             refused: false,
+            rules: false,
         }
     }
 
@@ -275,6 +278,7 @@ impl ChangeRecord {
             event: PgChangeEvent::new(change, position),
             payload: None,
             refused: true,
+            rules: false,
         }
     }
 
@@ -282,6 +286,21 @@ impl ChangeRecord {
     #[must_use]
     pub const fn is_refusal(&self) -> bool {
         self.refused
+    }
+
+    /// Build a record requiring authorization replacement for `table`.
+    #[must_use]
+    pub fn rules(table: impl Into<String>, position: PgCommitPosition) -> Self {
+        let mut record = Self::refusal(table, position);
+        record.refused = false;
+        record.rules = true;
+        record
+    }
+
+    /// Whether this record marks changed authorization rules.
+    #[must_use]
+    pub const fn is_rules(&self) -> bool {
+        self.rules
     }
 
     /// The change's commit position, the oplog key. The wire cursor is this
@@ -348,6 +367,9 @@ impl ChangeRecord {
         if self.refused {
             return ChangeOp::Refused;
         }
+        if self.rules {
+            return ChangeOp::Rules;
+        }
         ChangeOp::from(self.event.kind())
     }
 }
@@ -383,6 +405,8 @@ pub enum ChangeOp {
     /// The table serves again after a drift refusal, so every cursor before
     /// this record resyncs it.
     Refused,
+    /// The table's authorization rules changed.
+    Rules,
 }
 
 impl ChangeOp {
@@ -396,6 +420,7 @@ impl ChangeOp {
             Self::Delete => "delete",
             Self::Truncate => "truncate",
             Self::Refused => "refused",
+            Self::Rules => "rules",
         }
     }
 }
@@ -426,6 +451,7 @@ impl FromSql<ChangeOpSql, Pg> for ChangeOp {
             b"delete" => Ok(Self::Delete),
             b"truncate" => Ok(Self::Truncate),
             b"refused" => Ok(Self::Refused),
+            b"rules" => Ok(Self::Rules),
             other => Err(format!(
                 "unrecognised connetto_change_op label {:?}",
                 String::from_utf8_lossy(other)
@@ -598,6 +624,25 @@ pub trait Oplog: Send + Sync {
     ///
     /// Implementation-defined: a backing-store write failure.
     async fn readmit(&self, tables: &[String]) -> Result<(), Self::Error>;
+
+    /// The persisted fingerprint of each table's translated rules.
+    ///
+    /// # Errors
+    ///
+    /// Implementation-defined: a backing-store read failure.
+    async fn rules_fingerprints(&self) -> Result<BTreeMap<String, String>, Self::Error>;
+
+    /// Append one [`ChangeRecord::rules`] for each of `tables` at the position
+    /// the change stream resumes from, and upsert `fingerprints`, in one step.
+    ///
+    /// # Errors
+    ///
+    /// Implementation-defined: a backing-store write failure.
+    async fn record_rules(
+        &self,
+        tables: &[String],
+        fingerprints: &BTreeMap<String, String>,
+    ) -> Result<(), Self::Error>;
 }
 
 /// Where the records of tables serving again go: ahead of the commit the
@@ -742,6 +787,7 @@ struct Inner {
     pruning_by: Option<RetentionBound>,
     /// The tables a refusal left refused.
     refused: BTreeSet<String>,
+    rules_fingerprints: BTreeMap<String, String>,
 }
 
 /// An in-memory ring-buffer [`Oplog`] for Docker-free tests and single-node use.
@@ -778,6 +824,7 @@ impl InMemoryOplog {
                 bytes: 0,
                 pruning_by: None,
                 refused: BTreeSet::new(),
+                rules_fingerprints: BTreeMap::new(),
             }),
             config,
             clock,
@@ -1034,16 +1081,60 @@ impl Oplog for InMemoryOplog {
         }
         Ok(())
     }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
+    async fn rules_fingerprints(&self) -> Result<BTreeMap<String, String>, Infallible> {
+        Ok(self.inner.lock().rules_fingerprints.clone())
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
+    async fn record_rules(
+        &self,
+        tables: &[String],
+        fingerprints: &BTreeMap<String, String>,
+    ) -> Result<(), Infallible> {
+        let mut inner = self.inner.lock();
+        let now = self.clock.now_micros();
+        if let Some(commit) = inner.last_commit {
+            let first = inner
+                .max_position
+                .filter(|position| position.commit_lsn() == commit.end_lsn())
+                .map_or(0, |position| position.ordinal() + 1);
+            for (ordinal, table) in (first..).zip(tables) {
+                let position = PgCommitPosition::new(commit.end_lsn(), PgXid::INVALID, ordinal);
+                let record = ChangeRecord::rules(table, position);
+                let bytes = record.stored_bytes();
+                inner.max_position = Some(position);
+                inner.bytes = inner.bytes.saturating_add(bytes);
+                inner.entries.push_back(Entry {
+                    appended_micros: now,
+                    bytes,
+                    record,
+                });
+            }
+            self.prune_locked(&mut inner, now);
+        }
+        inner.rules_fingerprints.extend(fingerprints.clone());
+        Ok(())
+    }
 }
 
 pub use pg::{PgOplog, PgOplogError};
 
 mod pg {
+    use std::collections::BTreeMap;
+
     use connetto_core::quote_ident;
     use diesel::sql_types::{Array, BigInt, Binary, Bool, Nullable, Text};
     use diesel::{QueryableByName, sql_query};
-    use diesel_async::RunQueryDsl;
     use diesel_async::pooled_connection::bb8::Pool;
+    use diesel_async::{AsyncConnection, RunQueryDsl};
     use parking_lot::Mutex;
     use subql::{ChangeEvent, PgChangeEvent, PgCommit, PgCommitPosition, PgLsn, PgXid};
 
@@ -1121,6 +1212,14 @@ mod pg {
     struct RefusalRow {
         #[diesel(sql_type = Text)]
         table_name: String,
+    }
+
+    #[derive(QueryableByName)]
+    struct RulesRow {
+        #[diesel(sql_type = Text)]
+        table_name: String,
+        #[diesel(sql_type = Text)]
+        fingerprint: String,
     }
 
     /// The recorded commit, read back from the companion table.
@@ -1247,6 +1346,7 @@ mod pg {
                 ChangeOp::Delete,
                 ChangeOp::Truncate,
                 ChangeOp::Refused,
+                ChangeOp::Rules,
             ]
             .map(|op| format!("'{}'", op.label()))
             .join(", ");
@@ -1261,6 +1361,11 @@ mod pg {
                 ChangeOp::Refused.label()
             );
             sql_query(refused_label).execute(&mut *conn).await?;
+            let rules_label = format!(
+                "ALTER TYPE {CHANGE_OP_TYPE} ADD VALUE IF NOT EXISTS '{}'",
+                ChangeOp::Rules.label()
+            );
+            sql_query(rules_label).execute(&mut *conn).await?;
             let ddl = format!(
                 "CREATE TABLE IF NOT EXISTS {table} (\
                      commit_lsn BIGINT NOT NULL, \
@@ -1312,6 +1417,11 @@ mod pg {
                 table = quote_ident(&Self::refused_table(&self.table)),
             );
             sql_query(refused_ddl).execute(&mut *conn).await?;
+            let rules_ddl = format!(
+                "CREATE TABLE IF NOT EXISTS {table} (table_name TEXT PRIMARY KEY, fingerprint TEXT NOT NULL)",
+                table = quote_ident(&Self::rules_table(&self.table)),
+            );
+            sql_query(rules_ddl).execute(&mut *conn).await?;
             Ok(())
         }
 
@@ -1321,12 +1431,21 @@ mod pg {
             format!("{table}_refused")
         }
 
+        /// The per-major companion table holding translated rules fingerprints.
+        #[must_use]
+        pub fn rules_table(table: &str) -> String {
+            format!("{table}_rules")
+        }
+
         /// A record read back from its row. An empty stored payload is the
         /// marker's form, because a zstd frame is never empty.
         fn record(row: OplogRow) -> Result<ChangeRecord, PgOplogError> {
             let position = position_from_i64(row.commit_lsn, row.xid, row.ordinal);
             if row.op == ChangeOp::Refused.label() {
                 return Ok(ChangeRecord::refusal(row.table_name, position));
+            }
+            if row.op == ChangeOp::Rules.label() {
+                return Ok(ChangeRecord::rules(row.table_name, position));
             }
             let change: ChangeEvent = serde_json::from_slice(&row.event)?;
             if row.payload.is_empty() {
@@ -1701,6 +1820,78 @@ mod pg {
                 .await?;
             Ok(())
         }
+
+        async fn rules_fingerprints(&self) -> Result<BTreeMap<String, String>, PgOplogError> {
+            let mut connection = self.pool.get().await.map_err(pool_err)?;
+            // The per-major table name is chosen at runtime.
+            let query = format!(
+                "SELECT table_name, fingerprint FROM {}",
+                quote_ident(&Self::rules_table(&self.table)),
+            );
+            let rows: Vec<RulesRow> = sql_query(query).load(&mut *connection).await?;
+            Ok(rows
+                .into_iter()
+                .map(|row| (row.table_name, row.fingerprint))
+                .collect())
+        }
+
+        async fn record_rules(
+            &self,
+            tables: &[String],
+            fingerprints: &BTreeMap<String, String>,
+        ) -> Result<(), PgOplogError> {
+            let mut connection = self.pool.get().await.map_err(pool_err)?;
+            connection.transaction::<_, PgOplogError, _>(async move |connection| {
+                // The per-major table names are chosen at runtime.
+                sql_query(format!(
+                    "LOCK TABLE {} IN SHARE ROW EXCLUSIVE MODE",
+                    quote_ident(&self.table),
+                )).execute(&mut *connection).await?;
+                let commits: Vec<CommitRow> = sql_query(format!(
+                    "SELECT commit_lsn, xid, end_lsn FROM {}",
+                    quote_ident(&Self::commit_table(&self.table)),
+                )).load(&mut *connection).await?;
+                if let Some(commit) = commits.first() {
+                    let positions: Vec<PositionRow> = sql_query(format!(
+                        "SELECT commit_lsn, xid, ordinal FROM {} WHERE commit_lsn = $1 \
+                         ORDER BY xid DESC, ordinal DESC LIMIT 1",
+                        quote_ident(&self.table),
+                    )).bind::<BigInt, _>(commit.end_lsn).load(&mut *connection).await?;
+                    let first = positions.first().map_or(0, |position| position.ordinal + 1);
+                    let end_lsn = PgLsn(u64::try_from(commit.end_lsn).unwrap_or(0));
+                    for (ordinal, table) in (first..).zip(tables) {
+                        let position = position_from_i64(commit.end_lsn, 0, ordinal);
+                        let record = ChangeRecord::rules(table, position);
+                        let event = serde_json::to_vec(record.event().change())?;
+                        sql_query(format!(
+                            "INSERT INTO {} (commit_lsn, xid, ordinal, table_name, op, pk, is_tombstone, event, payload) \
+                             VALUES ($1, 0, $2, $3, $4, $5, FALSE, $6, $5)",
+                            quote_ident(&self.table),
+                        ))
+                        .bind::<BigInt, _>(part_to_i64(end_lsn.0)?)
+                        .bind::<BigInt, _>(ordinal)
+                        .bind::<Text, _>(table)
+                        .bind::<ChangeOpSql, _>(ChangeOp::Rules)
+                        .bind::<Binary, _>(&[] as &[u8])
+                        .bind::<Binary, _>(event)
+                        .execute(&mut *connection).await?;
+                    }
+                }
+                for (table, fingerprint) in fingerprints {
+                    sql_query(format!(
+                        "INSERT INTO {} (table_name, fingerprint) VALUES ($1, $2) \
+                         ON CONFLICT (table_name) DO UPDATE SET fingerprint = EXCLUDED.fingerprint",
+                        quote_ident(&Self::rules_table(&self.table)),
+                    ))
+                    .bind::<Text, _>(table)
+                    .bind::<Text, _>(fingerprint)
+                    .execute(&mut *connection).await?;
+                }
+                Ok(())
+            }).await?;
+            drop(connection);
+            self.prune().await
+        }
     }
 }
 
@@ -1708,6 +1899,88 @@ mod pg {
 mod tests {
     use super::*;
     use subql::PgXid;
+
+    #[test]
+    fn rules_records_are_distinct_from_refusals_and_truncates() {
+        let record = ChangeRecord::rules("orders", at(10));
+        assert!(record.is_rules());
+        assert!(!record.is_refusal());
+        assert_eq!(record.op(), ChangeOp::Rules);
+        assert_eq!(record.op().label(), "rules");
+        assert_eq!(record.position(), at(10));
+        assert_eq!(record.table(), "orders");
+        assert!(record.payload().is_none());
+        assert!(!row(1, at(10)).is_rules());
+        assert!(!ChangeRecord::refusal("orders", at(10)).is_rules());
+    }
+
+    #[tokio::test]
+    async fn fingerprints_without_history_are_retained_without_records() {
+        let log = InMemoryOplog::default();
+        let fingerprints = BTreeMap::from([("orders".to_owned(), "first".to_owned())]);
+        assert!(log.rules_fingerprints().await.expect("read").is_empty());
+        log.record_rules(&["orders".to_owned()], &fingerprints)
+            .await
+            .expect("record");
+        assert_eq!(log.rules_fingerprints().await.expect("read"), fingerprints);
+        assert_eq!(log.current_position().await.expect("position"), None);
+    }
+
+    #[tokio::test]
+    async fn rules_follow_readmissions_and_each_other_at_the_resume_position() {
+        let log = InMemoryOplog::default();
+        commit_one(&log, 1).await;
+        log.readmit(&["orders".to_owned()]).await.expect("readmit");
+        let readmission = log
+            .current_position()
+            .await
+            .expect("position")
+            .expect("record");
+        let fingerprints = BTreeMap::from([("orders".to_owned(), "first".to_owned())]);
+        log.record_rules(&["orders".to_owned(), "readers".to_owned()], &fingerprints)
+            .await
+            .expect("record");
+        let records = log.entries_since(readmission).await.expect("read");
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(ChangeRecord::is_rules));
+        assert_eq!(records[0].table(), "orders");
+        assert_eq!(records[1].table(), "readers");
+        assert_eq!(records[0].position().commit_lsn(), PgLsn(0x130));
+        assert!(records[0].position() < records[1].position());
+        let previous = records[1].position();
+        let changed = BTreeMap::from([("orders".to_owned(), "second".to_owned())]);
+        log.record_rules(&["orders".to_owned()], &changed)
+            .await
+            .expect("record");
+        let records = log.entries_since(previous).await.expect("read");
+        assert_eq!(records.len(), 1);
+        assert!(records[0].is_rules());
+        assert_eq!(log.rules_fingerprints().await.expect("read"), changed);
+    }
+
+    #[tokio::test]
+    async fn fingerprint_upserts_preserve_other_tables_and_survive_pruning() {
+        let log = InMemoryOplog::new(OplogConfig::default().with_max_entries(1));
+        commit_one(&log, 1).await;
+        let first = BTreeMap::from([("orders".to_owned(), "first".to_owned())]);
+        log.record_rules(&[], &first).await.expect("record");
+        let second = BTreeMap::from([("readers".to_owned(), "second".to_owned())]);
+        log.record_rules(&["orders".to_owned(), "readers".to_owned()], &second)
+            .await
+            .expect("record");
+        let mut expected = first;
+        expected.extend(second);
+        assert_eq!(log.rules_fingerprints().await.expect("read"), expected);
+        let records = log.entries_since(at(0)).await.expect("read");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].table(), "readers");
+    }
+
+    #[test]
+    fn fingerprint_tables_are_scoped_to_the_oplog() {
+        assert_eq!(PgOplog::rules_table("major_one"), "major_one_rules");
+        assert_eq!(PgOplog::rules_table("major_two"), "major_two_rules");
+    }
 
     /// Only a failure to reach the database may pass on a second read, so the default of no never hides a missing override.
     #[test]
