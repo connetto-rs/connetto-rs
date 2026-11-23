@@ -2052,9 +2052,10 @@ mod tests {
     use subql::visibility::RowView;
 
     use super::{
-        BTreeMap, Body, FactSource, FgaAuth, GrantHolder, GrantMove, GrpcService, ModelSubject,
-        OpenFgaError, OpenFgaPolicy, OpenFgaServiceClient, ParserDB, Principal, ProtoModel,
-        Reconciled, SubjectNaming, Translated, UpkeepError, VisibilityPolicy, WithdrawnFact,
+        BTreeMap, Body, FactSource, FgaAuth, GrantHolder, GrantMove, GrantReach, GrpcService,
+        ModelSubject, OpenFgaError, OpenFgaPolicy, OpenFgaServiceClient, ParserDB, Principal,
+        ProtoModel, Reconciled, SubjectNaming, Translated, Translator, UpkeepError,
+        VisibilityPolicy, WithdrawnFact,
     };
 
     /// The shape every connetto table carries: one permissive policy whose
@@ -3022,10 +3023,6 @@ mod tests {
     /// keep different names, and the set names the gated one alone.
     #[tokio::test]
     async fn key_tables_names_the_tables_gated_on_the_callers_keys() {
-        use diesel_async::AsyncPgConnection;
-        use diesel_async::pooled_connection::AsyncDieselConnectionManager;
-        use diesel_async::pooled_connection::bb8::Pool;
-
         const SCHEMA: &str = "
             CREATE TABLE papers(id INTEGER PRIMARY KEY, owner TEXT);
             ALTER TABLE papers ENABLE ROW LEVEL SECURITY;
@@ -3036,38 +3033,21 @@ mod tests {
             owner = ANY(string_to_array(current_setting('app.subjects', true), ','))); \
             CREATE POLICY journal_p ON journal FOR SELECT USING (\
             author = current_setting('app.user_id', true))";
-
-        let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
-            connetto_translate::Documents::new(
-                SCHEMA,
-                POLICIES,
-                connetto_test_harness::FIXTURE_ROLES,
-                connetto_test_harness::FIXTURE_READER,
-            ),
-            true,
-        )
-        .expect("both policies are one rls2fga classifies");
-        let naming = translated.naming();
-        let model = installed(&translated);
-        let (shapes, translator, reach) = translated.into_parts();
-        let delegate: OpenFgaPolicy<ParserDB, Never, ModelSubject<String, String>, Postgres> =
-            OpenFgaPolicy::new(
-                Arc::clone(&shapes),
-                OpenFgaServiceClient::new(Never),
-                "store",
-                &model,
+        let translated = |policies| {
+            Translated::of::<String, crate::defaults::ConnettoDefaults>(
+                connetto_translate::Documents::new(
+                    SCHEMA,
+                    policies,
+                    connetto_test_harness::FIXTURE_ROLES,
+                    connetto_test_harness::FIXTURE_READER,
+                ),
+                true,
             )
-            .expect("the index is usable");
-        let auth: FgaAuth<String, String, Never> = FgaAuth::new(shapes, delegate, naming);
-        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
-            "postgres://nobody@127.0.0.1:9/none".to_owned(),
-        );
-        let pool = Pool::builder()
-            .max_size(1)
-            .build(manager)
-            .await
-            .expect("the pool builds even though it connects nowhere");
-        let upkeep = auth.upkeep(reach, translator, FactSource::owner(pool));
+            .expect("every policy here is one rls2fga classifies")
+        };
+
+        let (auth, reach, translator) = unanswered(translated(POLICIES));
+        let upkeep = auth.upkeep(reach, translator, unreachable_facts().await);
         assert_eq!(
             upkeep.key_tables().as_ref(),
             ["papers".to_owned()],
@@ -3076,27 +3056,9 @@ mod tests {
         );
         let previous = auth.generation.load_full();
         let previous_tables = upkeep.key_tables();
-        let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
-            connetto_translate::Documents::new(
-                SCHEMA,
-                "CREATE POLICY journal_p ON journal FOR SELECT USING (author = ANY(string_to_array(current_setting('app.subjects', true), ',')))",
-                connetto_test_harness::FIXTURE_ROLES,
-                connetto_test_harness::FIXTURE_READER,
-            ),
-            true,
-        )
-        .expect("the replacement policy translates");
-        let naming = translated.naming();
-        let model = installed(&translated);
-        let (shapes, translator, reach) = translated.into_parts();
-        let delegate = OpenFgaPolicy::new(
-            Arc::clone(&shapes),
-            OpenFgaServiceClient::new(Never),
-            "store",
-            &model,
-        )
-        .expect("the replacement index is usable");
-        let replacement = FgaAuth::new(shapes, delegate, naming);
+        let (replacement, reach, translator) = unanswered(translated(
+            "CREATE POLICY journal_p ON journal FOR SELECT USING (author = ANY(string_to_array(current_setting('app.subjects', true), ',')))",
+        ));
         let facts = previous
             .upkeep
             .as_ref()
@@ -3120,6 +3082,71 @@ mod tests {
                 .as_ref(),
             ["papers".to_owned()]
         );
+    }
+
+    /// An upkeep whose executor was replaced by one built without upkeep refuses
+    /// every event for good and gates no table on the caller's keys.
+    #[tokio::test]
+    async fn an_upkeep_left_without_one_refuses_every_event() {
+        let (auth, reach, translator) = unanswered(translated(OWN_SHAPE));
+        let upkeep = auth.upkeep(reach, translator, unreachable_facts().await);
+        let (bare, _, _) = unanswered(translated(OWN_SHAPE));
+        auth.replace_from(&bare);
+        assert!(upkeep.key_tables().is_empty());
+        let mut data = pg_walstream::RowData::with_capacity(2);
+        data.push(Arc::from("id"), pg_walstream::ColumnValue::text("1"));
+        data.push(Arc::from("owner"), pg_walstream::ColumnValue::text("ada"));
+        let change = pg_walstream::ChangeEvent::insert(
+            "public",
+            "notes",
+            0,
+            data,
+            pg_walstream::Lsn::new(1),
+        );
+        let event = subql::PgChangeEvent::new(
+            change,
+            subql::PgCommitPosition::new(subql::PgLsn(1), subql::PgXid(1), 1),
+        );
+        assert!(matches!(
+            upkeep.keep_current(&event).await,
+            Err(UpkeepError::Unanswerable(_))
+        ));
+    }
+
+    /// An executor over `translated` whose store never answers, beside the
+    /// reach and translator its upkeep takes.
+    fn unanswered(
+        translated: Translated,
+    ) -> (FgaAuth<String, String, Never>, Arc<GrantReach>, Translator) {
+        let naming = translated.naming();
+        let model = installed(&translated);
+        let (shapes, translator, reach) = translated.into_parts();
+        let delegate = OpenFgaPolicy::new(
+            Arc::clone(&shapes),
+            OpenFgaServiceClient::new(Never),
+            "store",
+            &model,
+        )
+        .expect("the index is usable");
+        (FgaAuth::new(shapes, delegate, naming), reach, translator)
+    }
+
+    /// Facts read through a pool whose database nobody listens on.
+    async fn unreachable_facts() -> FactSource {
+        use diesel_async::AsyncPgConnection;
+        use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+        use diesel_async::pooled_connection::bb8::Pool;
+
+        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            "postgres://nobody@127.0.0.1:9/none".to_owned(),
+        );
+        FactSource::owner(
+            Pool::builder()
+                .max_size(1)
+                .build(manager)
+                .await
+                .expect("the pool builds even though it connects nowhere"),
+        )
     }
 
     /// An unreachable store holds the event for a retry, a model refusal ends the stream.

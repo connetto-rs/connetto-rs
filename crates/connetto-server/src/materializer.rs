@@ -419,6 +419,17 @@ pub enum Registration {
     Computed(ComputedCapture),
 }
 
+impl Registration {
+    /// The engine-assigned identity of either kind of registration.
+    #[must_use]
+    pub fn subscription_id(&self) -> SubscriptionId {
+        match self {
+            Self::Row(subscription) => *subscription,
+            Self::Computed(capture) => capture.subscription_id,
+        }
+    }
+}
+
 /// A server-computed subscription awaiting its first answer.
 pub struct ComputedCapture {
     /// Engine-assigned identity, one id space with row subscriptions.
@@ -2667,10 +2678,7 @@ where
             }
             other => other?,
         };
-        let sub_id = match &registered {
-            Registration::Row(sub_id) => *sub_id,
-            Registration::Computed(capture) => capture.subscription_id,
-        };
+        let sub_id = registered.subscription_id();
         self.reads.insert(sub_id, reads);
         Ok(registered)
     }
@@ -3565,12 +3573,10 @@ mod membership_term_tests {
     #[test]
     fn a_follow_identifies_snapshots_registered_under_older_rules() {
         let mut materializer = Materializer::builder(SCHEMA).build().expect("catalog");
-        let Registration::Row(subscription) = materializer
+        let subscription = materializer
             .register(1, "SELECT * FROM docs")
             .expect("registration")
-        else {
-            panic!("row registration");
-        };
+            .subscription_id();
         let rules = Arc::new(ParserDB::parse::<PostgreSqlDialect>(SCHEMA).expect("rules catalog"));
         materializer.follow_access_rules(rules, &[]);
         materializer.begin_rules_snapshot(subscription);
@@ -3585,12 +3591,10 @@ mod membership_term_tests {
     #[test]
     fn a_completed_snapshot_is_not_an_inflight_rules_race() {
         let mut materializer = Materializer::builder(SCHEMA).build().expect("catalog");
-        let Registration::Row(subscription) = materializer
+        let subscription = materializer
             .register(1, "SELECT * FROM docs")
             .expect("registration")
-        else {
-            panic!("row registration");
-        };
+            .subscription_id();
         assert!(!materializer.finish_rules_snapshot(subscription));
         let rules = Arc::new(ParserDB::parse::<PostgreSqlDialect>(SCHEMA).expect("rules catalog"));
         materializer.follow_access_rules(rules, &[]);
@@ -4430,20 +4434,24 @@ mod drift_refusal_tests {
          CREATE TABLE docs (id BIGINT PRIMARY KEY, team BIGINT);\n\
          CREATE TABLE notes (id BIGINT PRIMARY KEY, body TEXT);";
 
-    /// The `docs` policy reads `memberships`, as rls2fga reports it.
-    fn materializer() -> Materializer {
-        let table = |name: &str| {
+    /// `table`'s policy reading `reads`, as rls2fga reports it.
+    fn policy(table: &str, reads: &[&str]) -> rls2fga::types::PolicyReads {
+        let id = |name: &str| {
             rls2fga::types::TableId::from_stored(Some("public".to_owned()), name.to_owned())
         };
-        let reads = [rls2fga::types::PolicyReads {
-            name: "docs_read".to_owned(),
-            table: table("docs"),
+        rls2fga::types::PolicyReads {
+            name: format!("{table}_read"),
+            table: id(table),
             command: rls2fga::types::PolicyCommand::Select,
-            reads: vec![table("docs"), table("memberships")],
+            reads: reads.iter().map(|name| id(name)).collect(),
             unresolved: Vec::new(),
-        }];
+        }
+    }
+
+    /// The `docs` policy reads `memberships`.
+    fn materializer() -> Materializer {
         Materializer::builder(DDL)
-            .with_policy_reads(&reads)
+            .with_policy_reads(&[policy("docs", &["docs", "memberships"])])
             .build()
             .expect("the catalog parses")
     }
@@ -4490,6 +4498,26 @@ mod drift_refusal_tests {
             ["memberships"]
         );
         assert!(!materializer.refused().refuses("docs"));
+    }
+
+    #[test]
+    fn a_rules_change_reaches_the_readers_of_its_readers_under_the_followed_rules() {
+        let mut materializer = materializer();
+        let rules = Arc::new(ParserDB::parse::<PostgreSqlDialect>(DDL).expect("rules catalog"));
+        materializer.follow_access_rules(
+            rules,
+            &[policy("docs", &["memberships"]), policy("notes", &["docs"])],
+        );
+        assert_eq!(
+            materializer.rules_reach(&["memberships".to_owned()]),
+            ["memberships", "docs", "notes"]
+        );
+        assert_eq!(materializer.rules_reach(&["notes".to_owned()]), ["notes"]);
+        assert_eq!(
+            materializer.rules_reach(&["absent".to_owned()]),
+            ["absent"],
+            "a name the catalog cannot place reaches no reader"
+        );
     }
 
     /// Register `sql` the way a session's subscribe does.

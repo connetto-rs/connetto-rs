@@ -2,7 +2,9 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use rls2fga::generator::tuple_generator::TupleQuery;
-use rls2fga::types::{PolicyReads, RecordDescription, RelationShapes, RowNaming, TableId};
+use rls2fga::types::{
+    PolicyReads, RecordDescription, RelationShapes, RowNaming, TableId, TypeName,
+};
 use sql_traits::prelude::{DatabaseLike, FunctionLike, PolicyLike, TableLike};
 
 use super::{Enumeration, GrantReach, ParserDB, Postgres, SetupError, Shapes, Translated};
@@ -85,18 +87,12 @@ impl Translated {
                 .iter()
                 .any(|shape| !shape_known(catalog, shape))
             {
-                let mut reached = false;
-                for naming in translation
-                    .row_naming()
-                    .iter()
-                    .filter(|naming| naming.type_name == relation.type_name)
-                {
-                    refused.insert(naming.table.name().to_owned());
-                    reached = true;
-                }
-                if !reached {
-                    refused.extend(changed.iter().cloned());
-                }
+                refuse_type(
+                    translation.row_naming(),
+                    &relation.type_name,
+                    changed,
+                    &mut refused,
+                );
             }
         }
         let shapes = Arc::new(
@@ -126,17 +122,12 @@ impl Translated {
             )
             .is_err()
             {
-                let reached: Vec<_> = translation
-                    .row_naming()
-                    .iter()
-                    .filter(|naming| naming.type_name == answer.type_name)
-                    .map(|naming| naming.table.name().to_owned())
-                    .collect();
-                if reached.is_empty() {
-                    refused.extend(changed.iter().cloned());
-                } else {
-                    refused.extend(reached);
-                }
+                refuse_type(
+                    translation.row_naming(),
+                    &answer.type_name,
+                    changed,
+                    &mut refused,
+                );
             } else {
                 answers.push(answer.clone());
             }
@@ -326,20 +317,35 @@ fn index_refusals<'translation>(
         })
         .collect();
     for relation in &blocked {
-        let mut reached = false;
-        for naming in translation
-            .row_naming()
-            .iter()
-            .filter(|naming| naming.type_name == relation.type_name)
-        {
-            refused.insert(naming.table.name().to_owned());
-            reached = true;
-        }
-        if !reached {
-            refused.extend(changed.iter().cloned());
-        }
+        refuse_type(
+            translation.row_naming(),
+            &relation.type_name,
+            changed,
+            refused,
+        );
     }
     blocked
+}
+
+/// Refuse each table whose rows `type_name` names, or every changed table
+/// when no table's rows carry that type.
+fn refuse_type(
+    row_naming: &[RowNaming],
+    type_name: &TypeName,
+    changed: &[String],
+    refused: &mut BTreeSet<String>,
+) {
+    let mut reached = false;
+    for naming in row_naming
+        .iter()
+        .filter(|naming| naming.type_name == *type_name)
+    {
+        refused.insert(naming.table.name().to_owned());
+        reached = true;
+    }
+    if !reached {
+        refused.extend(changed.iter().cloned());
+    }
 }
 
 fn subject_tables<Database: DatabaseLike>(
@@ -501,6 +507,7 @@ fn fingerprint<Share: serde::Serialize>(share: &Share) -> Result<String, serde_j
 mod tests {
     use super::*;
     use sqlparser::dialect::PostgreSqlDialect;
+    use subql::visibility::openfga::OpenFgaError;
 
     fn catalog(policies: &str) -> ParserDB {
         ParserDB::parse::<PostgreSqlDialect>(&format!(
@@ -756,6 +763,43 @@ mod tests {
             SetupError::Store("invalid tuple".to_owned()).pause_cause(),
             None
         );
+        assert_eq!(
+            SetupError::Authorization(OpenFgaError::Transport {
+                attempts: 3,
+                message: "offline".to_owned(),
+            })
+            .pause_cause(),
+            Some(PauseCause::AuthServiceUnreachable)
+        );
+        assert_eq!(
+            SetupError::Authorization(OpenFgaError::RowCannotBeNamed).pause_cause(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_type_no_table_carries_refuses_every_changed_table() {
+        let mut refused = BTreeSet::new();
+        refuse_type(
+            &[],
+            &TypeName::canonicalized("unnamed"),
+            &["first_table".to_owned(), "second_table".to_owned()],
+            &mut refused,
+        );
+        assert_eq!(
+            refused,
+            BTreeSet::from(["first_table".to_owned(), "second_table".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_live_database_without_the_reader_role_is_unplannable() {
+        let live = ParserDB::parse::<PostgreSqlDialect>(&format!("{SCHEMA} {POLICY}"))
+            .expect("live catalog");
+        assert!(matches!(
+            startup().follow_database(&live, &["documents".to_owned()]),
+            Err(SetupError::Unplannable(_))
+        ));
     }
 
     #[test]
@@ -818,6 +862,16 @@ mod tests {
         let error = reconcile_error(ReconcileError::Replay(SetupError::Store(
             "invalid tuple".to_owned(),
         )));
+        assert_eq!(error.pause_cause(), None);
+        let error = reconcile_error(ReconcileError::Store(OpenFgaError::Transport {
+            attempts: 3,
+            message: "offline".to_owned(),
+        }));
+        assert_eq!(
+            error.pause_cause(),
+            Some(PauseCause::AuthServiceUnreachable)
+        );
+        let error = reconcile_error(ReconcileError::Contradiction("a fact".to_owned()));
         assert_eq!(error.pause_cause(), None);
     }
 

@@ -2447,11 +2447,10 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#50b596e642bbf0ad724b6b46cfc6da46e1a49cf9"
+source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#52391fe2c11dfc0e9942a929889ed29488a7156d"
 dependencies = [
  "recursive",
  "sql-traits",
- "sql-values 0.5.1",
  "sql-values 0.6.0",
  "sqlparser",
  "sqlparser-plpgsql",
@@ -2462,7 +2461,7 @@ dependencies = [
 [[package]]
 name = "pg_walstream"
 version = "0.10.0"
-source = "git+https://github.com/isdaniel/pg-walstream?branch=main#78c764a2d51ca3a05c25c119bc850be8f55b51e7"
+source = "git+https://github.com/isdaniel/pg-walstream?branch=main#8099d664c1c3d96167875739a7cd6c80afde95a2"
 dependencies = [
  "bytes",
  "chrono",
@@ -2983,7 +2982,7 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#aa79f3277170fe77c49b8c26aab6ada861e109a5"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#46dd895579e08ddfbeaf83c65fd5bbebd766be69"
 dependencies = [
  "rls2fga-types",
  "serde",
@@ -2997,7 +2996,7 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#aa79f3277170fe77c49b8c26aab6ada861e109a5"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#46dd895579e08ddfbeaf83c65fd5bbebd766be69"
 dependencies = [
  "serde",
  "sql-values 0.6.0",
@@ -3475,16 +3474,19 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sql-traits?branch=main#a31e374f6b3860b9abffd54a993cba07eb84bbb6"
+source = "git+https://github.com/connetto-rs/sql-traits?branch=main#ce12aeb5ac411b1ee6103831b937777e0cde453e"
 dependencies = [
  "geometric-traits",
  "once_cell",
+ "recursive",
  "serde",
  "sha2",
- "sql-values 0.5.1",
+ "sql-values 0.6.0",
  "sqlparser",
  "sqlparser-canonicalize",
+ "sqlparser-expr-eval",
  "sqlparser-plpgsql",
+ "sqlstate 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror 2.0.21",
  "unicode-normalization",
 ]
@@ -3498,16 +3500,6 @@ dependencies = [
  "bigdecimal",
  "chrono",
  "serde",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "sql-values"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa63391be723434747b0c2ffc2e7270f4a7a476d083b55cdda961c4773d1d5e4"
-dependencies = [
- "jiff",
  "thiserror 2.0.21",
 ]
 
@@ -3570,7 +3562,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.64.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#298b4bdf660d250a07aee620120bfb2d5c7c60ff"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#6a37ecb3fd517adee436e56b96e7fce4402a5708"
 dependencies = [
  "log",
  "recursive",
@@ -3590,6 +3582,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqlparser-expr-eval"
+version = "0.1.0"
+source = "git+https://github.com/connetto-rs/sqlparser-expr-eval?branch=main#46deb4392399a9658ac504ad39fd32556d4f9475"
+dependencies = [
+ "rpds",
+ "sql-values 0.6.0",
+ "sqlparser",
+]
+
+[[package]]
 name = "sqlparser-plpgsql"
 version = "0.1.0"
 source = "git+https://github.com/connetto-rs/sqlparser-plpgsql?branch=main#f5ea51d2d98a1ce18fc47f74185836165fcac612"
@@ -3602,7 +3604,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.7.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#298b4bdf660d250a07aee620120bfb2d5c7c60ff"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#6a37ecb3fd517adee436e56b96e7fce4402a5708"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3654,7 +3656,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/subql?branch=main#2794426cbe07c1bc72a53a5c655cd0ce273d4bb9"
+source = "git+https://github.com/connetto-rs/subql?branch=main#3541678e7089fce4ca1985957590af65c1d52e75"
 dependencies = [
  "arc-swap",
  "async-lock",

@@ -629,31 +629,20 @@ pub trait Oplog: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a backing-store read failure.
-    async fn rules_fingerprints(&self) -> Result<BTreeMap<String, String>, Self::Error> {
-        Ok(BTreeMap::new())
-    }
+    /// Implementation-defined: a backing-store read failure.
+    async fn rules_fingerprints(&self) -> Result<BTreeMap<String, String>, Self::Error>;
 
-    /// Atomically append rules records at the resume position and upsert fingerprints.
-    ///
-    /// Persistent implementations override the default used by test doubles.
+    /// Append one [`ChangeRecord::rules`] for each of `tables` at the position
+    /// the change stream resumes from, and upsert `fingerprints`, in one step.
     ///
     /// # Errors
     ///
-    /// Returns a backing-store write failure.
+    /// Implementation-defined: a backing-store write failure.
     async fn record_rules(
         &self,
         tables: &[String],
         fingerprints: &BTreeMap<String, String>,
-    ) -> Result<(), Self::Error> {
-        let _ = fingerprints;
-        for mut record in readmission_records(self.last_commit().await?, tables) {
-            record.refused = false;
-            record.rules = true;
-            self.append(&record).await?;
-        }
-        Ok(())
-    }
+    ) -> Result<(), Self::Error>;
 }
 
 /// Where the records of tables serving again go: ahead of the commit the

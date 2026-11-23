@@ -7812,7 +7812,7 @@ dependencies = [
 [[package]]
 name = "pg_walstream"
 version = "0.10.0"
-source = "git+https://github.com/LucaCappelletti94/pg-walstream?rev=adca568cf6f92f4dc24cad7c0aafc011f80643d3#adca568cf6f92f4dc24cad7c0aafc011f80643d3"
+source = "git+https://github.com/isdaniel/pg-walstream?branch=main#8099d664c1c3d96167875739a7cd6c80afde95a2"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -8483,8 +8483,8 @@ version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
- "heck 0.4.1",
- "itertools 0.14.0",
+ "heck 0.5.0",
+ "itertools 0.13.0",
  "log",
  "multimap",
  "petgraph",
@@ -8503,7 +8503,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -8551,7 +8551,7 @@ version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb5cd191fad9142d096efc97c64715db73db4adb60c38ebdf22f5b54cd6ea712"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "prost",
  "prost-build",
  "prost-types",
@@ -9316,7 +9316,7 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#4cdeafc31ce48f6e6b9f53b09fb6240e90d3e940"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#46dd895579e08ddfbeaf83c65fd5bbebd766be69"
 dependencies = [
  "openfga-client",
  "prost",
@@ -9332,7 +9332,7 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#4cdeafc31ce48f6e6b9f53b09fb6240e90d3e940"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#46dd895579e08ddfbeaf83c65fd5bbebd766be69"
 dependencies = [
  "serde",
  "sql-values 0.6.0",
@@ -10403,7 +10403,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",

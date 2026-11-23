@@ -21,6 +21,7 @@
 //! Reads and seeds go through typed diesel queries, matching the other tests;
 //! DML against the emulated backend stays as SQL strings.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1011,6 +1012,24 @@ impl Oplog for ScriptedOplog {
     async fn readmit(&self, tables: &[String]) -> Result<(), Refused> {
         self.inner
             .readmit(tables)
+            .await
+            .map_err(|never| match never {})
+    }
+
+    async fn rules_fingerprints(&self) -> Result<BTreeMap<String, String>, Refused> {
+        self.inner
+            .rules_fingerprints()
+            .await
+            .map_err(|never| match never {})
+    }
+
+    async fn record_rules(
+        &self,
+        tables: &[String],
+        fingerprints: &BTreeMap<String, String>,
+    ) -> Result<(), Refused> {
+        self.inner
+            .record_rules(tables, fingerprints)
             .await
             .map_err(|never| match never {})
     }

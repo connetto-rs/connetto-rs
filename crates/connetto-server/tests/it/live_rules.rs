@@ -419,6 +419,72 @@ async fn policy_tightening_replaces_rows_and_judges_later_events_under_new_rules
     server.stop().await;
 }
 
+/// The whole answer the next aggregate frame of the scalar `count` subscription carries.
+async fn count(client: &mut Client) -> i64 {
+    let ControlMessage::AggregateUpdate(update) = next_control(client).await else {
+        panic!("expected an aggregate answer");
+    };
+    assert_eq!(update.sub_id, "count");
+    super::reexec::integer(&update)
+}
+
+/// A computed subscription is answered afresh under the followed rules, since its
+/// maintained answer was folded under the rules they replaced.
+#[tokio::test]
+async fn policy_tightening_answers_a_computed_subscription_again_under_new_rules() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    setup(&fixture, false).await;
+    let server = Running::start(&fixture, NEVER, false).await;
+    let mut client = server.connect("policy-count", None).await;
+    client
+        .send_control(ControlMessage::Subscribe(Subscribe {
+            sub_id: "count".to_owned(),
+            spec: SubscriptionSpec::new("SELECT COUNT(*) FROM orders"),
+        }))
+        .await
+        .expect("subscribe");
+    assert!(matches!(
+        next_control(&mut client).await,
+        ControlMessage::AggregateColumns(_)
+    ));
+    assert_eq!(count(&mut client).await, 2);
+    // A change the stream delivers puts the server past its connect before the rules change.
+    fixture
+        .exec("INSERT INTO orders VALUES (3, 1.0, 2, 'visible')")
+        .await;
+    assert_eq!(count(&mut client).await, 3);
+    fixture.exec(TIGHTEN).await;
+    fixture
+        .exec("UPDATE orders SET status = 'changed' WHERE id = 2")
+        .await;
+    let resync = tokio::time::timeout(BOUND, async {
+        loop {
+            match next_control(&mut client).await {
+                ControlMessage::FullResyncRequired(resync) => return resync,
+                ControlMessage::AggregateUpdate(_) | ControlMessage::RevocationUpdate(_) => {}
+                other => panic!("unexpected frame ahead of the new answer {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the follow retires the computed subscription");
+    assert_eq!(resync.sub_id, "count");
+    assert_eq!(resync.reason, FullResyncReason::AuthorizationChange);
+    assert!(matches!(
+        next_control(&mut client).await,
+        ControlMessage::AggregateColumns(_)
+    ));
+    assert_eq!(
+        count(&mut client).await,
+        2,
+        "order 1 holds one item, which the tightened rule hides"
+    );
+    drop(client);
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn helper_trigger_follows_the_committed_change_before_later_rows() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
