@@ -21,8 +21,8 @@ CREATE TABLE notes (id INT PRIMARY KEY, body TEXT NOT NULL);";
 
 fn schema() -> SyncSchema {
     SyncSchema::new(
-        connetto_schema::translate_shared::<String, connetto_core::bots::TextIds>(
-            connetto_schema::Documents::new(
+        connetto_translate::translate_shared::<String, connetto_core::bots::TextIds>(
+            connetto_translate::Documents::new(
                 SCHEMA,
                 "",
                 connetto_test_harness::FIXTURE_ROLES,

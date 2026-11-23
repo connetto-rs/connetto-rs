@@ -17,7 +17,7 @@ thiserror.workspace = true
 connetto-core = { workspace = true, features = ["native-transport", "logging", "device-cert"] }
 connetto-server = { path = "../../crates/connetto-server" }
 connetto-client = { path = "../../crates/connetto-client", features = ["native-transport", "native-auth"] }
-connetto-schema = { workspace = true }
+connetto-translate = { workspace = true }
 connetto-ca = { path = "../../crates/connetto-ca" }
 # The mock identity provider `demo-idp` starts, the one the test stacks use.
 connetto-test-harness = { path = "../../crates/connetto-test-harness" }

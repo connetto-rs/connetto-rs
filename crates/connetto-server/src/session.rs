@@ -11928,7 +11928,7 @@ mod tests {
         };
         let member_tables = |ddl: &str, filter: &str| {
             let translator = rls2fga::translator::TranslatorBuilder::new(
-                connetto_schema::deployment::<String>(
+                connetto_translate::deployment::<String>(
                     READER,
                     connetto_core::auth::UnsetSettings::ALWAYS_BOUND,
                 )

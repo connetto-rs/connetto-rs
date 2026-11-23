@@ -359,7 +359,7 @@ jobs:
           - name: rest
             packages: >-
               -p connetto-core
-              -p connetto-schema
+              -p connetto-translate
               -p connetto-ca
               -p connetto-test-harness
               -p connetto-demo-stack

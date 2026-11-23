@@ -79,7 +79,7 @@ diesel::table! {
 /// The translated bundle the builds present.
 pub fn bundle() -> SyncSchema {
     SyncSchema::new(
-        connetto_schema::translate::<String, TextIds>(connetto_schema::Documents::new(
+        connetto_translate::translate::<String, TextIds>(connetto_translate::Documents::new(
             DEMO_DEPLOYMENT.schema,
             DEMO_DEPLOYMENT.policies,
             DEMO_DEPLOYMENT.roles,

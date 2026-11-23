@@ -110,7 +110,7 @@ async fn the_row_settles_the_verdict_and_it_costs_no_round_trip() {
     let (channel, store) = fixture.fga_store().await;
 
     let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-        connetto_schema::Documents::new(
+        connetto_translate::Documents::new(
             SCHEMA,
             &policies(),
             connetto_test_harness::FIXTURE_ROLES,
@@ -204,7 +204,7 @@ async fn a_note_that_does_not_refuse_is_logged_for_the_operator() {
         "a_note_that_does_not_refuse_is_logged_for_the_operator",
         |capture| async move {
             let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-                connetto_schema::Documents::new(
+                connetto_translate::Documents::new(
                     &schema,
                     &policies,
                     connetto_test_harness::FIXTURE_ROLES,
@@ -248,7 +248,7 @@ async fn a_reader_policy_decides_and_an_outside_role_policy_is_reported_and_left
         "a_reader_policy_decides_and_an_outside_role_policy_is_reported_and_left_out",
         |capture| async move {
             let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-                connetto_schema::Documents::new(
+                connetto_translate::Documents::new(
                     SCHEMA,
                     "ALTER TABLE r5b_notes ENABLE ROW LEVEL SECURITY;\n\
                      CREATE POLICY r5b_notes_reader ON r5b_notes FOR ALL TO app_reader \
@@ -322,7 +322,7 @@ async fn unchanged_rules_are_adopted_rather_than_rewritten() {
     let mut client = OpenFgaServiceClient::new(channel);
 
     let first = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-        connetto_schema::Documents::new(
+        connetto_translate::Documents::new(
             SCHEMA,
             &policies(),
             connetto_test_harness::FIXTURE_ROLES,
@@ -335,7 +335,7 @@ async fn unchanged_rules_are_adopted_rather_than_rewritten() {
     .await
     .expect("written");
     let second = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-        connetto_schema::Documents::new(
+        connetto_translate::Documents::new(
             SCHEMA,
             &policies(),
             connetto_test_harness::FIXTURE_ROLES,
@@ -397,7 +397,7 @@ async fn an_adopted_boot_reconciles_a_store_left_at_another_point() {
     let (channel, store) = fixture.fga_store().await;
 
     let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-        connetto_schema::Documents::new(
+        connetto_translate::Documents::new(
             SCHEMA,
             &policies(),
             connetto_test_harness::FIXTURE_ROLES,
@@ -442,7 +442,7 @@ async fn an_adopted_boot_reconciles_a_store_left_at_another_point() {
     drop(conn);
 
     let adopted = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-        connetto_schema::Documents::new(
+        connetto_translate::Documents::new(
             SCHEMA,
             &policies(),
             connetto_test_harness::FIXTURE_ROLES,
@@ -493,7 +493,7 @@ async fn an_adopted_boot_that_cannot_reconcile_refuses() {
     let (channel, store) = fixture.fga_store().await;
 
     let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-        connetto_schema::Documents::new(
+        connetto_translate::Documents::new(
             SCHEMA,
             &policies(),
             connetto_test_harness::FIXTURE_ROLES,
@@ -563,7 +563,7 @@ async fn a_table_with_row_level_security_and_no_policy_grants_nobody() {
 
     let policies = "ALTER TABLE r5b_notes ENABLE ROW LEVEL SECURITY;";
     let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-        connetto_schema::Documents::new(
+        connetto_translate::Documents::new(
             SCHEMA,
             policies,
             connetto_test_harness::FIXTURE_ROLES,
@@ -640,7 +640,7 @@ async fn a_changed_owner_reaches_the_store_before_the_row_is_delivered() {
     let (channel, store) = fixture.fga_store().await;
 
     let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-        connetto_schema::Documents::new(
+        connetto_translate::Documents::new(
             SCHEMA,
             &policies(),
             connetto_test_harness::FIXTURE_ROLES,
@@ -777,7 +777,7 @@ async fn cross_executor(
     let (channel, store) = fixture.fga_store().await;
     let schema = cross_schema();
     let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-        connetto_schema::Documents::new(
+        connetto_translate::Documents::new(
             &schema,
             &CROSS_POLICY_STATEMENTS.join(";\n"),
             connetto_test_harness::FIXTURE_ROLES,
@@ -983,7 +983,7 @@ async fn a_uuid_primary_key_is_named_so_an_owned_write_is_authorized() {
     let (channel, store) = fixture.fga_store().await;
 
     let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-        connetto_schema::Documents::new(
+        connetto_translate::Documents::new(
             ORDERS_SCHEMA,
             &orders_policies(),
             connetto_test_harness::FIXTURE_ROLES,
@@ -1123,7 +1123,7 @@ async fn replay_executor(
     let (channel, store) = fixture.fga_store().await;
     let schema = REPLAY_SCHEMA_STATEMENTS.join(";\n") + ";";
     let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-        connetto_schema::Documents::new(
+        connetto_translate::Documents::new(
             &schema,
             REPLAY_POLICY,
             connetto_test_harness::FIXTURE_ROLES,
@@ -1559,7 +1559,7 @@ async fn a_composite_key_share_is_withdrawn_through_the_re_run() {
     // the startup guard. Before rls2fga 98bda106 this returned Err.
     let schema = composite_schema();
     let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-        connetto_schema::Documents::new(
+        connetto_translate::Documents::new(
             &schema,
             COMPOSITE_POLICY,
             connetto_test_harness::FIXTURE_ROLES,
@@ -1754,7 +1754,7 @@ async fn keyed_replay_executor(
     let (channel, store) = fixture.fga_store().await;
     let schema = KEYED_REPLAY_SCHEMA_STATEMENTS.join(";\n") + ";";
     let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-        connetto_schema::Documents::new(
+        connetto_translate::Documents::new(
             &schema,
             KEYED_REPLAY_POLICY,
             connetto_test_harness::FIXTURE_ROLES,

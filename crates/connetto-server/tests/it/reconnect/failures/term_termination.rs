@@ -76,7 +76,7 @@ async fn term_manager(
         String,
         connetto_server::defaults::ConnettoDefaults,
     >(
-        connetto_schema::Documents::new(
+        connetto_translate::Documents::new(
             &ddl,
             POLICIES,
             connetto_test_harness::FIXTURE_ROLES,

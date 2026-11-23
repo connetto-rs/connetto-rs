@@ -314,8 +314,8 @@ mod tests {
     /// from the physical table a policy view stands over.
     #[test]
     fn an_archive_table_keeps_the_queried_columns_their_types_and_the_key() {
-        let bundle = connetto_schema::translate::<String, connetto_core::bots::TextIds>(
-            connetto_schema::Documents::new(
+        let bundle = connetto_translate::translate::<String, connetto_core::bots::TextIds>(
+            connetto_translate::Documents::new(
                 "-- connetto:major 1\nCREATE TABLE t (a BIGINT NOT NULL, b TEXT NOT NULL, c BYTEA, \
                  d DOUBLE PRECISION, PRIMARY KEY (b, a));",
                 "",

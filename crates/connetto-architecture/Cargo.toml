@@ -27,6 +27,6 @@ connetto-file-client = { path = "../connetto-file-client" }
 connetto-file-core = { path = "../connetto-file-core" }
 connetto-file-server = { path = "../connetto-file-server" }
 connetto-peer = { path = "../connetto-peer" }
-connetto-schema.workspace = true
+connetto-translate.workspace = true
 connetto-server = { path = "../connetto-server" }
 connetto-yew = { path = "../connetto-yew" }

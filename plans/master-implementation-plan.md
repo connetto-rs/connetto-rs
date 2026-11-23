@@ -1241,7 +1241,7 @@ Every caller reaches Postgres through connetto's one reader role, and a policy t
 3. The server builder takes the five kind role names. Preflight reads the kind roles from the live model and refuses a missing one and the attributes of decision 5, and the five kinds become the description's acting roles.
 4. `CallerBinding` switches to the caller's kind role, and the write path resets to the reader role for connetto's bookkeeping.
 5. The server translates with each kind's live privileges, every check, remote and local, carries the caller's kind per decision 10, and a marker row reloads grants and memberships with the policies.
-6. `connetto_schema` translates once per kind, the generated bundle carries one entry per kind, and the client opens its replica with the bundle of its kind.
+6. `connetto_translate` translates once per kind, the generated bundle carries one entry per kind, and the client opens its replica with the bundle of its kind.
 7. The subscription and write refusals of decision 8, and the client's error for a table its copy lacks.
 8. The deployment description declares, per setting, whether it may be unset, and for the identity whether it is a `uuid`, and `CallerBinding` binds `''` for an unset setting so declared and the absent marker for one declared always bound (decision 12).
 

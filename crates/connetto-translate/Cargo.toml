@@ -1,5 +1,5 @@
 [package]
-name = "connetto-schema"
+name = "connetto-translate"
 description = "The schema build step connetto ships: one translation of a deployment's Postgres sources into the bundle the client and its server both version."
 categories = ["database", "encoding"]
 keywords = ["sync", "cdc", "sqlite", "postgres", "schema"]

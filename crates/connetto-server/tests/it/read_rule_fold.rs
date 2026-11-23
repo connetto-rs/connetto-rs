@@ -161,7 +161,7 @@ async fn connected_clients(
         String,
         connetto_server::defaults::ConnettoDefaults,
     >(
-        connetto_schema::Documents::new(
+        connetto_translate::Documents::new(
             PG_DDL,
             POLICIES,
             connetto_test_harness::FIXTURE_ROLES,

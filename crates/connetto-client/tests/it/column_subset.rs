@@ -58,8 +58,8 @@ diesel::table! {
     }
 }
 fn schema() -> connetto_core::schema::SchemaBundle {
-    connetto_schema::translate::<String, connetto_core::bots::TextIds>(
-        connetto_schema::Documents::new(
+    connetto_translate::translate::<String, connetto_core::bots::TextIds>(
+        connetto_translate::Documents::new(
             PG_DDL,
             POLICIES,
             connetto_test_harness::FIXTURE_ROLES,

@@ -869,13 +869,13 @@ pub async fn provision_cap_policies(
     policies_sql: &str,
 ) {
     let cap =
-        connetto_schema::cap_policies::<connetto_core::bots::TextIds>(schema_sql, policies_sql)
+        connetto_translate::cap_policies::<connetto_core::bots::TextIds>(schema_sql, policies_sql)
             .unwrap_or_else(|err| panic!("the cap document generates: {err}"));
     if !cap.is_empty() {
         // The document is not idempotent, and the registry tables it caps
         // persist across the tests that share one Postgres, so a re-provision
         // would refuse the re-create. Drop the rules it (re)creates first.
-        let tables = connetto_schema::schema_tables(&connetto_schema::with_registry::<
+        let tables = connetto_translate::schema_tables(&connetto_translate::with_registry::<
             connetto_core::bots::TextIds,
         >(schema_sql))
         .expect("the schema with the registry parses");
@@ -975,7 +975,7 @@ pub async fn start_replication_on(pool: &Pool<AsyncPgConnection>, tables: &[&str
             published.push(registry);
         }
     }
-    for table in connetto_schema::BOOKKEEPING_TABLES {
+    for table in connetto_translate::BOOKKEEPING_TABLES {
         if !published.contains(table) {
             published.push(table);
         }

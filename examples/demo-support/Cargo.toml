@@ -41,7 +41,7 @@ client = [
   "dep:connetto-core",
   "dep:connetto-demo-deployment",
   "dep:connetto-file-core",
-  "dep:connetto-schema",
+  "dep:connetto-translate",
   "dep:diesel",
   "dep:image",
   "dep:js-sys",
@@ -126,7 +126,7 @@ manganis = { version = "0.7.10", optional = true }
 # plus the demos' local tier into the bundle the client builds include and the
 # version they present at handshake.
 [build-dependencies]
-connetto-schema = { path = "../../crates/connetto-schema", optional = true }
+connetto-translate = { path = "../../crates/connetto-translate", optional = true }
 
 [dev-dependencies]
 rmp-serde = "1.3"

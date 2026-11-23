@@ -590,7 +590,7 @@ dependencies = [
  "connetto-core",
  "connetto-demo-deployment",
  "connetto-file-core",
- "connetto-schema",
+ "connetto-translate",
  "connetto-web",
  "diesel",
  "image",
@@ -681,20 +681,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "connetto-schema"
-version = "0.0.0"
-dependencies = [
- "connetto-core",
- "diesel",
- "pg2sqlite",
- "serde",
- "sql-traits",
- "sqlparser",
- "thiserror 2.0.21",
- "toml 0.8.23",
-]
-
-[[package]]
 name = "connetto-tauri-page"
 version = "0.0.0"
 dependencies = [
@@ -707,6 +693,20 @@ dependencies = [
  "serde_bytes",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+]
+
+[[package]]
+name = "connetto-translate"
+version = "0.0.0"
+dependencies = [
+ "connetto-core",
+ "diesel",
+ "pg2sqlite",
+ "serde",
+ "sql-traits",
+ "sqlparser",
+ "thiserror 2.0.21",
+ "toml 0.8.23",
 ]
 
 [[package]]

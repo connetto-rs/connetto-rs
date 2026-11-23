@@ -393,7 +393,7 @@ mod tests {
     /// The same, with `roles` as the roles document instead of the fixture's.
     fn reach_as(shape: (&str, &str), roles: &str) -> GrantReach {
         Translated::of::<String, crate::defaults::ConnettoDefaults>(
-            connetto_schema::Documents::new(
+            connetto_translate::Documents::new(
                 shape.0,
                 shape.1,
                 roles,
@@ -413,7 +413,7 @@ mod tests {
     #[test]
     fn a_membership_fact_reaches_the_guarded_table() {
         let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
-            connetto_schema::Documents::new(
+            connetto_translate::Documents::new(
                 CROSS_TABLE.0,
                 CROSS_TABLE.1,
                 connetto_test_harness::FIXTURE_ROLES,

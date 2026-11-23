@@ -494,7 +494,7 @@ dependencies = [
  "connetto-core",
  "connetto-demo-deployment",
  "connetto-file-core",
- "connetto-schema",
+ "connetto-translate",
  "connetto-web",
  "diesel",
  "image",
@@ -551,7 +551,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "connetto-schema"
+name = "connetto-translate"
 version = "0.0.0"
 dependencies = [
  "connetto-core",
