@@ -75,6 +75,82 @@ fn builder_schema_installs_uuidv4_for_a_default_key() {
     assert_ne!(keys[0], keys[1], "two inserts mint distinct keys");
 }
 
+diesel::table! {
+    /// A row-secured table whose policy calls a SQL helper.
+    docs (id) {
+        /// Row key, public while `public_ids` holds it.
+        id -> Integer,
+        /// The row's label.
+        label -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    /// The ids the helper reads.
+    public_ids (id) {
+        /// A public row's key.
+        id -> Integer,
+    }
+}
+
+/// A replica whose policy calls a SQL helper reading another table runs the
+/// helper as the table-valued function the bundle carries, on a connection
+/// the builder opened, for both the policy's `WITH CHECK` and its `USING`.
+#[test]
+fn builder_schema_registers_the_helpers_its_policies_call() {
+    let bundle = connetto_translate::translate::<String, connetto_core::bots::TextIds>(
+        connetto_translate::Documents::new(
+            "-- connetto:major 1
+CREATE TABLE public_ids (id INT PRIMARY KEY);
+CREATE TABLE docs (id INT PRIMARY KEY, label TEXT);",
+            "CREATE FUNCTION is_public(p_id INT) RETURNS BOOLEAN LANGUAGE sql STABLE
+    AS $$ SELECT EXISTS (SELECT 1 FROM public_ids WHERE id = p_id) $$;
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY docs_public ON docs USING (is_public(id)) WITH CHECK (is_public(id));",
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
+    )
+    .expect("translate the sources");
+    assert!(
+        !bundle.helper_functions().is_empty(),
+        "the translation calls the helper as a table-valued function"
+    );
+    let mut conn = ClientBuilder::new(
+        SyncSchema::new(bundle),
+        super::support::NeverDial::<FakeTransport>::default(),
+    )
+    .open_driven()
+    .expect("open the replica with the bundle's DDL");
+    diesel::insert_into(public_ids::table)
+        .values(public_ids::id.eq(1))
+        .execute(conn.conn())
+        .expect("mark row 1 public");
+    diesel::insert_into(docs::table)
+        .values((docs::id.eq(1), docs::label.eq("public")))
+        .execute(conn.conn())
+        .expect("the helper admits a public row");
+    let refused = diesel::insert_into(docs::table)
+        .values((docs::id.eq(2), docs::label.eq("private")))
+        .execute(conn.conn())
+        .expect_err("the helper refuses a row that is not public");
+    assert!(
+        pg2sqlite::prelude::is_policy_refusal(&refused.to_string()),
+        "the policy refused the row, not a missing function: {refused}"
+    );
+    diesel::delete(public_ids::table)
+        .execute(conn.conn())
+        .expect("take row 1 out of the public ids");
+    let visible: Vec<i32> = docs::table
+        .select(docs::id)
+        .load(conn.conn())
+        .expect("read through the policy view");
+    assert!(
+        visible.is_empty(),
+        "the helper hides a row no longer public"
+    );
+}
+
 fn major(value: u32) -> Major {
     Major::new(value).expect("a test major is from 1 up")
 }

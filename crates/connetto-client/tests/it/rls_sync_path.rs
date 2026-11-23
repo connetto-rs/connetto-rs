@@ -164,10 +164,8 @@ fn options() -> Pg2SqliteOptions {
             connetto_core::CALLER_FUNCTION,
         ))
         .with_rls_audit_table_name("rls_audit".to_string())
-        // The download boundary: connetto holds this function true while it
-        // applies server-authoritative data, so the fail-closed write guards
-        // admit rows the caller may see but not write.
-        .with_write_exemption_function(connetto_core::WRITE_EXEMPTION_FUNCTION)
+        // connetto holds this function true while it applies server-authoritative data.
+        .with_rls_exemption_function(connetto_core::WRITE_EXEMPTION_FUNCTION)
 }
 
 /// Emits the SQLite DDL, policy table pairs and policy views for `pg_ddl`.
@@ -393,15 +391,16 @@ async fn a_server_row_lands_and_the_view_still_filters() {
     );
 
     // The translation also emits an audit table with monitor triggers that
-    // fire when a row lands in the backing table without being visible through
-    // the view, which is precisely what bob's row just did. That write is
-    // connetto's replica machinery reacting to a server patch, so it must not
-    // be captured: uploading it would name a table Postgres does not have.
+    // record a row landing in the backing table without being visible through
+    // the view. The apply holds the exemption, under which the view shows
+    // every row as it does to the table owner, so bob's row leaves no audit
+    // entry. Nor is it captured, since uploading it would name a table
+    // Postgres does not have.
     let audited: i64 = rls_audit::table
         .count()
         .get_result(conn.conn())
         .expect("read the audit trail");
-    assert_eq!(audited, 1, "the monitor trigger fired for the hidden row");
+    assert_eq!(audited, 0, "the exempt apply records no hidden row");
     assert!(
         conn.push().await.expect("push").is_none(),
         "and nothing was captured for upload, because the apply suspends capture",

@@ -33,8 +33,9 @@ pub enum TierStepRefused {
 /// one value.
 ///
 /// Every build registers `uuidv4()`, because a synced column `DEFAULT` may
-/// call it and a device without a server still has to mint the id. The
-/// application adds its own functions with
+/// call it and a device without a server still has to mint the id. It also
+/// registers each helper the bundle's DDL calls as a table-valued function.
+/// The application adds its own functions with
 /// [`with_sql_functions`](Self::with_sql_functions).
 #[derive(Clone)]
 pub struct SyncSchema {
@@ -53,7 +54,7 @@ pub struct SyncSchema {
 }
 
 impl SyncSchema {
-    /// Wrap a translated schema and register `uuidv4()`.
+    /// Wrap a translated schema and register `uuidv4()` and its helpers.
     #[must_use]
     pub fn new(bundle: SchemaBundle) -> Self {
         let policy_tables = PolicyTables::from_translation(
@@ -63,10 +64,11 @@ impl SyncSchema {
                 .map(|(logical, physical)| (logical.as_str(), physical.as_str())),
             bundle.policy_views().iter().cloned(),
         );
+        let sql_functions = uuidv4_installer().merged(helper_installer(&bundle));
         Self {
             bundle,
             policy_tables,
-            sql_functions: uuidv4_installer(),
+            sql_functions,
             unrecorded: HashSet::new(),
             mirror_ddl: None,
             shared_store: true,
@@ -252,5 +254,19 @@ fn uuidv4_installer() -> SqlFunctions {
             diesel::sqlite::SqliteFunctionBehavior::INNOCUOUS,
             || uuid::Uuid::new_v4().into_bytes(),
         )
+    }))
+}
+
+/// The installer that registers the helpers `bundle`'s DDL calls as
+/// table-valued functions, none when it calls none.
+fn helper_installer(bundle: &SchemaBundle) -> SqlFunctions {
+    let functions = bundle.helper_functions().to_vec();
+    if functions.is_empty() {
+        return SqlFunctions::new();
+    }
+    SqlFunctions::new().with(Arc::new(move |conn| {
+        functions
+            .iter()
+            .try_for_each(|function| function.register(conn))
     }))
 }

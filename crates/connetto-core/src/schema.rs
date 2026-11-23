@@ -28,6 +28,7 @@
 use core::fmt;
 use core::num::NonZeroU32;
 
+pub use pg2sqlite_runtime::HelperFunction;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::UnsetSettings;
@@ -147,9 +148,8 @@ pub const UUID_FUNCTION: &str = "uuidv4";
 pub const AUDIT_TABLE: &str = "rls_audit";
 
 /// The SQLite function connetto registers on every replica connection and
-/// holds true only while applying its own writes, so the translation's
-/// fail-closed guards admit server data and refuse the application's direct
-/// writes to the backing tables.
+/// holds true only while applying its own writes, lifting the translation's
+/// row-level security for them as PostgreSQL lifts it for the table owner.
 pub const WRITE_EXEMPTION_FUNCTION: &str = "connetto_write_exempt";
 
 /// The domain tag every bundle hash starts with, so a bundle hash can never
@@ -184,6 +184,7 @@ pub struct SchemaBundle {
     shared_tables: Vec<String>,
     shared_layout: Option<SharedLayout>,
     connection_ddl: String,
+    helper_functions: Vec<HelperFunction<String>>,
     major: Major,
     tier_history: TierHistory,
     unset_settings: UnsetSettings,
@@ -374,6 +375,7 @@ impl SchemaBundle {
             ),
             local_tier_ddl,
             shared_tables: Vec::new(),
+            helper_functions: Vec::new(),
             shared_layout: None,
             connection_ddl: String::new(),
             major,
@@ -430,6 +432,27 @@ impl SchemaBundle {
     #[must_use]
     pub fn with_connection_ddl(mut self, ddl: impl Into<String>) -> Self {
         self.connection_ddl = ddl.into();
+        self
+    }
+
+    /// Return a copy of this bundle also carrying `functions`, helpers its DDL
+    /// calls as table-valued functions, each name kept once. The version is
+    /// unaffected, since each name hashes its function and the DDL calls it by
+    /// that name.
+    #[must_use]
+    pub fn with_helper_functions(
+        mut self,
+        functions: impl IntoIterator<Item = HelperFunction<String>>,
+    ) -> Self {
+        for function in functions {
+            if !self
+                .helper_functions
+                .iter()
+                .any(|held| held.name == function.name)
+            {
+                self.helper_functions.push(function);
+            }
+        }
         self
     }
 
@@ -530,6 +553,13 @@ impl SchemaBundle {
     #[must_use]
     pub fn connection_ddl(&self) -> &str {
         &self.connection_ddl
+    }
+
+    /// The helpers every replica connection registers before it runs any of
+    /// this bundle's DDL.
+    #[must_use]
+    pub fn helper_functions(&self) -> &[HelperFunction<String>] {
+        &self.helper_functions
     }
 
     /// The schema version this bundle presents at handshake.

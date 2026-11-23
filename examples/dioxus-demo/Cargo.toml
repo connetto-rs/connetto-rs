@@ -144,10 +144,12 @@ required-features = []
 # graph will not resolve. The sources and revisions must match the root ones
 # exactly. The demo lockfile pins the rest of the graph.
 [patch.crates-io]
-diesel = { git = "https://github.com/diesel-rs/diesel" }
+# pg2sqlite's helper functions need diesel#5395 and #5396, whose branch follows diesel main.
+diesel = { git = "https://github.com/diesel-rs/diesel", branch = "upstream/sqlite-table-valued-functions-dynamic" }
 # Live in diesel-rs, named as `diesel` is above, so they build against that one diesel.
-diesel-async = { git = "https://github.com/diesel-rs/diesel" }
-diesel-dynamic-schema = { git = "https://github.com/diesel-rs/diesel" }
+diesel-async = { git = "https://github.com/diesel-rs/diesel", branch = "upstream/sqlite-table-valued-functions-dynamic" }
+diesel-dynamic-schema = { git = "https://github.com/diesel-rs/diesel", branch = "upstream/sqlite-table-valued-functions-dynamic" }
+sqlstate = { git = "https://github.com/diesel-rs/diesel", branch = "upstream/sqlite-table-valued-functions-dynamic" }
 sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
 sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
 # Until a pg_walstream release emits a Relation event for every pgoutput

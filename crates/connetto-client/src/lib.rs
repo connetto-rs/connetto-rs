@@ -2608,23 +2608,16 @@ pub(crate) fn register_bot_list(
     .map_err(|e| ClientError::Session(format!("registering the bot list function: {e}")))
 }
 
-/// The SQLite function a translated schema's write guards call to let
-/// connetto's own writes land underneath the policy triggers.
+/// Registers [`connetto_core::WRITE_EXEMPTION_FUNCTION`] and
+/// [`outbox::UNRECORDED_FUNCTION`] backed by `flags`, on every replica
+/// connection whether or not the schema names them.
 ///
-/// pg2sqlite's write guards are fail-closed: a translation built with
-/// `with_write_exemption_function` names one function, and a backing-table
-/// write is admitted only while that function returns true. connetto holds it
-/// true exactly while it holds the write exemption, which is every write
-/// connetto authors itself: applying server-authoritative patches, rolling a
-/// refused mutation back, evicting uncovered rows, and its own bookkeeping.
-/// The application's writes always see it false, so the policy judges them.
-/// Register [`connetto_core::WRITE_EXEMPTION_FUNCTION`] and
-/// [`outbox::UNRECORDED_FUNCTION`] backed by `flags`.
-///
-/// A build that translates its schema with policies passes the same name to
-/// `Pg2SqliteOptions::with_write_exemption_function`. connetto registers the
-/// function on every replica connection it opens, whether or not the schema
-/// names it.
+/// A schema translated with `Pg2SqliteOptions::with_rls_exemption_function`
+/// under that name lifts its row-level security while the function answers
+/// true, for writes and reads alike, as PostgreSQL lifts it for the table
+/// owner. connetto holds it true exactly while it holds the write exemption,
+/// for every write it authors itself, and the application always sees it
+/// false.
 ///
 /// Nondeterministic on purpose: their values change between statements (the
 /// guards flip them), so SQLite must not hoist or cache them the way the
