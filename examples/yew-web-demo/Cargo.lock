@@ -832,7 +832,7 @@ dependencies = [
 [[package]]
 name = "diesel"
 version = "2.4.0"
-source = "git+https://github.com/diesel-rs/diesel?branch=upstream%2Fsqlite-table-valued-functions-dynamic#e598203dd02a6cc96b1d7521014fda9e588b532d"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#e598203dd02a6cc96b1d7521014fda9e588b532d"
 dependencies = [
  "bigdecimal",
  "bitflags",
@@ -855,7 +855,7 @@ dependencies = [
 [[package]]
 name = "diesel-dynamic-schema"
 version = "0.3.0"
-source = "git+https://github.com/diesel-rs/diesel?branch=upstream%2Fsqlite-table-valued-functions-dynamic#e598203dd02a6cc96b1d7521014fda9e588b532d"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#e598203dd02a6cc96b1d7521014fda9e588b532d"
 dependencies = [
  "diesel",
 ]
@@ -874,7 +874,7 @@ dependencies = [
 [[package]]
 name = "diesel_attribute_parser"
 version = "0.1.0"
-source = "git+https://github.com/diesel-rs/diesel?branch=upstream%2Fsqlite-table-valued-functions-dynamic#e598203dd02a6cc96b1d7521014fda9e588b532d"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#e598203dd02a6cc96b1d7521014fda9e588b532d"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -884,7 +884,7 @@ dependencies = [
 [[package]]
 name = "diesel_derives"
 version = "2.4.0"
-source = "git+https://github.com/diesel-rs/diesel?branch=upstream%2Fsqlite-table-valued-functions-dynamic#e598203dd02a6cc96b1d7521014fda9e588b532d"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#e598203dd02a6cc96b1d7521014fda9e588b532d"
 dependencies = [
  "diesel_attribute_parser",
  "diesel_table_macro_syntax",
@@ -897,7 +897,7 @@ dependencies = [
 [[package]]
 name = "diesel_table_macro_syntax"
 version = "0.4.0"
-source = "git+https://github.com/diesel-rs/diesel?branch=upstream%2Fsqlite-table-valued-functions-dynamic#e598203dd02a6cc96b1d7521014fda9e588b532d"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#e598203dd02a6cc96b1d7521014fda9e588b532d"
 dependencies = [
  "syn 3.0.10",
 ]
@@ -932,7 +932,7 @@ checksum = "117240f60069e65410b3ae1bb213295bd828f707b5bec6596a1afc8793ce0cbc"
 [[package]]
 name = "dsl_auto_type"
 version = "0.3.0"
-source = "git+https://github.com/diesel-rs/diesel?branch=upstream%2Fsqlite-table-valued-functions-dynamic#e598203dd02a6cc96b1d7521014fda9e588b532d"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#e598203dd02a6cc96b1d7521014fda9e588b532d"
 dependencies = [
  "darling",
  "either",
@@ -3638,7 +3638,7 @@ dependencies = [
 [[package]]
 name = "sqlstate"
 version = "0.2.0"
-source = "git+https://github.com/diesel-rs/diesel?branch=upstream%2Fsqlite-table-valued-functions-dynamic#e598203dd02a6cc96b1d7521014fda9e588b532d"
+source = "git+https://github.com/LucaCappelletti94/diesel?branch=future#e598203dd02a6cc96b1d7521014fda9e588b532d"
 
 [[package]]
 name = "stable_deref_trait"
