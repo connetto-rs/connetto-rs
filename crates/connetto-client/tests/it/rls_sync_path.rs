@@ -365,6 +365,31 @@ async fn pump_to_snapshot_end(conn: &mut ConnettoConnection<LoopbackTransport>) 
     }
 }
 
+/// Alice's connection subscribed to `orders` under `sub`, against a server
+/// that answers the subscription with one snapshot of `rows`.
+async fn subscribed_to_snapshot(
+    schema: SyncSchema,
+    rows: &'static [(i64, &'static str, i64)],
+) -> ConnettoConnection<LoopbackTransport> {
+    let (mut server, client_end) = loopback();
+    tokio::spawn(async move {
+        ack_handshake(&mut server).await;
+        wait_subscribe(&mut server).await;
+        send_snapshot(&mut server, "sub", rows, 1).await;
+        while let Ok(Some(_)) = server.recv().await {}
+    });
+
+    let mut conn = ClientBuilder::new(schema, super::support::Once::new(client_end))
+        .signed_in(super::support::held(ALICE))
+        .connect_driven()
+        .await
+        .expect("connect");
+    conn.subscribe("sub", "SELECT * FROM orders")
+        .await
+        .expect("subscribe");
+    conn
+}
+
 /// The table names a mutation frame carries, decompressed and parsed as the
 /// server's write target would.
 fn uploaded_tables(patch: &MutationPatch) -> Vec<String> {
@@ -388,23 +413,7 @@ fn uploaded_tables(patch: &MutationPatch) -> Vec<String> {
 /// apply did not simply bypass the split.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_server_row_lands_and_the_view_still_filters() {
-    let schema = translation();
-    let (mut server, client_end) = loopback();
-    tokio::spawn(async move {
-        ack_handshake(&mut server).await;
-        wait_subscribe(&mut server).await;
-        send_snapshot(&mut server, "sub", &[(1, ALICE, 5), (2, "bob", 7)], 1).await;
-        while let Ok(Some(_)) = server.recv().await {}
-    });
-
-    let mut conn = ClientBuilder::new(schema, super::support::Once::new(client_end))
-        .signed_in(super::support::held("alice"))
-        .connect_driven()
-        .await
-        .expect("connect");
-    conn.subscribe("sub", "SELECT * FROM orders")
-        .await
-        .expect("subscribe");
+    let mut conn = subscribed_to_snapshot(translation(), &[(1, ALICE, 5), (2, "bob", 7)]).await;
     pump_to_snapshot_end(&mut conn).await;
 
     let visible: Vec<i64> = orders::table
@@ -448,23 +457,7 @@ async fn a_server_row_lands_and_the_view_still_filters() {
 /// A readable server row is not rejudged under the local INSERT policy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn authoritative_shared_row_is_not_rejudged_as_a_local_insert() {
-    let schema = schema_for(SHARED_READ_DDL);
-    let (mut server, client_end) = loopback();
-    tokio::spawn(async move {
-        ack_handshake(&mut server).await;
-        wait_subscribe(&mut server).await;
-        send_snapshot(&mut server, "sub", &[(2, "bob", 7)], 1).await;
-        while let Ok(Some(_)) = server.recv().await {}
-    });
-
-    let mut conn = ClientBuilder::new(schema, super::support::Once::new(client_end))
-        .signed_in(super::support::held("alice"))
-        .connect_driven()
-        .await
-        .expect("connect");
-    conn.subscribe("sub", "SELECT * FROM orders")
-        .await
-        .expect("subscribe");
+    let mut conn = subscribed_to_snapshot(schema_for(SHARED_READ_DDL), &[(2, "bob", 7)]).await;
     pump_to_snapshot_end(&mut conn).await;
 
     let stored: Vec<i64> = orders_rls::table
@@ -522,23 +515,7 @@ async fn local_insert_still_obeys_the_owner_check() {
 /// replica` fires none, while a local insert still fires them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_delivered_row_fires_no_translated_trigger() {
-    let schema = schema_for(ORDER_LOG_DDL);
-    let (mut server, client_end) = loopback();
-    tokio::spawn(async move {
-        ack_handshake(&mut server).await;
-        wait_subscribe(&mut server).await;
-        send_snapshot(&mut server, "sub", &[(1, ALICE, 5)], 1).await;
-        while let Ok(Some(_)) = server.recv().await {}
-    });
-
-    let mut conn = ClientBuilder::new(schema, super::support::Once::new(client_end))
-        .signed_in(super::support::held(ALICE))
-        .connect_driven()
-        .await
-        .expect("connect");
-    conn.subscribe("sub", "SELECT * FROM orders")
-        .await
-        .expect("subscribe");
+    let mut conn = subscribed_to_snapshot(schema_for(ORDER_LOG_DDL), &[(1, ALICE, 5)]).await;
     pump_to_snapshot_end(&mut conn).await;
 
     let visible: Vec<i64> = orders::table
@@ -571,23 +548,7 @@ async fn a_delivered_row_fires_no_translated_trigger() {
 /// A nested ownership predicate has the same authoritative apply contract.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn authoritative_row_allowed_by_nested_ownership_is_not_rejudged_as_a_local_insert() {
-    let schema = schema_for(NESTED_OWNERSHIP_DDL);
-    let (mut server, client_end) = loopback();
-    tokio::spawn(async move {
-        ack_handshake(&mut server).await;
-        wait_subscribe(&mut server).await;
-        send_snapshot(&mut server, "sub", &[(1, "bob", 7)], 1).await;
-        while let Ok(Some(_)) = server.recv().await {}
-    });
-
-    let mut conn = ClientBuilder::new(schema, super::support::Once::new(client_end))
-        .signed_in(super::support::held("alice"))
-        .connect_driven()
-        .await
-        .expect("connect");
-    conn.subscribe("sub", "SELECT * FROM orders")
-        .await
-        .expect("subscribe");
+    let mut conn = subscribed_to_snapshot(schema_for(NESTED_OWNERSHIP_DDL), &[(1, "bob", 7)]).await;
     pump_to_snapshot_end(&mut conn).await;
 
     let stored: Vec<i64> = orders_rls::table
@@ -611,23 +572,7 @@ async fn authoritative_row_allowed_by_nested_ownership_is_not_rejudged_as_a_loca
 /// no live query over this table would ever refresh.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_changed_table_is_reported_under_its_logical_name() {
-    let schema = translation();
-    let (mut server, client_end) = loopback();
-    tokio::spawn(async move {
-        ack_handshake(&mut server).await;
-        wait_subscribe(&mut server).await;
-        send_snapshot(&mut server, "sub", &[(1, ALICE, 5)], 1).await;
-        while let Ok(Some(_)) = server.recv().await {}
-    });
-
-    let mut conn = ClientBuilder::new(schema, super::support::Once::new(client_end))
-        .signed_in(super::support::held("alice"))
-        .connect_driven()
-        .await
-        .expect("connect");
-    conn.subscribe("sub", "SELECT * FROM orders")
-        .await
-        .expect("subscribe");
+    let mut conn = subscribed_to_snapshot(translation(), &[(1, ALICE, 5)]).await;
 
     let mut changed: Vec<String> = Vec::new();
     loop {
