@@ -2119,12 +2119,9 @@ mod tests {
         let bundle =
             translate::<String, TextIds>(Documents::new(&schema_sql, policies_sql, ROLES, READER))
                 .expect("translates");
-        let [helper] = bundle.helper_functions() else {
-            panic!(
-                "the policy calls one helper: {:?}",
-                bundle.helper_functions()
-            );
-        };
+        let helpers = bundle.helper_functions();
+        assert_eq!(helpers.len(), 1, "the policy calls one helper: {helpers:?}");
+        let helper = &helpers[0];
         assert!(
             helper.body.contains("public_ids"),
             "the helper answers from the table it reads: {}",
