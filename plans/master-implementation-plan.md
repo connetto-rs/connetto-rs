@@ -1228,7 +1228,7 @@ Completion requires native and headless-browser proof of encrypted replica opens
 ## R108: caller kinds as database roles
 
 
-**Blocked on shared semantics in sql-traits and on R107's live catalog, for slices 2 to 5.** pg2sqlite and rls2fga each work out on their own which policies apply to a role, which privileges gate a command, what `current_user` means and how a session setting is typed and split, and an alignment review measured against PostgreSQL 18 found them disagreeing on each. The fix computes those answers once in sql-traits, as a deployment description (the login role, the acting role of each kind, each session setting's type, separator and whether it may be unset, merged as sql-traits #213), privileges per command and per column, and the policies PostgreSQL applies to an acting role per statement shape, and has both translators adopt them. rls2fga #93, #94 (`TO` settled against caller roles) and #95 (table privileges per role) are held and rebuilt on those answers, so each rule exists once. The server reads the roles, memberships, grants and helper functions its translation needs from the live database, through the `PgDieselDatabase` R107 loads at boot and reloads at each marker row, so slices 2 to 5 also wait on rls2fga translating that live model. The two bot kinds take effect once R99 gives bots their logins. Slice 1 is blocked on nothing.
+**Blocked on R99, for the two bot kinds.** pg2sqlite and rls2fga take the answers of which policies apply to a role, which privileges gate a command, what `current_user` means and how a session setting is typed and split from one deployment description in sql-traits (merged as sql-traits #213), with privileges per command and column and the policies PostgreSQL applies to an acting role, so each rule exists once. The server reads the roles, memberships, grants and helper functions its translation needs from the live database, through the `PgDieselDatabase` R107 loads at boot and reloads at each marker row ([#616](https://github.com/connetto-rs/connetto-rs/pull/616)). The `bot_installation`, `bot` and `delegated` kinds take effect once R99 gives bots their logins.
 
 **Changes state.** Client tables: none, but the build's schema bundle becomes one bundle per kind, and a client opens its replica with the bundle of its kind. Server tables: none of connetto's. The deployment adds a third document, its kind roles and their grants, which its migration applies and the build reads for each kind's client copy. Wire messages: a refusal reason naming a table and a kind, for a subscription and for a write. Archive format: none.
 
@@ -1264,8 +1264,8 @@ Every caller reaches Postgres through connetto's one reader role, and a policy t
 
 1. **Refusals before OpenFGA.** Step 1. Merged.
 2. **One deployment description.** Step 2, in two pull requests. The first builds the description from the roles document and hands it to both translators, and waits on subql's follow-up to rls2fga's acting roles, which every check now states. The second is the preflight refusals of the reader role. Merged as [#498](https://github.com/connetto-rs/connetto-rs/pull/498) and [#609](https://github.com/connetto-rs/connetto-rs/pull/609).
-3. **The kind roles.** Steps 3 to 5. Blocked on sql-traits' privileges and effective policies, both translators adopting them, and R107's live load and marker row.
-4. **The client copy per kind.** Step 6. Needs slice 3.
+3. **The kind roles.** Steps 3 to 5. In one pull request with slice 4. The two bot kinds take effect once R99 gives bots their logins.
+4. **The client copy per kind.** Step 6. In one pull request with slice 3.
 5. **Refusing what a kind lacks.** Step 7. Needs slices 3 and 4.
 6. **Unset settings bound empty.** Step 8. Merged as [#614](https://github.com/connetto-rs/connetto-rs/pull/614).
 

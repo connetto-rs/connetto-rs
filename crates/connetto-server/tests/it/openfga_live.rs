@@ -237,21 +237,21 @@ async fn a_note_that_does_not_refuse_is_logged_for_the_operator() {
     );
 }
 
-/// A policy for the reader role decides who sees a row, and a policy for a
+/// A policy for the signed-in kind decides who sees a row, and a policy for a
 /// role outside connetto serves no caller, is left out of the model and is
 /// reported to the operator naming the policy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_reader_policy_decides_and_an_outside_role_policy_is_reported_and_left_out() {
+async fn a_kind_policy_decides_and_an_outside_role_policy_is_reported_and_left_out() {
     let fixture = Fixture::acquire().await;
     let (channel, store) = fixture.fga_store().await;
     let (translated, lines) = with_capture(
-        "a_reader_policy_decides_and_an_outside_role_policy_is_reported_and_left_out",
+        "a_kind_policy_decides_and_an_outside_role_policy_is_reported_and_left_out",
         |capture| async move {
             let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
                 connetto_translate::Documents::new(
                     SCHEMA,
                     "ALTER TABLE r5b_notes ENABLE ROW LEVEL SECURITY;\n\
-                     CREATE POLICY r5b_notes_reader ON r5b_notes FOR ALL TO app_reader \
+                     CREATE POLICY r5b_notes_reader ON r5b_notes FOR ALL TO authenticated \
                        USING (owner = current_setting('app.user_id', true));\n\
                      CREATE POLICY r5b_notes_staff ON r5b_notes FOR ALL TO support_staff \
                        USING (true);",
@@ -279,7 +279,7 @@ async fn a_reader_policy_decides_and_an_outside_role_policy_is_reported_and_left
     );
     assert!(
         !warned("r5b_notes_reader"),
-        "the reader's own policy is not: {lines:?}"
+        "the signed-in kind's own policy is not: {lines:?}"
     );
 
     let mut setup = OpenFgaServiceClient::new(channel.clone());

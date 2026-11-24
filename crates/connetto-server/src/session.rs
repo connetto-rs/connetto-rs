@@ -3706,6 +3706,7 @@ where
         let mut materializer = self.materializer.lock().await;
         match materializer.register_translated(
             consumer_id,
+            None,
             sql,
             &binds,
             None,
@@ -3921,6 +3922,7 @@ where
         let mut materializer = self.materializer.lock().await;
         match materializer.register_translated(
             consumer_id,
+            None,
             sql,
             binds,
             None,
@@ -9900,6 +9902,7 @@ where
         state: &SessionState<Id, Key>,
     ) -> Result<Registered, SubscribeRefusal> {
         let mut materializer = self.materializer.lock().await;
+        let kind = state.principal.kind();
         let pg_sql = materializer.translate_subscription_sql(&sub.spec.query)?;
         // The rule's caller-reading term only describes when the caller is stated.
         let subscriber = state
@@ -9918,7 +9921,14 @@ where
         // re-raises anything genuinely refused, term problems included, since
         // subql describes and registers through one compile path.
         let terms = materializer
-            .describe_terms(consumer_id, &pg_sql, &sub.spec.binds, subscriber, subjects)
+            .describe_terms(
+                consumer_id,
+                kind,
+                &pg_sql,
+                &sub.spec.binds,
+                subscriber,
+                subjects,
+            )
             .unwrap_or_default();
         let member_tables = member_tables_of(&terms, materializer.catalog())?;
         let seed = self.seed_for_terms(&terms, state).await?;
@@ -9930,6 +9940,7 @@ where
         let viewer = self.viewer_read_setup(state);
         let registration = materializer.register_translated(
             consumer_id,
+            Some(kind),
             &pg_sql,
             &sub.spec.binds,
             seed,
@@ -12237,6 +12248,7 @@ mod tests {
             let translator = rls2fga::translator::TranslatorBuilder::new(
                 connetto_translate::deployment::<String>(
                     READER,
+                    connetto_core::KindRoles::defaults(),
                     connetto_core::auth::UnsetSettings::ALWAYS_BOUND,
                 )
                 .expect("the test deployment's description holds"),
@@ -12248,6 +12260,7 @@ mod tests {
                 .with_caller(
                     crate::materializer::CallerMappings::of::<String>(
                         READER,
+                        connetto_core::KindRoles::defaults(),
                         connetto_core::auth::UnsetSettings::ALWAYS_BOUND,
                     )
                     .expect("the test deployment's description holds"),
@@ -12258,7 +12271,14 @@ mod tests {
                 .translate_subscription_sql(&format!("SELECT * FROM docs WHERE {filter}"))
                 .expect("the caller function reverse translates");
             let terms = materializer
-                .describe_terms(1, &pg_sql, &[], None, Vec::new())
+                .describe_terms(
+                    1,
+                    connetto_core::CallerKind::Authenticated,
+                    &pg_sql,
+                    &[],
+                    None,
+                    Vec::new(),
+                )
                 .expect("the membership term describes");
             let member_tables = super::member_tables_of(&terms, materializer.catalog());
             (terms.len(), member_tables)

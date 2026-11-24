@@ -47,9 +47,11 @@ fn schema() -> SyncSchema {
         SchemaBundle::new(
             "-- connetto:major 1",
             "",
-            SQLITE_DDL,
-            Vec::<(String, String)>::new(),
-            vec!["visible".to_owned()],
+            connetto_core::ReplicaCopy::new(
+                SQLITE_DDL,
+                Vec::<(String, String)>::new(),
+                vec!["visible".to_owned()],
+            ),
             None::<&str>,
         )
         .expect("the source declares major 1"),

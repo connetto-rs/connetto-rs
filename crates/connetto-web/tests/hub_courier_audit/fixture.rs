@@ -311,11 +311,7 @@ impl Harness {
         content: Option<ContentArchive<BrowserStore>>,
     ) -> (Self, Peer) {
         let (initial, peer) = upstream(bound, true, false);
-        let schema = SyncSchema::new(SchemaBundle::new(
-            "-- connetto:major 1", "",
-            "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT); CREATE TABLE photos (id INTEGER PRIMARY KEY, content_id BLOB NOT NULL)",
-            Vec::<(String, String)>::new(), Vec::<String>::new(), None::<&str>,
-        ).expect("audit schema"));
+        let schema = SyncSchema::new(SchemaBundle::new("-- connetto:major 1", "", connetto_core::ReplicaCopy::new("CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT); CREATE TABLE photos (id INTEGER PRIMARY KEY, content_id BLOB NOT NULL)", Vec::<(String, String)>::new(), Vec::<String>::new()), None::<&str>).expect("audit schema"));
         let worker = bound
             .run(
                 "initial upstream handshake",

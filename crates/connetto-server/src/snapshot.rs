@@ -302,6 +302,14 @@ mod pg {
             self
         }
 
+        /// Switch every caller's transaction to the role `kind_roles` names
+        /// for the caller's kind. A source on the owner pool names none.
+        #[must_use]
+        pub fn with_kind_roles(mut self, kind_roles: connetto_core::KindRoles) -> Self {
+            self.binding = self.binding.with_kind_roles(kind_roles);
+            self
+        }
+
         /// Name the publication the change stream reads, so a membership
         /// term's table can be verified as replicated at registration (R27).
         #[must_use]

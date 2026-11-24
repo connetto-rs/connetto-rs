@@ -67,6 +67,7 @@ fn options() -> Pg2SqliteOptions {
         .with_deployment(
             connetto_translate::deployment::<String>(
                 connetto_test_harness::FIXTURE_READER,
+                connetto_core::KindRoles::defaults(),
                 connetto_translate::UnsetSettings::ALWAYS_BOUND,
             )
             .expect("the deployment description builds"),

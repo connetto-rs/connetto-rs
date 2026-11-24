@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::schema::ConnettoSchema;
-use connetto_core::auth::Principal;
+use connetto_core::auth::{KindRoles, Principal};
 use diesel::QueryableByName;
 use diesel::pg::Pg;
 use diesel::query_builder::{BoxedSqlQuery, SqlQuery};
@@ -142,9 +142,9 @@ pub struct SubjectNaming {
     /// parameter spelled like a grantee column. Reading that as a grantee would
     /// announce a move to one bearer and leave the row on every other device.
     gated_keys: BTreeMap<String, String>,
-    /// The PostgreSQL role every request acts as, the deployment's reader
-    /// role, which every check states as the caller's acting role.
-    acting_role: String,
+    /// The PostgreSQL role each kind of caller acts as, which every check
+    /// states as the caller's acting role.
+    kind_roles: KindRoles,
 }
 
 impl SubjectNaming {
@@ -166,7 +166,7 @@ impl SubjectNaming {
     fn resolve<Key: CapabilityKey>(
         shapes: &Shapes<ParserDB>,
         relations: &[RelationShapes],
-        acting_role: &str,
+        kind_roles: &KindRoles,
     ) -> Self {
         let subjects_parameter = shapes
             .required_parameters()
@@ -197,7 +197,7 @@ impl SubjectNaming {
             subjects_parameter,
             bot_list_parameter,
             gated_keys,
-            acting_role: acting_role.to_owned(),
+            kind_roles: kind_roles.clone(),
         }
     }
 
@@ -324,9 +324,11 @@ where
     }
 
     /// rls2fga gates every relation on the acting role, PUBLIC policies
-    /// included, so a check that left it out would be denied.
+    /// included, so a check that left it out would be denied. The role is the
+    /// caller's kind, which belongs to the connection rather than to the
+    /// person, so it rides every check instead of being stored as a fact.
     fn acting_role(&self) -> Option<&str> {
-        Some(&self.naming.acting_role)
+        Some(self.naming.kind_roles.role(self.principal.kind()))
     }
 
     fn request_value(&self, parameter: &str, out: &mut RequestValues) -> bool {
@@ -661,8 +663,8 @@ pub struct Translated {
     policy_tables: Vec<String>,
     reach: Arc<GrantReach>,
     outputs: Arc<rls2fga::translator::Outputs>,
-    resolve_subjects: fn(&Shapes<ParserDB>, &[RelationShapes], &str) -> SubjectNaming,
-    reader_role: String,
+    resolve_subjects: fn(&Shapes<ParserDB>, &[RelationShapes], &KindRoles) -> SubjectNaming,
+    kind_roles: KindRoles,
     /// The tables each policy reads, which a weakened replica identity
     /// refuses together with the table it weakened on (R107 decision 10).
     policy_reads: Vec<rls2fga::types::PolicyReads>,
@@ -699,6 +701,7 @@ impl Translated {
             .map_err(|err| SetupError::Catalog(err.to_string()))?;
         let deployment = connetto_translate::deployment::<Key>(
             documents.reader_role(),
+            documents.kind_roles(),
             documents.unset_settings(),
         )
         .map_err(|err| SetupError::Catalog(err.to_string()))?;
@@ -709,7 +712,7 @@ impl Translated {
         let translation = translator
             .translate(&catalog)
             .map_err(|err| SetupError::Unplannable(err.to_string()))?;
-        warn_outside_policies(&catalog, documents.reader_role());
+        warn_outside_policies(&catalog, documents.kind_roles());
         let relations = translation.relations().to_vec();
         let naming = translation.row_naming().to_vec();
         let resulting = translation.resulting_rows().to_vec();
@@ -778,7 +781,7 @@ impl Translated {
         let subjects = Arc::new(SubjectNaming::resolve::<Key>(
             &shapes,
             &relations,
-            documents.reader_role(),
+            documents.kind_roles(),
         ));
 
         Ok(Self {
@@ -791,7 +794,7 @@ impl Translated {
             reach: Arc::new(reach),
             outputs: Arc::new(outputs),
             resolve_subjects: SubjectNaming::resolve::<Key>,
-            reader_role: documents.reader_role().to_owned(),
+            kind_roles: documents.kind_roles().clone(),
             policy_reads,
         })
     }
@@ -1255,24 +1258,26 @@ fn warn_operator_notes(notes: &[TranslationNote]) {
     }
 }
 
-/// Warn of every policy the reader role is not subject to, naming the policy
-/// and its table.
+/// Warn of every policy no kind role is subject to, naming the policy and its
+/// table.
 ///
-/// Every caller acts as the reader role, so such a policy, one for an
+/// Every caller acts as its kind's role, so such a policy, one for an
 /// administration tool that logs in outside connetto for instance, serves
 /// none of connetto's callers, and both the model and the replica leave it
-/// out. Whether the role is subject to it is sql-traits' answer, the one
-/// both translations settle the `TO` clause with.
-fn warn_outside_policies(catalog: &ParserDB, reader_role: &str) {
+/// out. Whether a role is subject to it is sql-traits' answer, the one both
+/// translations settle the `TO` clause with.
+fn warn_outside_policies(catalog: &ParserDB, kind_roles: &KindRoles) {
     use sql_traits::prelude::{DatabaseLike as _, PolicyLike as _};
 
-    let Some(reader) = catalog.role(reader_role) else {
-        return;
-    };
-    for policy in catalog
-        .policies()
-        .filter(|policy| !policy.applies_to_role(reader, catalog))
-    {
+    let roles: Vec<_> = kind_roles
+        .iter()
+        .filter_map(|(_, role)| catalog.role(role))
+        .collect();
+    for policy in catalog.policies().filter(|policy| {
+        !roles
+            .iter()
+            .any(|role| policy.applies_to_role(role, catalog))
+    }) {
         tracing::warn!(
             subject = %policy.name(),
             table = %policy.table_name,
@@ -2773,6 +2778,7 @@ mod tests {
         assert!(
             crate::CallerMappings::of::<OnIdentity>(
                 "app_reader",
+                connetto_core::KindRoles::defaults(),
                 connetto_core::auth::UnsetSettings::ALWAYS_BOUND,
             )
             .is_err()

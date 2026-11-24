@@ -183,9 +183,11 @@ async fn seed_replica_with_tier(
         SchemaBundle::new(
             SOURCE,
             "",
-            SQLITE_DDL,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                SQLITE_DDL,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             Some(TIER_DDL),
         )
         .expect("the source declares major 1"),
@@ -628,9 +630,7 @@ CREATE VIEW orders AS SELECT id, owner_id FROM orders_rls WHERE owner_id = curre
         SchemaBundle::new(
             SOURCE,
             "",
-            ddl,
-            vec![("orders", "orders_rls")],
-            vec!["orders"],
+            connetto_core::ReplicaCopy::new(ddl, vec![("orders", "orders_rls")], vec!["orders"]),
             None::<&str>,
         )
         .expect("the source declares major 1"),

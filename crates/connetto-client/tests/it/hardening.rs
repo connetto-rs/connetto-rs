@@ -183,9 +183,11 @@ async fn a_tier_rests_at_one_attached_database_and_stays_writable() {
         SchemaBundle::new(
             SOURCE,
             "",
-            DDL,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                DDL,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             Some(TIER_DDL),
         )
         .expect("the source declares major 1"),
@@ -272,9 +274,11 @@ async fn a_missing_tier_file_fails_the_open_rather_than_appearing() {
         SchemaBundle::new(
             SOURCE,
             "",
-            DDL,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                DDL,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             Some(TIER_DDL),
         )
         .expect("the source declares major 1"),
@@ -483,9 +487,11 @@ async fn a_tier_script_may_lead_with_a_pragma() {
         SchemaBundle::new(
             SOURCE,
             "",
-            DDL,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                DDL,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             Some(PRAGMA_LED_TIER_DDL),
         )
         .expect("the source declares major 1"),

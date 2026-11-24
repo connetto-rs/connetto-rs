@@ -63,6 +63,9 @@ impl Deployment {
             .await;
         provision_cap_policies(fixture.admin(), SCHEMA, POLICIES).await;
         fixture
+            .setup_roles(connetto_test_harness::FIXTURE_ROLES)
+            .await;
+        fixture
             .start_replication(&["docs", "project_members", "papers", "shares"])
             .await;
         fixture.provision_auth_tables().await;

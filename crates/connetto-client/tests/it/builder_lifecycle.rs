@@ -130,9 +130,11 @@ fn schema() -> SyncSchema {
         SchemaBundle::new(
             "-- connetto:major 1\nCREATE TABLE items (id INT PRIMARY KEY, label TEXT);",
             "",
-            DDL,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                DDL,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             None::<&str>,
         )
         .expect("the source declares major 1"),

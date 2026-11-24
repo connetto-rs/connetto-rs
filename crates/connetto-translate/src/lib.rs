@@ -49,9 +49,12 @@ pub use connetto_core::bots::{TextIds, UuidIds};
 use connetto_core::sql::quote_ident;
 use connetto_core::{
     AUDIT_TABLE, BOT_LIST_FUNCTION, BOT_LIST_SEPARATOR, BOT_LIST_SETTING, BOT_LIST_WILDCARD,
-    CALLER_FUNCTION, HelperFunction, SUBJECTS_FUNCTION, SchemaBundle, SharedLayout, UUID_FUNCTION,
-    WRITE_EXEMPTION_FUNCTION,
+    CALLER_FUNCTION, HelperFunction, ReplicaCopy, SUBJECTS_FUNCTION, SchemaBundle, SharedLayout,
+    UUID_FUNCTION, WRITE_EXEMPTION_FUNCTION,
 };
+/// The caller kinds and the roles they act as, which build scripts pass to
+/// `emit` through [`Documents`], re-exported beside it.
+pub use connetto_core::{CallerKind, KindRoles};
 use diesel::connection::SimpleConnection;
 use diesel::{Connection, SqliteConnection};
 use pg2sqlite::manifest::WrapperKind;
@@ -451,8 +454,8 @@ pub fn shared_tables<Id: BotRegistryIdSql>(
 }
 
 /// The deployment description both translators read, built once here: the
-/// reader role the server logs in as and acts as, and the three session
-/// settings connetto binds on every request.
+/// reader role the server logs in as, the role each kind of caller acts as,
+/// and the three session settings connetto binds on every request.
 ///
 /// The server binds every setting on every request. A half the caller does
 /// not hold takes [`connetto_core::auth::absent_marker`], and the setting is
@@ -464,10 +467,12 @@ pub fn shared_tables<Id: BotRegistryIdSql>(
 ///
 /// # Errors
 ///
-/// [`SchemaError::Deployment`] when the description cannot hold, which only a
-/// capability key whose setting name collides with another setting reaches.
+/// [`SchemaError::Deployment`] when the description cannot hold, which a
+/// capability key whose setting name collides with another setting reaches,
+/// and two kinds acting as the same role.
 pub fn deployment<K: CapabilityKey>(
     reader_role: &str,
+    kind_roles: &KindRoles,
     unset: UnsetSettings,
 ) -> Result<Deployment, SchemaError> {
     let set = |separator: char| SettingValue::Set {
@@ -483,7 +488,7 @@ pub fn deployment<K: CapabilityKey>(
     };
     Ok(Deployment::new(
         reader_role,
-        [reader_role],
+        kind_roles.iter().map(|(_, role)| role),
         [
             presence(
                 SessionSetting::value(
@@ -505,9 +510,9 @@ pub fn deployment<K: CapabilityKey>(
     )?)
 }
 
-/// A deployment's three Postgres source documents, the role connetto reads
-/// and writes as, which the roles document creates, and which caller
-/// settings a request may leave unset.
+/// A deployment's three Postgres source documents, the role connetto logs in
+/// as, the role each kind of caller acts as, all of which the roles document
+/// creates, and which caller settings a request may leave unset.
 ///
 /// The roles document holds the deployment's `CREATE ROLE` statements and
 /// its grants on the tables the schema declares, and both translators read
@@ -519,26 +524,31 @@ pub struct Documents<'a> {
     policies: &'a str,
     roles: &'a str,
     reader_role: &'a str,
+    kind_roles: &'a KindRoles,
     unset_settings: UnsetSettings,
 }
 
 impl<'a> Documents<'a> {
     /// The schema, the policies and the roles documents, and the reader role
-    /// the roles document creates, with both caller settings always bound.
+    /// the roles document creates, with each kind acting as its default role
+    /// and both caller settings always bound.
     #[must_use]
-    pub const fn new(
-        schema: &'a str,
-        policies: &'a str,
-        roles: &'a str,
-        reader_role: &'a str,
-    ) -> Self {
+    pub fn new(schema: &'a str, policies: &'a str, roles: &'a str, reader_role: &'a str) -> Self {
         Self {
             schema,
             policies,
             roles,
             reader_role,
+            kind_roles: KindRoles::defaults(),
             unset_settings: UnsetSettings::ALWAYS_BOUND,
         }
+    }
+
+    /// The same documents, each kind acting as the role `kind_roles` names.
+    #[must_use]
+    pub const fn with_kind_roles(mut self, kind_roles: &'a KindRoles) -> Self {
+        self.kind_roles = kind_roles;
+        self
     }
 
     /// The same documents, declaring which caller settings a request may
@@ -568,10 +578,16 @@ impl<'a> Documents<'a> {
         self.roles
     }
 
-    /// The role connetto logs in and acts as.
+    /// The role connetto logs in as.
     #[must_use]
     pub const fn reader_role(&self) -> &'a str {
         self.reader_role
+    }
+
+    /// The role each kind of caller acts as.
+    #[must_use]
+    pub const fn kind_roles(&self) -> &'a KindRoles {
+        self.kind_roles
     }
 
     /// Which caller settings a request may leave unset.
@@ -591,36 +607,38 @@ impl<'a> Documents<'a> {
 /// which fixes the subjects setting and separator the deployment declares.
 /// The documents are translated in the order a migration applies them,
 /// schema, roles, policies, then the [`cap_policies`] the schema and policies
-/// generate, so the replica holds the cap its Postgres source holds. The
-/// replica is translated as the reader
-/// role, so its policies and grants are the ones PostgreSQL applies to the
-/// reader. The schema reaches the replica translation without its
-/// references, which the server alone enforces, while the bundle keeps the
-/// source as written. The replica DDL is applied to a throwaway in-memory
-/// database first, so a translation SQLite refuses is an error here rather
-/// than a boot-time failure on the client.
+/// generate, so the replica holds the cap its Postgres source holds. Each
+/// kind's copy is translated as the role that kind acts as, so its policies
+/// and grants are the ones PostgreSQL applies to that kind's callers, and
+/// kinds whose translations are equal share one copy. The schema reaches the
+/// replica translation without its references, which the server alone
+/// enforces, while the bundle keeps the source as written. Every copy's DDL
+/// is applied to a throwaway in-memory database first, so a translation
+/// SQLite refuses is an error here rather than a boot-time failure on the
+/// client.
 ///
 /// # Errors
 ///
 /// [`SchemaError::Translate`] when a source does not parse or the translation
-/// fails, a roles document that never creates the reader role among them,
+/// fails, a roles document that never creates the reader role or a kind's
+/// role among them, [`SchemaError::Deployment`] as [`deployment`],
 /// [`SchemaError::Major`] when the schema source does not declare its
-/// major, and [`SchemaError::Sqlite`] when the replica DDL is not accepted.
+/// major, and [`SchemaError::Sqlite`] when a replica DDL is not accepted.
 pub fn translate<K: CapabilityKey, Id: BotRegistryIdSql>(
     documents: Documents<'_>,
 ) -> Result<SchemaBundle, SchemaError> {
-    translated::<K, Id>(documents, &[])
+    translated::<K, Id>(documents, &[], &[])
 }
 
 /// Translate a deployment's source documents with connetto's fixed options,
 /// placing the validated `shared` tables in a separate `connetto_shared` store.
 ///
 /// As [`translate`], but first checks `shared` under [`shared_tables`] and
-/// compiles the shared store's four lifecycle programs from a second
-/// translation that places those tables in the `connetto_shared` schema. The
-/// bundle carries the shared tables and the layout beside the unshared
-/// replica DDL; the version is the unshared one, since where a device stores a
-/// table changes nothing on the wire.
+/// compiles each copy's four shared store lifecycle programs from a second
+/// translation that places those tables in the `connetto_shared` schema. Each
+/// copy carries the shared tables and the layout beside the unshared replica
+/// DDL. The version is the unshared one, since where a device stores a table
+/// changes nothing on the wire.
 ///
 /// # Errors
 ///
@@ -631,18 +649,20 @@ pub fn translate_shared<K: CapabilityKey, Id: BotRegistryIdSql>(
     shared: &[&str],
 ) -> Result<SchemaBundle, SchemaError> {
     let shared = shared_tables::<Id>(documents.schema, shared)?;
-    translated::<K, Id>(documents, &shared)
+    translated::<K, Id>(documents, &shared, &[])
 }
 
-/// The shared step behind [`translate`] and [`translate_shared`]: translate
-/// the synced tier, and when `shared` is non-empty compile its layout.
+/// The shared step behind [`translate`], [`translate_shared`] and [`emit`]:
+/// translate the synced tier once per kind, compile each copy's layout when
+/// `shared` is non-empty, and give every copy the local tier's
+/// `tier_functions` beside its own helpers.
 fn translated<K: CapabilityKey, Id: BotRegistryIdSql>(
     documents: Documents<'_>,
     shared: &[String],
+    tier_functions: &[HelperFunction<String>],
 ) -> Result<SchemaBundle, SchemaError> {
     let schema_sql = with_registry::<Id>(documents.schema);
     let policies_sql = documents.policies;
-    let options = replica_options::<K>(documents.reader_role, documents.unset_settings)?;
     let mut translator = parsed_documents(&without_references(&schema_sql)?, "")?;
     let cap = cap_policies_inner(&schema_sql, policies_sql)?;
     // In the order a migration applies them: a role exists before a policy
@@ -654,6 +674,41 @@ fn translated<K: CapabilityKey, Id: BotRegistryIdSql>(
                 .map_err(|err| SchemaError::Translate(err.to_string()))?;
         }
     }
+    let mut distinct: Vec<std::sync::Arc<ReplicaCopy>> = Vec::with_capacity(CallerKind::ALL.len());
+    let mut held = Vec::with_capacity(CallerKind::ALL.len());
+    for kind in CallerKind::ALL {
+        let copy = kind_copy::<K>(&translator, documents, kind, shared)?
+            .with_helper_functions(tier_functions.iter().cloned());
+        let copy = if let Some(seen) = distinct.iter().find(|seen| ***seen == copy) {
+            std::sync::Arc::clone(seen)
+        } else {
+            let copy = std::sync::Arc::new(copy);
+            distinct.push(std::sync::Arc::clone(&copy));
+            copy
+        };
+        held.push((kind, copy));
+    }
+    let mut held = held.into_iter();
+    let (_, first) = held.next().expect("CallerKind::ALL names every kind");
+    let bundle = SchemaBundle::new(schema_sql, policies_sql, first, None::<&str>)?
+        .with_unset_settings(documents.unset_settings);
+    Ok(held.fold(bundle, |bundle, (kind, copy)| bundle.with_copy(kind, copy)))
+}
+
+/// The copy a caller of `kind` opens, translated as the role that kind acts
+/// as, with its shared store layout when `shared` is non-empty.
+fn kind_copy<K: CapabilityKey>(
+    translator: &Pg2Sqlite,
+    documents: Documents<'_>,
+    kind: CallerKind,
+    shared: &[String],
+) -> Result<ReplicaCopy, SchemaError> {
+    let options = kind_options::<K>(
+        documents.reader_role,
+        documents.kind_roles,
+        documents.unset_settings,
+        kind,
+    )?;
     let report = translator
         .translate_with_report(&options)
         .map_err(|err| SchemaError::Translate(err.to_string()))?;
@@ -669,18 +724,10 @@ fn translated<K: CapabilityKey, Id: BotRegistryIdSql>(
         .map(|entry| (entry.logical.clone(), entry.physical.clone()))
         .collect::<Vec<(String, String)>>();
     let views = view_names(report.script.iter());
-    let mut bundle = SchemaBundle::new(
-        schema_sql,
-        policies_sql,
-        replica_ddl,
-        pairs,
-        views,
-        None::<&str>,
-    )?
-    .with_connection_ddl(connection_ddl)
-    .with_helper_functions(helper_functions(report.script))
-    .with_shared_tables(shared.iter().cloned())
-    .with_unset_settings(documents.unset_settings);
+    let mut copy = ReplicaCopy::new(replica_ddl, pairs, views)
+        .with_connection_ddl(connection_ddl)
+        .with_helper_functions(helper_functions(report.script))
+        .with_shared_tables(shared.iter().cloned());
     if !shared.is_empty() {
         let shared_options =
             options.with_attached_tables("connetto_shared", shared.iter().cloned());
@@ -688,11 +735,11 @@ fn translated<K: CapabilityKey, Id: BotRegistryIdSql>(
             .translate_with_report(&shared_options)
             .map_err(|err| SchemaError::Translate(err.to_string()))?;
         let layout = shared_layout(&shared_report.script)?;
-        bundle = bundle
+        copy = copy
             .with_shared_layout(layout)
             .with_helper_functions(helper_functions(shared_report.script));
     }
-    Ok(bundle)
+    Ok(copy)
 }
 
 /// `schema_sql` with every column `REFERENCES` and table `FOREIGN KEY` clause
@@ -966,11 +1013,13 @@ fn rerun_history(dir: &Path) -> Result<(), SchemaError> {
 
 /// The build-script entry point.
 ///
-/// Reads the three Postgres source documents, translates the synced tier as
-/// `reader_role` and,
+/// Reads the three Postgres source documents, `sources` holding the schema,
+/// the policies and the roles documents in that order, translates the synced
+/// tier once per kind as the role `kind_roles` names for it, with
+/// `reader_role` the role connetto logs in as and,
 /// when a [`TierSource`] is given, the deployment's own local tier as a
 /// separate reference universe and the tier history its exports hold,
-/// validates both DDLs against a throwaway SQLite database, checks `shared`
+/// validates every DDL against a throwaway SQLite database, checks `shared`
 /// under [`shared_tables`], and writes `connetto-translate.rs` under `OUT_DIR`.
 /// It prints `cargo::rerun-if-changed` for every file it reads, the history
 /// directory's files included.
@@ -984,12 +1033,10 @@ fn rerun_history(dir: &Path) -> Result<(), SchemaError> {
 /// let version = bundle.version();
 /// ```
 ///
-/// The module also exposes the translated documents as `pub const` strings
-/// (`SCHEMA_SOURCE`, `POLICIES_SOURCE`, `REPLICA_DDL`, `CAP_POLICIES`, and
-/// `LOCAL_TIER_DDL` when the build has a local tier), so a `const` context
-/// such as `concat!` can use them without re-deriving the bundle. `emit` also
-/// writes the cap document to `connetto-cap-policies.sql` in `OUT_DIR`, the
-/// SQL the deployment applies beside its schema and policies.
+/// The module writes each distinct kind's copy once, and `bundle()` hands
+/// every kind holding it the same shared copy. `emit` also writes the cap
+/// document to `connetto-cap-policies.sql` in `OUT_DIR`, the SQL the
+/// deployment applies beside its schema and policies.
 ///
 /// # Errors
 ///
@@ -999,18 +1046,18 @@ fn rerun_history(dir: &Path) -> Result<(), SchemaError> {
 /// [`SchemaError::TierHistory`] when the history does not reach the bundle's
 /// major.
 pub fn emit<K: CapabilityKey, Id: BotRegistryIdSql>(
-    schema: &Path,
-    policies: &Path,
-    roles: &Path,
+    sources: [&Path; 3],
     reader_role: &str,
+    kind_roles: &KindRoles,
     unset_settings: UnsetSettings,
     tier: Option<&TierSource>,
     shared: &[&str],
 ) -> Result<(), SchemaError> {
     let out_dir = std::env::var("OUT_DIR").map_err(|_| SchemaError::MissingOutDir)?;
     emit_to::<K, Id>(
-        [schema, policies, roles],
+        sources,
         reader_role,
+        kind_roles,
         unset_settings,
         tier,
         shared,
@@ -1019,8 +1066,7 @@ pub fn emit<K: CapabilityKey, Id: BotRegistryIdSql>(
 }
 
 /// The body of [`emit`], its output directory supplied, so a test can run
-/// the step without a build script. `sources` are the schema, policies and
-/// roles documents, in that order.
+/// the step without a build script.
 ///
 /// # Errors
 ///
@@ -1028,6 +1074,7 @@ pub fn emit<K: CapabilityKey, Id: BotRegistryIdSql>(
 pub(crate) fn emit_to<K: CapabilityKey, Id: BotRegistryIdSql>(
     sources: [&Path; 3],
     reader_role: &str,
+    kind_roles: &KindRoles,
     unset_settings: UnsetSettings,
     tier: Option<&TierSource>,
     shared: &[&str],
@@ -1046,18 +1093,28 @@ pub(crate) fn emit_to<K: CapabilityKey, Id: BotRegistryIdSql>(
         std::fs::read_to_string(sources[2])?,
     ];
     let cap = cap_policies::<Id>(&schema_sql, &policies_sql)?;
-    let mut bundle = translate_shared::<K, Id>(
+    let shared = shared_tables::<Id>(&schema_sql, shared)?;
+    let tier = match tier {
+        Some(tier) => Some((
+            tier,
+            translate_tier(&std::fs::read_to_string(tier.source())?)?,
+        )),
+        None => None,
+    };
+    let tier_functions = tier
+        .as_ref()
+        .map_or(&[][..], |(_, (_, functions))| functions);
+    let mut bundle = translated::<K, Id>(
         Documents::new(&schema_sql, &policies_sql, &roles_sql, reader_role)
+            .with_kind_roles(kind_roles)
             .with_unset_settings(unset_settings),
-        shared,
+        &shared,
+        tier_functions,
     )?;
-    if let Some(tier) = tier {
-        let tier_sql = std::fs::read_to_string(tier.source())?;
-        let (tier_ddl, tier_functions) = translate_tier(&tier_sql)?;
+    if let Some((tier, (tier_ddl, _))) = tier {
         let history = boundary::tier_history(tier.history(), bundle.major(), &tier_ddl)?;
         bundle = bundle
             .with_local_tier(tier_ddl)
-            .with_helper_functions(tier_functions)
             .with_tier_history(history)?;
     }
     std::fs::write(out_dir.join("connetto-cap-policies.sql"), &cap)?;
@@ -1076,41 +1133,25 @@ fn options() -> Pg2SqliteOptions {
         .with_rls_exemption_function(WRITE_EXEMPTION_FUNCTION)
 }
 
-/// The pg2sqlite options the synced tier translates under: the
-/// [`query_options`], and the reader role as the role the replica acts as.
-///
-/// Acting as the reader settles every policy's `TO` clause the way PostgreSQL
-/// settles it for connetto's callers, and holds each table to the reader's
-/// grants: a table the reader cannot read stays out of the replica, and one it
-/// can only read is read-only there.
-///
-/// # Errors
-///
-/// As [`deployment`].
-pub fn replica_options<K: CapabilityKey>(
-    reader_role: &str,
-    unset_settings: UnsetSettings,
-) -> Result<Pg2SqliteOptions, SchemaError> {
-    Ok(query_options::<K>(reader_role, unset_settings)?.with_acting_role(reader_role))
-}
-
 /// The pg2sqlite options a client's query reverse translates under on the
 /// server: the fixed set, the [`deployment`] declaring what each session
 /// setting holds, and the replica function answering each setting, so a
 /// replica function reads back as the setting the build translated it from.
 ///
 /// They name no acting role. The server runs the translated query as the
-/// reader role, so PostgreSQL holds it to that role's grants and policies.
+/// caller's kind role, so PostgreSQL holds it to that role's grants and
+/// policies.
 ///
 /// # Errors
 ///
 /// As [`deployment`].
 pub fn query_options<K: CapabilityKey>(
     reader_role: &str,
+    kind_roles: &KindRoles,
     unset_settings: UnsetSettings,
 ) -> Result<Pg2SqliteOptions, SchemaError> {
     Ok(options()
-        .with_deployment(deployment::<K>(reader_role, unset_settings)?)
+        .with_deployment(deployment::<K>(reader_role, kind_roles, unset_settings)?)
         .with_session_variable(SessionVariableMapping::new(
             connetto_core::auth::DEFAULT_USER_SETTING,
             CALLER_FUNCTION,
@@ -1120,6 +1161,27 @@ pub fn query_options<K: CapabilityKey>(
             BOT_LIST_SETTING,
             BOT_LIST_FUNCTION,
         )))
+}
+
+/// The [`query_options`] the build translates `kind`'s copy under, acting
+/// as the role `kind` acts as.
+///
+/// Acting as the kind's role settles every policy's `TO` clause the way
+/// PostgreSQL settles it for the server's `SET ROLE` to that role, and holds
+/// each table to the role's grants: a table the role cannot read stays out
+/// of the replica, and one it can only read is read-only there.
+///
+/// # Errors
+///
+/// As [`deployment`].
+fn kind_options<K: CapabilityKey>(
+    reader_role: &str,
+    kind_roles: &KindRoles,
+    unset_settings: UnsetSettings,
+    kind: CallerKind,
+) -> Result<Pg2SqliteOptions, SchemaError> {
+    Ok(query_options::<K>(reader_role, kind_roles, unset_settings)?
+        .with_acting_role(kind_roles.role(kind)))
 }
 
 /// Parse the documents into one translator, in the given order.
@@ -1315,10 +1377,11 @@ fn validate_shared(program: &str) -> Result<(), SchemaError> {
 ///
 /// The translated documents are named as literals so the included module is
 /// all the demo's runtime needs, a `bundle()` that builds the
-/// [`connetto_core::SchemaBundle`], plus the `pub const` documents for the
-/// `const` contexts that cannot re-derive the bundle. When the build has a
-/// local tier, `bundle()` also attaches the tier history the build read from
-/// its exports, so the device holds every generated step from the oldest
+/// [`connetto_core::SchemaBundle`], plus the `pub const` source documents.
+/// Each distinct copy is written once, as a function `bundle()` calls once
+/// and shares between the kinds that hold it. When the build has a local
+/// tier, `bundle()` also attaches the tier history the build read from its
+/// exports, so the device holds every generated step from the oldest
 /// exported major to the build's own major.
 fn render(bundle: &SchemaBundle, cap: &str) -> String {
     let tier = match bundle.local_tier_ddl() {
@@ -1337,78 +1400,107 @@ fn render(bundle: &SchemaBundle, cap: &str) -> String {
     } else {
         String::new()
     };
-    let tables = bundle
-        .policy_tables()
+    let mut distinct: Vec<std::sync::Arc<ReplicaCopy>> = Vec::new();
+    let held = CallerKind::ALL.map(|kind| {
+        let copy = bundle.shared_copy(kind);
+        distinct
+            .iter()
+            .position(|seen| std::sync::Arc::ptr_eq(seen, &copy))
+            .unwrap_or_else(|| {
+                distinct.push(copy);
+                distinct.len() - 1
+            })
+    });
+    let copies = distinct
         .iter()
-        .map(|(logical, physical)| format!("({}, {})", raw_literal(logical), raw_literal(physical)))
+        .enumerate()
+        .map(|(index, copy)| copy_function(index, copy))
+        .collect::<String>();
+    let built = (0..distinct.len())
+        .map(|index| format!("std::sync::Arc::new(copy_{index}())"))
         .collect::<Vec<_>>()
-        .join(",\n            ");
-    let tables = if tables.is_empty() {
-        "&[]".to_string()
-    } else {
-        format!("&[\n            {tables}\n        ]")
-    };
-    let views = borrowed_slice(bundle.policy_views());
-    let shared = borrowed_slice(bundle.shared_tables());
-    let unset = unset_settings_expression(bundle.unset_settings());
-    let layout = match bundle.shared_layout() {
-        Some(layout) => {
-            // An `Option` either way, so the const's type never depends on
-            // whether this build shares a table.
-            format!(
-                "pub const SHARED_LAYOUT: Option<(&str, &str, &str, &str)> = Some(({}, {}, {}, {}));",
-                raw_literal(layout.sql(true, true)),
-                raw_literal(layout.sql(true, false)),
-                raw_literal(layout.sql(false, true)),
-                raw_literal(layout.sql(false, false)),
+        .join(", ");
+    let kinds = CallerKind::ALL.into_iter().zip(held).skip(1).fold(
+        String::new(),
+        |mut kinds, (kind, index)| {
+            use core::fmt::Write as _;
+            writeln!(
+                kinds,
+                ".with_copy(connetto_core::CallerKind::{kind:?}, std::sync::Arc::clone(&copies[{index}]))"
             )
-        }
-        None => "pub const SHARED_LAYOUT: Option<(&str, &str, &str, &str)> = None;".to_string(),
-    };
-    let functions = helper_function_literals(bundle);
+            .expect("writing to a String never fails");
+            kinds
+        },
+    );
+    let unset = unset_settings_expression(bundle.unset_settings());
     format!(
         "// Generated by connetto_translate::emit. Do not edit.\n\
          #[doc(hidden)]\n\
          pub mod connetto_schema_bundle {{\n\
          /// The Postgres schema source document.\n\
          pub const SCHEMA_SOURCE: &str = {};\n\
-        /// The Postgres policy source document.\n\
-        pub const POLICIES_SOURCE: &str = {};\n\
-        /// The translated replica DDL a client applies to a fresh replica.\n\
-        pub const REPLICA_DDL: &str = {};\n\
-        /// The connection program that recreates the TEMP objects a source leaves.\n\
-        pub const CONNECTION_DDL: &str = {};\n\
-        /// The bot cap the deployment applies beside its schema and policies.\n\
-        pub const CAP_POLICIES: &str = {};\n\
+         /// The Postgres policy source document.\n\
+         pub const POLICIES_SOURCE: &str = {};\n\
+         /// The bot cap the deployment applies beside its schema and policies.\n\
+         pub const CAP_POLICIES: &str = {};\n\
          /// The translated local tier, when the build has one.\n\
          {tier}\n\
-         /// The (logical, physical) pairs the translation split.\n\
-         pub const POLICY_TABLES: &[(&str, &str)] = {tables};\n\
-         /// Every view the translation emitted.\n\
-         pub const POLICY_VIEWS: &[&str] = {views};\n\
-         /// The tables a device stores once for every account.\n\
-         pub const SHARED_TABLES: &[&str] = {shared};\n\
-         /// The shared store's four lifecycle programs, when the build shares a\n\
-         /// table. The tuple is (both-fresh, main-fresh, shared-fresh, reopen).\n\
-         {layout}\n\
-         /// The helpers every replica connection registers before it runs any\n\
-         /// DDL, as (name, parameters, columns, body).\n\
-         pub const HELPER_FUNCTIONS: &[(&str, &[&str], &[&str], &str)] = &[{functions}];\n\
+         {copies}\
          /// The schema bundle this build translated from its own Postgres\n\
          /// sources. The version is the hash of exactly these contents.\n\
          #[must_use]\n\
          pub fn bundle() -> connetto_core::SchemaBundle {{\n\
-         let mut bundle = connetto_core::SchemaBundle::new(\n\
+         let copies = [{built}];\n\
+         connetto_core::SchemaBundle::new(\n\
              SCHEMA_SOURCE,\n\
              POLICIES_SOURCE,\n\
-             REPLICA_DDL,\n\
-             POLICY_TABLES.iter().copied(),\n\
-             POLICY_VIEWS.iter().copied(),\n\
+             std::sync::Arc::clone(&copies[{}]),\n\
              LOCAL_TIER_DDL,\n\
          )\n\
          .expect(\"the build step translated this bundle\")\n\
+         {kinds}\
+         .with_unset_settings({unset})\n\
+         {history}\n\
+         }}\n\
+         }}\n",
+        raw_literal(bundle.schema_source()),
+        raw_literal(bundle.policies_source()),
+        raw_literal(cap),
+        held[0],
+    )
+}
+
+/// The generated function `copy_<index>` that builds `copy`.
+fn copy_function(index: usize, copy: &ReplicaCopy) -> String {
+    let tables = copy
+        .policy_tables()
+        .iter()
+        .map(|(logical, physical)| format!("({}, {})", raw_literal(logical), raw_literal(physical)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let layout = copy.shared_layout().map_or_else(String::new, |layout| {
+        format!(
+            "\n.with_shared_layout(connetto_core::SharedLayout::new({}, {}, {}, {}))",
+            raw_literal(layout.sql(true, true)),
+            raw_literal(layout.sql(true, false)),
+            raw_literal(layout.sql(false, true)),
+            raw_literal(layout.sql(false, false)),
+        )
+    });
+    format!(
+        "/// The replica the kinds holding copy {index} open.\n\
+         fn copy_{index}() -> connetto_core::ReplicaCopy {{\n\
+         const POLICY_TABLES: &[(&str, &str)] = &[{tables}];\n\
+         const POLICY_VIEWS: &[&str] = {};\n\
+         const SHARED_TABLES: &[&str] = {};\n\
+         const HELPER_FUNCTIONS: &[(&str, &[&str], &[&str], &str)] = &[{}];\n\
+         connetto_core::ReplicaCopy::new(\n\
+             {},\n\
+             POLICY_TABLES.iter().copied(),\n\
+             POLICY_VIEWS.iter().copied(),\n\
+         )\n\
          .with_shared_tables(SHARED_TABLES.iter().copied())\n\
-         .with_connection_ddl(CONNECTION_DDL)\n\
+         .with_connection_ddl({})\n\
          .with_helper_functions(HELPER_FUNCTIONS.iter().map(\n\
              |&(name, parameters, columns, body)| connetto_core::HelperFunction {{\n\
                  name: name.to_owned(),\n\
@@ -1416,29 +1508,19 @@ fn render(bundle: &SchemaBundle, cap: &str) -> String {
                  columns: columns.iter().map(|&column| column.to_owned()).collect(),\n\
                  body: body.to_owned(),\n\
              }},\n\
-         ))\n\
-         .with_unset_settings({unset})\n\
-         {history};\n\
-         if let Some((both_fresh, main_fresh, shared_fresh, reopen)) = SHARED_LAYOUT {{\n\
-             bundle = bundle.with_shared_layout(\n\
-                 connetto_core::SharedLayout::new(both_fresh, main_fresh, shared_fresh, reopen),\n\
-             );\n\
-         }}\n\
-         bundle\n\
-         }}\n\
+         )){layout}\n\
          }}\n",
-        raw_literal(bundle.schema_source()),
-        raw_literal(bundle.policies_source()),
-        raw_literal(bundle.replica_ddl()),
-        raw_literal(bundle.connection_ddl()),
-        raw_literal(cap),
+        borrowed_slice(copy.policy_views()),
+        borrowed_slice(copy.shared_tables()),
+        helper_function_literals(copy),
+        raw_literal(copy.replica_ddl()),
+        raw_literal(copy.connection_ddl()),
     )
 }
 
-/// `bundle`'s helpers as the entries of the `HELPER_FUNCTIONS` slice literal.
-fn helper_function_literals(bundle: &SchemaBundle) -> String {
-    bundle
-        .helper_functions()
+/// `copy`'s helpers as the entries of the `HELPER_FUNCTIONS` slice literal.
+fn helper_function_literals(copy: &ReplicaCopy) -> String {
+    copy.helper_functions()
         .iter()
         .map(|function| {
             format!(
@@ -1656,10 +1738,10 @@ mod tests {
         let bundle =
             translate::<String, connetto_core::bots::TextIds>(documents(&schema, policies))
                 .expect("translates");
+        let replica_ddl = bundle.copy(CallerKind::Authenticated).replica_ddl();
         assert!(
-            bundle.replica_ddl().contains("current_bot_list"),
-            "the replica DDL names the bot list function: {}",
-            bundle.replica_ddl()
+            replica_ddl.contains("current_bot_list"),
+            "the replica DDL names the bot list function: {replica_ddl}"
         );
         // connetto adds the registry tables to the document it translates, so
         // the Postgres source and the replica DDL both carry them.
@@ -1678,22 +1760,23 @@ mod tests {
                 bundle.schema_source()
             );
             assert!(
-                bundle.replica_ddl().contains(table),
+                replica_ddl.contains(table),
                 "the replica DDL carries {table}"
             );
         }
     }
 
-    /// A policy for the reader role holds on the replica, and a policy for a
-    /// role outside connetto is left out of it instead of refusing the build.
+    /// A policy for one kind's role holds on that kind's copy alone, and a
+    /// policy for a role outside connetto is left out of every copy instead
+    /// of refusing the build.
     #[test]
-    fn a_reader_policy_holds_and_an_outside_role_policy_is_left_out() {
+    fn a_kind_policy_holds_on_its_copy_and_an_outside_role_policy_is_left_out() {
         let schema = majored(
             "CREATE TABLE notes (id INT PRIMARY KEY, word_id INT NOT NULL, \
              owner_id TEXT NOT NULL, body TEXT);",
         );
         let policies = "ALTER TABLE notes ENABLE ROW LEVEL SECURITY; \
-                        CREATE POLICY notes_reader ON notes FOR ALL TO app_reader \
+                        CREATE POLICY notes_signed_in ON notes FOR ALL TO authenticated \
                           USING (owner_id = current_setting('app.user_id', true)); \
                         CREATE POLICY notes_staff ON notes FOR ALL TO support_staff \
                           USING (true);";
@@ -1702,42 +1785,63 @@ mod tests {
             &schema, policies, &roles, READER,
         ))
         .expect("a policy for a role outside connetto refuses nothing");
-        let mut conn = SqliteConnection::establish(":memory:").expect("open the replica");
-        conn.batch_execute(bundle.replica_ddl())
-            .expect("apply the replica DDL");
-        let exemption = register_replica_functions(&mut conn, "alice", "*");
-        for (id, owner) in [(1, "alice"), (2, "bob")] {
-            diesel::insert_into(notes::table)
-                .values((
-                    notes::id.eq(id),
-                    notes::word_id.eq(0),
-                    notes::owner_id.eq(owner),
-                    notes::body.eq("b"),
-                ))
-                .execute(&mut conn)
-                .expect("seed a row");
+        let anonymous = bundle.shared_copy(CallerKind::Anon);
+        for kind in [
+            CallerKind::BotInstallation,
+            CallerKind::Bot,
+            CallerKind::Delegated,
+        ] {
+            assert!(
+                std::sync::Arc::ptr_eq(&anonymous, &bundle.shared_copy(kind)),
+                "{kind:?}, which no policy names either, shares the anonymous copy"
+            );
         }
-        exemption.store(false, std::sync::atomic::Ordering::Relaxed);
-        let visible: Vec<i32> = notes::table
-            .select(notes::id)
-            .order(notes::id)
-            .load(&mut conn)
-            .expect("read the view");
-        assert_eq!(
-            visible,
-            [1],
-            "the reader's policy admits alice's row alone, and support_staff's \
-             policy admitting every row does not reach the replica"
+        assert!(
+            !std::sync::Arc::ptr_eq(&anonymous, &bundle.shared_copy(CallerKind::Authenticated)),
+            "the signed-in copy, which the policy reaches, is its own"
         );
+        for (kind, expected) in [
+            (CallerKind::Authenticated, &[1][..]),
+            (CallerKind::Anon, &[][..]),
+        ] {
+            let mut conn = SqliteConnection::establish(":memory:").expect("open the replica");
+            conn.batch_execute(bundle.copy(kind).replica_ddl())
+                .expect("apply the replica DDL");
+            let exemption = register_replica_functions(&mut conn, "alice", "*");
+            for (id, owner) in [(1, "alice"), (2, "bob")] {
+                diesel::insert_into(notes::table)
+                    .values((
+                        notes::id.eq(id),
+                        notes::word_id.eq(0),
+                        notes::owner_id.eq(owner),
+                        notes::body.eq("b"),
+                    ))
+                    .execute(&mut conn)
+                    .expect("seed a row");
+            }
+            exemption.store(false, std::sync::atomic::Ordering::Relaxed);
+            let visible: Vec<i32> = notes::table
+                .select(notes::id)
+                .order(notes::id)
+                .load(&mut conn)
+                .expect("read the view");
+            assert_eq!(
+                visible, expected,
+                "the signed-in policy admits alice's row to the {kind:?} copy alone, and \
+                 support_staff's policy admitting every row reaches no copy"
+            );
+        }
     }
 
     /// The derivation and the database agree on the views over the
     /// deployment's own schema and policies.
     #[test]
     fn the_derived_views_are_the_views_sqlite_builds() {
-        let options = replica_options::<String>(
+        let options = kind_options::<String>(
             connetto_demo_deployment::READER_ROLE,
+            KindRoles::defaults(),
             UnsetSettings::ALWAYS_BOUND,
+            CallerKind::Authenticated,
         )
         .expect("the demo deployment's description holds");
         let translator = parsed_documents(
@@ -1782,26 +1886,80 @@ mod tests {
         }
     }
 
+    /// The one copy a render test bundle's kinds hold unless a test gives one
+    /// kind another.
+    fn orders_copy() -> ReplicaCopy {
+        ReplicaCopy::new(
+            "CREATE TABLE orders_rls (id INTEGER);",
+            [("orders", "orders_rls")],
+            ["orders"],
+        )
+    }
+
     /// The rendered file names the bundle module and embeds the DDL verbatim.
     #[test]
     fn render_embeds_the_bundle_contents() {
         let bundle = SchemaBundle::new(
             majored("CREATE TABLE orders (id INT);"),
             "CREATE POLICY orders_p ON orders USING (true);",
-            "CREATE TABLE orders_rls (id INTEGER);",
-            [("orders", "orders_rls")],
-            ["orders"],
+            orders_copy(),
             None::<&str>,
         )
         .expect("the source declares major 1");
         let source = render(&bundle, "");
         assert!(source.contains("pub mod connetto_schema_bundle"));
         assert!(source.contains("pub fn bundle() -> connetto_core::SchemaBundle"));
-        assert!(source.contains(&raw_literal(bundle.replica_ddl())));
+        assert!(source.contains(&raw_literal(orders_copy().replica_ddl())));
         assert!(
             source.contains("LOCAL_TIER_DDL: Option<&str> = None"),
             "the tier is an Option even when the build has none"
         );
+    }
+
+    /// Each distinct copy is written once, and every kind holding it shares
+    /// the one value `bundle()` builds from it.
+    #[test]
+    fn render_writes_each_distinct_copy_once() {
+        let anonymous = ReplicaCopy::new(
+            "CREATE TABLE orders_rls (id INTEGER, anonymous INTEGER);",
+            [("orders", "orders_rls")],
+            ["orders"],
+        );
+        let bundle = SchemaBundle::new(
+            majored("CREATE TABLE orders (id INT);"),
+            "",
+            orders_copy(),
+            None::<&str>,
+        )
+        .expect("the source declares major 1")
+        .with_copy(CallerKind::Anon, anonymous.clone());
+        let source = render(&bundle, "");
+        assert_eq!(
+            source.matches("-> connetto_core::ReplicaCopy {").count(),
+            2,
+            "two distinct copies, two functions: {source}"
+        );
+        assert_eq!(
+            source
+                .matches(&raw_literal(orders_copy().replica_ddl()))
+                .count(),
+            1,
+            "the copy four kinds share is written once: {source}"
+        );
+        assert!(source.contains(&raw_literal(anonymous.replica_ddl())));
+        for kind in [
+            CallerKind::Authenticated,
+            CallerKind::BotInstallation,
+            CallerKind::Bot,
+            CallerKind::Delegated,
+        ] {
+            assert!(
+                source.contains(&format!(
+                    ".with_copy(connetto_core::CallerKind::{kind:?}, std::sync::Arc::clone(&copies[1]))"
+                )),
+                "{kind:?} shares the second copy: {source}"
+            );
+        }
     }
 
     /// The tier const is an `Option` with a tier too, so its type does not
@@ -1811,9 +1969,11 @@ mod tests {
         let bundle = SchemaBundle::new(
             majored("CREATE TABLE orders (id INT);"),
             "",
-            "CREATE TABLE orders (id INTEGER);",
-            [] as [(&str, &str); 0],
-            [] as [&str; 0],
+            ReplicaCopy::new(
+                "CREATE TABLE orders (id INTEGER);",
+                [] as [(&str, &str); 0],
+                [] as [&str; 0],
+            ),
             None::<&str>,
         )
         .expect("the source declares major 1")
@@ -1833,39 +1993,39 @@ mod tests {
         let bundle = SchemaBundle::new(
             majored("CREATE TABLE orders (id INT);"),
             "",
-            "CREATE TABLE orders_rls (id INTEGER);",
-            [("orders", "orders_rls")],
-            ["orders"],
+            orders_copy(),
             None::<&str>,
         )
         .expect("the source declares major 1");
         let source = render(&bundle, "");
         assert!(
             source.contains(
-                "pub const POLICY_TABLES: &[(&str, &str)] = &[\n            (r\"orders\", r\"orders_rls\")\n        ];"
+                "const POLICY_TABLES: &[(&str, &str)] = &[(r\"orders\", r\"orders_rls\")];"
             ),
             "the pairs const is a borrowed slice: {source}"
         );
         assert!(
-            source.contains("pub const POLICY_VIEWS: &[&str] = &[r\"orders\"];"),
+            source.contains("const POLICY_VIEWS: &[&str] = &[r\"orders\"];"),
             "the views const is a borrowed slice: {source}"
         );
         let empty = SchemaBundle::new(
             majored("CREATE TABLE orders (id INT);"),
             "",
-            "CREATE TABLE orders (id INTEGER);",
-            [] as [(&str, &str); 0],
-            [] as [&str; 0],
+            ReplicaCopy::new(
+                "CREATE TABLE orders (id INTEGER);",
+                [] as [(&str, &str); 0],
+                [] as [&str; 0],
+            ),
             None::<&str>,
         )
         .expect("the source declares major 1");
         let source = render(&empty, "");
         assert!(
-            source.contains("pub const POLICY_TABLES: &[(&str, &str)] = &[];"),
+            source.contains("const POLICY_TABLES: &[(&str, &str)] = &[];"),
             "zero pairs still emit a borrowed slice: {source}"
         );
         assert!(
-            source.contains("pub const POLICY_VIEWS: &[&str] = &[];"),
+            source.contains("const POLICY_VIEWS: &[&str] = &[];"),
             "zero views still emit a borrowed slice: {source}"
         );
     }
@@ -1922,7 +2082,12 @@ mod tests {
             &["notes", "papers", "tags"],
         )
         .expect("every caller-dependent table translates shared");
-        assert_eq!(bundle.shared_tables(), ["notes", "papers", "tags"]);
+        for kind in CallerKind::ALL {
+            assert_eq!(
+                bundle.copy(kind).shared_tables(),
+                ["notes", "papers", "tags"]
+            );
+        }
     }
 
     /// A name the synced schema does not declare is refused rather than
@@ -1957,7 +2122,12 @@ mod tests {
         let plain =
             translate::<String, connetto_core::bots::TextIds>(documents(&majored(without), ""))
                 .expect("translates without references");
-        assert_eq!(bundle.replica_ddl(), plain.replica_ddl());
+        for kind in CallerKind::ALL {
+            assert_eq!(
+                bundle.copy(kind).replica_ddl(),
+                plain.copy(kind).replica_ddl()
+            );
+        }
         assert!(bundle.schema_source().contains("REFERENCES folders(id)"));
         assert!(bundle.schema_source().contains("REFERENCES notes(id)"));
     }
@@ -1966,10 +2136,19 @@ mod tests {
     const READER: &str = "app_reader";
 
     /// The roles document every test deployment carries, creating [`READER`]
-    /// and granting it every table.
+    /// and the five kind roles it switches to, and granting the kinds every
+    /// table.
     const ROLES: &str = "CREATE ROLE app_reader LOGIN;\n\
-         GRANT USAGE ON SCHEMA public TO app_reader;\n\
-         GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_reader;";
+         CREATE ROLE anon NOLOGIN;\n\
+         CREATE ROLE authenticated NOLOGIN;\n\
+         CREATE ROLE bot_installation NOLOGIN;\n\
+         CREATE ROLE bot NOLOGIN;\n\
+         CREATE ROLE delegated NOLOGIN;\n\
+         GRANT anon, authenticated, bot_installation, bot, delegated TO app_reader \
+           WITH INHERIT FALSE, SET TRUE;\n\
+         GRANT USAGE ON SCHEMA public TO anon, authenticated, bot_installation, bot, delegated;\n\
+         GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public \
+           TO anon, authenticated, bot_installation, bot, delegated;";
 
     /// `schema` and `policies` with [`ROLES`] and [`READER`].
     fn documents<'a>(schema: &'a str, policies: &'a str) -> Documents<'a> {
@@ -2007,7 +2186,7 @@ mod tests {
         ] {
             let mut conn = SqliteConnection::establish(":memory:").expect("open the replica");
             let exemption = register_replica_functions(&mut conn, caller, BOT_LIST_WILDCARD);
-            conn.batch_execute(bundle.replica_ddl())
+            conn.batch_execute(bundle.copy(CallerKind::Authenticated).replica_ddl())
                 .expect("the replica DDL applies");
             conn.batch_execute(
                 "INSERT INTO owned (id, owner, public) VALUES \
@@ -2067,8 +2246,16 @@ mod tests {
         let (sources, _, _) = emit_inputs(dir.path(), 1);
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).expect("the output directory writes");
-        emit_to::<String, TextIds>(paths(&sources), READER, ALWAYS, None, &[], &out)
-            .expect("emits");
+        emit_to::<String, TextIds>(
+            paths(&sources),
+            READER,
+            KindRoles::defaults(),
+            ALWAYS,
+            None,
+            &[],
+            &out,
+        )
+        .expect("emits");
         let rendered =
             std::fs::read_to_string(out.join("connetto-translate.rs")).expect("the bundle file");
         assert!(
@@ -2110,6 +2297,7 @@ mod tests {
         emit_to::<String, TextIds>(
             [schema.as_path(), policies.as_path(), roles.as_path()],
             READER,
+            KindRoles::defaults(),
             ALWAYS,
             None,
             &[],
@@ -2119,7 +2307,7 @@ mod tests {
         let bundle =
             translate::<String, TextIds>(Documents::new(&schema_sql, policies_sql, ROLES, READER))
                 .expect("translates");
-        let helpers = bundle.helper_functions();
+        let helpers = bundle.copy(CallerKind::Authenticated).helper_functions();
         assert_eq!(helpers.len(), 1, "the policy calls one helper: {helpers:?}");
         let helper = &helpers[0];
         assert!(
@@ -2144,7 +2332,7 @@ mod tests {
         );
         assert!(
             rendered.contains(".with_helper_functions(HELPER_FUNCTIONS"),
-            "the generated bundle attaches them: {rendered}"
+            "the generated copy attaches them: {rendered}"
         );
     }
 
@@ -2160,8 +2348,16 @@ mod tests {
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).expect("the output directory writes");
         let source = TierSource::new(&tier, &history);
-        emit_to::<String, TextIds>(paths(&sources), READER, ALWAYS, Some(&source), &[], &out)
-            .expect("emits with the history");
+        emit_to::<String, TextIds>(
+            paths(&sources),
+            READER,
+            KindRoles::defaults(),
+            ALWAYS,
+            Some(&source),
+            &[],
+            &out,
+        )
+        .expect("emits with the history");
         let rendered =
             std::fs::read_to_string(out.join("connetto-translate.rs")).expect("the bundle file");
         assert!(
@@ -2185,9 +2381,16 @@ mod tests {
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).expect("the output directory writes");
         let source = TierSource::new(&tier, dir.path().join("absent"));
-        let err =
-            emit_to::<String, TextIds>(paths(&sources), READER, ALWAYS, Some(&source), &[], &out)
-                .expect_err("an absent history directory refuses");
+        let err = emit_to::<String, TextIds>(
+            paths(&sources),
+            READER,
+            KindRoles::defaults(),
+            ALWAYS,
+            Some(&source),
+            &[],
+            &out,
+        )
+        .expect_err("an absent history directory refuses");
         match err {
             SchemaError::MissingHistoryDir { dir: reported } => {
                 assert_eq!(reported, dir.path().join("absent"));
@@ -2212,9 +2415,16 @@ mod tests {
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).expect("the output directory writes");
         let source = TierSource::new(&tier, &history);
-        let err =
-            emit_to::<String, TextIds>(paths(&sources), READER, ALWAYS, Some(&source), &[], &out)
-                .expect_err("a stale export refuses");
+        let err = emit_to::<String, TextIds>(
+            paths(&sources),
+            READER,
+            KindRoles::defaults(),
+            ALWAYS,
+            Some(&source),
+            &[],
+            &out,
+        )
+        .expect_err("a stale export refuses");
         match err {
             SchemaError::StaleExport { major, path, .. } => {
                 assert_eq!(major, 1);
@@ -2234,9 +2444,16 @@ mod tests {
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).expect("the output directory writes");
         let source = TierSource::new(&tier, &history);
-        let err =
-            emit_to::<String, TextIds>(paths(&sources), READER, ALWAYS, Some(&source), &[], &out)
-                .expect_err("a missing export refuses");
+        let err = emit_to::<String, TextIds>(
+            paths(&sources),
+            READER,
+            KindRoles::defaults(),
+            ALWAYS,
+            Some(&source),
+            &[],
+            &out,
+        )
+        .expect_err("a missing export refuses");
         match err {
             SchemaError::MissingExport { major, path, .. } => {
                 assert_eq!(major, 1);
@@ -2259,9 +2476,16 @@ mod tests {
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).expect("the output directory writes");
         let source = TierSource::new(&tier, &history);
-        let err =
-            emit_to::<String, TextIds>(paths(&sources), READER, ALWAYS, Some(&source), &[], &out)
-                .expect_err("a gap refuses");
+        let err = emit_to::<String, TextIds>(
+            paths(&sources),
+            READER,
+            KindRoles::defaults(),
+            ALWAYS,
+            Some(&source),
+            &[],
+            &out,
+        )
+        .expect_err("a gap refuses");
         match err {
             SchemaError::HistoryGap { dir, missing, .. } => {
                 assert_eq!(dir, history);
@@ -2443,14 +2667,28 @@ mod tests {
         std::fs::create_dir_all(&out).expect("the output directory writes");
         let source = TierSource::new(&tier, &history);
         std::fs::remove_file(&tier).expect("the source deletes");
-        let err =
-            emit_to::<String, TextIds>(paths(&sources), READER, ALWAYS, Some(&source), &[], &out)
-                .expect_err("a missing tier source refuses");
+        let err = emit_to::<String, TextIds>(
+            paths(&sources),
+            READER,
+            KindRoles::defaults(),
+            ALWAYS,
+            Some(&source),
+            &[],
+            &out,
+        )
+        .expect_err("a missing tier source refuses");
         assert!(matches!(err, SchemaError::Io(_)));
         std::fs::write(&tier, "not a Postgres document").expect("the source writes");
-        let err =
-            emit_to::<String, TextIds>(paths(&sources), READER, ALWAYS, Some(&source), &[], &out)
-                .expect_err("an untranslatable tier source refuses");
+        let err = emit_to::<String, TextIds>(
+            paths(&sources),
+            READER,
+            KindRoles::defaults(),
+            ALWAYS,
+            Some(&source),
+            &[],
+            &out,
+        )
+        .expect_err("an untranslatable tier source refuses");
         assert!(matches!(err, SchemaError::Translate(_)));
     }
 
@@ -2470,11 +2708,11 @@ mod tests {
         }
 
         assert!(matches!(
-            deployment::<OnIdentity>(READER, ALWAYS),
+            deployment::<OnIdentity>(READER, KindRoles::defaults(), ALWAYS),
             Err(SchemaError::Deployment(_))
         ));
         assert!(matches!(
-            query_options::<OnIdentity>(READER, ALWAYS),
+            query_options::<OnIdentity>(READER, KindRoles::defaults(), ALWAYS),
             Err(SchemaError::Deployment(_))
         ));
         assert!(matches!(
@@ -2492,12 +2730,28 @@ mod tests {
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).expect("the output directory writes");
         std::fs::write(&sources[2], "CREATE ROLE someone_else LOGIN;").expect("the roles write");
-        let err = emit_to::<String, TextIds>(paths(&sources), READER, ALWAYS, None, &[], &out)
-            .expect_err("a roles document without the reader refuses");
+        let err = emit_to::<String, TextIds>(
+            paths(&sources),
+            READER,
+            KindRoles::defaults(),
+            ALWAYS,
+            None,
+            &[],
+            &out,
+        )
+        .expect_err("a roles document without the reader refuses");
         assert!(err.to_string().contains(READER), "{err}");
         std::fs::remove_file(&sources[2]).expect("the roles source deletes");
-        let err = emit_to::<String, TextIds>(paths(&sources), READER, ALWAYS, None, &[], &out)
-            .expect_err("a missing roles document refuses");
+        let err = emit_to::<String, TextIds>(
+            paths(&sources),
+            READER,
+            KindRoles::defaults(),
+            ALWAYS,
+            None,
+            &[],
+            &out,
+        )
+        .expect_err("a missing roles document refuses");
         assert!(matches!(err, SchemaError::Io(_)));
     }
 
@@ -2518,8 +2772,15 @@ mod tests {
         let source = TierSource::new(&tier, &history);
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).expect("the output directory writes");
-        let result =
-            emit_to::<String, TextIds>(paths(&sources), READER, ALWAYS, Some(&source), &[], &out);
+        let result = emit_to::<String, TextIds>(
+            paths(&sources),
+            READER,
+            KindRoles::defaults(),
+            ALWAYS,
+            Some(&source),
+            &[],
+            &out,
+        );
         std::fs::set_permissions(
             &history,
             std::os::unix::fs::PermissionsExt::from_mode(0o755),
@@ -2535,13 +2796,19 @@ mod tests {
     fn emit_refuses_outside_a_build_script() {
         let dir = tempfile::tempdir().expect("a scratch directory");
         let (sources, _, _) = emit_inputs(dir.path(), 1);
-        let [schema, policies, roles] = paths(&sources);
         assert!(
             std::env::var("OUT_DIR").is_err(),
             "cargo leaves OUT_DIR unset for tests"
         );
-        let err = emit::<String, TextIds>(schema, policies, roles, READER, ALWAYS, None, &[])
-            .expect_err("without OUT_DIR the entry point refuses");
+        let err = emit::<String, TextIds>(
+            paths(&sources),
+            READER,
+            KindRoles::defaults(),
+            ALWAYS,
+            None,
+            &[],
+        )
+        .expect_err("without OUT_DIR the entry point refuses");
         assert!(matches!(err, SchemaError::MissingOutDir));
     }
 
@@ -2553,15 +2820,31 @@ mod tests {
         let out = dir.path().join("out");
         std::fs::create_dir_all(out.join("connetto-cap-policies.sql"))
             .expect("the blocking directory writes");
-        let err = emit_to::<String, TextIds>(paths(&sources), READER, ALWAYS, None, &[], &out)
-            .expect_err("a directory where the cap file should be refuses");
+        let err = emit_to::<String, TextIds>(
+            paths(&sources),
+            READER,
+            KindRoles::defaults(),
+            ALWAYS,
+            None,
+            &[],
+            &out,
+        )
+        .expect_err("a directory where the cap file should be refuses");
         assert!(matches!(err, SchemaError::Io(_)));
         let out = dir.path().join("out2");
         std::fs::create_dir_all(&out).expect("the output directory writes");
         std::fs::create_dir_all(out.join("connetto-translate.rs"))
             .expect("the blocking directory writes");
-        let err = emit_to::<String, TextIds>(paths(&sources), READER, ALWAYS, None, &[], &out)
-            .expect_err("a directory where the bundle file should be refuses");
+        let err = emit_to::<String, TextIds>(
+            paths(&sources),
+            READER,
+            KindRoles::defaults(),
+            ALWAYS,
+            None,
+            &[],
+            &out,
+        )
+        .expect_err("a directory where the bundle file should be refuses");
         assert!(matches!(err, SchemaError::Io(_)));
     }
 
@@ -2575,9 +2858,7 @@ mod tests {
                 connetto_core::MAJOR_DIRECTIVE
             ),
             "",
-            "CREATE TABLE orders_rls (id INTEGER);",
-            [] as [(&str, &str); 0],
-            [] as [&str; 0],
+            orders_copy(),
             None::<&str>,
         )
         .expect("the source declares major 2")
@@ -2606,9 +2887,7 @@ mod tests {
         let bundle = SchemaBundle::new(
             majored("CREATE TABLE orders (id INT);"),
             "",
-            "CREATE TABLE orders_rls (id INTEGER);",
-            [] as [(&str, &str); 0],
-            [] as [&str; 0],
+            orders_copy(),
             None::<&str>,
         )
         .expect("the source declares major 1")
@@ -2754,7 +3033,10 @@ mod tests {
     fn a_shared_table_joins_with_a_private_main_table() {
         use diesel::JoinOnDsl as _;
         let bundle = shared_consumer_bundle();
-        let layout = bundle.shared_layout().expect("the build shares a table");
+        let layout = bundle
+            .copy(CallerKind::Authenticated)
+            .shared_layout()
+            .expect("the build shares a table");
         let mut conn = conn_with_shared(":memory:");
         conn.batch_execute(layout.sql(true, true))
             .expect("apply the fresh layout");
@@ -2785,7 +3067,10 @@ mod tests {
     #[test]
     fn a_reopen_with_a_fresh_main_keeps_the_shared_file() {
         let bundle = shared_consumer_bundle();
-        let layout = bundle.shared_layout().expect("the build shares a table");
+        let layout = bundle
+            .copy(CallerKind::Authenticated)
+            .shared_layout()
+            .expect("the build shares a table");
         let shared = temp_file("shared.db");
         let main_first = temp_file("main-first.db");
         let main_second = temp_file("main-second.db");
@@ -2847,7 +3132,10 @@ mod tests {
     #[test]
     fn a_reopen_recreates_the_shared_readers() {
         let bundle = shared_consumer_bundle();
-        let layout = bundle.shared_layout().expect("the build shares a table");
+        let layout = bundle
+            .copy(CallerKind::Authenticated)
+            .shared_layout()
+            .expect("the build shares a table");
         let shared = temp_file("shared-reopen.db");
         let main = temp_file("main-reopen.db");
         let _guard = TempFiles(vec![shared.clone(), main.clone()]);

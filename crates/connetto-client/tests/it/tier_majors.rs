@@ -80,9 +80,11 @@ fn build(at: u32, tier: Option<&str>, history: Option<TierHistory>) -> SyncSchem
     let bundle = SchemaBundle::new(
         format!("{MAJOR_DIRECTIVE} {at}"),
         "",
-        REPLICA_DDL,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
+        connetto_core::ReplicaCopy::new(
+            REPLICA_DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+        ),
         tier,
     )
     .expect("the source declares its major");

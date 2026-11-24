@@ -7,7 +7,7 @@
 //! bot is held to its declared tables rather than refused.
 
 use connetto_core::auth::{
-    ContentCaller, DEFAULT_SUBJECTS_SETTING, DEFAULT_USER_SETTING, UnsetSettings,
+    ContentCaller, DEFAULT_SUBJECTS_SETTING, DEFAULT_USER_SETTING, KindRoles, UnsetSettings,
 };
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 
@@ -31,6 +31,11 @@ pub struct CallerSettings {
     /// Which of the two the deployment's policies may find unset, as the
     /// server's schema declares it.
     pub unset: UnsetSettings,
+    /// The role each kind of caller acts as while the deployment's
+    /// visibility function answers it, so the policies written for that kind
+    /// apply. `None` answers every caller as the reader role itself, for a
+    /// deployment without kind roles.
+    pub kind_roles: Option<KindRoles>,
 }
 
 impl Default for CallerSettings {
@@ -40,6 +45,7 @@ impl Default for CallerSettings {
             subjects: DEFAULT_SUBJECTS_SETTING.to_owned(),
             separator: ',',
             unset: UnsetSettings::ALWAYS_BOUND,
+            kind_roles: None,
         }
     }
 }
@@ -71,6 +77,37 @@ pub(crate) async fn bind_caller(
     .get_result::<(String, String, String)>(conn)
     .await
     .map(drop)
+}
+
+/// The files among `file_ids` the deployment's `connetto_visible_files` lets
+/// the bound caller see, asked as the caller's kind role and answered back
+/// under the reader role, which connetto's own file tables are granted to.
+/// Runs inside the transaction [`bind_caller`] bound.
+pub(crate) async fn visible_files(
+    conn: &mut AsyncPgConnection,
+    settings: &CallerSettings,
+    caller: &ContentCaller,
+    file_ids: Vec<Vec<u8>>,
+) -> Result<Vec<Vec<u8>>, diesel::result::Error> {
+    let Some(kind_roles) = &settings.kind_roles else {
+        return diesel::select(functions::connetto_visible_files(file_ids))
+            .get_result(conn)
+            .await;
+    };
+    diesel::select(functions::set_config(
+        "role",
+        kind_roles.role(caller.kind()),
+        true,
+    ))
+    .execute(conn)
+    .await?;
+    let visible = diesel::select(functions::connetto_visible_files(file_ids))
+        .get_result(conn)
+        .await?;
+    diesel::select(functions::set_config("role", "none", true))
+        .execute(conn)
+        .await?;
+    Ok(visible)
 }
 
 /// The key `caller` owns manifest rows under.

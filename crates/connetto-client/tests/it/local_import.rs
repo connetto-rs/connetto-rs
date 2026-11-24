@@ -83,9 +83,11 @@ async fn device_at(source: &str, synced_ddl: &str, tier_ddl: &str, account: &str
     let bundle = SchemaBundle::new(
         source,
         "",
-        synced_ddl,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
+        connetto_core::ReplicaCopy::new(
+            synced_ddl,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+        ),
         Some(tier_ddl),
     )
     .expect("the source declares a major");

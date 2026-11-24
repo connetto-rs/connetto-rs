@@ -77,11 +77,21 @@ pub use roster::{RosterAuth, WITHHELD_ID};
 pub const FIXTURE_READER: &str = "app_reader";
 
 /// The roles document a fixture deployment's translations read, creating
-/// [`FIXTURE_READER`] and granting it every table the fixture's documents
-/// declare, the grants the replica translation holds each table to.
+/// [`FIXTURE_READER`] and the five default kind roles it switches to, and
+/// granting the kinds every table the fixture's documents declare, the
+/// grants each kind's replica translation holds each table to.
 pub const FIXTURE_ROLES: &str = "CREATE ROLE app_reader LOGIN;\n\
      GRANT USAGE ON SCHEMA public TO app_reader;\n\
-     GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_reader;";
+     CREATE ROLE anon NOLOGIN;\n\
+     CREATE ROLE authenticated NOLOGIN;\n\
+     CREATE ROLE bot_installation NOLOGIN;\n\
+     CREATE ROLE bot NOLOGIN;\n\
+     CREATE ROLE delegated NOLOGIN;\n\
+     GRANT anon, authenticated, bot_installation, bot, delegated TO app_reader \
+       WITH INHERIT FALSE, SET TRUE;\n\
+     GRANT USAGE ON SCHEMA public TO anon, authenticated, bot_installation, bot, delegated;\n\
+     GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public \
+       TO anon, authenticated, bot_installation, bot, delegated;";
 
 diesel::table! {
     /// The cluster's roles, read to skip a role a roles document creates twice.

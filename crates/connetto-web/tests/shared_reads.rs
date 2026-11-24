@@ -107,19 +107,17 @@ fn bundle() -> SchemaBundle {
     SchemaBundle::new(
         "-- connetto:major 1",
         "",
-        MIRROR_DDL,
-        [("public", "public_rls")],
-        ["public"],
+        connetto_core::ReplicaCopy::new(MIRROR_DDL, [("public", "public_rls")], ["public"])
+            .with_shared_tables(["entries", "public"])
+            .with_shared_layout(SharedLayout::new(
+                format!("{ORDERS_DDL}; {TEMP_READER}; {SHARED_DDL}"),
+                format!("{ORDERS_DDL}; {TEMP_READER}"),
+                format!("{SHARED_DDL}; {TEMP_READER}"),
+                TEMP_READER,
+            )),
         None::<&str>,
     )
     .expect("the fixture declares its major")
-    .with_shared_tables(["entries", "public"])
-    .with_shared_layout(SharedLayout::new(
-        format!("{ORDERS_DDL}; {TEMP_READER}; {SHARED_DDL}"),
-        format!("{ORDERS_DDL}; {TEMP_READER}"),
-        format!("{SHARED_DDL}; {TEMP_READER}"),
-        TEMP_READER,
-    ))
 }
 
 /// A dialer handing out `transport` once and nothing after.

@@ -31,9 +31,9 @@ use connetto_test_harness::{
     ConnettoDefaults, OPLOG_TABLE, PUBLICATION, RosterAuth, SLOT, WITHHELD_ID, exec, pool_for,
     provision_writers,
 };
-use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
+use diesel_async::{AsyncPgConnection, SimpleAsyncConnection};
 use sqlite_diff_rs::{ParsedDiffSet, PatchsetOp, Value};
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::{ParserDB, PgCommitPosition, PgLsn, PgStreamingCdcSource, PgStreamingConfig};
@@ -321,6 +321,12 @@ async fn a_lossy_promotion_resyncs_the_lost_rows_and_resumes_the_rest() {
     let url = board.url();
     let pool = pool_for(&url).await;
     let oplog = provision(&pool).await;
+    pool.get()
+        .await
+        .expect("admin connection")
+        .batch_execute(connetto_test_harness::FIXTURE_ROLES)
+        .await
+        .expect("apply the roles to the fresh cluster");
     exec(
         &pool,
         &format!("CREATE PUBLICATION {PUBLICATION} FOR TABLE orders"),

@@ -18,8 +18,7 @@ use connetto_file_core::{ChunkHash, ChunkMeta};
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 
-use crate::caller::{CallerSettings, bind_caller};
-use crate::functions;
+use crate::caller::{CallerSettings, bind_caller, visible_files};
 use crate::schema::ConnettoFileSchema;
 
 /// Returns the chunk hashes from `chunks` that `caller` must upload.
@@ -60,7 +59,7 @@ pub(crate) async fn needed_hashes<S: ConnettoFileSchema>(
 
         // Step 3: the declared hashes that committed manifests visible to
         // the caller already carry.
-        let present = visible_committed_hashes_in::<S>(c, &declared).await?;
+        let present = visible_committed_hashes_in::<S>(c, &settings, &caller, &declared).await?;
 
         let needed = chunks_snap
             .iter()
@@ -97,7 +96,7 @@ pub(crate) async fn new_declared_bytes<S: ConnettoFileSchema>(
     let lens = pairs.to_vec();
     conn.transaction::<u64, diesel::result::Error, _>(async move |c| {
         bind_caller(c, &settings, &caller).await?;
-        let present = visible_committed_hashes_in::<S>(c, &declared).await?;
+        let present = visible_committed_hashes_in::<S>(c, &settings, &caller, &declared).await?;
         // Each hash counts once. The stored total sums distinct
         // (hash, len) pairs, so a manifest repeating a chunk slab may
         // charge it at most once.
@@ -117,16 +116,15 @@ pub(crate) async fn new_declared_bytes<S: ConnettoFileSchema>(
 /// [`bind_caller`], so `connetto_visible_files` applies RLS.
 async fn visible_committed_hashes_in<S: ConnettoFileSchema>(
     c: &mut AsyncPgConnection,
+    settings: &CallerSettings,
+    caller: &ContentCaller,
     declared: &[Vec<u8>],
 ) -> Result<HashSet<[u8; 32]>, diesel::result::Error> {
     let candidate_ids = committed_file_ids_for::<S>(c, declared).await?;
     if candidate_ids.is_empty() {
         return Ok(HashSet::new());
     }
-    let visible_ids: Vec<Vec<u8>> =
-        diesel::select(functions::connetto_visible_files(candidate_ids))
-            .get_result(c)
-            .await?;
+    let visible_ids = visible_files(c, settings, caller, candidate_ids).await?;
     if visible_ids.is_empty() {
         return Ok(HashSet::new());
     }

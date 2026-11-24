@@ -140,9 +140,11 @@ fn open_with(synced: &str, tier: Option<&str>) -> Conn {
         SchemaBundle::new(
             SOURCE,
             "",
-            synced,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                synced,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             tier,
         )
         .expect("the source declares major 1"),
