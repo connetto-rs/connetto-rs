@@ -108,6 +108,36 @@ CREATE POLICY orders_insert ON orders
     );
 ";
 
+/// Every insert into `orders` appends to `order_log` through a translated
+/// `AFTER INSERT` trigger.
+const ORDER_LOG_DDL: &str = "-- connetto:major 1
+CREATE TABLE orders (
+    id BIGINT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    quantity BIGINT NOT NULL
+);
+
+ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY orders_p ON orders
+    FOR ALL
+    USING (owner_id = current_setting('app.user_id', true));
+
+CREATE TABLE order_log (
+    order_id BIGINT PRIMARY KEY
+);
+
+CREATE FUNCTION log_order() RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO order_log (order_id) VALUES (NEW.id);
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER orders_log AFTER INSERT ON orders
+    FOR EACH ROW EXECUTE FUNCTION log_order();
+";
+
 /// The signed-in caller for every test here. The replica is named from the
 /// identity that opened it, so this value is fixed for its whole life.
 const ALICE: &str = "alice";
@@ -147,6 +177,14 @@ diesel::table! {
         id -> BigInt,
         /// The logical table the entry is about.
         table_name -> Text,
+    }
+}
+
+diesel::table! {
+    /// The rows the `orders_log` trigger appends.
+    order_log (order_id) {
+        /// The order the trigger saw inserted.
+        order_id -> BigInt,
     }
 }
 
@@ -327,6 +365,31 @@ async fn pump_to_snapshot_end(conn: &mut ConnettoConnection<LoopbackTransport>) 
     }
 }
 
+/// Alice's connection subscribed to `orders` under `sub`, against a server
+/// that answers the subscription with one snapshot of `rows`.
+async fn subscribed_to_snapshot(
+    schema: SyncSchema,
+    rows: &'static [(i64, &'static str, i64)],
+) -> ConnettoConnection<LoopbackTransport> {
+    let (mut server, client_end) = loopback();
+    tokio::spawn(async move {
+        ack_handshake(&mut server).await;
+        wait_subscribe(&mut server).await;
+        send_snapshot(&mut server, "sub", rows, 1).await;
+        while let Ok(Some(_)) = server.recv().await {}
+    });
+
+    let mut conn = ClientBuilder::new(schema, super::support::Once::new(client_end))
+        .signed_in(super::support::held(ALICE))
+        .connect_driven()
+        .await
+        .expect("connect");
+    conn.subscribe("sub", "SELECT * FROM orders")
+        .await
+        .expect("subscribe");
+    conn
+}
+
 /// The table names a mutation frame carries, decompressed and parsed as the
 /// server's write target would.
 fn uploaded_tables(patch: &MutationPatch) -> Vec<String> {
@@ -350,23 +413,7 @@ fn uploaded_tables(patch: &MutationPatch) -> Vec<String> {
 /// apply did not simply bypass the split.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_server_row_lands_and_the_view_still_filters() {
-    let schema = translation();
-    let (mut server, client_end) = loopback();
-    tokio::spawn(async move {
-        ack_handshake(&mut server).await;
-        wait_subscribe(&mut server).await;
-        send_snapshot(&mut server, "sub", &[(1, ALICE, 5), (2, "bob", 7)], 1).await;
-        while let Ok(Some(_)) = server.recv().await {}
-    });
-
-    let mut conn = ClientBuilder::new(schema, super::support::Once::new(client_end))
-        .signed_in(super::support::held("alice"))
-        .connect_driven()
-        .await
-        .expect("connect");
-    conn.subscribe("sub", "SELECT * FROM orders")
-        .await
-        .expect("subscribe");
+    let mut conn = subscribed_to_snapshot(translation(), &[(1, ALICE, 5), (2, "bob", 7)]).await;
     pump_to_snapshot_end(&mut conn).await;
 
     let visible: Vec<i64> = orders::table
@@ -410,23 +457,7 @@ async fn a_server_row_lands_and_the_view_still_filters() {
 /// A readable server row is not rejudged under the local INSERT policy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn authoritative_shared_row_is_not_rejudged_as_a_local_insert() {
-    let schema = schema_for(SHARED_READ_DDL);
-    let (mut server, client_end) = loopback();
-    tokio::spawn(async move {
-        ack_handshake(&mut server).await;
-        wait_subscribe(&mut server).await;
-        send_snapshot(&mut server, "sub", &[(2, "bob", 7)], 1).await;
-        while let Ok(Some(_)) = server.recv().await {}
-    });
-
-    let mut conn = ClientBuilder::new(schema, super::support::Once::new(client_end))
-        .signed_in(super::support::held("alice"))
-        .connect_driven()
-        .await
-        .expect("connect");
-    conn.subscribe("sub", "SELECT * FROM orders")
-        .await
-        .expect("subscribe");
+    let mut conn = subscribed_to_snapshot(schema_for(SHARED_READ_DDL), &[(2, "bob", 7)]).await;
     pump_to_snapshot_end(&mut conn).await;
 
     let stored: Vec<i64> = orders_rls::table
@@ -479,26 +510,45 @@ async fn local_insert_still_obeys_the_owner_check() {
     );
 }
 
+/// A row the server delivers fires none of the replica's translated triggers,
+/// as a PostgreSQL subscriber applying with `session_replication_role =
+/// replica` fires none, while a local insert still fires them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delivered_row_fires_no_translated_trigger() {
+    let mut conn = subscribed_to_snapshot(schema_for(ORDER_LOG_DDL), &[(1, ALICE, 5)]).await;
+    pump_to_snapshot_end(&mut conn).await;
+
+    let visible: Vec<i64> = orders::table
+        .select(orders::id)
+        .load(conn.conn())
+        .expect("read through the logical name");
+    assert_eq!(visible, vec![1], "the delivered row must land");
+
+    diesel::insert_into(orders::table)
+        .values((
+            orders::id.eq(2),
+            orders::owner_id.eq(ALICE),
+            orders::quantity.eq(7),
+        ))
+        .execute(conn.conn())
+        .expect("Alice inserts her own order");
+
+    let logged: Vec<i64> = order_log::table
+        .select(order_log::order_id)
+        .order(order_log::order_id.asc())
+        .load(conn.conn())
+        .expect("read the trigger's log");
+    assert_eq!(
+        logged,
+        vec![2],
+        "only the local insert fires the trigger, the delivered row does not",
+    );
+}
+
 /// A nested ownership predicate has the same authoritative apply contract.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn authoritative_row_allowed_by_nested_ownership_is_not_rejudged_as_a_local_insert() {
-    let schema = schema_for(NESTED_OWNERSHIP_DDL);
-    let (mut server, client_end) = loopback();
-    tokio::spawn(async move {
-        ack_handshake(&mut server).await;
-        wait_subscribe(&mut server).await;
-        send_snapshot(&mut server, "sub", &[(1, "bob", 7)], 1).await;
-        while let Ok(Some(_)) = server.recv().await {}
-    });
-
-    let mut conn = ClientBuilder::new(schema, super::support::Once::new(client_end))
-        .signed_in(super::support::held("alice"))
-        .connect_driven()
-        .await
-        .expect("connect");
-    conn.subscribe("sub", "SELECT * FROM orders")
-        .await
-        .expect("subscribe");
+    let mut conn = subscribed_to_snapshot(schema_for(NESTED_OWNERSHIP_DDL), &[(1, "bob", 7)]).await;
     pump_to_snapshot_end(&mut conn).await;
 
     let stored: Vec<i64> = orders_rls::table
@@ -522,23 +572,7 @@ async fn authoritative_row_allowed_by_nested_ownership_is_not_rejudged_as_a_loca
 /// no live query over this table would ever refresh.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_changed_table_is_reported_under_its_logical_name() {
-    let schema = translation();
-    let (mut server, client_end) = loopback();
-    tokio::spawn(async move {
-        ack_handshake(&mut server).await;
-        wait_subscribe(&mut server).await;
-        send_snapshot(&mut server, "sub", &[(1, ALICE, 5)], 1).await;
-        while let Ok(Some(_)) = server.recv().await {}
-    });
-
-    let mut conn = ClientBuilder::new(schema, super::support::Once::new(client_end))
-        .signed_in(super::support::held("alice"))
-        .connect_driven()
-        .await
-        .expect("connect");
-    conn.subscribe("sub", "SELECT * FROM orders")
-        .await
-        .expect("subscribe");
+    let mut conn = subscribed_to_snapshot(translation(), &[(1, ALICE, 5)]).await;
 
     let mut changed: Vec<String> = Vec::new();
     loop {
