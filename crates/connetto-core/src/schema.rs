@@ -880,6 +880,24 @@ mod tests {
         .expect("the source declares major 1")
     }
 
+    /// A helper the replica and the shared store both call is registered once,
+    /// and carrying helpers leaves the version alone because each name already
+    /// hashes its function.
+    #[test]
+    fn a_helper_named_twice_is_carried_once_outside_the_version() {
+        let helper = |body: &str| HelperFunction {
+            name: "is_public_1a2b".to_owned(),
+            parameters: vec!["p_id".to_owned()],
+            columns: vec!["value".to_owned()],
+            body: body.to_owned(),
+        };
+        let bundle = reference()
+            .with_helper_functions([helper("SELECT 1")])
+            .with_helper_functions([helper("SELECT 2")]);
+        assert_eq!(bundle.helper_functions(), [helper("SELECT 1")]);
+        assert_eq!(bundle.version(), reference().version());
+    }
+
     #[test]
     fn every_field_of_the_bundle_changes_the_version() {
         let base = reference().version();

@@ -2085,6 +2085,72 @@ mod tests {
         );
     }
 
+    /// A build whose policy calls a SQL helper renders that helper into the
+    /// bundle file, so the generated `bundle()` carries what a device
+    /// registers before it runs the DDL calling it.
+    #[test]
+    fn emit_renders_the_helpers_the_replica_calls() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let schema = dir.path().join("schema.sql");
+        let policies = dir.path().join("policies.sql");
+        let roles = dir.path().join("roles.sql");
+        let schema_sql = majored(
+            "CREATE TABLE public_ids (id INT PRIMARY KEY);\n\
+             CREATE TABLE docs (id INT PRIMARY KEY, label TEXT);",
+        );
+        let policies_sql = "CREATE FUNCTION is_public(p_id INT) RETURNS BOOLEAN LANGUAGE sql STABLE \
+                              AS $$ SELECT EXISTS (SELECT 1 FROM public_ids WHERE id = p_id) $$;\n\
+                            ALTER TABLE docs ENABLE ROW LEVEL SECURITY;\n\
+                            CREATE POLICY docs_public ON docs USING (is_public(id));";
+        std::fs::write(&schema, &schema_sql).expect("the schema source writes");
+        std::fs::write(&policies, policies_sql).expect("the policies source writes");
+        std::fs::write(&roles, ROLES).expect("the roles source writes");
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).expect("the output directory writes");
+        emit_to::<String, TextIds>(
+            [schema.as_path(), policies.as_path(), roles.as_path()],
+            READER,
+            ALWAYS,
+            None,
+            &[],
+            &out,
+        )
+        .expect("emits");
+        let bundle =
+            translate::<String, TextIds>(Documents::new(&schema_sql, policies_sql, ROLES, READER))
+                .expect("translates");
+        let [helper] = bundle.helper_functions() else {
+            panic!(
+                "the policy calls one helper: {:?}",
+                bundle.helper_functions()
+            );
+        };
+        assert!(
+            helper.body.contains("public_ids"),
+            "the helper answers from the table it reads: {}",
+            helper.body
+        );
+        let rendered =
+            std::fs::read_to_string(out.join("connetto-translate.rs")).expect("the bundle file");
+        let entry = format!(
+            "({}, {}, {}, {})",
+            raw_literal(&helper.name),
+            borrowed_slice(&helper.parameters),
+            borrowed_slice(&helper.columns),
+            raw_literal(&helper.body),
+        );
+        assert!(
+            rendered.contains(&format!(
+                "HELPER_FUNCTIONS: &[(&str, &[&str], &[&str], &str)] = &[{entry}]"
+            )),
+            "the bundle file carries the helper: {rendered}"
+        );
+        assert!(
+            rendered.contains(".with_helper_functions(HELPER_FUNCTIONS"),
+            "the generated bundle attaches them: {rendered}"
+        );
+    }
+
     /// A build whose history holds a fresh export for its major attaches
     /// the history to the bundle it renders.
     #[test]
