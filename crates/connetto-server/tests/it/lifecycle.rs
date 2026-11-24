@@ -448,6 +448,9 @@ async fn a_weakened_replica_identity_refuses_a_model_table() {
     exec(&pool, "INSERT INTO owned VALUES (1, 'alice', 'seed')").await;
     fixture.start_replication(&["owned"]).await;
     fixture.provision_auth_tables().await;
+    fixture
+        .setup_roles(connetto_test_harness::FIXTURE_ROLES)
+        .await;
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await

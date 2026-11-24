@@ -37,9 +37,11 @@ fn builder() -> WebClientBuilder {
     let bundle = connetto_core::schema::SchemaBundle::new(
         REPLICA_DDL,
         REPLICA_DDL,
-        REPLICA_DDL,
-        Vec::<(&str, &str)>::new(),
-        Vec::<&str>::new(),
+        connetto_core::ReplicaCopy::new(
+            REPLICA_DDL,
+            Vec::<(&str, &str)>::new(),
+            Vec::<&str>::new(),
+        ),
         Some(TIER_DDL),
     )
     .expect("the source declares major 1");

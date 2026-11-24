@@ -105,14 +105,7 @@ pub mod build {
     #[must_use]
     pub fn raw_schema(ddl: &str) -> SyncSchema {
         SyncSchema::new(
-            SchemaBundle::new(
-                "-- connetto:major 1",
-                "",
-                ddl,
-                Vec::<(String, String)>::new(),
-                Vec::<String>::new(),
-                None::<&str>,
-            )
+            SchemaBundle::new("-- connetto:major 1", "", connetto_core::ReplicaCopy::new(ddl, Vec::<(String, String)>::new(), Vec::<String>::new()), None::<&str>)
             .expect("the source declares major 1"),
         )
     }

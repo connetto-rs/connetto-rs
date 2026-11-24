@@ -49,9 +49,11 @@ fn schema() -> SyncSchema {
         SchemaBundle::new(
             "-- connetto:major 1",
             "",
-            SQLITE_DDL,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                SQLITE_DDL,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             None::<&str>,
         )
         .expect("the fixture declares its major"),

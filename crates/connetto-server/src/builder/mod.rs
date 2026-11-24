@@ -299,21 +299,24 @@ impl Database {
 }
 
 /// The deployment's source documents, catalog DDL, read policies and roles,
-/// and the reader role the roles document creates.
+/// the reader role the roles document creates, and the role each kind of
+/// caller acts as.
 #[derive(Clone, Debug)]
 pub struct ServerSchema {
     pg_ddl: String,
     pg_policies: String,
     pg_roles: String,
     reader_role: String,
+    kind_roles: connetto_core::KindRoles,
     devices: bool,
     unset: connetto_core::auth::UnsetSettings,
 }
 
 impl ServerSchema {
     /// Name the catalog DDL, the policies that decide which view a logical
-    /// name resolves to, the roles document creating the reader role and its
-    /// grants, and the reader role the server reads and writes as.
+    /// name resolves to, the roles document creating the reader role, the
+    /// kind roles and their grants, and the reader role the server logs in
+    /// as. Each kind acts as its default role.
     #[must_use]
     pub fn new(
         pg_ddl: impl Into<String>,
@@ -326,6 +329,7 @@ impl ServerSchema {
             pg_policies: pg_policies.into(),
             pg_roles: pg_roles.into(),
             reader_role: reader_role.into(),
+            kind_roles: connetto_core::KindRoles::default(),
             devices: false,
             unset: connetto_core::auth::UnsetSettings::ALWAYS_BOUND,
         }
@@ -340,7 +344,17 @@ impl ServerSchema {
             &self.pg_roles,
             &self.reader_role,
         )
+        .with_kind_roles(&self.kind_roles)
         .with_unset_settings(self.unset)
+    }
+
+    /// Each kind acting as the role `kind_roles` names, the roles the client
+    /// build passed to [`connetto_translate::emit`], for a deployment whose
+    /// database another API already holds a default kind name on.
+    #[must_use]
+    pub fn with_kind_roles(mut self, kind_roles: connetto_core::KindRoles) -> Self {
+        self.kind_roles = kind_roles;
+        self
     }
 
     /// Hold the device enrolment table in the catalog, the device identity
@@ -1991,13 +2005,18 @@ where
                         documents.roles(),
                         documents.reader_role(),
                     )
-                    .with_unset_settings(schema.unset),
+                    .with_unset_settings(schema.unset)
+                    .with_kind_roles(&schema.kind_roles),
                 )?;
                 crate::portability::validate(
                     list,
                     &schema.engine_ddl::<D>(),
                     &replica,
-                    &CallerMappings::of::<String>(&schema.reader_role, schema.unset)?,
+                    &CallerMappings::of::<String>(
+                        &schema.reader_role,
+                        &schema.kind_roles,
+                        schema.unset,
+                    )?,
                     serves_content,
                 )
             })
@@ -2020,7 +2039,13 @@ where
         completion.lag_watch = lag_watch.as_ref().map(BackgroundTask::completion);
         let reader_pool_size = reader_reserve.total();
         let reader_pool = build_pool(&database.reader_url, reader_pool_size).await?;
-        require_reader_role(&reader_pool, &schema.reader_role, &synced).await?;
+        require_reader_role(
+            &reader_pool,
+            &schema.reader_role,
+            &schema.kind_roles,
+            &synced,
+        )
+        .await?;
         if portability
             .as_ref()
             .is_some_and(ValidatedList::needs_owner_snapshot)
@@ -2082,6 +2107,7 @@ where
                     guard.read_limits(Tier::Identified),
                     reader.files.take(),
                     schema.unset,
+                    schema.kind_roles.clone(),
                 )
                 .map(Arc::new)
             })
@@ -2306,24 +2332,33 @@ async fn require_cap_policies(pool: &PgPool, synced: &[String]) -> Result<(), Bu
     Ok(())
 }
 
-/// Refuse a reader URL that is not the reader role, or a reader role the
-/// policies and grants of a synced table do not bind.
+/// Refuse a reader URL that is not the reader role, a kind role the reader
+/// cannot safely act as, or a reader or kind role the policies and grants of
+/// a synced table do not bind.
 ///
-/// Both translators model the rules that bind the reader role, so a reader
-/// connection that logs in or acts as another role, or a reader that owns a
+/// Both translators model the rules that bind each kind role, so a reader
+/// connection that logs in or acts as another role, a kind role that logs in,
+/// bypasses the rules or that the reader inherits, or a role that owns a
 /// synced table or inherits its owner's privileges, would read and write
-/// around them.
+/// around them. A missing kind role refuses too, since connetto creates no
+/// server objects.
 async fn require_reader_role(
     reader_pool: &PgPool,
     reader_role: &str,
+    kind_roles: &connetto_core::KindRoles,
     synced: &[String],
 ) -> Result<(), BuildError> {
+    let roles: Vec<&str> = std::iter::once(reader_role)
+        .chain(kind_roles.iter().map(|(_, role)| role))
+        .collect();
     let required: Vec<Artifact<'_>> = std::iter::once(Artifact::ActingRole(reader_role))
-        .chain(
-            synced
-                .iter()
-                .map(|table| Artifact::PolicyBoundTable(table.as_str())),
-        )
+        .chain(kind_roles.iter().map(|(_, role)| Artifact::KindRole(role)))
+        .chain(synced.iter().flat_map(|table| {
+            roles.iter().map(|role| Artifact::PolicyBoundTable {
+                role,
+                table: table.as_str(),
+            })
+        }))
         .collect();
     preflight::require(reader_pool, &required).await?;
     Ok(())
@@ -2525,12 +2560,14 @@ async fn build_reader_side<D: ConnettoSchema>(
         &database.reader_url,
         reader_pool_size,
         schema.unset,
+        schema.kind_roles.clone(),
         hooks,
     )
     .await?;
     let snapshot = PgSnapshotSource::from_ddl(pool.clone(), &schema.engine_ddl::<D>())?
         .with_publication(publication)
-        .with_unset_settings(schema.unset);
+        .with_unset_settings(schema.unset)
+        .with_kind_roles(schema.kind_roles.clone());
     Ok(ReaderSide {
         pool,
         signer,
@@ -2665,22 +2702,25 @@ async fn build_write_side<D: ConnettoSchema>(
         .with_policy_reads(translated.policy_reads())
         .with_caller(CallerMappings::of::<String>(
             &schema.reader_role,
+            &schema.kind_roles,
             schema.unset,
         )?)
         .with_read_connector(engine_connector)
         .build()?;
-    // The second opinion reads as the reader role, so it takes its pool before the write target consumes it.
+    // The second opinion reads as the caller's kind role, so it takes its pool before the write target consumes it.
     let second = if second_opinion {
         Some(
             RlsAuth::<D::Id, String>::from_ddl(pools.reader.clone(), &schema.engine_ddl::<D>())
                 .map_err(|err| BuildError::SecondOpinion(err.to_string()))?
-                .with_unset_settings(schema.unset),
+                .with_unset_settings(schema.unset)
+                .with_kind_roles(schema.kind_roles.clone()),
         )
     } else {
         None
     };
     let write = pg_write_target::<D>(pools.reader, &schema.engine_ddl::<D>())?
-        .with_unset_settings(schema.unset);
+        .with_unset_settings(schema.unset)
+        .with_kind_roles(schema.kind_roles.clone());
     // Move-out withdrawals read on the owner pool, where the membership that ended no longer hides the rows (R27 decision 6).
     let withdrawals = PgSnapshotSource::from_ddl(pools.owner.clone(), &schema.engine_ddl::<D>())?
         .with_unset_settings(schema.unset);
@@ -3114,8 +3154,8 @@ mod tests {
                  ALTER TABLE papers ENABLE ROW LEVEL SECURITY;",
                 "CREATE POLICY papers_p ON papers FOR SELECT USING \
                  (owner = current_setting('app.user_id', true))",
-                "CREATE ROLE app_reader LOGIN;",
-                "app_reader",
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
             ),
             true,
         )

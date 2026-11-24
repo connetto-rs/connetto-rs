@@ -210,6 +210,9 @@ async fn reset_portability_fixture(pool: &Pool<AsyncPgConnection>, fixture: &Fix
          _connetto_session_writers TO app_reader",
     )
     .await;
+    fixture
+        .setup_roles(connetto_test_harness::FIXTURE_ROLES)
+        .await;
     let mut conn = pool.get().await.expect("a connection");
     diesel::insert_into(records::table)
         .values(vec![

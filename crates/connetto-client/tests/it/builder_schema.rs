@@ -31,9 +31,11 @@ fn builder_schema_installs_uuidv4_for_a_default_key() {
         SchemaBundle::new(
             "-- connetto:major 1\nCREATE TABLE things (id UUID PRIMARY KEY, label TEXT);",
             "",
-            DDL,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                DDL,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             None::<&str>,
         )
         .expect("the source declares major 1"),
@@ -113,7 +115,10 @@ CREATE POLICY docs_public ON docs USING (is_public(id)) WITH CHECK (is_public(id
     )
     .expect("translate the sources");
     assert!(
-        !bundle.helper_functions().is_empty(),
+        !bundle
+            .copy(connetto_core::CallerKind::Anon)
+            .helper_functions()
+            .is_empty(),
         "the translation calls the helper as a table-valued function"
     );
     let mut conn = ClientBuilder::new(
@@ -151,6 +156,55 @@ CREATE POLICY docs_public ON docs USING (is_public(id)) WITH CHECK (is_public(id
     );
 }
 
+/// A build opens the anonymous copy until it acts as a kind, and a policy
+/// written `TO authenticated` holds on the signed-in copy only.
+#[test]
+fn a_build_opens_the_copy_of_the_kind_it_acts_as() {
+    use connetto_core::CallerKind;
+
+    let bundle = connetto_translate::translate::<String, connetto_core::bots::TextIds>(
+        connetto_translate::Documents::new(
+            "-- connetto:major 1
+CREATE TABLE docs (id INT PRIMARY KEY, label TEXT);",
+            "ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY docs_signed_in ON docs TO authenticated USING (true) WITH CHECK (true);",
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
+    )
+    .expect("translate the sources");
+    let open = |schema: SyncSchema| {
+        ClientBuilder::new(
+            schema,
+            super::support::NeverDial::<FakeTransport>::default(),
+        )
+        .open_driven()
+        .expect("open the replica with the kind's copy")
+    };
+    let anonymous = SyncSchema::new(bundle.clone());
+    assert_eq!(anonymous.kind(), CallerKind::Anon);
+    let mut conn = open(anonymous);
+    let refused = diesel::insert_into(docs::table)
+        .values((docs::id.eq(1), docs::label.eq("mine")))
+        .execute(conn.conn())
+        .expect_err("no policy reaches the anonymous copy");
+    assert!(
+        pg2sqlite::prelude::is_policy_refusal(&refused.to_string()),
+        "the copy's row security refused the row: {refused}"
+    );
+
+    let mut conn = open(SyncSchema::new(bundle).acting_as(CallerKind::Authenticated));
+    diesel::insert_into(docs::table)
+        .values((docs::id.eq(1), docs::label.eq("mine")))
+        .execute(conn.conn())
+        .expect("the signed-in copy carries the policy that admits the row");
+    let visible: Vec<i32> = docs::table
+        .select(docs::id)
+        .load(conn.conn())
+        .expect("read through the policy view");
+    assert_eq!(visible, [1]);
+}
+
 fn major(value: u32) -> Major {
     Major::new(value).expect("a test major is from 1 up")
 }
@@ -163,9 +217,11 @@ fn a_tier_step_outside_the_boundaries_is_refused() {
         let bundle = SchemaBundle::new(
             "-- connetto:major 3",
             "",
-            "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)",
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)",
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             Some("CREATE TABLE notes (id INTEGER PRIMARY KEY)"),
         )
         .expect("the source declares major 3");

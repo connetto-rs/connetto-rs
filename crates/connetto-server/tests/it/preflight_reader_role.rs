@@ -1,21 +1,24 @@
-//! Startup refuses a reader connection that is not the reader role, or a reader
-//! role that holds the privileges of a declared table's owner.
+//! Startup refuses a reader connection that is not the reader role, a kind
+//! role the reader cannot safely act as, or a role that holds the privileges
+//! of a declared table's owner.
 //!
-//! Every caller reaches Postgres as the reader role, and both translators model
-//! the policies and grants that bind that role. A connection that logs in as
-//! another role, or switches to one through a role setting, is bound by other
-//! rules. A role holding the owner's privileges skips the table's policies
-//! unless the table forces row-level security, and holds every grant on it.
+//! Every caller reaches Postgres through the reader role and acts as its
+//! kind's role, and both translators model the policies and grants that bind
+//! the kind roles. A connection that logs in as another role, or switches to
+//! one through a role setting, is bound by other rules. A role holding the
+//! owner's privileges skips the table's policies unless the table forces
+//! row-level security, and holds every grant on it.
 //!
 //! Needs Docker: the fixture starts its own Postgres.
 
-use connetto_server::preflight::{self, Artifact, PreflightError};
+use connetto_server::preflight::{self, Artifact, KindRoleFault, PreflightError};
 use connetto_test_harness::server_fixture::with_user_url;
 use connetto_test_harness::{Fixture, pool_for};
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::bb8::Pool;
 
 const READER: &str = "rrole_reader";
+const KIND: &str = "rrole_kind";
 
 const SETUP: [&str; 6] = [
     "CREATE ROLE rrole_reader LOGIN PASSWORD 'rrole_reader'",
@@ -95,7 +98,10 @@ async fn a_connection_that_logs_in_or_acts_as_another_role_is_refused() {
 async fn a_reader_holding_the_privileges_of_a_table_owner_is_refused() {
     let fixture = Fixture::acquire().await;
     fixture.setup(&SETUP).await;
-    let required = [Artifact::PolicyBoundTable("rrole_items")];
+    let required = [Artifact::PolicyBoundTable {
+        role: READER,
+        table: "rrole_items",
+    }];
 
     preflight::require(&pool_as(&fixture, READER).await, &required)
         .await
@@ -150,7 +156,10 @@ async fn an_absent_declared_table_is_refused_as_missing() {
     fixture.setup(&SETUP).await;
     let refused = preflight::require(
         &pool_as(&fixture, READER).await,
-        &[Artifact::PolicyBoundTable("rrole_absent")],
+        &[Artifact::PolicyBoundTable {
+            role: READER,
+            table: "rrole_absent",
+        }],
     )
     .await
     .expect_err("an absent table is refused");
@@ -161,4 +170,120 @@ async fn an_absent_declared_table_is_refused_as_missing() {
         ),
         "{refused:?}"
     );
+}
+
+/// A kind role owning a declared table skips its policies, so a caller of
+/// that kind would read and write around them, whatever the reader holds.
+#[tokio::test]
+async fn a_kind_role_holding_the_privileges_of_a_table_owner_is_refused() {
+    let fixture = Fixture::acquire().await;
+    fixture.setup(&SETUP).await;
+    fixture.exec("CREATE ROLE rrole_kind NOLOGIN").await;
+    let required = [Artifact::PolicyBoundTable {
+        role: KIND,
+        table: "rrole_items",
+    }];
+    preflight::require(&pool_as(&fixture, READER).await, &required)
+        .await
+        .expect("a kind role that does not own the table is fit");
+
+    fixture
+        .exec("ALTER TABLE rrole_items OWNER TO rrole_owner")
+        .await;
+    fixture
+        .exec("GRANT rrole_owner TO rrole_kind WITH INHERIT TRUE")
+        .await;
+    let refused = preflight::require(&pool_as(&fixture, READER).await, &required)
+        .await
+        .expect_err("a kind role inheriting the owner's privileges is refused");
+    assert!(
+        matches!(
+            refused,
+            PreflightError::OwnerPrivileges { ref table, ref role, ref owner }
+                if table == "rrole_items" && role == KIND && owner == "rrole_owner"
+        ),
+        "{refused:?}"
+    );
+}
+
+/// The faults the reader's pool reports for the kind role.
+async fn kind_faults(fixture: &Fixture) -> Vec<KindRoleFault> {
+    match preflight::require(&pool_as(fixture, READER).await, &[Artifact::KindRole(KIND)]).await {
+        Ok(()) => Vec::new(),
+        Err(PreflightError::KindRole { role, faults }) if role == KIND => faults,
+        Err(other) => panic!("a kind role is refused for its faults alone: {other:?}"),
+    }
+}
+
+/// A kind role is refused when it is missing, when it could act on its own
+/// or around every policy, and when the reader holds it in any way but the
+/// one switch connetto makes per transaction.
+#[tokio::test]
+async fn a_kind_role_the_reader_cannot_safely_act_as_is_refused() {
+    let fixture = Fixture::acquire().await;
+    fixture.setup(&SETUP).await;
+    let refused = preflight::require(
+        &pool_as(&fixture, READER).await,
+        &[Artifact::KindRole(KIND)],
+    )
+    .await
+    .expect_err("a missing kind role is refused");
+    assert!(
+        matches!(
+            refused,
+            PreflightError::Missing { noun: "kind role", ref name } if name == KIND
+        ),
+        "{refused:?}"
+    );
+
+    fixture.exec("CREATE ROLE rrole_kind NOLOGIN").await;
+    assert_eq!(
+        kind_faults(&fixture).await,
+        [KindRoleFault::NotSettable],
+        "the reader must be able to switch to the kind role"
+    );
+
+    fixture
+        .exec("GRANT rrole_kind TO rrole_reader WITH INHERIT FALSE, SET TRUE")
+        .await;
+    assert_eq!(kind_faults(&fixture).await, []);
+
+    for (alter, undo, fault) in [
+        (
+            "ALTER ROLE rrole_kind LOGIN",
+            "ALTER ROLE rrole_kind NOLOGIN",
+            KindRoleFault::LogsIn,
+        ),
+        (
+            "ALTER ROLE rrole_kind BYPASSRLS",
+            "ALTER ROLE rrole_kind NOBYPASSRLS",
+            KindRoleFault::BypassesRls,
+        ),
+        (
+            "ALTER ROLE rrole_kind SUPERUSER",
+            "ALTER ROLE rrole_kind NOSUPERUSER",
+            KindRoleFault::Superuser,
+        ),
+        (
+            "GRANT pg_read_all_data TO rrole_kind",
+            "REVOKE pg_read_all_data FROM rrole_kind",
+            KindRoleFault::ReadsAllData,
+        ),
+        (
+            "GRANT pg_write_all_data TO rrole_kind",
+            "REVOKE pg_write_all_data FROM rrole_kind",
+            KindRoleFault::WritesAllData,
+        ),
+        (
+            "GRANT rrole_kind TO rrole_reader WITH INHERIT TRUE",
+            "GRANT rrole_kind TO rrole_reader WITH INHERIT FALSE",
+            KindRoleFault::InheritedByReader,
+        ),
+    ] {
+        fixture.exec(alter).await;
+        let faults = kind_faults(&fixture).await;
+        assert!(faults.contains(&fault), "{alter}: {faults:?}");
+        fixture.exec(undo).await;
+        assert_eq!(kind_faults(&fixture).await, [], "{undo}");
+    }
 }

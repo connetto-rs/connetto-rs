@@ -1374,9 +1374,11 @@ mod tests {
                 SchemaBundle::new(
                     SOURCE,
                     "",
-                    ddl,
-                    Vec::<(String, String)>::new(),
-                    Vec::<String>::new(),
+                    connetto_core::ReplicaCopy::new(
+                        ddl,
+                        Vec::<(String, String)>::new(),
+                        Vec::<String>::new(),
+                    ),
                     None::<&str>,
                 )
                 .expect("the source declares major 1"),

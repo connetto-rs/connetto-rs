@@ -212,6 +212,9 @@ pub async fn reset_fixture(pool: &Pool<AsyncPgConnection>, fixture: &Fixture) {
         "GRANT USAGE ON SEQUENCE _connetto_courier_notices_id_seq TO app_reader",
     )
     .await;
+    // The kind roles a caller acts as, granted what the fixture's tables
+    // hold once those tables exist.
+    fixture.setup_roles(crate::FIXTURE_ROLES).await;
     exec(pool, "INSERT INTO orders VALUES (1, 1.0, 3, 'seed')").await;
     fixture.start_replication(&["orders"]).await;
 }

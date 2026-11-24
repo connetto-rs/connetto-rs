@@ -804,6 +804,9 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
     fixture.start_replication(&["owned"]).await;
     fixture.provision_auth_tables().await;
     exec(&admin, "GRANT SELECT ON auth_events TO app_reader").await;
+    fixture
+        .setup_roles(connetto_test_harness::FIXTURE_ROLES)
+        .await;
 
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
 
@@ -2081,7 +2084,17 @@ async fn e2e_content_ticket_round_trips_over_a_live_session() {
     reset_fixture(&pool, &fixture).await;
     fixture.start_replication(&["orders"]).await;
     apply_content_deployment(&pool, true).await;
-    exec(&pool, "GRANT SELECT ON photos TO app_reader").await;
+    exec(
+        &pool,
+        "GRANT SELECT ON photos TO app_reader, anon, authenticated, bot_installation, bot, delegated",
+    )
+    .await;
+    exec(
+        &pool,
+        "GRANT EXECUTE ON FUNCTION connetto_visible_files(BYTEA[]) \
+         TO app_reader, anon, authenticated, bot_installation, bot, delegated",
+    )
+    .await;
     fixture.provision_auth_tables().await;
 
     let store = TempDir::new().expect("content store dir");

@@ -27,11 +27,12 @@
 
 use core::fmt;
 use core::num::NonZeroU32;
+use std::sync::Arc;
 
 pub use pg2sqlite_runtime::HelperFunction;
 use serde::{Deserialize, Serialize};
 
-use crate::auth::UnsetSettings;
+use crate::auth::{CallerKind, UnsetSettings};
 
 /// The replica's local name for `current_setting('app.user_id')`, which the
 /// identity arm of every deployment policy compares against.
@@ -160,12 +161,13 @@ const BUNDLE_DOMAIN_TAG: &str = "connetto-schema-bundle-v1\0";
 /// (derived at boot from its Postgres sources) and by an application build
 /// (translated at build time from the same sources).
 ///
-/// It holds the two Postgres source documents, the translated replica DDL
-/// they produce, the policy table pairs the translation split, the policy
-/// views the translation emitted, and an optional translated local tier.
-/// The local tier is a separate database, attached under its own schema on a
-/// replica, so it is not part of the synced shape the version covers and
-/// changing it does not change the version.
+/// It holds the two Postgres source documents, an optional translated local
+/// tier, and one [`ReplicaCopy`] per [`CallerKind`], the replica a caller of
+/// that kind opens, translated for the database role the kind acts as (R108).
+/// Kinds whose copies are equal share one. The local tier is a separate
+/// database, attached under its own schema on a replica, so it is not part of
+/// the synced shape the version covers and changing it does not change the
+/// version.
 ///
 /// The version is always the hash of these contents, computed by
 /// [`version`](SchemaBundle::version), and there is no other way to obtain
@@ -177,17 +179,26 @@ const BUNDLE_DOMAIN_TAG: &str = "connetto-schema-bundle-v1\0";
 pub struct SchemaBundle {
     schema_source: String,
     policies_source: String,
+    local_tier_ddl: Option<String>,
+    copies: [Arc<ReplicaCopy>; 5],
+    major: Major,
+    tier_history: TierHistory,
+    unset_settings: UnsetSettings,
+}
+
+/// What one kind of caller's replica holds: the translated replica DDL, the
+/// policy table pairs the translation split, the policy views it emitted, the
+/// tables a device stores once for every account with the shared store's
+/// layout, the connection program, and the helpers the DDL calls.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplicaCopy {
     replica_ddl: String,
     policy_tables: Vec<(String, String)>,
     policy_views: Vec<String>,
-    local_tier_ddl: Option<String>,
     shared_tables: Vec<String>,
     shared_layout: Option<SharedLayout>,
     connection_ddl: String,
     helper_functions: Vec<HelperFunction<String>>,
-    major: Major,
-    tier_history: TierHistory,
-    unset_settings: UnsetSettings,
 }
 
 /// The generated structural step of one local-tier boundary, from the major
@@ -328,59 +339,62 @@ impl SchemaBundle {
     /// Build a bundle from its contents, in the one place the contents are
     /// authoritative, the build step that translated them or a test.
     ///
-    /// `policy_tables` are the `(logical, physical)` pairs the translation
-    /// split, `policy_views` every view it emitted, and `local_tier_ddl` the
-    /// translated local tier, when the build has one. Order of the pairs and
-    /// views does not matter, the hash sorts them.
+    /// Every kind starts out holding `copy`, which
+    /// [`with_copy`](Self::with_copy) replaces for one kind. `local_tier_ddl`
+    /// is the translated local tier, when the build has one.
     ///
     /// # Errors
     ///
     /// The [`MajorError`] when `schema_source` does not declare its major
     /// through [`MAJOR_DIRECTIVE`].
-    pub fn new<S, P, D, T, TL, TP, V, VN, L>(
+    pub fn new<S, P, L>(
         schema_source: S,
         policies_source: P,
-        replica_ddl: D,
-        policy_tables: T,
-        policy_views: V,
+        copy: impl Into<Arc<ReplicaCopy>>,
         local_tier_ddl: Option<L>,
     ) -> Result<Self, MajorError>
     where
         S: Into<String>,
         P: Into<String>,
-        D: Into<String>,
-        T: IntoIterator<Item = (TL, TP)>,
-        TL: Into<String>,
-        TP: Into<String>,
-        V: IntoIterator<Item = VN>,
-        VN: Into<String>,
         L: Into<String>,
     {
         let schema_source = schema_source.into();
         let major = Major::declared_in(&schema_source)?;
         let local_tier_ddl: Option<String> = local_tier_ddl.map(Into::into);
+        let copy = copy.into();
         Ok(Self {
             schema_source,
             policies_source: policies_source.into(),
-            replica_ddl: replica_ddl.into(),
-            policy_tables: policy_tables
-                .into_iter()
-                .map(|(logical, physical)| (logical.into(), physical.into()))
-                .collect(),
-            policy_views: policy_views.into_iter().map(Into::into).collect(),
             tier_history: TierHistory::new(
                 major,
                 local_tier_ddl.is_some().then_some(major),
                 Vec::new(),
             ),
             local_tier_ddl,
-            shared_tables: Vec::new(),
-            helper_functions: Vec::new(),
-            shared_layout: None,
-            connection_ddl: String::new(),
+            copies: CallerKind::ALL.map(|_| Arc::clone(&copy)),
             major,
             unset_settings: UnsetSettings::ALWAYS_BOUND,
         })
+    }
+
+    /// Return a copy of this bundle in which `kind` holds `copy`, the replica
+    /// translated for the role that kind acts as.
+    #[must_use]
+    pub fn with_copy(mut self, kind: CallerKind, copy: impl Into<Arc<ReplicaCopy>>) -> Self {
+        self.copies[kind.index()] = copy.into();
+        self
+    }
+
+    /// The replica a caller of `kind` opens.
+    #[must_use]
+    pub fn copy(&self, kind: CallerKind) -> &ReplicaCopy {
+        &self.copies[kind.index()]
+    }
+
+    /// The replica a caller of `kind` opens, shared rather than copied.
+    #[must_use]
+    pub fn shared_copy(&self, kind: CallerKind) -> Arc<ReplicaCopy> {
+        Arc::clone(&self.copies[kind.index()])
     }
 
     /// The application schema major the schema source declares.
@@ -399,59 +413,6 @@ impl SchemaBundle {
         self.local_tier_ddl = Some(local_tier_ddl.into());
         if self.tier_history.first_with_tier.is_none() {
             self.tier_history.first_with_tier = Some(self.major);
-        }
-        self
-    }
-
-    /// Return a copy of this bundle naming the tables a device stores once for
-    /// every account. The version is unaffected, since where a device stores a
-    /// table changes nothing on the wire.
-    #[must_use]
-    pub fn with_shared_tables<T: Into<String>>(
-        mut self,
-        tables: impl IntoIterator<Item = T>,
-    ) -> Self {
-        self.shared_tables = tables.into_iter().map(Into::into).collect();
-        self
-    }
-
-    /// Return a copy of this bundle carrying the shared store's translated
-    /// layout, for a build that stores a table once for every account. The
-    /// version is unaffected, since the layout is a device-side artifact, not
-    /// part of the synced shape it covers.
-    #[must_use]
-    pub fn with_shared_layout(mut self, layout: SharedLayout) -> Self {
-        self.shared_layout = Some(layout);
-        self
-    }
-
-    /// Return a copy of this bundle carrying its connection program, the
-    /// statements a connection to an existing replica runs to recreate its
-    /// `TEMP` objects. The version is unaffected, since the first
-    /// initialization the replica DDL hashes already covers it.
-    #[must_use]
-    pub fn with_connection_ddl(mut self, ddl: impl Into<String>) -> Self {
-        self.connection_ddl = ddl.into();
-        self
-    }
-
-    /// Return a copy of this bundle also carrying `functions`, helpers its DDL
-    /// calls as table-valued functions, each name kept once. The version is
-    /// unaffected, since each name hashes its function and the DDL calls it by
-    /// that name.
-    #[must_use]
-    pub fn with_helper_functions(
-        mut self,
-        functions: impl IntoIterator<Item = HelperFunction<String>>,
-    ) -> Self {
-        for function in functions {
-            if !self
-                .helper_functions
-                .iter()
-                .any(|held| held.name == function.name)
-            {
-                self.helper_functions.push(function);
-            }
         }
         self
     }
@@ -505,6 +466,154 @@ impl SchemaBundle {
         &self.policies_source
     }
 
+    /// The translated local tier, when the build has one. It is not part of
+    /// the synced shape the version covers.
+    #[must_use]
+    pub fn local_tier_ddl(&self) -> Option<&str> {
+        self.local_tier_ddl.as_deref()
+    }
+
+    /// The schema version this bundle presents at handshake.
+    ///
+    /// SHA-256 over the domain tag, then each field length-prefixed with its
+    /// byte length as a big-endian `u64` and followed by its bytes, in a
+    /// fixed order:
+    ///
+    /// 1. the schema source, with CRLF normalized to LF,
+    /// 2. the policies source, normalized the same way,
+    /// 3. for each kind in [`CallerKind::ALL`] order, its copy's replica
+    ///    DDL normalized the same way, its policy pairs, lowercased and
+    ///    sorted, each as logical then physical, joined with NULs, and its
+    ///    policy views, lowercased and sorted, joined with NULs,
+    /// 4. [`CALLER_FUNCTION`],
+    /// 5. [`SUBJECTS_FUNCTION`],
+    /// 6. the user setting's declaration, `0` always bound, `1` may be unset,
+    ///    `uuid` may be unset and a `uuid` when set,
+    /// 7. whether the subjects setting may be unset, `1` or `0`.
+    ///
+    /// The length prefixes are what keep the encoding unambiguous under
+    /// concatenation, so one field gaining the text another lost cannot keep
+    /// the hash put. Line endings are normalized so a CRLF vs LF checkout
+    /// difference does not force a spurious reload. Nothing else is, so any
+    /// real edit changes the hash. The pair and view names are lowercased the
+    /// same way the client's policy map holds them, so a document rewritten
+    /// in case alone reads as the same schema.
+    #[must_use]
+    pub fn version(&self) -> SchemaVersion {
+        use sha2::{Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+        hasher.update(BUNDLE_DOMAIN_TAG.as_bytes());
+        for source in [&self.schema_source, &self.policies_source] {
+            field_into(&mut hasher, &source.replace("\r\n", "\n"));
+        }
+        for copy in &self.copies {
+            field_into(&mut hasher, &copy.replica_ddl.replace("\r\n", "\n"));
+            field_into(&mut hasher, &pairs_field(&copy.policy_tables));
+            field_into(&mut hasher, &views_field(&copy.policy_views));
+        }
+        for field in [
+            CALLER_FUNCTION,
+            SUBJECTS_FUNCTION,
+            user_field(self.unset_settings),
+            presence_field(self.unset_settings.subjects_may_be_unset()),
+        ] {
+            field_into(&mut hasher, field);
+        }
+        SchemaVersion::from_hash(hasher.finalize().to_vec())
+    }
+}
+
+impl fmt::Debug for SchemaBundle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SchemaBundle")
+            .field("major", &self.major)
+            .field("version", &self.version())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReplicaCopy {
+    /// Build one kind's copy from its translated replica DDL, the
+    /// `(logical, physical)` pairs the translation split and every view it
+    /// emitted. Order of the pairs and views does not matter, the hash sorts
+    /// them.
+    pub fn new<D, T, TL, TP, V, VN>(replica_ddl: D, policy_tables: T, policy_views: V) -> Self
+    where
+        D: Into<String>,
+        T: IntoIterator<Item = (TL, TP)>,
+        TL: Into<String>,
+        TP: Into<String>,
+        V: IntoIterator<Item = VN>,
+        VN: Into<String>,
+    {
+        Self {
+            replica_ddl: replica_ddl.into(),
+            policy_tables: policy_tables
+                .into_iter()
+                .map(|(logical, physical)| (logical.into(), physical.into()))
+                .collect(),
+            policy_views: policy_views.into_iter().map(Into::into).collect(),
+            shared_tables: Vec::new(),
+            shared_layout: None,
+            connection_ddl: String::new(),
+            helper_functions: Vec::new(),
+        }
+    }
+
+    /// The same copy naming the tables a device stores once for every
+    /// account. The version is unaffected, since where a device stores a
+    /// table changes nothing on the wire.
+    #[must_use]
+    pub fn with_shared_tables<T: Into<String>>(
+        mut self,
+        tables: impl IntoIterator<Item = T>,
+    ) -> Self {
+        self.shared_tables = tables.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// The same copy carrying the shared store's translated layout, for a
+    /// build that stores a table once for every account. The version is
+    /// unaffected, since the layout is a device-side artifact, not part of
+    /// the synced shape it covers.
+    #[must_use]
+    pub fn with_shared_layout(mut self, layout: SharedLayout) -> Self {
+        self.shared_layout = Some(layout);
+        self
+    }
+
+    /// The same copy carrying its connection program, the statements a
+    /// connection to an existing replica runs to recreate its `TEMP`
+    /// objects. The version is unaffected, since the first initialization
+    /// the replica DDL hashes already covers it.
+    #[must_use]
+    pub fn with_connection_ddl(mut self, ddl: impl Into<String>) -> Self {
+        self.connection_ddl = ddl.into();
+        self
+    }
+
+    /// The same copy also carrying `functions`, helpers its DDL calls as
+    /// table-valued functions, each name kept once. The version is
+    /// unaffected, since each name hashes its function and the DDL calls it
+    /// by that name.
+    #[must_use]
+    pub fn with_helper_functions(
+        mut self,
+        functions: impl IntoIterator<Item = HelperFunction<String>>,
+    ) -> Self {
+        for function in functions {
+            if !self
+                .helper_functions
+                .iter()
+                .any(|held| held.name == function.name)
+            {
+                self.helper_functions.push(function);
+            }
+        }
+        self
+    }
+
     /// The translated replica DDL, the SQLite document a client applies when
     /// it opens a fresh replica.
     #[must_use]
@@ -526,13 +635,6 @@ impl SchemaBundle {
         &self.policy_views
     }
 
-    /// The translated local tier, when the build has one. It is not part of
-    /// the synced shape the version covers.
-    #[must_use]
-    pub fn local_tier_ddl(&self) -> Option<&str> {
-        self.local_tier_ddl.as_deref()
-    }
-
     /// The tables a device stores once for every account, as the build
     /// validated them.
     #[must_use]
@@ -543,7 +645,7 @@ impl SchemaBundle {
     /// The shared store's translated layout, when the build shares a table.
     /// It is not part of the synced shape the version covers.
     #[must_use]
-    pub fn shared_layout(&self) -> Option<&SharedLayout> {
+    pub const fn shared_layout(&self) -> Option<&SharedLayout> {
         self.shared_layout.as_ref()
     }
 
@@ -556,77 +658,17 @@ impl SchemaBundle {
     }
 
     /// The helpers every replica connection registers before it runs any of
-    /// this bundle's DDL.
+    /// this copy's DDL.
     #[must_use]
     pub fn helper_functions(&self) -> &[HelperFunction<String>] {
         &self.helper_functions
-    }
-
-    /// The schema version this bundle presents at handshake.
-    ///
-    /// SHA-256 over the domain tag, then each field length-prefixed with its
-    /// byte length as a big-endian `u64` and followed by its bytes, in a
-    /// fixed order:
-    ///
-    /// 1. the schema source, with CRLF normalized to LF,
-    /// 2. the policies source, normalized the same way,
-    /// 3. the replica DDL, normalized the same way,
-    /// 4. the policy pairs, lowercased and sorted, each as logical then
-    ///    physical, joined with NULs,
-    /// 5. the policy views, lowercased and sorted, joined with NULs,
-    /// 6. [`CALLER_FUNCTION`],
-    /// 7. [`SUBJECTS_FUNCTION`],
-    /// 8. the user setting's declaration, `0` always bound, `1` may be unset,
-    ///    `uuid` may be unset and a `uuid` when set,
-    /// 9. whether the subjects setting may be unset, `1` or `0`.
-    ///
-    /// The length prefixes are what keep the encoding unambiguous under
-    /// concatenation, so one field gaining the text another lost cannot keep
-    /// the hash put. Line endings are normalized so a CRLF vs LF checkout
-    /// difference does not force a spurious reload. Nothing else is, so any
-    /// real edit changes the hash. The pair and view names are lowercased the
-    /// same way the client's policy map holds them, so a document rewritten
-    /// in case alone reads as the same schema.
-    #[must_use]
-    pub fn version(&self) -> SchemaVersion {
-        use sha2::{Digest, Sha256};
-
-        let mut hasher = Sha256::new();
-        hasher.update(BUNDLE_DOMAIN_TAG.as_bytes());
-        let pairs = pairs_field(&self.policy_tables);
-        let views = views_field(&self.policy_views);
-        for field in [
-            self.schema_source.replace("\r\n", "\n").as_str(),
-            self.policies_source.replace("\r\n", "\n").as_str(),
-            self.replica_ddl.replace("\r\n", "\n").as_str(),
-            pairs.as_str(),
-            views.as_str(),
-            CALLER_FUNCTION,
-            SUBJECTS_FUNCTION,
-            user_field(self.unset_settings),
-            presence_field(self.unset_settings.subjects_may_be_unset()),
-        ] {
-            field_into(&mut hasher, field);
-        }
-        SchemaVersion::from_hash(hasher.finalize().to_vec())
-    }
-}
-
-impl fmt::Debug for SchemaBundle {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SchemaBundle")
-            .field("major", &self.major)
-            .field("version", &self.version())
-            .field("policy_tables", &self.policy_tables)
-            .field("policy_views", &self.policy_views)
-            .finish_non_exhaustive()
     }
 }
 
 /// The shared store's translated layout: the four SQL programs a device runs to
 /// open a replica whose shared tables live in a separate database file, one for
 /// each freshness situation of the main and shared files.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SharedLayout {
     fresh_both: String,
     fresh_main: String,
@@ -792,9 +834,7 @@ mod tests {
         SchemaBundle::new(
             format!("{MAJOR_DIRECTIVE} {value}"),
             "",
-            "",
-            NO_TABLES.iter().copied(),
-            NO_VIEWS.iter().copied(),
+            ReplicaCopy::new("", NO_TABLES.iter().copied(), NO_VIEWS.iter().copied()),
             Some("CREATE TABLE notes (id INTEGER PRIMARY KEY)"),
         )
         .expect("the source declares its major")
@@ -867,17 +907,31 @@ mod tests {
         format!("{MAJOR_DIRECTIVE} 1\n{source}")
     }
 
-    /// One bundle of known contents, the reference every case below varies.
-    fn reference() -> SchemaBundle {
-        SchemaBundle::new(
-            majored("CREATE TABLE orders (id INT);"),
-            "CREATE POLICY orders_p ON orders USING (true);",
-            "CREATE TABLE orders_rls (id INTEGER); CREATE VIEW orders AS SELECT * FROM orders_rls;",
+    const REFERENCE_DDL: &str =
+        "CREATE TABLE orders_rls (id INTEGER); CREATE VIEW orders AS SELECT * FROM orders_rls;";
+
+    /// The copy of known contents every kind of the reference bundle holds.
+    fn reference_copy() -> ReplicaCopy {
+        ReplicaCopy::new(
+            REFERENCE_DDL,
             [("orders", "orders_rls")],
             ["orders", "orders_rls_violations"],
-            None::<&str>,
         )
-        .expect("the source declares major 1")
+    }
+
+    /// A major 1 bundle of `schema` and `policies` whose every kind holds `copy`.
+    fn bundle(schema: &str, policies: &str, copy: ReplicaCopy) -> SchemaBundle {
+        SchemaBundle::new(majored(schema), policies, copy, None::<&str>)
+            .expect("the source declares major 1")
+    }
+
+    /// One bundle of known contents, the reference every case below varies.
+    fn reference() -> SchemaBundle {
+        bundle(
+            "CREATE TABLE orders (id INT);",
+            "CREATE POLICY orders_p ON orders USING (true);",
+            reference_copy(),
+        )
     }
 
     /// A helper the replica and the shared store both call is registered once,
@@ -891,47 +945,59 @@ mod tests {
             columns: vec!["value".to_owned()],
             body: body.to_owned(),
         };
-        let bundle = reference()
+        let copy = reference_copy()
             .with_helper_functions([helper("SELECT 1")])
             .with_helper_functions([helper("SELECT 2")]);
-        assert_eq!(bundle.helper_functions(), [helper("SELECT 1")]);
-        assert_eq!(bundle.version(), reference().version());
+        assert_eq!(copy.helper_functions(), [helper("SELECT 1")]);
+        assert_eq!(
+            reference().with_copy(CallerKind::Anon, copy).version(),
+            reference().version()
+        );
     }
 
     #[test]
     fn every_field_of_the_bundle_changes_the_version() {
         let base = reference().version();
+        let policies = "CREATE POLICY orders_p ON orders USING (true);";
         let varied = [
-            SchemaBundle::new(majored("CREATE TABLE orders (id INT, extra INT);"), "CREATE POLICY orders_p ON orders USING (true);",
-            "CREATE TABLE orders_rls (id INTEGER); CREATE VIEW orders AS SELECT * FROM orders_rls;",
-            [("orders", "orders_rls")],
-            ["orders", "orders_rls_violations"],
-            None::<&str>,).expect("the source declares major 1")
+            bundle(
+                "CREATE TABLE orders (id INT, extra INT);",
+                policies,
+                reference_copy(),
+            )
             .version(),
-            SchemaBundle::new(majored("CREATE TABLE orders (id INT);"), "CREATE POLICY orders_p ON orders USING (id > 0);",
-            "CREATE TABLE orders_rls (id INTEGER); CREATE VIEW orders AS SELECT * FROM orders_rls;",
-            [("orders", "orders_rls")],
-            ["orders", "orders_rls_violations"],
-            None::<&str>,).expect("the source declares major 1")
+            bundle(
+                "CREATE TABLE orders (id INT);",
+                "CREATE POLICY orders_p ON orders USING (id > 0);",
+                reference_copy(),
+            )
             .version(),
-            SchemaBundle::new(majored("CREATE TABLE orders (id INT);"), "CREATE POLICY orders_p ON orders USING (true);",
-            "CREATE TABLE orders_rls (id INTEGER NOT NULL); CREATE VIEW orders AS SELECT * FROM orders_rls;",
-            [("orders", "orders_rls")],
-            ["orders", "orders_rls_violations"],
-            None::<&str>,).expect("the source declares major 1")
-            .version(),
-            SchemaBundle::new(majored("CREATE TABLE orders (id INT);"), "CREATE POLICY orders_p ON orders USING (true);",
-            "CREATE TABLE orders_rls (id INTEGER); CREATE VIEW orders AS SELECT * FROM orders_rls;",
-            [("orders", "orders_split")],
-            ["orders", "orders_rls_violations"],
-            None::<&str>,).expect("the source declares major 1")
-            .version(),
-            SchemaBundle::new(majored("CREATE TABLE orders (id INT);"), "CREATE POLICY orders_p ON orders USING (true);",
-            "CREATE TABLE orders_rls (id INTEGER); CREATE VIEW orders AS SELECT * FROM orders_rls;",
-            [("orders", "orders_rls")],
-            ["orders"],
-            None::<&str>,).expect("the source declares major 1")
-            .version(),
+            reference()
+                .with_copy(
+                    CallerKind::Delegated,
+                    ReplicaCopy::new(
+                        "CREATE TABLE orders_rls (id INTEGER NOT NULL); CREATE VIEW orders AS SELECT * FROM orders_rls;",
+                        [("orders", "orders_rls")],
+                        ["orders", "orders_rls_violations"],
+                    ),
+                )
+                .version(),
+            reference()
+                .with_copy(
+                    CallerKind::Anon,
+                    ReplicaCopy::new(
+                        REFERENCE_DDL,
+                        [("orders", "orders_split")],
+                        ["orders", "orders_rls_violations"],
+                    ),
+                )
+                .version(),
+            reference()
+                .with_copy(
+                    CallerKind::Authenticated,
+                    ReplicaCopy::new(REFERENCE_DDL, [("orders", "orders_rls")], ["orders"]),
+                )
+                .version(),
             reference()
                 .with_unset_settings(UnsetSettings::ALWAYS_BOUND.with_user())
                 .version(),
@@ -947,9 +1013,18 @@ mod tests {
             base, varied[1],
             "the policies source is part of the version"
         );
-        assert_ne!(base, varied[2], "the replica DDL is part of the version");
-        assert_ne!(base, varied[3], "the policy pairs are part of the version");
-        assert_ne!(base, varied[4], "the policy views are part of the version");
+        assert_ne!(
+            base, varied[2],
+            "every kind's replica DDL is part of the version"
+        );
+        assert_ne!(
+            base, varied[3],
+            "every kind's policy pairs are part of the version"
+        );
+        assert_ne!(
+            base, varied[4],
+            "every kind's policy views are part of the version"
+        );
         assert_ne!(
             base, varied[5],
             "whether the user setting may be unset is part of the version"
@@ -962,6 +1037,20 @@ mod tests {
             varied[5], varied[7],
             "whether the identity is a uuid is part of the version"
         );
+    }
+
+    /// Two kinds swapping their copies is a different deployment, since each
+    /// caller would open the other's replica.
+    #[test]
+    fn which_kind_holds_a_copy_is_part_of_the_version() {
+        let other = ReplicaCopy::new(
+            "CREATE TABLE notes (id INTEGER);",
+            NO_TABLES.iter().copied(),
+            NO_VIEWS.iter().copied(),
+        );
+        let anon_other = reference().with_copy(CallerKind::Anon, other.clone());
+        let authenticated_other = reference().with_copy(CallerKind::Authenticated, other);
+        assert_ne!(anon_other.version(), authenticated_other.version());
     }
 
     #[test]
@@ -1003,7 +1092,10 @@ mod tests {
     #[test]
     fn the_shared_tables_do_not_change_the_version() {
         let without = reference();
-        let with = without.clone().with_shared_tables(["orders"]);
+        let with = reference().with_copy(
+            CallerKind::Authenticated,
+            reference_copy().with_shared_tables(["orders"]),
+        );
         assert_eq!(
             without.version(),
             with.version(),
@@ -1013,40 +1105,40 @@ mod tests {
 
     #[test]
     fn pair_and_view_order_does_not_change_the_version() {
-        let base = SchemaBundle::new(
-            majored("CREATE TABLE orders (id INT);"),
+        let base = bundle(
+            "CREATE TABLE orders (id INT);",
             "CREATE POLICY orders_p ON orders USING (true);",
-            "CREATE TABLE orders_rls (id INTEGER);",
-            [("orders", "orders_rls"), ("notes", "notes_rls")],
-            ["notes", "orders", "orders_rls_violations"],
-            None::<&str>,
+            ReplicaCopy::new(
+                "CREATE TABLE orders_rls (id INTEGER);",
+                [("orders", "orders_rls"), ("notes", "notes_rls")],
+                ["notes", "orders", "orders_rls_violations"],
+            ),
         )
-        .expect("the source declares major 1")
         .version();
-        let reordered = SchemaBundle::new(
-            majored("CREATE TABLE orders (id INT);"),
+        let reordered = bundle(
+            "CREATE TABLE orders (id INT);",
             "CREATE POLICY orders_p ON orders USING (true);",
-            "CREATE TABLE orders_rls (id INTEGER);",
-            [("notes", "notes_rls"), ("orders", "orders_rls")],
-            ["orders_rls_violations", "orders", "notes"],
-            None::<&str>,
-        )
-        .expect("the source declares major 1");
+            ReplicaCopy::new(
+                "CREATE TABLE orders_rls (id INTEGER);",
+                [("notes", "notes_rls"), ("orders", "orders_rls")],
+                ["orders_rls_violations", "orders", "notes"],
+            ),
+        );
         assert_eq!(base, reordered.version(), "the hash sorts both lists");
     }
 
     #[test]
     fn pair_names_are_case_insensitive() {
         let base = reference().version();
-        let recased = SchemaBundle::new(
-            majored("CREATE TABLE orders (id INT);"),
+        let recased = bundle(
+            "CREATE TABLE orders (id INT);",
             "CREATE POLICY orders_p ON orders USING (true);",
-            "CREATE TABLE orders_rls (id INTEGER); CREATE VIEW orders AS SELECT * FROM orders_rls;",
-            [("ORDERS", "ORDERS_RLS")],
-            ["ORDERS", "ORDERS_RLS_VIOLATIONS"],
-            None::<&str>,
-        )
-        .expect("the source declares major 1");
+            ReplicaCopy::new(
+                REFERENCE_DDL,
+                [("ORDERS", "ORDERS_RLS")],
+                ["ORDERS", "ORDERS_RLS_VIOLATIONS"],
+            ),
+        );
         assert_eq!(
             base,
             recased.version(),
@@ -1057,53 +1149,22 @@ mod tests {
     const NO_TABLES: &[(&str, &str)] = &[];
     const NO_VIEWS: &[&str] = &[];
 
+    /// A copy of `ddl` with no split tables and no views.
+    fn bare(ddl: &str) -> ReplicaCopy {
+        ReplicaCopy::new(ddl, NO_TABLES.iter().copied(), NO_VIEWS.iter().copied())
+    }
+
     #[test]
     fn two_field_splits_of_one_concatenation_differ() {
         // One byte string, split between two fields at different points. A
         // scheme that hashed the concatenation would read the two bundles as
         // equal. The length prefixes make the split part of the identity.
-        let left = SchemaBundle::new(
-            majored("AB"),
-            "",
-            "DDL",
-            NO_TABLES.iter().copied(),
-            NO_VIEWS.iter().copied(),
-            None::<&str>,
-        )
-        .expect("the source declares major 1")
-        .version();
-        let right = SchemaBundle::new(
-            majored("A"),
-            "B",
-            "DDL",
-            NO_TABLES.iter().copied(),
-            NO_VIEWS.iter().copied(),
-            None::<&str>,
-        )
-        .expect("the source declares major 1")
-        .version();
+        let left = bundle("AB", "", bare("DDL")).version();
+        let right = bundle("A", "B", bare("DDL")).version();
         assert_ne!(left, right, "the split at the field boundary is hashed");
 
-        let left = SchemaBundle::new(
-            majored("A\nB"),
-            "C",
-            "DDL",
-            NO_TABLES.iter().copied(),
-            NO_VIEWS.iter().copied(),
-            None::<&str>,
-        )
-        .expect("the source declares major 1")
-        .version();
-        let right = SchemaBundle::new(
-            majored("A"),
-            "B\nC",
-            "DDL",
-            NO_TABLES.iter().copied(),
-            NO_VIEWS.iter().copied(),
-            None::<&str>,
-        )
-        .expect("the source declares major 1")
-        .version();
+        let left = bundle("A\nB", "C", bare("DDL")).version();
+        let right = bundle("A", "B\nC", bare("DDL")).version();
         assert_ne!(left, right, "so is a split across a newline");
     }
 
@@ -1125,42 +1186,26 @@ mod tests {
     #[test]
     fn the_version_is_the_documented_digest() {
         let bundle = reference();
-        let expected = manual_digest(&[
-            &majored("CREATE TABLE orders (id INT);"),
+        let schema = majored("CREATE TABLE orders (id INT);");
+        let mut fields = vec![
+            schema.as_str(),
             "CREATE POLICY orders_p ON orders USING (true);",
-            "CREATE TABLE orders_rls (id INTEGER); CREATE VIEW orders AS SELECT * FROM orders_rls;",
-            "orders\u{0}orders_rls",
-            "orders\u{0}orders_rls_violations",
-            CALLER_FUNCTION,
-            SUBJECTS_FUNCTION,
-            "0",
-            "0",
-        ]);
-        assert_eq!(bundle.version().hash(), &expected[..]);
+        ];
+        for _ in CallerKind::ALL {
+            fields.extend([
+                REFERENCE_DDL,
+                "orders\u{0}orders_rls",
+                "orders\u{0}orders_rls_violations",
+            ]);
+        }
+        fields.extend([CALLER_FUNCTION, SUBJECTS_FUNCTION, "0", "0"]);
+        assert_eq!(bundle.version().hash(), &manual_digest(&fields)[..]);
     }
 
     #[test]
     fn crlf_and_lf_sources_hash_equal() {
-        let lf = SchemaBundle::new(
-            majored("A\nB\nC"),
-            "D\nE",
-            "F\nG",
-            NO_TABLES.iter().copied(),
-            NO_VIEWS.iter().copied(),
-            None::<&str>,
-        )
-        .expect("the source declares major 1")
-        .version();
-        let crlf = SchemaBundle::new(
-            majored("A\r\nB\r\nC"),
-            "D\r\nE",
-            "F\r\nG",
-            NO_TABLES.iter().copied(),
-            NO_VIEWS.iter().copied(),
-            None::<&str>,
-        )
-        .expect("the source declares major 1")
-        .version();
+        let lf = bundle("A\nB\nC", "D\nE", bare("F\nG")).version();
+        let crlf = bundle("A\r\nB\r\nC", "D\r\nE", bare("F\r\nG")).version();
         assert_eq!(lf, crlf);
     }
 
@@ -1175,24 +1220,24 @@ mod tests {
     #[test]
     fn the_shared_layout_and_connection_program_do_not_change_the_version() {
         let base = reference().version();
+        let with = |copy: ReplicaCopy| reference().with_copy(CallerKind::Anon, copy).version();
         assert_eq!(
             base,
-            reference().with_shared_layout(layout()).version(),
+            with(reference_copy().with_shared_layout(layout())),
             "the shared layout alone changes nothing on the wire"
         );
         assert_eq!(
             base,
-            reference()
-                .with_connection_ddl("CREATE TEMP VIEW reader AS SELECT 1;")
-                .version(),
+            with(reference_copy().with_connection_ddl("CREATE TEMP VIEW reader AS SELECT 1;")),
             "the connection program alone changes nothing on the wire"
         );
         assert_eq!(
             base,
-            reference()
-                .with_shared_layout(layout())
-                .with_connection_ddl("CREATE TEMP VIEW reader AS SELECT 1;")
-                .version(),
+            with(
+                reference_copy()
+                    .with_shared_layout(layout())
+                    .with_connection_ddl("CREATE TEMP VIEW reader AS SELECT 1;")
+            ),
             "a device that shares a table must present the same schema as one that does not"
         );
     }
@@ -1208,12 +1253,12 @@ mod tests {
         assert_eq!(layout.sql(false, false), "reopen");
     }
 
-    /// A bundle built without a shared store has no layout and no connection
+    /// A copy built without a shared store has no layout and no connection
     /// program, so a device that never shares reads `None` and the empty
     /// program.
     #[test]
-    fn a_fresh_bundle_has_no_shared_layout_and_no_connection_program() {
-        let base = reference();
+    fn a_fresh_copy_has_no_shared_layout_and_no_connection_program() {
+        let base = reference_copy();
         assert!(base.shared_layout().is_none());
         assert_eq!(base.connection_ddl(), "");
     }
@@ -1237,9 +1282,7 @@ mod tests {
             SchemaBundle::new(
                 "CREATE TABLE orders (id INT);",
                 "",
-                "CREATE TABLE orders_rls (id INTEGER); CREATE VIEW orders AS SELECT * FROM orders_rls;",
-                Vec::<(String, String)>::new(),
-                Vec::<String>::new(),
+                reference_copy(),
                 None::<&str>,
             ),
             Err(MajorError::Missing)

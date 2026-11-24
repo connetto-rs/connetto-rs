@@ -180,9 +180,15 @@ impl WebClientBuilder {
         self
     }
 
-    /// Sign in, moving the build to the signed-in stage.
+    /// Sign in, moving the build to the signed-in stage, whose replica and
+    /// tab mirrors are the signed-in copy.
     pub fn signed_in<S: WebSignIn>(mut self, sign_in: S) -> WebSignedIn {
         self.build.web.sign_in = Some(sign_in.into_kind());
+        self.build.web.schema = self
+            .build
+            .web
+            .schema
+            .acting_as(connetto_core::CallerKind::Authenticated);
         WebSignedIn { build: self.build }
     }
 

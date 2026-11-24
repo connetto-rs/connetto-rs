@@ -37,9 +37,11 @@ fn bundle_major_2() -> SyncSchema {
         SchemaBundle::new(
             "-- connetto:major 2",
             "",
-            DDL,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                DDL,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             None::<&str>,
         )
         .expect("the source declares major 2"),

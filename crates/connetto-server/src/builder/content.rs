@@ -280,6 +280,7 @@ pub(crate) async fn build<D: crate::schema::ConnettoSchema>(
     reader_url: &str,
     reader_pool_size: u32,
     unset: connetto_core::auth::UnsetSettings,
+    kind_roles: connetto_core::auth::KindRoles,
     hooks: FileHooks<D::Id>,
 ) -> Result<FileHalf, ContentBuildError> {
     let Some(settings) = settings else {
@@ -287,10 +288,12 @@ pub(crate) async fn build<D: crate::schema::ConnettoSchema>(
     };
     settings.validate()?;
     // The server binds the caller under connetto's default names, which is
-    // what its session manager is left configured with, and reads an absent
-    // half as the schema declares.
+    // what its session manager is left configured with, reads an absent half
+    // as the schema declares, and asks the deployment's visibility function
+    // as the caller's kind.
     let caller_settings = files::CallerSettings {
         unset,
+        kind_roles: Some(kind_roles),
         ..files::CallerSettings::default()
     };
     let (signer, public) = ticket_keypair(&settings)?;
@@ -401,6 +404,7 @@ pub(crate) async fn build<D: crate::schema::ConnettoSchema>(
     _reader_url: &str,
     _reader_pool_size: u32,
     _unset: connetto_core::auth::UnsetSettings,
+    _kind_roles: connetto_core::auth::KindRoles,
     _hooks: FileHooks<D::Id>,
 ) -> Result<FileHalf, ContentBuildError> {
     if settings.is_some() {
@@ -570,6 +574,7 @@ mod tests {
             "postgres://unused",
             1,
             connetto_core::auth::UnsetSettings::ALWAYS_BOUND,
+            connetto_core::KindRoles::default(),
             no_hooks(),
         )
         .await
@@ -664,6 +669,7 @@ mod tests {
             &reader_url,
             2,
             connetto_core::auth::UnsetSettings::ALWAYS_BOUND,
+            connetto_core::KindRoles::default(),
             no_hooks(),
         )
         .await

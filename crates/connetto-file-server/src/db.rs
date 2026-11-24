@@ -10,8 +10,7 @@ use diesel_async::{AsyncConnection, AsyncConnectionCore, AsyncPgConnection, RunQ
 
 use connetto_core::auth::ContentCaller;
 
-use crate::caller::{CallerSettings, attributions_of_key, bind_caller};
-use crate::functions;
+use crate::caller::{CallerSettings, attributions_of_key, bind_caller, visible_files};
 use crate::needed;
 use crate::schema::ConnettoFileSchema;
 
@@ -184,11 +183,8 @@ pub(crate) async fn file_visible_to_caller(
     reader_conn
         .transaction::<bool, diesel::result::Error, _>(async move |conn| {
             bind_caller(conn, &settings, &caller).await?;
-            let visible: Vec<Vec<u8>> = diesel::select(functions::connetto_visible_files(vec![
-                file_id_bytes.clone(),
-            ]))
-            .get_result(conn)
-            .await?;
+            let visible =
+                visible_files(conn, &settings, &caller, vec![file_id_bytes.clone()]).await?;
             Ok(visible.contains(&file_id_bytes))
         })
         .await
@@ -361,10 +357,7 @@ pub(crate) async fn all_chunks_satisfied<S: ConnettoFileSchema>(
             if candidate_ids.is_empty() {
                 return Ok(false);
             }
-            let visible_ids: Vec<Vec<u8>> =
-                diesel::select(functions::connetto_visible_files(candidate_ids))
-                    .get_result(conn)
-                    .await?;
+            let visible_ids = visible_files(conn, &settings, &caller, candidate_ids).await?;
             if visible_ids.is_empty() {
                 return Ok(false);
             }

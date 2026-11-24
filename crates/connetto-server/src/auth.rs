@@ -163,6 +163,14 @@ mod rls {
             self
         }
 
+        /// Switch every caller's transaction to the role `kind_roles` names
+        /// for the caller's kind, as the server's reader-side paths do.
+        #[must_use]
+        pub fn with_kind_roles(mut self, kind_roles: connetto_core::KindRoles) -> Self {
+            self.binding = self.binding.with_kind_roles(kind_roles);
+            self
+        }
+
         /// Build over a connection pool and a Postgres DDL catalog.
         ///
         /// # Errors

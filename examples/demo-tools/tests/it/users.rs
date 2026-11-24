@@ -10,23 +10,34 @@ use connetto_test_harness::server_fixture::mint_tokens;
 use connetto_test_harness::stack::{DEMO_DEPLOYMENT, provision, spawn_server};
 use connetto_test_harness::{MOCK_OAUTH_PROVIDER, MockOauth, with_user};
 use diesel::QueryDsl as _;
-use diesel::sql_types::Text;
+use diesel::sql_types::{Bool, Text};
 use diesel_async::{AsyncConnection as _, AsyncPgConnection, RunQueryDsl as _};
 
-/// The account ids `users` shows the reader role, bound as the server binds
-/// a person's session, the caller as `caller` and the bot list as the
-/// wildcard that passes the deployment's restrictive cap policies.
+diesel::define_sql_function! {
+    fn set_config(name: Text, value: Text, is_local: Bool) -> Text;
+}
+
+/// Read account ids as an authenticated caller with the wildcard bot list.
 async fn visible_to(reader_url: &str, caller: &str) -> Vec<String> {
     let mut connection = AsyncPgConnection::establish(reader_url)
         .await
         .expect("the reader connects");
-    diesel::sql_query("SELECT set_config('app.user_id', $1, false), set_config($2, $3, false)")
-        .bind::<Text, _>(caller)
-        .bind::<Text, _>(connetto_core::schema::BOT_LIST_SETTING)
-        .bind::<Text, _>(connetto_core::schema::BOT_LIST_WILDCARD)
-        .execute(&mut connection)
-        .await
-        .expect("bind the caller");
+    diesel::select((
+        set_config("app.user_id", caller, false),
+        set_config(
+            connetto_core::schema::BOT_LIST_SETTING,
+            connetto_core::schema::BOT_LIST_WILDCARD,
+            false,
+        ),
+        set_config(
+            "role",
+            connetto_core::KindRoles::defaults().role(connetto_core::CallerKind::Authenticated),
+            false,
+        ),
+    ))
+    .execute(&mut connection)
+    .await
+    .expect("bind the caller");
     users::table
         .select(users::id)
         .order(users::id)

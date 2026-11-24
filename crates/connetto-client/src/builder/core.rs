@@ -17,6 +17,7 @@ use core::pin::Pin;
 use core::time::Duration;
 use std::sync::Arc;
 
+use connetto_core::CallerKind;
 use connetto_core::auth::{CapabilityKey, CapabilitySubject};
 use connetto_core::custody::Custody;
 use connetto_core::messages::Grant;
@@ -462,9 +463,8 @@ where
 /// use connetto_client::{ClientBuilder, SyncSchema};
 /// use connetto_core::{LoopbackError, LoopbackTransport, SchemaBundle};
 /// # let bundle = SchemaBundle::new(
-/// #     "-- connetto:major 1", "POLICIES", "DDL",
-/// #     Vec::<(String, String)>::new(),
-/// #     Vec::<String>::new(),
+/// #     "-- connetto:major 1", "POLICIES",
+/// #     connetto_core::ReplicaCopy::new("DDL", Vec::<(String, String)>::new(), Vec::<String>::new()),
 /// #     None::<&str>,
 /// # ).expect("the source declares major 1");
 /// // `connect_with_pump` returns a future. Await it on your platform's
@@ -484,9 +484,8 @@ where
 /// # use connetto_client::{ClientBuilder, Gate, MemoryKeyStore, SyncSchema};
 /// # use connetto_core::{LoopbackError, LoopbackTransport, SchemaBundle};
 /// # let bundle = SchemaBundle::new(
-/// #     "-- connetto:major 1", "POLICIES", "DDL",
-/// #     Vec::<(String, String)>::new(),
-/// #     Vec::<String>::new(),
+/// #     "-- connetto:major 1", "POLICIES",
+/// #     connetto_core::ReplicaCopy::new("DDL", Vec::<(String, String)>::new(), Vec::<String>::new()),
 /// #     None::<&str>,
 /// # ).expect("the source declares major 1");
 /// let builder = ClientBuilder::new(
@@ -500,9 +499,8 @@ where
 /// # use connetto_client::{ClientBuilder, Gate, SyncSchema};
 /// # use connetto_core::{LoopbackError, LoopbackTransport, SchemaBundle};
 /// # let bundle = SchemaBundle::new(
-/// #     "-- connetto:major 1", "POLICIES", "DDL",
-/// #     Vec::<(String, String)>::new(),
-/// #     Vec::<String>::new(),
+/// #     "-- connetto:major 1", "POLICIES",
+/// #     connetto_core::ReplicaCopy::new("DDL", Vec::<(String, String)>::new(), Vec::<String>::new()),
 /// #     None::<&str>,
 /// # ).expect("the source declares major 1");
 /// let builder = ClientBuilder::new(
@@ -568,13 +566,14 @@ where
     }
 
     /// Sign in with a credential the caller already holds, moving the build
-    /// to the signed-in stage.
+    /// to the signed-in stage, whose replica is the signed-in copy.
     ///
     /// The platform layers fork the provider sign-in into their own stores
     /// before reaching this builder, and hand the result here as a held
     /// credential.
     #[must_use]
-    pub fn signed_in(self, credential: HeldCredential) -> CoreSignedIn<T, C> {
+    pub fn signed_in(mut self, credential: HeldCredential) -> CoreSignedIn<T, C> {
+        self.base.schema = self.base.schema.acting_as(CallerKind::Authenticated);
         CoreSignedIn {
             base: self.base,
             credential,

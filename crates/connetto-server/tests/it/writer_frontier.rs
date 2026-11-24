@@ -38,7 +38,7 @@ use connetto_core::messages::{
     MutationRejectReason, PriorRefusal, Provenance, WriterGrant, WriterOutcome, WriterRef,
     WriterRequest, WriterSecret, writer_bind_message,
 };
-use connetto_core::schema::SchemaBundle;
+use connetto_core::schema::{ReplicaCopy, SchemaBundle};
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport as _};
 use connetto_server::audit::{AuditHook, AuthEvent, AuthOp};
@@ -4128,9 +4128,11 @@ fn accept_bundle() -> SyncSchema {
         SchemaBundle::new(
             ACCEPT_DDL,
             "",
-            ACCEPT_SQLITE_DDL,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            ReplicaCopy::new(
+                ACCEPT_SQLITE_DDL,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             None::<&str>,
         )
         .expect("the source declares its major"),

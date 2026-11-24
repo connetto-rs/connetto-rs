@@ -75,9 +75,11 @@ fn first_build() -> SyncSchema {
         SchemaBundle::new(
             format!("{MAJOR_DIRECTIVE} 1"),
             "",
-            REPLICA_V1,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                REPLICA_V1,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             Some(TIER_V1),
         )
         .expect("the source declares major 1"),
@@ -89,9 +91,11 @@ fn second_build() -> SyncSchema {
         SchemaBundle::new(
             format!("{MAJOR_DIRECTIVE} 2"),
             "",
-            REPLICA_V2,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                REPLICA_V2,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             Some(TIER_V2),
         )
         .expect("the source declares major 2")
@@ -110,9 +114,11 @@ fn build(at: u32, tier: Option<&str>, history: Option<TierHistory>) -> SyncSchem
     let bundle = SchemaBundle::new(
         format!("{MAJOR_DIRECTIVE} {at}"),
         "",
-        REPLICA_V1,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
+        connetto_core::ReplicaCopy::new(
+            REPLICA_V1,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+        ),
         tier,
     )
     .expect("the source declares its major");

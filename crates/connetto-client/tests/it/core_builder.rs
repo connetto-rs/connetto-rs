@@ -46,9 +46,11 @@ fn bundle() -> SyncSchema {
         SchemaBundle::new(
             SOURCE,
             "policies",
-            DDL,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                DDL,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             None::<&str>,
         )
         .expect("the source declares major 1"),
@@ -238,9 +240,11 @@ async fn an_anonymous_caller_answers_as_its_bundle_declares() {
                 SchemaBundle::new(
                     SOURCE,
                     "policies",
-                    DDL,
-                    Vec::<(String, String)>::new(),
-                    Vec::<String>::new(),
+                    connetto_core::ReplicaCopy::new(
+                        DDL,
+                        Vec::<(String, String)>::new(),
+                        Vec::<String>::new(),
+                    ),
                     None::<&str>,
                 )
                 .expect("the source declares major 1")
@@ -681,9 +685,11 @@ fn an_anonymous_build_answers_the_caller_and_subjects_functions_as_nobody() {
         SchemaBundle::new(
             SOURCE,
             "policies",
-            ddl,
-            Vec::<(String, String)>::new(),
-            vec!["visible".to_owned()],
+            connetto_core::ReplicaCopy::new(
+                ddl,
+                Vec::<(String, String)>::new(),
+                vec!["visible".to_owned()],
+            ),
             None::<&str>,
         )
         .expect("the source declares major 1"),

@@ -118,9 +118,11 @@ fn build(major: u32, ddl: &str) -> SyncSchema {
         SchemaBundle::new(
             format!("{MAJOR_DIRECTIVE} {major}"),
             "",
-            ddl,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                ddl,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             None::<&str>,
         )
         .expect("the source declares its major"),

@@ -774,6 +774,7 @@ pub async fn term_over_owner_fixture(fixture: &Fixture) -> Server {
 pub fn caller_mapping() -> CallerMappings {
     CallerMappings::of::<String>(
         crate::FIXTURE_READER,
+        connetto_core::KindRoles::defaults(),
         connetto_core::auth::UnsetSettings::ALWAYS_BOUND,
     )
     .expect("the fixture deployment's description holds")

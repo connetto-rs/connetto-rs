@@ -22,9 +22,9 @@ const POLICIES: &str = "ALTER TABLE orders ENABLE ROW LEVEL SECURITY; \
      USING (owner = current_setting('app.user_id', true)) \
      WITH CHECK (owner = current_setting('app.user_id', true));";
 
-/// The bundle version a side declares, derived the way the production binary
-/// derives it, from the same sources both sides hold.
-fn derived_version() -> SchemaVersion {
+/// The bundle both sides hold, translated the way the production binary
+/// translates it.
+fn translated() -> SchemaBundle {
     connetto_translate::translate::<String, connetto_core::bots::TextIds>(
         connetto_translate::Documents::new(
             PG_DDL,
@@ -34,7 +34,12 @@ fn derived_version() -> SchemaVersion {
         ),
     )
     .expect("translate the sources")
-    .version()
+}
+
+/// The bundle version a side declares, derived from the same sources both
+/// sides hold.
+fn derived_version() -> SchemaVersion {
+    translated().version()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -80,17 +85,7 @@ async fn the_handshake_gate_hashes_the_same_bundle_on_both_sides() {
     .await;
 
     let mut conn = ClientBuilder::new(
-        SyncSchema::new(
-            connetto_translate::translate::<String, connetto_core::bots::TextIds>(
-                connetto_translate::Documents::new(
-                    PG_DDL,
-                    POLICIES,
-                    connetto_test_harness::FIXTURE_ROLES,
-                    connetto_test_harness::FIXTURE_READER,
-                ),
-            )
-            .expect("translate the sources"),
-        ),
+        SyncSchema::new(translated()),
         super::support::NeverDial::<LoopbackTransport>::default(),
     )
     .signed_in(super::support::held("alice"))
@@ -110,9 +105,11 @@ async fn the_handshake_gate_hashes_the_same_bundle_on_both_sides() {
     let stale_bundle = SchemaBundle::new(
         PG_DDL,
         POLICIES,
-        "CREATE TABLE orders_rls (id INTEGER PRIMARY KEY, owner TEXT, body TEXT);",
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
+        connetto_core::ReplicaCopy::new(
+            "CREATE TABLE orders_rls (id INTEGER PRIMARY KEY, owner TEXT, body TEXT);",
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+        ),
         None::<&str>,
     )
     .expect("the source declares major 1");

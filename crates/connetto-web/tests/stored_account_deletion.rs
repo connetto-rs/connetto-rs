@@ -51,19 +51,21 @@ fn bundle() -> SchemaBundle {
     SchemaBundle::new(
         "-- connetto:major 1",
         "",
-        format!("{LOCAL}; CREATE TABLE shared_items (id INTEGER PRIMARY KEY, label TEXT)"),
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
+        connetto_core::ReplicaCopy::new(
+            format!("{LOCAL}; CREATE TABLE shared_items (id INTEGER PRIMARY KEY, label TEXT)"),
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+        )
+        .with_shared_tables(["shared_items"])
+        .with_shared_layout(SharedLayout::new(
+            format!("{LOCAL}; {SHARED}"),
+            LOCAL,
+            SHARED,
+            "",
+        )),
         None::<&str>,
     )
     .unwrap()
-    .with_shared_tables(["shared_items"])
-    .with_shared_layout(SharedLayout::new(
-        format!("{LOCAL}; {SHARED}"),
-        LOCAL,
-        SHARED,
-        "",
-    ))
 }
 
 struct Place<'storage>(&'storage ReplicaStorage);

@@ -320,9 +320,11 @@ async fn the_durable_local_tier_is_encrypted_under_the_replica_key_and_resumes()
         SchemaBundle::new(
             SOURCE,
             "",
-            SQLITE_DDL,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                SQLITE_DDL,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             Some(TIER_DDL),
         )
         .expect("the source declares major 1"),
@@ -390,9 +392,11 @@ async fn a_tier_file_from_another_connection_cannot_attach_to_an_encrypted_repli
         SchemaBundle::new(
             SOURCE,
             "",
-            SQLITE_DDL,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                SQLITE_DDL,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             Some(TIER_DDL),
         )
         .expect("the source declares major 1"),

@@ -240,7 +240,8 @@ async fn setup(fixture: &Fixture, helper: bool) {
     for statement in [
         "DROP TABLE IF EXISTS keep CASCADE",
         KEEP_DDL,
-        "GRANT SELECT, INSERT, UPDATE, DELETE ON keep TO app_reader",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON keep \
+         TO app_reader, anon, authenticated, bot_installation, bot, delegated",
         "INSERT INTO keep VALUES (1, 'sibling')",
         "UPDATE orders SET quantity = 1 WHERE id = 1",
         "INSERT INTO orders VALUES (2, 1.0, 2, 'visible')",

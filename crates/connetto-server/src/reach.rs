@@ -569,8 +569,15 @@ mod tests {
                    owner = current_setting('app.user_id', true));",
             ),
             "CREATE ROLE app_reader LOGIN;\n\
-             GRANT USAGE ON SCHEMA public TO app_reader;\n\
-             GRANT SELECT (id, title) ON docs TO app_reader;",
+             CREATE ROLE anon NOLOGIN;\n\
+             CREATE ROLE authenticated NOLOGIN;\n\
+             CREATE ROLE bot_installation NOLOGIN;\n\
+             CREATE ROLE bot NOLOGIN;\n\
+             CREATE ROLE delegated NOLOGIN;\n\
+             GRANT anon, authenticated, bot_installation, bot, delegated TO app_reader \
+               WITH INHERIT FALSE, SET TRUE;\n\
+             GRANT USAGE ON SCHEMA public TO anon, authenticated, bot_installation, bot, delegated;\n\
+             GRANT SELECT (id, title) ON docs TO anon, authenticated, bot_installation, bot, delegated;",
         );
         for relation in ["can_select_id", "can_select_title", "can_select_on_table"] {
             assert_eq!(

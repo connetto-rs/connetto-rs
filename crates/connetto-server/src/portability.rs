@@ -23,9 +23,11 @@ use crate::key_filter::{KeyError, KeyFilter};
 use crate::materializer::{CallerMappings, MaterializerError, translate_select, wire_binds};
 use crate::snapshot::{BinaryRows, attach_binds, page_sql};
 use crate::throttle::ReadLimits;
-use connetto_core::SessionId;
-use connetto_core::auth::{AuthContext, Principal, Subject, UnsetSettings, VerifiedSession};
+use connetto_core::auth::{
+    AuthContext, KindRoles, Principal, Subject, UnsetSettings, VerifiedSession,
+};
 use connetto_core::messages::SqliteValue;
+use connetto_core::{CallerKind, SessionId};
 use diesel::QueryableByName;
 use diesel::sql_types::{Bool, Text, Timestamptz};
 use diesel_async::pooled_connection::bb8::{Pool, RunError};
@@ -443,7 +445,8 @@ impl ValidatedList {
     }
 
     /// The download served from `reader` and `owner` under `limits`, reading
-    /// file bytes from `files` and binding the person as `unset` declares.
+    /// file bytes from `files` and binding the person as `unset` declares,
+    /// acting as the signed-in role `kind_roles` names.
     ///
     /// # Errors
     ///
@@ -456,6 +459,7 @@ impl ValidatedList {
         limits: ReadLimits,
         files: Option<FileSource>,
         unset: UnsetSettings,
+        kind_roles: KindRoles,
     ) -> Result<PortabilityState, BuildError> {
         if files.is_none()
             && let Some(query) = self.queries.iter().find(|query| query.file.is_some())
@@ -471,7 +475,9 @@ impl ValidatedList {
             owner,
             limits,
             files,
-            binding: BindingSettings::default().with_unset(unset),
+            binding: BindingSettings::default()
+                .with_unset(unset)
+                .with_kind_roles(kind_roles),
         })
     }
 }
@@ -479,7 +485,8 @@ impl ValidatedList {
 /// Validate `list` against the deployment's catalog, `engine_ddl`, and its
 /// client replica schema, `replica`, before anything connects, with
 /// `serves_content` saying whether a content store will be there to read
-/// files from.
+/// files from. A data request is always a signed-in person's, so the queries
+/// translate and the archive takes its shape as the signed-in kind.
 ///
 /// # Errors
 ///
@@ -495,7 +502,8 @@ pub(crate) fn validate(
 ) -> Result<ValidatedList, BuildError> {
     let catalog = ParserDB::parse::<PostgreSqlDialect>(engine_ddl)
         .map_err(|err| MaterializerError::Catalog(format!("{err:?}")))?;
-    let mut replica = archive::Replica::open(replica).map_err(BuildError::PortabilityReplica)?;
+    let mut replica = archive::Replica::open(replica.copy(CallerKind::Authenticated))
+        .map_err(BuildError::PortabilityReplica)?;
     let query_list_hash = query_list_hash(&list.queries);
     let mut tables = HashSet::new();
     let mut queries = Vec::with_capacity(list.queries.len());
