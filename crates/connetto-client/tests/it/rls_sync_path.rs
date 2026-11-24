@@ -108,6 +108,36 @@ CREATE POLICY orders_insert ON orders
     );
 ";
 
+/// Every insert into `orders` appends to `order_log` through a translated
+/// `AFTER INSERT` trigger.
+const ORDER_LOG_DDL: &str = "-- connetto:major 1
+CREATE TABLE orders (
+    id BIGINT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    quantity BIGINT NOT NULL
+);
+
+ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY orders_p ON orders
+    FOR ALL
+    USING (owner_id = current_setting('app.user_id', true));
+
+CREATE TABLE order_log (
+    order_id BIGINT PRIMARY KEY
+);
+
+CREATE FUNCTION log_order() RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO order_log (order_id) VALUES (NEW.id);
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER orders_log AFTER INSERT ON orders
+    FOR EACH ROW EXECUTE FUNCTION log_order();
+";
+
 /// The signed-in caller for every test here. The replica is named from the
 /// identity that opened it, so this value is fixed for its whole life.
 const ALICE: &str = "alice";
@@ -147,6 +177,14 @@ diesel::table! {
         id -> BigInt,
         /// The logical table the entry is about.
         table_name -> Text,
+    }
+}
+
+diesel::table! {
+    /// The rows the `orders_log` trigger appends.
+    order_log (order_id) {
+        /// The order the trigger saw inserted.
+        order_id -> BigInt,
     }
 }
 
@@ -476,6 +514,57 @@ async fn local_insert_still_obeys_the_owner_check() {
             .get_result::<i64>(conn.conn())
             .expect("count backing rows"),
         0,
+    );
+}
+
+/// A row the server delivers fires none of the replica's translated triggers,
+/// as a PostgreSQL subscriber applying with `session_replication_role =
+/// replica` fires none, while a local insert still fires them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delivered_row_fires_no_translated_trigger() {
+    let schema = schema_for(ORDER_LOG_DDL);
+    let (mut server, client_end) = loopback();
+    tokio::spawn(async move {
+        ack_handshake(&mut server).await;
+        wait_subscribe(&mut server).await;
+        send_snapshot(&mut server, "sub", &[(1, ALICE, 5)], 1).await;
+        while let Ok(Some(_)) = server.recv().await {}
+    });
+
+    let mut conn = ClientBuilder::new(schema, super::support::Once::new(client_end))
+        .signed_in(super::support::held(ALICE))
+        .connect_driven()
+        .await
+        .expect("connect");
+    conn.subscribe("sub", "SELECT * FROM orders")
+        .await
+        .expect("subscribe");
+    pump_to_snapshot_end(&mut conn).await;
+
+    let visible: Vec<i64> = orders::table
+        .select(orders::id)
+        .load(conn.conn())
+        .expect("read through the logical name");
+    assert_eq!(visible, vec![1], "the delivered row must land");
+
+    diesel::insert_into(orders::table)
+        .values((
+            orders::id.eq(2),
+            orders::owner_id.eq(ALICE),
+            orders::quantity.eq(7),
+        ))
+        .execute(conn.conn())
+        .expect("Alice inserts her own order");
+
+    let logged: Vec<i64> = order_log::table
+        .select(order_log::order_id)
+        .order(order_log::order_id.asc())
+        .load(conn.conn())
+        .expect("read the trigger's log");
+    assert_eq!(
+        logged,
+        vec![2],
+        "only the local insert fires the trigger, the delivered row does not",
     );
 }
 
