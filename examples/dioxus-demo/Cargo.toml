@@ -144,10 +144,13 @@ required-features = []
 # graph will not resolve. The sources and revisions must match the root ones
 # exactly. The demo lockfile pins the rest of the graph.
 [patch.crates-io]
-diesel = { git = "https://github.com/diesel-rs/diesel" }
-# Live in diesel-rs, named as `diesel` is above, so they build against that one diesel.
-diesel-async = { git = "https://github.com/diesel-rs/diesel" }
-diesel-dynamic-schema = { git = "https://github.com/diesel-rs/diesel" }
+# The diesel fork's `future` branch carries diesel main plus #5395 and #5396, the
+# SQLite table-valued functions pg2sqlite's helpers register through, until they merge.
+diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
+# Live in diesel's repository, named as `diesel` is above, so they build against that one diesel.
+diesel-async = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
+diesel-dynamic-schema = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
+sqlstate = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
 sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
 sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
 # Until a pg_walstream release emits a Relation event for every pgoutput
@@ -171,6 +174,11 @@ android-native-keyring-store = { git = "https://github.com/LucaCappelletti94/and
 # R53 and R74, until released: the fork's `future` branch, the sealed and
 # Windows Hello store stack merged with the TPM signing key (upstream #19).
 windows-native-keyring-store = { git = "https://github.com/LucaCappelletti94/windows-native-keyring-store", rev = "8a8ffde9913b36bd464c8cd5dd24bf80e39dce37" }
+
+# pg2sqlite-runtime names diesel-dynamic-schema from diesel-rs, so it follows the
+# fork as well and one diesel builds.
+[patch."https://github.com/diesel-rs/diesel"]
+diesel-dynamic-schema = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
 
 # Fast test iteration: release-grade optimization without the fat link.
 # Mirrors the root workspace profile of the same name.

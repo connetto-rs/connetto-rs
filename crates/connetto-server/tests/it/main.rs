@@ -5,6 +5,11 @@
 //! Run one old target's tests via a nextest filter, e.g.
 //! `cargo nextest run --cargo-profile testfast --all-features -E 'test(subscription_translate::)'`.
 
+// Proving a session's `serve` future `Send` for a policy the helper takes as a
+// generic, as `reconnect::failures::wave_client` spawns it, nests deeper than
+// the default 128.
+#![recursion_limit = "256"]
+
 mod abuse;
 mod anonymous_writer;
 mod ban_doors;

@@ -190,6 +190,15 @@ pub(super) fn open_replica(db_path: &Path) -> Option<SqliteConnection> {
         || connetto_core::BOT_LIST_WILDCARD.to_owned(),
     )
     .ok();
+    // The translated views call the exemption too, and the harness reads as
+    // the application does, under the policies.
+    conn.register_noarg_sql_function::<diesel::sql_types::Bool, _, _>(
+        connetto_core::WRITE_EXEMPTION_FUNCTION,
+        diesel::sqlite::SqliteFunctionBehavior::DETERMINISTIC
+            | diesel::sqlite::SqliteFunctionBehavior::INNOCUOUS,
+        || false,
+    )
+    .ok();
     Some(conn)
 }
 

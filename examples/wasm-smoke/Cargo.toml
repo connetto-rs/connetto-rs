@@ -76,7 +76,10 @@ zstd = "0.13"
 # cross workspaces, so the spike needs the same routing or the diesel backed
 # graph will not resolve. The sources must match the root ones exactly.
 [patch.crates-io]
-diesel = { git = "https://github.com/diesel-rs/diesel" }
+# The diesel fork's `future` branch carries diesel main plus #5395 and #5396, the
+# SQLite table-valued functions pg2sqlite's helpers register through, until they merge.
+diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
+sqlstate = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
 sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
 sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
 # Until a pg_walstream release carries the startup metadata API subql main
@@ -86,6 +89,11 @@ pg_walstream = { git = "https://github.com/isdaniel/pg-walstream", branch = "mai
 sql-values = { git = "https://github.com/connetto-rs/sql-values", branch = "main" }
 # subql main follows sqlite-diff-rs main for its float4 storage form.
 sqlite-diff-rs = { git = "https://github.com/connetto-rs/sqlite-diff-rs", branch = "main" }
+
+# pg2sqlite-runtime names diesel-dynamic-schema from diesel-rs, so it follows the
+# fork as well and one diesel builds.
+[patch."https://github.com/diesel-rs/diesel"]
+diesel-dynamic-schema = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
 
 # Fast test iteration: release-grade optimization without the fat link.
 # Mirrors the root workspace profile of the same name.
