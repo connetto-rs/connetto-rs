@@ -191,7 +191,7 @@ impl Translated {
         let subjects = Arc::new((self.resolve_subjects)(
             &shapes,
             translation.relations(),
-            &self.reader_role,
+            &self.kind_roles,
         ));
         let translated = Self {
             shapes,
@@ -207,7 +207,7 @@ impl Translated {
             policy_reads,
             outputs,
             resolve_subjects: self.resolve_subjects,
-            reader_role: self.reader_role.clone(),
+            kind_roles: self.kind_roles.clone(),
         };
         refused.retain(|table| served.contains(table.as_str()));
         Ok(LiveTranslation {
@@ -511,9 +511,15 @@ mod tests {
 
     fn catalog(policies: &str) -> ParserDB {
         ParserDB::parse::<PostgreSqlDialect>(&format!(
-            "CREATE ROLE reader; CREATE TABLE first_table(id INT PRIMARY KEY, owner TEXT); \
+            "CREATE ROLE reader; \
+             CREATE ROLE anon; CREATE ROLE authenticated; CREATE ROLE bot_installation; \
+             CREATE ROLE bot; CREATE ROLE delegated; \
+             GRANT anon, authenticated, bot_installation, bot, delegated TO reader \
+               WITH INHERIT FALSE, SET TRUE; \
+             CREATE TABLE first_table(id INT PRIMARY KEY, owner TEXT); \
              CREATE TABLE second_table(id INT PRIMARY KEY, owner TEXT); \
-             GRANT SELECT ON first_table, second_table TO reader; \
+             GRANT SELECT ON first_table, second_table \
+               TO anon, authenticated, bot_installation, bot, delegated; \
              ALTER TABLE first_table ENABLE ROW LEVEL SECURITY; \
              ALTER TABLE second_table ENABLE ROW LEVEL SECURITY; {policies}"
         ))
@@ -884,6 +890,7 @@ mod tests {
         );
         let deployment = connetto_translate::deployment::<String>(
             "reader",
+            connetto_core::KindRoles::defaults(),
             connetto_core::auth::UnsetSettings::ALWAYS_BOUND,
         )
         .expect("deployment");

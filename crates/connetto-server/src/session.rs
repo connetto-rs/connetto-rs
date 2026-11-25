@@ -2195,6 +2195,7 @@ struct SessionState<Id, Key> {
     credits: u32,
     pending: VecDeque<Deliverable>,
     input: HeldInput,
+    /// The session retains its sender until teardown.
     outbound_rx: mpsc::UnboundedReceiver<Outbound>,
     held_outbound: VecDeque<Outbound>,
     /// Row subscriptions by client label, each keeping the request that made it
@@ -3730,6 +3731,7 @@ where
         let mut materializer = self.materializer.lock().await;
         match materializer.register_translated(
             consumer_id,
+            None,
             sql,
             &binds,
             None,
@@ -3945,6 +3947,7 @@ where
         let mut materializer = self.materializer.lock().await;
         match materializer.register_translated(
             consumer_id,
+            None,
             sql,
             binds,
             None,
@@ -6525,15 +6528,15 @@ where
 
         // Every exit breaks with its result rather than returning, so the teardown below always runs.
         let mut last_inbound = tokio::time::Instant::now();
-        let ended: Result<(), SessionError> = loop {
+        let (ended, reason) = loop {
             if state.closing {
-                break Ok(());
+                break (Ok(()), "requested");
             }
             // Between two frames, so the rows a snapshot missed precede every live patch still queued, which all commit later.
             if !state.missed.is_empty()
                 && let Err(err) = self.replay_missed(&mut transport, &mut state).await
             {
-                break Err(err);
+                break (Err(err), "missed_replay_failed");
             }
             // One task, two arms. The transport arm awaits a whole subscribe,
             // including its first page of rows, so the outbound arm cannot
@@ -6548,33 +6551,33 @@ where
                 incoming = state.input.recv(&mut transport) => {
                     match self.handle_incoming(&mut transport, incoming, &mut state).await {
                         Ok(true) => last_inbound = tokio::time::Instant::now(),
-                        Ok(false) => break Ok(()),
-                        Err(err) => break Err(err),
+                        Ok(false) => break (Ok(()), "peer_closed"),
+                        Err(err) => break (Err(err), "incoming_failed"),
                     }
                 }
-                outbound = async {
+                Some(outbound) = async {
                     match state.held_outbound.pop_front() {
                         Some(outbound) => Some(outbound),
                         None => state.outbound_rx.recv().await,
                     }
                 } => {
-                    let Some(outbound) = outbound else { break Ok(()) };
                     let handled = outbound.released_when_handled();
                     let outcome = self.handle_outbound(&mut transport, outbound, &mut state).await;
                     state.outbound.queue.release(handled);
                     match outcome {
                         Ok(true) => {}
-                        Ok(false) => break Ok(()),
-                        Err(err) => break Err(err),
+                        Ok(false) => break (Ok(()), "outbound_requested"),
+                        Err(err) => break (Err(err), "outbound_failed"),
                     }
                 }
                 () = next_key_expiry(&state.key_expiry, &self.config) => self.expire_keys(&mut state).await,
                 // Only an inbound frame moves `last_inbound`, so this is the client's silence.
-                () = tokio::time::sleep_until(last_inbound + self.config.idle_limit()) => break Ok(()),
+                () = tokio::time::sleep_until(last_inbound + self.config.idle_limit()) => break (Ok(()), "idle"),
             }
         };
 
         self.end_session(state).await;
+        tracing::info!(reason, ?ended, silent_for = ?last_inbound.elapsed(), "connection closed");
         ended
     }
 
@@ -6588,7 +6591,6 @@ where
         self.unregister_writer_session(&state).await;
         self.guard.forget_connection(state.session_id);
         self.unsubscribe_all(state).await;
-        tracing::info!("connection closed");
     }
 
     /// Handle one transport read, answering whether the session goes on.
@@ -10113,6 +10115,7 @@ where
         state: &SessionState<Id, Key>,
     ) -> Result<Registered, SubscribeRefusal> {
         let mut materializer = self.materializer.lock().await;
+        let kind = state.principal.kind();
         let pg_sql = materializer.translate_subscription_sql(&sub.spec.query)?;
         // The rule's caller-reading term only describes when the caller is stated.
         let subscriber = state
@@ -10131,7 +10134,14 @@ where
         // re-raises anything genuinely refused, term problems included, since
         // subql describes and registers through one compile path.
         let terms = materializer
-            .describe_terms(consumer_id, &pg_sql, &sub.spec.binds, subscriber, subjects)
+            .describe_terms(
+                consumer_id,
+                kind,
+                &pg_sql,
+                &sub.spec.binds,
+                subscriber,
+                subjects,
+            )
             .unwrap_or_default();
         let member_tables = member_tables_of(&terms, materializer.catalog())?;
         let seed = self.seed_for_terms(&terms, state).await?;
@@ -10143,6 +10153,7 @@ where
         let viewer = self.viewer_read_setup(state);
         let registration = materializer.register_translated(
             consumer_id,
+            Some(kind),
             &pg_sql,
             &sub.spec.binds,
             seed,
@@ -11475,10 +11486,10 @@ where
                     Some(frame) => state.input.push(frame, self.config.catchup_input_budget)?,
                     None => return Ok(CatchupWait::Closed(None)),
                 },
-                outbound = state.outbound_rx.recv() => match outbound {
-                    Some(Outbound::Fatal(fatal)) => return Ok(CatchupWait::Closed(Some(fatal))),
-                    Some(Outbound::Drop) | None => return Ok(CatchupWait::Closed(None)),
-                    Some(outbound) => state.held_outbound.push_back(outbound),
+                Some(outbound) = state.outbound_rx.recv() => match outbound {
+                    Outbound::Fatal(fatal) => return Ok(CatchupWait::Closed(Some(fatal))),
+                    Outbound::Drop => return Ok(CatchupWait::Closed(None)),
+                    outbound => state.held_outbound.push_back(outbound),
                 },
             }
         }
@@ -12459,6 +12470,7 @@ mod tests {
             let translator = rls2fga::translator::TranslatorBuilder::new(
                 connetto_translate::deployment::<String>(
                     READER,
+                    connetto_core::KindRoles::defaults(),
                     connetto_core::auth::UnsetSettings::ALWAYS_BOUND,
                 )
                 .expect("the test deployment's description holds"),
@@ -12470,6 +12482,7 @@ mod tests {
                 .with_caller(
                     crate::materializer::CallerMappings::of::<String>(
                         READER,
+                        connetto_core::KindRoles::defaults(),
                         connetto_core::auth::UnsetSettings::ALWAYS_BOUND,
                     )
                     .expect("the test deployment's description holds"),
@@ -12480,7 +12493,14 @@ mod tests {
                 .translate_subscription_sql(&format!("SELECT * FROM docs WHERE {filter}"))
                 .expect("the caller function reverse translates");
             let terms = materializer
-                .describe_terms(1, &pg_sql, &[], None, Vec::new())
+                .describe_terms(
+                    1,
+                    connetto_core::CallerKind::Authenticated,
+                    &pg_sql,
+                    &[],
+                    None,
+                    Vec::new(),
+                )
                 .expect("the membership term describes");
             let member_tables = super::member_tables_of(&terms, materializer.catalog());
             (terms.len(), member_tables)

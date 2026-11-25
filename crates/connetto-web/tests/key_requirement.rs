@@ -37,9 +37,11 @@ fn schema(ddl: &str, tier: Option<&str>) -> SyncSchema {
         SchemaBundle::new(
             SOURCE,
             "",
-            ddl,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                ddl,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             tier,
         )
         .expect("the source declares major 1"),

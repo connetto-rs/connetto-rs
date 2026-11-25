@@ -184,9 +184,11 @@ async fn an_older_server_major_reads_as_server_behind() {
         SchemaBundle::new(
             "-- connetto:major 2",
             "",
-            SQLITE_DDL,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                SQLITE_DDL,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             None::<&str>,
         )
         .expect("the source declares major 2"),

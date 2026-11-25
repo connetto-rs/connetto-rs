@@ -11,10 +11,13 @@
 
 fn main() {
     connetto_translate::emit::<String, connetto_translate::TextIds>(
-        std::path::Path::new("../deployment/schema.sql"),
-        std::path::Path::new("../deployment/policies.sql"),
-        std::path::Path::new("../deployment/roles.sql"),
+        [
+            std::path::Path::new("../deployment/schema.sql"),
+            std::path::Path::new("../deployment/policies.sql"),
+            std::path::Path::new("../deployment/roles.sql"),
+        ],
         "connetto_reader",
+        connetto_translate::KindRoles::defaults(),
         connetto_translate::UnsetSettings::ALWAYS_BOUND,
         &connetto_translate::Acknowledgements::new(),
         Some(&connetto_translate::TierSource::new(

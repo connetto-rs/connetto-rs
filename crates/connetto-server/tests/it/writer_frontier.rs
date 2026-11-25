@@ -38,7 +38,7 @@ use connetto_core::messages::{
     MutationRejectReason, PriorRefusal, Provenance, WriterGrant, WriterOutcome, WriterRef,
     WriterRequest, WriterSecret, writer_bind_message,
 };
-use connetto_core::schema::SchemaBundle;
+use connetto_core::schema::{ReplicaCopy, SchemaBundle};
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport as _};
 use connetto_server::audit::{AuditHook, AuthEvent, AuthOp};
@@ -4148,9 +4148,11 @@ fn accept_bundle() -> SyncSchema {
         SchemaBundle::new(
             ACCEPT_DDL,
             "",
-            ACCEPT_SQLITE_DDL,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            ReplicaCopy::new(
+                ACCEPT_SQLITE_DDL,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             None::<&str>,
         )
         .expect("the source declares its major"),
@@ -4448,6 +4450,23 @@ async fn a_fresh_commit_marks_both_writer_sessions_before_their_first_patch() {
                 }
                 frame => panic!("unexpected frame {frame:?}"),
             }
+        }
+        let ControlMessage::WritesSettled(marker) = other.next_control().await else {
+            panic!("expected settling before the other session's patch");
+        };
+        assert_eq!(
+            marker.writer,
+            connetto_core::messages::WriterRef::Number(number)
+        );
+        assert_eq!(marker.through_seq, 2);
+        assert!(marker.before_patch);
+        for _ in 0..2 {
+            assert!(matches!(
+                other.recv().await,
+                Some(IncomingFrame::Bulk(
+                    connetto_core::messages::BulkMessage::LivePatch(_)
+                ))
+            ));
         }
         author.close().await;
         other.close().await;

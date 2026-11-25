@@ -154,6 +154,109 @@ fn absent_value(may_be_unset: bool) -> &'static str {
     if may_be_unset { "" } else { absent_marker() }
 }
 
+/// The kind of caller a request comes from, each of which acts as its own
+/// database role (R108).
+///
+/// The kinds are flat, so no kind implies another, and a policy for every
+/// caller names no role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CallerKind {
+    /// A caller holding no login, reading what share keys and public rows open.
+    Anon,
+    /// A signed-in user.
+    Authenticated,
+    /// A bot installation acting as itself.
+    BotInstallation,
+    /// An app acting as itself.
+    Bot,
+    /// An agent acting for a user under a consent.
+    Delegated,
+}
+
+impl CallerKind {
+    /// Every kind, in the order a bundle and its version list them.
+    pub const ALL: [Self; 5] = [
+        Self::Anon,
+        Self::Authenticated,
+        Self::BotInstallation,
+        Self::Bot,
+        Self::Delegated,
+    ];
+
+    /// The role a deployment that renames nothing creates for this kind.
+    #[must_use]
+    pub const fn default_role(self) -> &'static str {
+        match self {
+            Self::Anon => "anon",
+            Self::Authenticated => "authenticated",
+            Self::BotInstallation => "bot_installation",
+            Self::Bot => "bot",
+            Self::Delegated => "delegated",
+        }
+    }
+
+    /// The kind's position in [`ALL`](Self::ALL).
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// The database role each [`CallerKind`] acts as.
+///
+/// A deployment that shares a role name with another API on the same
+/// database, such as Supabase's own `anon`, renames connetto's kinds, since
+/// that API's grants would otherwise reach connetto's callers.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct KindRoles {
+    roles: [std::sync::Arc<str>; 5],
+}
+
+impl Default for KindRoles {
+    fn default() -> Self {
+        Self {
+            roles: CallerKind::ALL.map(|kind| kind.default_role().into()),
+        }
+    }
+}
+
+impl KindRoles {
+    /// The roles of a deployment that renames nothing, shared by every
+    /// borrower.
+    #[must_use]
+    pub fn defaults() -> &'static Self {
+        static DEFAULTS: std::sync::LazyLock<KindRoles> =
+            std::sync::LazyLock::new(KindRoles::default);
+        &DEFAULTS
+    }
+
+    /// The same roles, `kind` acting as `role`.
+    #[must_use]
+    pub fn with_role(mut self, kind: CallerKind, role: impl Into<std::sync::Arc<str>>) -> Self {
+        self.roles[kind.index()] = role.into();
+        self
+    }
+
+    /// The role `kind` acts as.
+    #[must_use]
+    pub fn role(&self, kind: CallerKind) -> &str {
+        &self.roles[kind.index()]
+    }
+
+    /// The role `kind` acts as, shared rather than copied.
+    #[must_use]
+    pub fn shared_role(&self, kind: CallerKind) -> std::sync::Arc<str> {
+        std::sync::Arc::clone(&self.roles[kind.index()])
+    }
+
+    /// Every kind with the role it acts as, in [`CallerKind::ALL`] order.
+    pub fn iter(&self) -> impl Iterator<Item = (CallerKind, &str)> {
+        CallerKind::ALL
+            .into_iter()
+            .map(|kind| (kind, self.role(kind)))
+    }
+}
+
 /// Session-scoped identity: a user id and nothing else.
 ///
 /// Tenant and role belong in the authorization model rather than on the
@@ -355,6 +458,17 @@ impl<Id, Key> Principal<Id, Key> {
         self.identity.as_ref()
     }
 
+    /// The kind this caller acts as, signed in when a login resolved and
+    /// anonymous otherwise.
+    #[must_use]
+    pub const fn kind(&self) -> CallerKind {
+        if self.identity.is_some() {
+            CallerKind::Authenticated
+        } else {
+            CallerKind::Anon
+        }
+    }
+
     /// The bot list a login bound on this run, when one resolved it.
     #[must_use]
     pub fn bot_list(&self) -> Option<&crate::bots::BotList> {
@@ -440,6 +554,17 @@ impl ContentCaller {
     #[must_use]
     pub fn identity(&self) -> Option<&str> {
         self.identity.as_deref()
+    }
+
+    /// The kind this caller acts as, signed in when a login resolved and
+    /// anonymous otherwise.
+    #[must_use]
+    pub const fn kind(&self) -> CallerKind {
+        if self.identity.is_some() {
+            CallerKind::Authenticated
+        } else {
+            CallerKind::Anon
+        }
     }
 
     /// The login's session, `None` for a caller holding no login.

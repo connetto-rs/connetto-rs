@@ -86,9 +86,11 @@ fn build() -> SyncSchema {
         SchemaBundle::new(
             format!("{MAJOR_DIRECTIVE} 1"),
             "",
-            DDL,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                DDL,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             None::<&str>,
         )
         .expect("the source declares its major"),

@@ -230,19 +230,21 @@ fn bundle(major: u32, orders: &str) -> SchemaBundle {
     SchemaBundle::new(
         format!("{MAJOR_DIRECTIVE} {major}\n{orders}"),
         "",
-        mirror(orders),
-        [("vocabulary", "vocabulary_store")],
-        ["vocabulary"],
+        connetto_core::ReplicaCopy::new(
+            mirror(orders),
+            [("vocabulary", "vocabulary_store")],
+            ["vocabulary"],
+        )
+        .with_shared_tables(["vocabulary"])
+        .with_shared_layout(SharedLayout::new(
+            format!("{orders}; {TEMP_READER}; {SHARED_STORE}"),
+            format!("{orders}; {TEMP_READER}"),
+            format!("{SHARED_STORE}; {TEMP_READER}"),
+            TEMP_READER,
+        )),
         None::<&str>,
     )
     .expect("the source declares its major")
-    .with_shared_tables(["vocabulary"])
-    .with_shared_layout(SharedLayout::new(
-        format!("{orders}; {TEMP_READER}; {SHARED_STORE}"),
-        format!("{orders}; {TEMP_READER}"),
-        format!("{SHARED_STORE}; {TEMP_READER}"),
-        TEMP_READER,
-    ))
 }
 
 /// The worker's encrypted replica entries in the OPFS pool.

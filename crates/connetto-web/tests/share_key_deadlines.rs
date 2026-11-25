@@ -65,9 +65,11 @@ fn skd_schema() -> SyncSchema {
         SchemaBundle::new(
             "-- connetto:major 1",
             "",
-            SKD_DDL,
-            Vec::<(String, String)>::new(),
-            vec!["visible".to_owned()],
+            connetto_core::ReplicaCopy::new(
+                SKD_DDL,
+                Vec::<(String, String)>::new(),
+                vec!["visible".to_owned()],
+            ),
             None::<&str>,
         )
         .expect("the source declares major 1"),
@@ -1222,9 +1224,11 @@ async fn a_held_ticket_keeps_its_request_through_the_swap() {
             SchemaBundle::new(
                 "-- connetto:major 1",
                 "",
-                PHOTOS_DDL,
-                Vec::<(String, String)>::new(),
-                Vec::<String>::new(),
+                connetto_core::ReplicaCopy::new(
+                    PHOTOS_DDL,
+                    Vec::<(String, String)>::new(),
+                    Vec::<String>::new(),
+                ),
                 None::<&str>,
             )
             .expect("the source declares major 1"),
@@ -1413,9 +1417,11 @@ async fn a_held_upload_still_reads_the_swap_answer() {
             SchemaBundle::new(
                 "-- connetto:major 1",
                 "",
-                PHOTOS_DDL,
-                Vec::<(String, String)>::new(),
-                Vec::<String>::new(),
+                connetto_core::ReplicaCopy::new(
+                    PHOTOS_DDL,
+                    Vec::<(String, String)>::new(),
+                    Vec::<String>::new(),
+                ),
                 None::<&str>,
             )
             .expect("the source declares major 1"),
@@ -1644,9 +1650,11 @@ fn held_schema(major: u32) -> SyncSchema {
         SchemaBundle::new(
             format!("-- connetto:major {major}"),
             "",
-            PHOTOS_DDL,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                PHOTOS_DDL,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             None::<&str>,
         )
         .expect("the source declares its major"),

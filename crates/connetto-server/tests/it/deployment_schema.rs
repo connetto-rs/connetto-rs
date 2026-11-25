@@ -756,6 +756,9 @@ async fn a_deployment_schema_of_its_own_serves_through_the_builder() {
     }
     publish_own_writer_tables(&pool).await;
     recreate_registry_over_uuid(&pool).await;
+    fixture
+        .setup_roles(connetto_test_harness::FIXTURE_ROLES)
+        .await;
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind a listener");

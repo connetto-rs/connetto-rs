@@ -192,7 +192,7 @@ fn builder_with(
 
 /// Seed the `owned` table with one row under `user_id` and the row-level
 /// policy the RLS second-opinion tests read against.
-async fn seed_owned_rls(pool: &Pool<AsyncPgConnection>, user_id: &str) {
+async fn seed_owned_rls(pool: &Pool<AsyncPgConnection>, fixture: &Fixture, user_id: &str) {
     for stmt in [
         "DROP TABLE IF EXISTS owned CASCADE",
         "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_reader') \
@@ -218,6 +218,9 @@ async fn seed_owned_rls(pool: &Pool<AsyncPgConnection>, user_id: &str) {
     )
     .await;
     provision_cap_policies(pool, OWNED_PG_DDL, OWNED_POLICIES).await;
+    fixture
+        .setup_roles(connetto_test_harness::FIXTURE_ROLES)
+        .await;
 }
 
 /// The integer in a scalar aggregate answer.
@@ -655,7 +658,11 @@ async fn provision_big(pool: &Pool<AsyncPgConnection>) {
         NO_POLICIES,
     )
     .await;
-    exec(pool, "GRANT SELECT ON big TO app_reader").await;
+    exec(
+        pool,
+        "GRANT SELECT ON big TO app_reader, anon, authenticated, bot_installation, bot, delegated",
+    )
+    .await;
     exec(pool, "ALTER TABLE big REPLICA IDENTITY FULL").await;
     exec(
         pool,
@@ -1164,7 +1171,7 @@ async fn a_second_opinion_divergence_is_counted_not_blocked() {
     // The identity the deterministic resolver derives before any login.
     let user_id =
         connetto_server::authn::identity::deterministic_uuid(idp.issuer(), "e2e-user").to_string();
-    seed_owned_rls(&pool, &user_id).await;
+    seed_owned_rls(&pool, &fixture, &user_id).await;
     exec(&pool, OPEN_HELPER).await;
     exec(
         &pool,
@@ -1275,7 +1282,7 @@ async fn a_per_viewer_statistic_keeps_the_viewers_rows_over_the_production_wirin
         connetto_server::authn::identity::deterministic_uuid(idp.issuer(), "alice").to_string();
     let bob_id =
         connetto_server::authn::identity::deterministic_uuid(idp.issuer(), "bob").to_string();
-    seed_owned_rls(&pool, &alice_id).await;
+    seed_owned_rls(&pool, &fixture, &alice_id).await;
     exec(
         &pool,
         &format!("INSERT INTO owned VALUES (2, '{bob_id}', 'bob seed')"),
@@ -1431,6 +1438,9 @@ async fn an_identity_declared_unset_reads_an_anonymous_caller_as_nobody() {
     provision_cap_policies(&pool, UUID_OWNED_PG_DDL, UUID_OWNED_POLICIES).await;
     fixture.start_replication(&["uuid_owned"]).await;
     fixture.provision_auth_tables().await;
+    fixture
+        .setup_roles(connetto_test_harness::FIXTURE_ROLES)
+        .await;
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -1509,7 +1519,7 @@ async fn a_backend_row_moves_the_count_of_a_late_subscriber() {
 
     let idp = MockOauth::start().await;
     let (_channel, store) = fixture.fga_store().await;
-    seed_no_rls_orders(&pool).await;
+    seed_no_rls_orders(&pool, &fixture).await;
     fixture.start_replication(&["orders"]).await;
     fixture.provision_auth_tables().await;
 
@@ -1571,7 +1581,7 @@ async fn a_backend_row_moves_the_count_of_a_late_subscriber() {
 
 /// The `orders` table without row-level security, the demo's shape, with the
 /// reader role granted on it and on the writer bookkeeping.
-async fn seed_no_rls_orders(pool: &Pool<AsyncPgConnection>) {
+async fn seed_no_rls_orders(pool: &Pool<AsyncPgConnection>, fixture: &Fixture) {
     for stmt in [
         "DROP TABLE IF EXISTS orders CASCADE",
         "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_reader') \
@@ -1586,6 +1596,9 @@ async fn seed_no_rls_orders(pool: &Pool<AsyncPgConnection>) {
         exec(pool, stmt).await;
     }
     provision_cap_policies(pool, PG_DDL, NO_POLICIES).await;
+    fixture
+        .setup_roles(connetto_test_harness::FIXTURE_ROLES)
+        .await;
 }
 
 /// Logging out revokes the session the live connection belongs to, the
@@ -1970,7 +1983,7 @@ async fn a_second_boot_reconciles_the_installed_model() {
     let (_channel, store) = fixture.fga_store().await;
     let user_id =
         connetto_server::authn::identity::deterministic_uuid(idp.issuer(), "e2e-user").to_string();
-    seed_owned_rls(&pool, &user_id).await;
+    seed_owned_rls(&pool, &fixture, &user_id).await;
     fixture.start_replication(&["owned"]).await;
     fixture.provision_auth_tables().await;
 
@@ -2105,7 +2118,7 @@ async fn build_owned_with(policies: &str) -> (Result<ServerParts, BuildError>, (
     let (channel, store) = fixture.fga_store().await;
     let user_id =
         connetto_server::authn::identity::deterministic_uuid(idp.issuer(), "e2e-user").to_string();
-    seed_owned_rls(&pool, &user_id).await;
+    seed_owned_rls(&pool, &fixture, &user_id).await;
     fixture.start_replication(&["owned"]).await;
     fixture.provision_auth_tables().await;
     let fga_url = fixture.fga_url().await.to_owned();
@@ -3492,9 +3505,9 @@ pub(super) async fn apply_content_deployment(pool: &Pool<AsyncPgConnection>) {
         "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_reader') \
          THEN CREATE ROLE app_reader LOGIN PASSWORD 'app_reader'; END IF; END $$",
         "GRANT USAGE ON SCHEMA public TO app_reader",
-        "GRANT SELECT ON photos TO app_reader",
+        "GRANT SELECT ON photos TO app_reader, anon, authenticated, bot_installation, bot, delegated",
         "GRANT SELECT ON _cfs_chunk_registry, _cfs_manifests, _cfs_manifest_chunks \
-         TO app_reader",
+         TO app_reader, anon, authenticated, bot_installation, bot, delegated",
     ] {
         exec(pool, stmt).await;
     }

@@ -69,9 +69,11 @@ async fn archive_carries_manifest_and_compressed_patchset_entries() {
         SchemaBundle::new(
             SOURCE,
             "",
-            SYNCED_DDL,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                SYNCED_DDL,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             Some(TIER_DDL),
         )
         .expect("the source declares major 1"),
@@ -230,9 +232,11 @@ fn everything_scope_carries_both_tiers_unsynced_omits_synced_replica() {
         SchemaBundle::new(
             SOURCE,
             "",
-            SYNCED_DDL,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                SYNCED_DDL,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             Some(TIER_DDL),
         )
         .expect("the source declares major 1"),
@@ -356,9 +360,7 @@ CREATE INDEX orders_rls_owner_idx ON orders_rls(owner_id);
         SchemaBundle::new(
             SOURCE,
             "",
-            ddl,
-            vec![("orders", "orders_rls")],
-            vec!["orders"],
+            connetto_core::ReplicaCopy::new(ddl, vec![("orders", "orders_rls")], vec!["orders"]),
             None::<&str>,
         )
         .expect("the source declares major 1"),
@@ -432,9 +434,11 @@ fn a_file_sink_and_a_buffer_sink_write_the_same_archive() {
         SchemaBundle::new(
             SOURCE,
             "",
-            SYNCED_DDL,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                SYNCED_DDL,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             Some(TIER_DDL),
         )
         .expect("the source declares major 1"),

@@ -193,6 +193,7 @@ fn options() -> Pg2SqliteOptions {
         .with_deployment(
             connetto_translate::deployment::<String>(
                 connetto_test_harness::FIXTURE_READER,
+                connetto_core::KindRoles::defaults(),
                 connetto_translate::UnsetSettings::ALWAYS_BOUND,
             )
             .expect("the deployment description builds"),
@@ -252,8 +253,13 @@ fn translation() -> SyncSchema {
 fn schema_for(pg_ddl: &str) -> SyncSchema {
     let (ddl, pairs, views) = translation_for(pg_ddl);
     SyncSchema::new(
-        SchemaBundle::new(pg_ddl, "", ddl, pairs, views, None::<&str>)
-            .expect("the source declares major 1"),
+        SchemaBundle::new(
+            pg_ddl,
+            "",
+            connetto_core::ReplicaCopy::new(ddl, pairs, views),
+            None::<&str>,
+        )
+        .expect("the source declares major 1"),
     )
 }
 
@@ -727,9 +733,11 @@ fn an_unaccounted_policy_view_refuses_to_open() {
             SchemaBundle::new(
                 PG_DDL,
                 "",
-                ddl,
-                Vec::<(String, String)>::new(),
-                Vec::<String>::new(),
+                connetto_core::ReplicaCopy::new(
+                    ddl,
+                    Vec::<(String, String)>::new(),
+                    Vec::<String>::new(),
+                ),
                 None::<&str>,
             )
             .expect("the source declares major 1"),

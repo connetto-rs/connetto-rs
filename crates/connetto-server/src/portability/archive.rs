@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 
 use bytes::Bytes;
+use connetto_core::ReplicaCopy;
 use connetto_core::quote_ident;
-use connetto_core::schema::SchemaBundle;
 use diesel::connection::SimpleConnection as _;
 use diesel::query_builder::{BoxedSqlQuery, SqlQuery};
 use diesel::sql_types::{BigInt, Binary, Double, Integer, Nullable, Text};
@@ -66,15 +66,15 @@ struct ColumnInfo {
 }
 
 impl Replica {
-    /// Apply `bundle`'s replica DDL to a scratch database.
-    pub(super) fn open(bundle: &SchemaBundle) -> Result<Self, PortabilityError> {
+    /// Apply `copy`'s replica DDL to a scratch database.
+    pub(super) fn open(copy: &ReplicaCopy) -> Result<Self, PortabilityError> {
         let mut conn =
             SqliteConnection::establish(":memory:").map_err(PortabilityError::ReplicaOpen)?;
-        conn.batch_execute(bundle.replica_ddl())
+        conn.batch_execute(copy.replica_ddl())
             .map_err(PortabilityError::Replica)?;
         Ok(Self {
             conn,
-            physical: bundle.policy_tables().iter().cloned().collect(),
+            physical: copy.policy_tables().iter().cloned().collect(),
         })
     }
 
@@ -324,15 +324,15 @@ mod tests {
             ),
         )
         .expect("the schema translates");
+        let copy = bundle.copy(connetto_core::CallerKind::Authenticated);
         assert!(
-            bundle
-                .policy_tables()
+            copy.policy_tables()
                 .iter()
                 .any(|(logical, _)| logical == "t"),
             "the bot list cap puts t behind a view: {:?}",
-            bundle.policy_tables()
+            copy.policy_tables()
         );
-        let mut replica = Replica::open(&bundle).expect("the replica schema applies");
+        let mut replica = Replica::open(copy).expect("the replica schema applies");
         let shape = replica
             .shape("t", &["d".to_owned(), "a".to_owned(), "b".to_owned()])
             .expect("the columns carry the key");

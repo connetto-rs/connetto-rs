@@ -449,6 +449,7 @@ where
             let registration = materializer
                 .register_translated(
                     consumer,
+                    None,
                     D::Audit::COURIER_RECEIPT_FILTER_SQL,
                     &[
                         SqliteValue::Integer(question.writer),

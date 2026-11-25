@@ -545,9 +545,11 @@ async fn a_local_tier_row_survives_eviction_of_synced_rows() {
         SchemaBundle::new(
             SOURCE,
             "",
-            DDL,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                DDL,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             Some(LOCAL_DDL),
         )
         .expect("the source declares major 1"),

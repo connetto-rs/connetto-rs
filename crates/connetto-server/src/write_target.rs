@@ -391,6 +391,14 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
         self
     }
 
+    /// Switch every caller's transaction to the role `kind_roles` names for
+    /// the caller's kind, returning to the reader for connetto's bookkeeping.
+    #[must_use]
+    pub fn with_kind_roles(mut self, kind_roles: connetto_core::KindRoles) -> Self {
+        self.binding = self.binding.with_kind_roles(kind_roles);
+        self
+    }
+
     /// How this target binds the caller.
     ///
     /// The one configured binding, so the per-viewer read and the ticket path
@@ -688,6 +696,8 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
                                 .collect(),
                         };
                         let text = outcome.json();
+                        // connetto's bookkeeping is the reader's, never a kind's.
+                        crate::capability::reset_role(c).await?;
                         D::Writers::settle_outcome(c, settle.writer, seq, &text).await?;
                         if let Some((writer, oseq, _, _)) = original {
                             D::Writers::settle_outcome(c, writer, oseq, &text).await?;
@@ -704,6 +714,7 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
                 if affected < expected {
                     return Err(CommitError::Denied);
                 }
+                crate::capability::reset_role(c).await?;
                 Self::advance_original(c, original).await?;
                 Self::courier_notice(c, settle, seq, &applied).await?;
                 if !D::Writers::advance(c, settle.writer, seq, &settle.entry_hash).await? {

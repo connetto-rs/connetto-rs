@@ -11,6 +11,7 @@
 //! translate as syntax, a missing bind fails registration cleanly, and an
 //! unparseable query fails as `Translate` rather than reaching subql.
 
+use connetto_core::CallerKind;
 use connetto_core::messages::SqliteValue;
 use connetto_server::{
     CallerMappings, Materializer, MaterializerError, NoConnector, ReadBudget, Registration,
@@ -19,6 +20,9 @@ use connetto_server::{
 
 const PG_DDL: &str =
     "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, amount INT, price FLOAT, tag BYTEA);";
+
+/// The kind every test caller acts as, a signed-in user.
+const KIND: CallerKind = CallerKind::Authenticated;
 
 fn materializer() -> Materializer {
     Materializer::builder(PG_DDL)
@@ -102,6 +106,7 @@ fn register_sqlite_rejects_a_missing_bind() {
     let mut mat = materializer();
     match mat.register_sqlite(
         1,
+        KIND,
         "SELECT * FROM t WHERE amount > ?",
         &[],
         ReadBudget::new(core::time::Duration::from_secs(5)),
@@ -118,6 +123,7 @@ fn register_sqlite_classifies_translated_query() {
     let agg = mat
         .register_sqlite(
             1,
+            KIND,
             "SELECT COUNT(*) FROM t",
             &[],
             ReadBudget::new(core::time::Duration::from_secs(5)),
@@ -131,6 +137,7 @@ fn register_sqlite_classifies_translated_query() {
     let row = mat
         .register_sqlite(
             2,
+            KIND,
             "SELECT * FROM t WHERE amount > ?",
             &[SqliteValue::Integer(0)],
             ReadBudget::new(core::time::Duration::from_secs(5)),
@@ -155,6 +162,7 @@ fn register_sqlite_accepts_a_real_bind() {
     let row = mat
         .register_sqlite(
             1,
+            KIND,
             "SELECT * FROM t WHERE price > ?",
             &[SqliteValue::Real(1.5)],
             ReadBudget::new(core::time::Duration::from_secs(5)),
@@ -170,6 +178,7 @@ fn register_sqlite_accepts_a_blob_bind() {
     let row = mat
         .register_sqlite(
             1,
+            KIND,
             "SELECT * FROM t WHERE tag = ?",
             &[SqliteValue::Blob(vec![0xde, 0xad, 0xbe, 0xef])],
             ReadBudget::new(core::time::Duration::from_secs(5)),
@@ -183,6 +192,7 @@ fn register_sqlite_rejects_unparseable_query() {
     let mut mat = materializer();
     match mat.register_sqlite(
         1,
+        KIND,
         "SELECT ((( FROM",
         &[],
         ReadBudget::new(core::time::Duration::from_secs(5)),
@@ -210,6 +220,7 @@ fn registers_the_exact_shape_diesel_renders() {
     let reg = mat
         .register_sqlite(
             1,
+            KIND,
             "SELECT `t`.`id`, `t`.`name`, `t`.`amount`, `t`.`price`, `t`.`tag` FROM `t` \
              WHERE (`t`.`amount` > ?) ORDER BY `t`.`id`",
             &[SqliteValue::Integer(0)],
@@ -306,6 +317,7 @@ fn the_subject_set_reach_reverses_to_the_membership_it_came_from() {
         .with_caller(
             CallerMappings::of::<String>(
                 connetto_test_harness::FIXTURE_READER,
+                connetto_core::KindRoles::defaults(),
                 connetto_core::auth::UnsetSettings::ALWAYS_BOUND,
             )
             .expect("the deployment description builds"),

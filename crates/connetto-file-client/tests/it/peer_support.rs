@@ -795,9 +795,11 @@ pub async fn captured_photo(
         SchemaBundle::new(
             "-- connetto:major 1",
             "",
-            PLAIN_PHOTOS,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                PLAIN_PHOTOS,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             None::<&str>,
         )
         .expect("the source declares major 1"),

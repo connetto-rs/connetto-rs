@@ -75,9 +75,11 @@ fn split_schema(major: u32) -> SyncSchema {
         SchemaBundle::new(
             format!("{MAJOR_DIRECTIVE} {major}\n-- split"),
             "",
-            format!("{SPLIT_DDL} {V1_DDL};"),
-            vec![("t".to_owned(), "physical_t".to_owned())],
-            vec!["t".to_owned()],
+            connetto_core::ReplicaCopy::new(
+                format!("{SPLIT_DDL} {V1_DDL};"),
+                vec![("t".to_owned(), "physical_t".to_owned())],
+                vec!["t".to_owned()],
+            ),
             None::<&str>,
         )
         .expect("the source declares its major"),
@@ -118,9 +120,11 @@ fn schema(major: u32, ddl: &str) -> SyncSchema {
         SchemaBundle::new(
             format!("{MAJOR_DIRECTIVE} {major}\n-- {ddl}"),
             "",
-            ddl,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                ddl,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             None::<&str>,
         )
         .expect("the source declares its major"),

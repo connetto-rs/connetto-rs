@@ -39,6 +39,16 @@ A difference whose tuple key states both sides is sent in two calls with the rem
 
 The question of which tables a policy reads is answered from the catalog, not from a `subql` re-export. `sql-traits` already models policies, so `DatabaseLike::policies()` with the policy's using and check expressions answers it from the catalog connetto already parses. `subql` owes nothing here. The connetto side, the startup refusal for a policy that reads a table the publication does not carry, is [08-authorization.md](08-authorization.md).
 
+## Schema drift
+
+### The drift guard
+
+**Shipped**, as `src/drift`. `DriftGuard` wraps a `CdcSource` and judges each table's live shape, read through a `LiveCatalog` (`PgLiveCatalog` over `pg_diesel` for PostgreSQL), against the consumer's catalog before the first event, on every schema message naming the table, such as a pgoutput `Relation`, and every reconciliation interval. A shape the catalog can ignore passes. Any other change refuses only that table, whose events the guard drops while it yields `DriftSignal::Refused` with every reason, and a table whose undrained changes the source lost yields `DriftSignal::ChangesLost`. `RefusedTables` answers the apply path as a `RefusalView`, so an upload naming a refused table is refused before any op applies. The connetto side, the schema refusal of the table's subscriptions and writes, is [20-deployment.md](20-deployment.md#running-the-server).
+
+### The rules signal
+
+**Shipped.** A consumer that hands the guard the rules it runs, `RulesFollowing`, has every live read compare each table's `TableRules` too, its owner and row-security flags, its policies, every function they reach and its table and column grants. A difference, or an event on the marker table the consumer names, makes the guard read every table it has not refused and yield one `DriftSignal::RulesChanged` naming each table whose rules changed, with the database it read. The connetto side, which translates and serves the new rules, is [08-authorization.md](08-authorization.md#following-live-rules).
+
 ## Resource Management
 
 ### Subscription registry limits (Q4.2)

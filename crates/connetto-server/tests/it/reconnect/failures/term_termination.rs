@@ -94,6 +94,7 @@ async fn term_manager(
             .with_caller(
                 CallerMappings::of::<String>(
                     connetto_test_harness::FIXTURE_READER,
+                    connetto_core::KindRoles::defaults(),
                     connetto_core::auth::UnsetSettings::ALWAYS_BOUND,
                 )
                 .expect("the deployment description builds"),

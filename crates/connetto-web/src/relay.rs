@@ -6227,9 +6227,11 @@ mod tests {
                 connetto_core::schema::SchemaBundle::new(
                     SOURCE,
                     "",
-                    ddl,
-                    Vec::<(String, String)>::new(),
-                    Vec::<String>::new(),
+                    connetto_core::ReplicaCopy::new(
+                        ddl,
+                        Vec::<(String, String)>::new(),
+                        Vec::<String>::new(),
+                    ),
                     None::<&str>,
                 )
                 .expect("the source declares major 1"),
@@ -7019,9 +7021,11 @@ mod tests {
                 SchemaBundle::new(
                     SOURCE,
                     "",
-                    DDL,
-                    Vec::<(String, String)>::new(),
-                    Vec::<String>::new(),
+                    connetto_core::ReplicaCopy::new(
+                        DDL,
+                        Vec::<(String, String)>::new(),
+                        Vec::<String>::new(),
+                    ),
                     None::<&str>,
                 )
                 .expect("audit schema"),
@@ -7251,9 +7255,11 @@ mod tests {
             SchemaBundle::new(
                 "-- connetto:major 1",
                 "",
-                DDL,
-                Vec::<(String, String)>::new(),
-                Vec::<String>::new(),
+                connetto_core::ReplicaCopy::new(
+                    DDL,
+                    Vec::<(String, String)>::new(),
+                    Vec::<String>::new(),
+                ),
                 None::<&str>,
             )
             .expect("the source declares major 1"),
@@ -7767,22 +7773,24 @@ mod tests {
         connetto_core::schema::SchemaBundle::new(
             "-- connetto:major 1",
             "",
-            "CREATE TABLE orders (id INTEGER PRIMARY KEY, label TEXT); \
-             CREATE TABLE entries (id INTEGER PRIMARY KEY, author TEXT); \
-             CREATE TABLE public_rls (id INTEGER PRIMARY KEY, owner_id TEXT NOT NULL); \
-             CREATE VIEW public AS SELECT id, owner_id FROM public_rls;",
-            [("public", "public_rls")],
-            ["public"],
+            connetto_core::ReplicaCopy::new(
+                "CREATE TABLE orders (id INTEGER PRIMARY KEY, label TEXT); \
+         CREATE TABLE entries (id INTEGER PRIMARY KEY, author TEXT); \
+         CREATE TABLE public_rls (id INTEGER PRIMARY KEY, owner_id TEXT NOT NULL); \
+         CREATE VIEW public AS SELECT id, owner_id FROM public_rls;",
+                [("public", "public_rls")],
+                ["public"],
+            )
+            .with_shared_tables(["entries", "public"])
+            .with_shared_layout(connetto_core::schema::SharedLayout::new(
+                format!("{SHARED_FIXTURE_ORDERS}; {SHARED_FIXTURE_TEMP}; {SHARED_FIXTURE_SHARED}"),
+                format!("{SHARED_FIXTURE_ORDERS}; {SHARED_FIXTURE_TEMP}"),
+                format!("{SHARED_FIXTURE_SHARED}; {SHARED_FIXTURE_TEMP}"),
+                SHARED_FIXTURE_TEMP,
+            )),
             None::<&str>,
         )
         .expect("the fixture declares its major")
-        .with_shared_tables(["entries", "public"])
-        .with_shared_layout(connetto_core::schema::SharedLayout::new(
-            format!("{SHARED_FIXTURE_ORDERS}; {SHARED_FIXTURE_TEMP}; {SHARED_FIXTURE_SHARED}"),
-            format!("{SHARED_FIXTURE_ORDERS}; {SHARED_FIXTURE_TEMP}"),
-            format!("{SHARED_FIXTURE_SHARED}; {SHARED_FIXTURE_TEMP}"),
-            SHARED_FIXTURE_TEMP,
-        ))
     }
 
     /// An offline signed-in worker over the shared-store fixture, the shared
@@ -8577,9 +8585,11 @@ mod tests {
                 connetto_core::schema::SchemaBundle::new(
                     SOURCE,
                     "",
-                    DDL,
-                    Vec::<(String, String)>::new(),
-                    Vec::<String>::new(),
+                    connetto_core::ReplicaCopy::new(
+                        DDL,
+                        Vec::<(String, String)>::new(),
+                        Vec::<String>::new(),
+                    ),
                     Some(FOLDERS_TIER),
                 )
                 .expect("the source declares major 1"),

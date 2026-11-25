@@ -224,9 +224,11 @@ async fn a_tier_table_created_after_open_is_caught_at_the_next_write() {
         SchemaBundle::new(
             SOURCE,
             "",
-            KEYED_DDL,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                KEYED_DDL,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             Some("CREATE TABLE drafts (id INTEGER PRIMARY KEY, body TEXT)"),
         )
         .expect("the source declares major 1"),
@@ -265,9 +267,11 @@ fn an_unkeyed_tier_table_is_refused_on_the_create_path() {
         SchemaBundle::new(
             SOURCE,
             "",
-            KEYED_DDL,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                KEYED_DDL,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             Some("CREATE TABLE scratch (body TEXT)"),
         )
         .expect("the source declares major 1"),
@@ -294,9 +298,11 @@ async fn an_unkeyed_tier_table_is_refused_on_the_existing_path() {
         SchemaBundle::new(
             SOURCE,
             "",
-            KEYED_DDL,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                KEYED_DDL,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             Some("CREATE TABLE scratch (body TEXT)"),
         )
         .expect("the source declares major 1"),
