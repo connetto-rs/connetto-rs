@@ -2173,6 +2173,7 @@ struct SessionState<Id, Key> {
     credits: u32,
     pending: VecDeque<Deliverable>,
     input: HeldInput,
+    /// The session retains its sender until teardown.
     outbound_rx: mpsc::UnboundedReceiver<Outbound>,
     held_outbound: VecDeque<Outbound>,
     /// Row subscriptions by client label, each keeping the request that made it
@@ -6441,13 +6442,12 @@ where
                         Err(err) => break (Err(err), "incoming_failed"),
                     }
                 }
-                outbound = async {
+                Some(outbound) = async {
                     match state.held_outbound.pop_front() {
                         Some(outbound) => Some(outbound),
                         None => state.outbound_rx.recv().await,
                     }
                 } => {
-                    let Some(outbound) = outbound else { break (Ok(()), "outbound_closed") };
                     let handled = outbound.released_when_handled();
                     let outcome = self.handle_outbound(&mut transport, outbound, &mut state).await;
                     state.outbound.queue.release(handled);
@@ -11271,10 +11271,10 @@ where
                     Some(frame) => state.input.push(frame, self.config.catchup_input_budget)?,
                     None => return Ok(CatchupWait::Closed(None)),
                 },
-                outbound = state.outbound_rx.recv() => match outbound {
-                    Some(Outbound::Fatal(fatal)) => return Ok(CatchupWait::Closed(Some(fatal))),
-                    Some(Outbound::Drop) | None => return Ok(CatchupWait::Closed(None)),
-                    Some(outbound) => state.held_outbound.push_back(outbound),
+                Some(outbound) = state.outbound_rx.recv() => match outbound {
+                    Outbound::Fatal(fatal) => return Ok(CatchupWait::Closed(Some(fatal))),
+                    Outbound::Drop => return Ok(CatchupWait::Closed(None)),
+                    outbound => state.held_outbound.push_back(outbound),
                 },
             }
         }

@@ -49,6 +49,7 @@ use subql::{
 };
 
 mod failures;
+mod session_exit;
 const PG_DDL: &str =
     "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
 const SQLITE_DDL: &str =
