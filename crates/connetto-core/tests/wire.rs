@@ -23,13 +23,14 @@ use connetto_core::{
         CourierRange, DeviceAttestation, DeviceRevokedAck, DeviceSummary, DevicesList,
         DevicesRequest, EnrolChallenge, EnrolChallengeRequest, EnrolGrant, EnrolRefusal,
         EnrolRefused, EnrolRequest, FatalError, FatalErrorReason, FullResyncReason,
-        FullResyncRequired, Grant, Handshake, HandshakeAck, LivePatch, MutationConflict,
-        MutationHeader, MutationPatch, MutationReject, MutationRejectReason, NonFatalError,
-        PauseCause, Ping, Pong, Provenance, ProvisionalStatus, ProvisionalVerdicts, RateLimited,
-        RegisterBot, ReplaceShareKeys, RetireWriter, RevocationUpdate, RevokeDeviceRequest,
-        ShareKeysReplaced, SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch, SqliteValue,
-        Subscribe, SubscriptionSpec, Unsubscribe, Verdict, WriterAnswer, WriterGrant,
-        WriterOutcome, WriterRef, WriterRequest, WriterSecret,
+        FullResyncRequired, Grant, Handshake, HandshakeAck, LivePatch, MutationApplied,
+        MutationConflict, MutationHeader, MutationPatch, MutationReject, MutationRejectReason,
+        NonFatalError, PauseCause, Ping, Pong, Provenance, ProvisionalStatus, ProvisionalVerdicts,
+        RateLimited, RegisterBot, ReplaceShareKeys, RetireWriter, RevocationUpdate,
+        RevokeDeviceRequest, ShareKeysReplaced, SignedList, SnapshotBegin, SnapshotEnd,
+        SnapshotPatch, SqliteValue, Subscribe, SubscriptionSpec, Unsubscribe, Verdict,
+        WriterAnswer, WriterGrant, WriterOutcome, WriterRef, WriterRequest, WriterSecret,
+        WritesSettled,
     },
     version::PROTOCOL_VERSION,
 };
@@ -66,6 +67,35 @@ fn round_trip_bulk(message: &BulkMessage) {
         "framed bulk decoder must consume everything"
     );
     assert_eq!(*message, framed_back, "framed bulk round-trip mismatch");
+}
+
+#[test]
+fn number_writer_settled_high_water_round_trips() {
+    for before_patch in [false, true] {
+        round_trip_control(&ControlMessage::WritesSettled(WritesSettled {
+            writer: WriterRef::Number(42),
+            through_seq: u64::MAX,
+            before_patch,
+        }));
+    }
+}
+
+#[test]
+fn device_writer_settled_high_water_round_trips() {
+    for before_patch in [false, true] {
+        round_trip_control(&ControlMessage::WritesSettled(WritesSettled {
+            writer: WriterRef::Device([0xa5; 32]),
+            through_seq: 0,
+            before_patch,
+        }));
+    }
+}
+
+#[test]
+fn mutation_applied_sequence_only_round_trips() {
+    round_trip_control(&ControlMessage::MutationApplied(MutationApplied {
+        client_seq: 42,
+    }));
 }
 
 #[test]

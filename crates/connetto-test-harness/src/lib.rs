@@ -2746,7 +2746,9 @@ impl Client {
 
     /// Drain a subscription's initial snapshot, from `SnapshotBegin` through
     /// `SnapshotEnd`, and return the snapshot patches seen in between (an empty
-    /// snapshot has none).
+    /// snapshot has none). A `WritesSettled` mark the server sends ahead of
+    /// the snapshot's rows is passed over, since this client holds no
+    /// provisional rows for it to drop.
     ///
     /// # Panics
     ///
@@ -2774,6 +2776,7 @@ impl Client {
                     );
                     return patches;
                 }
+                Some(IncomingFrame::Control(ControlMessage::WritesSettled(_))) => {}
                 other => panic!("expected snapshot patch or end, got {other:?}"),
             }
         }

@@ -297,7 +297,7 @@ async fn sent_but_unprocessed_mutation_replays_after_resume() {
     conn.attach(open_session(&manager)).await.expect("resume");
     loop {
         match conn.pump_one().await.expect("pump") {
-            ClientEvent::MutationApplied { client_seq } => {
+            ClientEvent::MutationApplied { client_seq, .. } => {
                 assert_eq!(client_seq, seq);
                 break;
             }
@@ -382,7 +382,7 @@ async fn applied_but_unacked_mutation_dedupes_on_resume() {
     conn.attach(open_session(&manager)).await.expect("resume");
     loop {
         match conn.pump_one().await.expect("pump") {
-            ClientEvent::MutationApplied { client_seq } => {
+            ClientEvent::MutationApplied { client_seq, .. } => {
                 assert_eq!(client_seq, seq, "the replay's re-answer names the sequence");
                 break;
             }
@@ -495,7 +495,7 @@ async fn restart_replays_persisted_pending() {
         .expect("second connect");
     loop {
         match conn.pump_one().await.expect("pump") {
-            ClientEvent::MutationApplied { client_seq } => {
+            ClientEvent::MutationApplied { client_seq, .. } => {
                 assert_eq!(client_seq, 1);
                 break;
             }
@@ -540,7 +540,9 @@ where
 {
     loop {
         match conn.pump_one().await.expect("pump") {
-            ClientEvent::MutationApplied { client_seq: seq } if seq == client_seq => return,
+            ClientEvent::MutationApplied {
+                client_seq: seq, ..
+            } if seq == client_seq => return,
             ClientEvent::Closed | ClientEvent::ServerClosed { .. } => {
                 panic!("closed before sequence {client_seq} was answered")
             }

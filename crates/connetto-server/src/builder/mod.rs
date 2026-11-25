@@ -2007,7 +2007,7 @@ where
         require_schema_tables::<D>(&pool, bans, device_identity.is_some()).await?;
         let synced = synced_tables::<D>(&schema.pg_ddl)?;
         require_cap_policies(&pool, &synced).await?;
-        let (oplog, lag_watch) = prepare_change_log(
+        let (oplog, lag_watch) = prepare_change_log::<D>(
             &pool,
             &slot,
             &publication,
@@ -2350,7 +2350,7 @@ fn install_device_identity<D: ConnettoSchema>(
 /// slot watch, handing back the watch's stop handle so a refusal after it
 /// started cannot leave it running. Everything here reads or writes connetto's
 /// own bookkeeping, so it runs on the owner pool.
-async fn prepare_change_log(
+async fn prepare_change_log<D: ConnettoSchema>(
     pool: &PgPool,
     slot: &str,
     publication: &str,
@@ -2379,15 +2379,14 @@ async fn prepare_change_log(
             column: "xid_horizon",
         },
         Artifact::Table(&xid_table),
-        // The pending verdicts push on a row the stream must carry (R77
-        // decision 11). The writer and settled tables always stand.
+        // Writer frontiers and transaction-completion markers must reach ingestion.
         Artifact::PublishedTable {
             publication,
-            table: connetto_translate::BOOKKEEPING_TABLES[0],
+            table: D::Writers::WRITERS_TABLE,
         },
         Artifact::PublishedTable {
             publication,
-            table: connetto_translate::BOOKKEEPING_TABLES[1],
+            table: D::Writers::SETTLED_TABLE,
         },
     ];
     // The enrolment table stands only with device identity, so its publication

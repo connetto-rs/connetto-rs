@@ -36,19 +36,12 @@ impl ExportScope {
 
 /// The archive format name.
 const FORMAT: &str = "connetto-local-data";
-/// Version 8 carries each queued write's writer, the secret a number writer
-/// was issued under (R70), sequence, chain hash and the application schema
-/// major it was captured under, beside the major the archive was made under
-/// (R31), and for a build that exchanges with peers (R77 decision 16) every
-/// held peer entry in its position order with its state, origin and digest
-/// (R78 decision 20) and the per-author cursors with their last verified
-/// offers and certificate ends, the retraction log and the provisional
-/// records apart from them.
-const VERSION: u32 = 8;
+const VERSION: u32 = 9;
 const MANIFEST: &str = "manifest.json";
 const SYNCED_ROWS: &str = "synced.patchset";
 const LOCAL_ROWS: &str = "device-private.patchset";
 const PENDING: &str = "pending.changesets";
+const HELD_OVERLAYS: &str = "held-overlays.patchset";
 /// The stored peer entries a build that exchanges with peers carries.
 const PEER_ENTRIES: &str = "_connetto_peer_entry";
 /// The per-author peer cursors a build that exchanges with peers carries.
@@ -127,6 +120,10 @@ pub(crate) struct Archive<'a> {
     pub(crate) local_rows: Option<Vec<u8>>,
     /// Unconfirmed writes in causal append order.
     pub(crate) pending: Vec<ArchivedEntry>,
+    /// Dropped frontiers in each original writer's sequence space.
+    pub(crate) derived_marks: Vec<(connetto_core::messages::WriterRef, u64)>,
+    /// Acknowledged overlay rows and their original ownership tags.
+    pub(crate) held_overlays: Vec<u8>,
     /// The stored peer entries in their position order, carried by a build
     /// that exchanges with peers (R77 decision 16).
     pub(crate) peer_entries: Vec<ArchivedPeerEntry>,
@@ -151,6 +148,12 @@ pub(crate) struct ArchivedEntry {
     pub(crate) major: Option<Major>,
     /// The captured changeset.
     pub(crate) changeset: Vec<u8>,
+    /// The provisional derived changeset, empty when no effects remain.
+    pub(crate) derived: Vec<u8>,
+    /// The entry's shared overlay rows and ownership tags.
+    pub(crate) overlay: Vec<u8>,
+    /// The exact local backing changeset, absent when upload bytes apply locally.
+    pub(crate) local_changeset: Option<Vec<u8>>,
     /// The secret the queue's number writer was issued under, so an import
     /// names that number to the server (R70 decision 22).
     pub(crate) secret: Option<connetto_core::messages::WriterSecret>,
@@ -228,6 +231,10 @@ pub(crate) struct Incoming {
     pub(crate) local_rows: Option<Vec<u8>>,
     /// Unconfirmed writes in causal append order.
     pub(crate) pending: Vec<ArchivedEntry>,
+    /// Dropped frontiers in each original writer's sequence space.
+    pub(crate) derived_marks: Vec<(connetto_core::messages::WriterRef, u64)>,
+    /// Acknowledged overlay rows and their original ownership tags.
+    pub(crate) held_overlays: Vec<u8>,
     /// The stored peer entries in their position order, absent from an
     /// archive made by a build that exchanges with no peers.
     pub(crate) peer_entries: Vec<ArchivedPeerEntry>,

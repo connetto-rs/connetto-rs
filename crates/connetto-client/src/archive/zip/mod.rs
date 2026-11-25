@@ -10,7 +10,7 @@ use super::{
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Manifest {
+pub(super) struct Manifest<'a> {
     pub(super) format: String,
     pub(super) version: u32,
     pub(super) scope: String,
@@ -18,6 +18,8 @@ pub(super) struct Manifest {
     pub(super) major: Option<connetto_core::Major>,
     #[serde(default)]
     pub(super) account: Option<String>,
+    #[serde(default)]
+    pub(super) derived_marks: std::borrow::Cow<'a, [(connetto_core::messages::WriterRef, u64)]>,
     pub(super) compression: String,
     pub(super) note: String,
     pub(super) entries: Vec<Entry>,
@@ -42,6 +44,7 @@ pub(super) fn validate_attachment_path(
         SYNCED_ROWS,
         LOCAL_ROWS,
         PENDING,
+        super::HELD_OVERLAYS,
         PEER_ENTRIES,
         PEER_CURSORS,
     ];
@@ -101,6 +104,9 @@ mod tests {
             hash: [0u8; 32],
             major: connetto_core::Major::new(1),
             changeset: changeset.to_vec(),
+            derived: Vec::new(),
+            overlay: Vec::new(),
+            local_changeset: None,
             secret: None,
             provenance: None,
         }
@@ -116,14 +122,64 @@ mod tests {
             entry(3, &[255u8; 300]),
         ];
         let encoded = encode_pending(&records);
-        assert_eq!(decode_pending(&encoded).expect("decode"), records);
+        assert_eq!(
+            decode_pending(&encoded, super::super::VERSION).expect("decode"),
+            records
+        );
     }
 
     /// A truncated queue entry is refused rather than read as a shorter one.
     #[test]
     fn a_truncated_queue_entry_is_refused() {
         let encoded = encode_pending(&[entry(1, &[1u8, 2, 3])]);
-        assert!(decode_pending(&encoded[..encoded.len() - 1]).is_err());
+        assert!(decode_pending(&encoded[..encoded.len() - 1], super::super::VERSION).is_err());
+    }
+
+    #[test]
+    fn derived_changesets_round_trip_independently() {
+        let mut first = entry(1, &[1, 2]);
+        first.derived = vec![3, 4, 5];
+        first.overlay = vec![8, 9, 10];
+        first.local_changeset = Some(vec![6, 7]);
+        let records = vec![first, entry(2, &[])];
+        let encoded = encode_pending(&records);
+        assert_eq!(
+            decode_pending(&encoded, super::super::VERSION).expect("decode"),
+            records
+        );
+    }
+
+    #[test]
+    fn version_eight_entries_have_no_derived_changeset() {
+        let record = entry(1, &[1, 2]);
+        let mut encoded = encode_pending(std::slice::from_ref(&record));
+        encoded.truncate(encoded.len() - 17);
+        assert_eq!(
+            decode_pending(&encoded, 8).expect("legacy queue"),
+            vec![record]
+        );
+    }
+
+    #[test]
+    fn empty_local_capture_is_distinct_from_upload_fallback() {
+        let mut overlay_only = entry(1, &[7, 8]);
+        overlay_only.local_changeset = Some(Vec::new());
+        let records = vec![overlay_only, entry(2, &[9])];
+        let bytes = encode_pending(&records);
+        assert_eq!(
+            decode_pending(&bytes, super::super::VERSION).expect("local captures"),
+            records,
+        );
+    }
+
+    #[test]
+    fn truncated_derived_changesets_are_refused() {
+        let mut record = entry(1, &[]);
+        record.derived = vec![4, 5, 6];
+        let mut encoded = encode_pending(&[record]);
+        while encoded.pop().is_some() {
+            assert!(decode_pending(&encoded, super::super::VERSION).is_err());
+        }
     }
 
     #[test]

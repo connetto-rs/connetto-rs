@@ -335,6 +335,26 @@ mod tests {
     use subql::catalog_helpers::table_id;
 
     #[test]
+    fn settled_table_is_known_to_the_guard() {
+        let documents = crate::schema::engine_ddl::<crate::defaults::ConnettoDefaults>(
+            "CREATE TABLE public.documents (id INTEGER PRIMARY KEY);",
+            false,
+        );
+        let guarded = guard_catalog(&documents).expect("guard catalog");
+        assert!(table_id::<Postgres, _>(&guarded, "_connetto_settled").is_some());
+    }
+
+    #[test]
+    fn configured_settled_table_is_known_to_the_guard() {
+        let documents = crate::schema::engine_ddl::<crate::defaults::ConnettoDefaults>(
+            "CREATE SCHEMA writer_drift; CREATE TABLE writer_drift.app_settled (writer BIGINT, seq BIGINT, PRIMARY KEY (writer, seq));",
+            false,
+        );
+        let guarded = guard_catalog(&documents).expect("guard catalog");
+        assert!(table_id::<Postgres, _>(&guarded, "writer_drift.app_settled").is_some());
+    }
+
+    #[test]
     fn marker_uses_shared_engine_table_numbers() {
         let documents = crate::schema::engine_ddl::<crate::defaults::ConnettoDefaults>(
             "CREATE TABLE public.zebra (id INTEGER PRIMARY KEY); CREATE TABLE public.apple (id INTEGER PRIMARY KEY);",

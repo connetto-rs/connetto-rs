@@ -31,9 +31,9 @@ pub(crate) fn open<R: Read + Seek>(source: R) -> Result<(Incoming, ArchiveReader
             manifest.format
         )));
     }
-    if manifest.version != VERSION {
+    if !(8..=VERSION).contains(&manifest.version) {
         return Err(ClientError::Import(format!(
-            "the archive is version {}, and this build reads version {VERSION}",
+            "the archive is version {}, and this build reads versions 8 through {VERSION}",
             manifest.version
         )));
     }
@@ -41,7 +41,8 @@ pub(crate) fn open<R: Read + Seek>(source: R) -> Result<(Incoming, ArchiveReader
     let declared = validate_archive_layout(&mut zip, &manifest, scope)?;
     let synced_present = declared.contains(SYNCED_ROWS);
     let local_rows = read_entry(&mut zip, LOCAL_ROWS)?;
-    let pending = read_pending_queue(&mut zip)?;
+    let held_overlays = read_entry(&mut zip, super::super::HELD_OVERLAYS)?.unwrap_or_default();
+    let pending = read_pending_queue(&mut zip, manifest.version)?;
     let peer_entries = read_peer_entries(&mut zip)?;
     let peer_cursors = read_peer_cursors(&mut zip)?;
     let attachments = declare_attachments(&mut zip, &manifest.entries)?;
@@ -54,6 +55,8 @@ pub(crate) fn open<R: Read + Seek>(source: R) -> Result<(Incoming, ArchiveReader
             synced_present,
             local_rows,
             pending,
+            derived_marks: manifest.derived_marks.into_owned(),
+            held_overlays,
             peer_entries,
             peer_cursors,
             attachments,
@@ -99,7 +102,9 @@ fn capacity_for(path: &str, size: u64) -> Result<usize, ClientError> {
     })
 }
 
-fn read_manifest<R: Read + Seek>(zip: &mut zip::ZipArchive<R>) -> Result<Manifest, ClientError> {
+fn read_manifest<R: Read + Seek>(
+    zip: &mut zip::ZipArchive<R>,
+) -> Result<Manifest<'static>, ClientError> {
     let mut entry = zip.by_name(MANIFEST).map_err(|_| {
         ClientError::Import(
             "the archive carries no manifest, so it is not a connetto export".to_owned(),
@@ -123,9 +128,10 @@ fn parse_scope(scope: &str) -> Result<ExportScope, ClientError> {
 
 fn read_pending_queue<R: Read + Seek>(
     zip: &mut zip::ZipArchive<R>,
+    version: u32,
 ) -> Result<Vec<super::super::ArchivedEntry>, ClientError> {
     match read_entry(zip, PENDING)? {
-        Some(bytes) => decode_pending(&bytes),
+        Some(bytes) => decode_pending(&bytes, version),
         None => Ok(Vec::new()),
     }
 }
@@ -154,7 +160,7 @@ fn read_peer_cursors<R: Read + Seek>(
 
 fn validate_archive_layout<R: Read + Seek>(
     zip: &mut zip::ZipArchive<R>,
-    manifest: &Manifest,
+    manifest: &Manifest<'_>,
     scope: ExportScope,
 ) -> Result<HashSet<String>, ClientError> {
     if manifest.compression != "per-entry" {
@@ -237,14 +243,19 @@ fn validate_entry_declaration(entry: &Entry) -> Result<(), ClientError> {
         "pending" if entry.path == PENDING => require_encoding(entry, "zstd"),
         "peer-entries" if entry.path == PEER_ENTRIES => require_encoding(entry, "zstd"),
         "peer-cursors" if entry.path == PEER_CURSORS => require_encoding(entry, "zstd"),
+        "held-overlays" if entry.path == super::super::HELD_OVERLAYS => {
+            require_encoding(entry, "zstd")
+        }
         "attachment" => {
             validate_attachment_path(&entry.path, ClientError::Import)?;
             require_encoding(entry, "identity")
         }
-        "rows" | "pending" | "peer-entries" | "peer-cursors" => Err(ClientError::Import(format!(
-            "archive entry {} contradicts kind {}",
-            entry.path, entry.kind
-        ))),
+        "rows" | "pending" | "peer-entries" | "peer-cursors" | "held-overlays" => {
+            Err(ClientError::Import(format!(
+                "archive entry {} contradicts kind {}",
+                entry.path, entry.kind
+            )))
+        }
         kind => Err(ClientError::Import(format!(
             "unknown archive entry kind {kind}"
         ))),
@@ -328,6 +339,7 @@ fn declare_attachments<R: Read + Seek>(
 
 pub(super) fn decode_pending(
     bytes: &[u8],
+    version: u32,
 ) -> Result<Vec<super::super::ArchivedEntry>, ClientError> {
     use connetto_core::messages::Provenance;
 
@@ -398,26 +410,31 @@ pub(super) fn decode_pending(
         } else {
             return Err(malformed());
         };
-        let len = usize::try_from(u64::from_be_bytes(
-            bytes
-                .get(at..at.checked_add(8).ok_or_else(malformed)?)
-                .ok_or_else(malformed)?
-                .try_into()
-                .map_err(|_| malformed())?,
-        ))
-        .map_err(|_| malformed())?;
-        at += 8;
-        let changeset = bytes
-            .get(at..at.checked_add(len).ok_or_else(malformed)?)
-            .ok_or_else(malformed)?
-            .to_vec();
-        at = at.checked_add(len).ok_or_else(malformed)?;
+        let changeset = read_bytes_field(bytes, &mut at, &malformed)?;
+        let derived = if version >= 9 {
+            read_bytes_field(bytes, &mut at, &malformed)?
+        } else {
+            Vec::new()
+        };
+        let overlay = if version >= 9 {
+            read_bytes_field(bytes, &mut at, &malformed)?
+        } else {
+            Vec::new()
+        };
+        let local_changeset = if version >= 9 {
+            read_optional_bytes(bytes, &mut at, &malformed)?
+        } else {
+            None
+        };
         entries.push(super::super::ArchivedEntry {
             writer,
             seq,
             hash,
             major,
             changeset,
+            derived,
+            overlay,
+            local_changeset,
             secret,
             provenance,
         });
@@ -628,23 +645,23 @@ mod tests {
         super::super::write::start(Vec::new(), archive)?.finish()
     }
 
-    /// What an export writes, an import reads back unchanged, each queued
-    /// write keeping the major it was captured under or none.
-    #[test]
-    fn an_archive_round_trips() {
+    fn pending_fixture() -> Vec<crate::archive::ArchivedEntry> {
         let number = connetto_core::messages::WriterRef::Number(4);
         let secret = |byte| {
             Some(connetto_core::messages::WriterSecret::from_bytes(
                 [byte; 32],
             ))
         };
-        let pending = vec![
+        vec![
             crate::archive::ArchivedEntry {
                 writer: number,
                 seq: 1,
                 hash: [9u8; 32],
                 major: Major::new(1),
                 changeset: vec![9u8; 16],
+                derived: vec![6u8; 12],
+                overlay: vec![2u8; 9],
+                local_changeset: Some(vec![4u8; 7]),
                 secret: secret(5),
                 provenance: Some(connetto_core::messages::Provenance {
                     writer: connetto_core::messages::WriterRef::Number(2),
@@ -658,6 +675,9 @@ mod tests {
                 hash: [8u8; 32],
                 major: None,
                 changeset: vec![8u8; 4],
+                derived: Vec::new(),
+                overlay: Vec::new(),
+                local_changeset: None,
                 secret: secret(5),
                 provenance: None,
             },
@@ -667,6 +687,9 @@ mod tests {
                 hash: [7u8; 32],
                 major: None,
                 changeset: vec![7u8; 16],
+                derived: vec![5u8; 8],
+                overlay: vec![1u8; 5],
+                local_changeset: Some(Vec::new()),
                 secret: None,
                 provenance: Some(connetto_core::messages::Provenance {
                     writer: connetto_core::messages::WriterRef::Number(3),
@@ -674,7 +697,14 @@ mod tests {
                     secret: None,
                 }),
             },
-        ];
+        ]
+    }
+
+    /// What an export writes, an import reads back unchanged, each queued
+    /// write keeping the major it was captured under or none.
+    #[test]
+    fn an_archive_round_trips() {
+        let pending = pending_fixture();
         let (peer_entries, peer_cursors) = peer_fixture();
         let archive = Archive {
             scope: ExportScope::Unsynced,
@@ -684,6 +714,8 @@ mod tests {
             synced_rows: None,
             local_rows: Some(vec![7u8; 64]),
             pending: pending.clone(),
+            derived_marks: vec![(connetto_core::messages::WriterRef::Number(91), 37)],
+            held_overlays: vec![5u8; 19],
             peer_entries: peer_entries.clone(),
             peer_cursors: peer_cursors.clone(),
             attachments: &[],
@@ -697,6 +729,8 @@ mod tests {
         assert!(!read_back.synced_present);
         assert_eq!(read_back.local_rows, Some(vec![7u8; 64]));
         assert_eq!(read_back.pending, pending);
+        assert_eq!(read_back.derived_marks, archive.derived_marks);
+        assert_eq!(read_back.held_overlays, archive.held_overlays);
         let (expected_entries, expected_cursors) = peer_fixture();
         assert_eq!(read_back.peer_entries, expected_entries);
         assert_eq!(read_back.peer_cursors, expected_cursors);
@@ -711,6 +745,8 @@ mod tests {
             synced_rows: Some(vec![3u8; 32]),
             local_rows: None,
             pending: Vec::new(),
+            derived_marks: archive.derived_marks.clone(),
+            held_overlays: archive.held_overlays.clone(),
             peer_entries,
             peer_cursors,
             attachments: &[],
@@ -719,6 +755,8 @@ mod tests {
         let (expected_entries, expected_cursors) = peer_fixture();
         assert_eq!(read_back.peer_entries, expected_entries);
         assert_eq!(read_back.peer_cursors, expected_cursors);
+        assert_eq!(read_back.derived_marks, everything.derived_marks);
+        assert_eq!(read_back.held_overlays, everything.held_overlays);
     }
 
     /// One author's entries and cursors the round-trip tests name.
@@ -773,6 +811,32 @@ mod tests {
             },
         ];
         (entries, cursors)
+    }
+
+    #[test]
+    fn archives_without_dropped_marks_have_zero_frontiers() {
+        for version in [8, 9] {
+            let manifest = json!({
+                "format": "connetto-local-data",
+                "version": version,
+                "scope": "unsynced",
+                "schema_fingerprint": "abc123",
+                "major": 1,
+                "compression": "per-entry",
+                "note": "test",
+                "entries": [],
+            });
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            zip.start_file("manifest.json", zip::write::SimpleFileOptions::default())
+                .expect("start manifest");
+            zip.write_all(&serde_json::to_vec(&manifest).expect("encode manifest"))
+                .expect("write manifest");
+            let bytes = zip.finish().expect("finish archive").into_inner();
+            assert_eq!(
+                read(&bytes).expect("read archive").derived_marks,
+                Vec::<(connetto_core::messages::WriterRef, u64)>::new()
+            );
+        }
     }
 
     /// A version 4 archive carries no capture major per write, so this build
@@ -923,7 +987,8 @@ mod tests {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&1u64.to_be_bytes());
         bytes.extend_from_slice(&u64::MAX.to_be_bytes());
-        let error = decode_pending(&bytes).expect_err("overflowing queue entry must be refused");
+        let error = decode_pending(&bytes, super::VERSION)
+            .expect_err("overflowing queue entry must be refused");
         assert!(
             error.to_string().contains("malformed"),
             "expected 'malformed' in error: {error}"
@@ -938,12 +1003,15 @@ mod tests {
             hash: [7; 32],
             major: Major::new(1),
             changeset: vec![8],
+            derived: Vec::new(),
+            overlay: Vec::new(),
+            local_changeset: None,
             secret: None,
             provenance: None,
         };
         let mut bytes = super::super::write::encode_pending(std::slice::from_ref(&entry));
         assert_eq!(
-            decode_pending(&bytes)
+            decode_pending(&bytes, super::VERSION)
                 .expect("a valid capture major")
                 .as_slice(),
             std::slice::from_ref(&entry)
@@ -954,7 +1022,7 @@ mod tests {
         for kept in (0..4).rev() {
             bytes.truncate(major_at + kept);
             assert!(matches!(
-                decode_pending(&bytes),
+                decode_pending(&bytes, super::VERSION),
                 Err(crate::ClientError::Import(_))
             ));
         }
@@ -974,12 +1042,15 @@ mod tests {
             hash: [7; 32],
             major: Major::new(1),
             changeset: vec![8],
+            derived: Vec::new(),
+            overlay: Vec::new(),
+            local_changeset: None,
             secret: Some(WriterSecret::from_bytes([5; WriterSecret::LEN])),
             provenance: None,
         };
         let bytes = super::super::write::encode_pending(std::slice::from_ref(&entry));
         assert_eq!(
-            decode_pending(&bytes)
+            decode_pending(&bytes, super::VERSION)
                 .expect("a valid writer secret")
                 .as_slice(),
             std::slice::from_ref(&entry)
@@ -992,7 +1063,7 @@ mod tests {
         cut.truncate(presence_at + WriterSecret::LEN);
         for malformed in [unknown, cut] {
             assert!(matches!(
-                decode_pending(&malformed),
+                decode_pending(&malformed, super::VERSION),
                 Err(crate::ClientError::Import(_))
             ));
         }
@@ -1136,6 +1207,8 @@ mod tests {
                 synced_rows: None,
                 local_rows: None,
                 pending: Vec::new(),
+                derived_marks: Vec::new(),
+                held_overlays: Vec::new(),
                 peer_entries: Vec::new(),
                 peer_cursors: Vec::new(),
                 attachments: std::slice::from_ref(&declaration),

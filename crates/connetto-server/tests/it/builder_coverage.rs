@@ -2581,6 +2581,29 @@ async fn an_audit_table_outside_the_publication_refuses_startup() {
 }
 
 #[tokio::test]
+async fn a_settled_table_outside_the_publication_refuses_startup() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+    exec(
+        &pool,
+        &format!("ALTER PUBLICATION {PUBLICATION} DROP TABLE _connetto_settled"),
+    )
+    .await;
+    let (builder, _idp, _keys) = builder_over(&fixture, 0).await;
+    match refused(builder.build().await, "settled changes must be published") {
+        BuildError::Preflight(PreflightError::Missing { noun, name }) => {
+            assert_eq!(noun, "replicated table");
+            assert_eq!(name, "_connetto_settled");
+        }
+        other => panic!("unexpected startup result {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn an_audit_reader_without_select_refuses_startup() {
     let _keyring = isolated_session_keyring();
     let _serial = PG_SERIAL.lock().await;

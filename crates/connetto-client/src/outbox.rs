@@ -6,9 +6,9 @@
 //! The triggers are generated from the replica's own catalog at every open
 //! and by every [`change_schema`](crate::ConnettoConnection::change_schema),
 //! and they record nothing while connetto's write exemption is raised, so
-//! server frames, rollbacks, replays and bookkeeping never enter the outbox,
-//! nor while [`UNRECORDED_FUNCTION`] answers true, which keeps out a write
-//! the policy guards still judge, as a peer's entry applied as its author is.
+//! server frames, rollbacks, replays and bookkeeping never enter the outbox.
+//! [`UNRECORDED_FUNCTION`] excludes peer writes except their derived effects,
+//! which are captured separately and inverted before the landing commits.
 //! A table in the shared store gets the same triggers on each identity's own
 //! connection, which write that identity's outbox in `main` and hold the
 //! written row in the store's `_connetto_shared_holding` under the
@@ -47,7 +47,7 @@ use crate::{ClientError, SHARED_SCHEMA, is_internal_table, is_shared, schema_ddl
 /// bookkeeping.
 pub(crate) const OUTBOX_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_outbox \
     (seq INTEGER PRIMARY KEY AUTOINCREMENT, tbl TEXT NOT NULL, op TEXT NOT NULL, \
-     old TEXT, new TEXT); \
+     old TEXT, new TEXT, marked INTEGER NOT NULL DEFAULT 0, overlay INTEGER NOT NULL DEFAULT 0); \
     CREATE TABLE IF NOT EXISTS _connetto_outbox_blob \
     (seq INTEGER NOT NULL, col TEXT NOT NULL, side TEXT NOT NULL, value BLOB NOT NULL, \
      PRIMARY KEY (seq, col, side))";
@@ -137,7 +137,12 @@ fn keyed_tables(
 ///
 /// [`ClientError`] when the catalog cannot be read.
 fn recorded_tables(db: &mut SqliteConnection) -> Result<Vec<(String, Vec<Column>)>, ClientError> {
-    keyed_tables(db, "main", |_| true)
+    let overlays = crate::overlay::names(db)?;
+    keyed_tables(db, "main", |table| {
+        !overlays
+            .iter()
+            .any(|overlay| overlay.eq_ignore_ascii_case(table))
+    })
 }
 
 /// The names of the keyed application tables in `schema`.
@@ -208,7 +213,7 @@ pub(crate) fn install(db: &mut SqliteConnection) -> Result<(), ClientError> {
     for (table, columns) in recorded_tables(db)? {
         db.batch_execute(&triggers("main", &table, &columns, None))?;
     }
-    Ok(())
+    install_overlays(db)
 }
 
 /// Create the outbox triggers for every table of `shared` in the shared
@@ -259,7 +264,6 @@ fn carried(column: &Column, columns: &[Column]) -> String {
 /// only schemas holding them.
 fn triggers(schema: &str, table: &str, columns: &[Column], holder: Option<&str>) -> String {
     let target = format!("{}.{}", quote_ident(schema), quote_ident(table));
-    let literal = table.replace('\'', "''");
     let whole = |_: &Column| "1".to_owned();
     let changed = |column: &Column| carried(column, columns);
     let (insert, delete) = (whole, whole);
@@ -299,37 +303,188 @@ fn triggers(schema: &str, table: &str, columns: &[Column], holder: Option<&str>)
                 key_clause(row, columns)
             );
         }
-        let mut blobs = String::new();
-        for ((row, carry), side) in old.into_iter().zip(["o"]).chain(new.into_iter().zip(["n"])) {
-            for column in columns {
-                let value = format!("{row}.{}", quote_ident(&column.name));
-                let _ = write!(
-                    blobs,
-                    "INSERT INTO _connetto_outbox_blob (seq, col, side, value) \
-                     SELECT (SELECT max(seq) FROM _connetto_outbox), '{}', '{side}', {value} \
-                     WHERE typeof({value}) = 'blob' AND {}; ",
-                    column.name.replace('\'', "''"),
-                    carry(column)
-                );
-            }
-        }
-        let old = old.map_or_else(
-            || "NULL".to_owned(),
-            |(row, carry)| encoded(row, columns, carry),
-        );
-        let new = new.map_or_else(
-            || "NULL".to_owned(),
-            |(row, carry)| encoded(row, columns, carry),
+        let capture = capture_body(
+            table,
+            op,
+            old,
+            new,
+            columns,
+            &format!("{}(0) > 0", connetto_core::DERIVED_WRITE_FUNCTION),
+            false,
         );
         format!(
             "CREATE TEMP TRIGGER {name} AFTER {event} ON {target} \
-             WHEN NOT {WRITE_EXEMPTION_FUNCTION}() AND NOT {UNRECORDED_FUNCTION}() BEGIN \
-             INSERT INTO _connetto_outbox (tbl, op, old, new) \
-             VALUES ('{literal}', '{op}', {old}, {new}); {blobs}{held}END; "
+             WHEN NOT {WRITE_EXEMPTION_FUNCTION}() AND \
+             (NOT {UNRECORDED_FUNCTION}() OR {derived}(0) > 0) BEGIN \
+             {capture}{held}END; ",
+            derived = connetto_core::DERIVED_WRITE_FUNCTION,
         )
     })
     .collect::<Vec<_>>()
     .concat()
+}
+
+type CapturedRow<'row> = Option<(&'row str, &'row dyn Fn(&Column) -> String)>;
+
+fn capture_body(
+    table: &str,
+    operation: &str,
+    old: CapturedRow<'_>,
+    new: CapturedRow<'_>,
+    columns: &[Column],
+    marked: &str,
+    overlay: bool,
+) -> String {
+    let mut blobs = String::new();
+    for ((row, carry), side) in old.into_iter().zip(["o"]).chain(new.into_iter().zip(["n"])) {
+        for column in columns {
+            let value = format!("{row}.{}", quote_ident(&column.name));
+            let _ = write!(
+                blobs,
+                "INSERT INTO _connetto_outbox_blob (seq, col, side, value) \
+                 SELECT (SELECT max(seq) FROM _connetto_outbox), '{}', '{side}', {value} \
+                 WHERE typeof({value}) = 'blob' AND {}; ",
+                column.name.replace('\'', "''"),
+                carry(column)
+            );
+        }
+    }
+    let old = old.map_or_else(
+        || "NULL".to_owned(),
+        |(row, carry)| encoded(row, columns, carry),
+    );
+    let new = new.map_or_else(
+        || "NULL".to_owned(),
+        |(row, carry)| encoded(row, columns, carry),
+    );
+    format!(
+        "INSERT INTO _connetto_outbox (tbl, op, old, new, marked, overlay) \
+         VALUES ('{}', '{operation}', {old}, {new}, {marked}, {}); {blobs}",
+        table.replace('\'', "''"),
+        i32::from(overlay),
+    )
+}
+
+fn install_overlays(database: &mut SqliteConnection) -> Result<(), ClientError> {
+    use crate::overlay::_connetto_overlays;
+    let entries: Vec<(String, String)> = _connetto_overlays::table
+        .select((_connetto_overlays::physical, _connetto_overlays::overlay))
+        .load(database)?;
+    for (physical, overlay) in entries {
+        let mut shape = columns(database, "main", &overlay)?;
+        let target = format!("main.{}", quote_ident(&overlay));
+        let derived = connetto_core::DERIVED_WRITE_FUNCTION;
+        let whole = |_: &Column| "1".to_owned();
+        for (operation, event, old, new) in [
+            (
+                "I",
+                "INSERT",
+                None,
+                Some(("NEW", &whole as &dyn Fn(&Column) -> String)),
+            ),
+            (
+                "U",
+                "UPDATE",
+                Some(("OLD", &whole as &dyn Fn(&Column) -> String)),
+                Some(("NEW", &whole as &dyn Fn(&Column) -> String)),
+            ),
+            (
+                "D",
+                "DELETE",
+                Some(("OLD", &whole as &dyn Fn(&Column) -> String)),
+                None,
+            ),
+        ] {
+            let capture = capture_body(&overlay, operation, old, new, &shape, "1", false);
+            database.batch_execute(&format!(
+                "CREATE TEMP TRIGGER {} AFTER {event} ON {target} \
+                 WHEN NOT {WRITE_EXEMPTION_FUNCTION}() AND {derived}(0) > 0 \
+                 BEGIN {capture} END",
+                trigger_name(&format!("derived_{operation}"), &overlay)
+            ))?;
+        }
+        shape.retain(|column| column.name != "pg2sqlite_tombstone");
+        let changed = |column: &Column| carried(column, &shape);
+        let live = "NEW.pg2sqlite_tombstone = 0";
+        let old_live = "OLD.pg2sqlite_tombstone = 0";
+        for (label, timing, event, operation, predicate, old, new) in [
+            (
+                "insert",
+                "AFTER",
+                "INSERT",
+                "I",
+                live.to_owned(),
+                None,
+                Some(("NEW", &whole as &dyn Fn(&Column) -> String)),
+            ),
+            (
+                "revive",
+                "BEFORE",
+                "UPDATE",
+                "I",
+                format!("NOT ({old_live}) AND {live}"),
+                None,
+                Some(("NEW", &whole as &dyn Fn(&Column) -> String)),
+            ),
+            (
+                "update",
+                "AFTER",
+                "UPDATE",
+                "U",
+                format!("{old_live} AND {live}"),
+                Some(("OLD", &changed as &dyn Fn(&Column) -> String)),
+                Some(("NEW", &changed as &dyn Fn(&Column) -> String)),
+            ),
+            (
+                "bury",
+                "AFTER",
+                "UPDATE",
+                "D",
+                format!("{old_live} AND NOT ({live})"),
+                Some(("OLD", &whole as &dyn Fn(&Column) -> String)),
+                None,
+            ),
+        ] {
+            let capture = capture_body(&physical, operation, old, new, &shape, "0", true);
+            database.batch_execute(&format!(
+                "CREATE TEMP TRIGGER {} {timing} {event} ON {target} \
+                 WHEN NOT {WRITE_EXEMPTION_FUNCTION}() AND NOT {UNRECORDED_FUNCTION}() \
+                 AND {derived}(0) = 0 AND ({predicate}) BEGIN {capture} END",
+                trigger_name(label, &overlay),
+            ))?;
+        }
+        install_overlay_tags(database, &overlay, &target, &shape)?;
+    }
+    Ok(())
+}
+
+fn install_overlay_tags(
+    database: &mut SqliteConnection,
+    overlay: &str,
+    target: &str,
+    shape: &[Column],
+) -> Result<(), ClientError> {
+    for event in ["INSERT", "UPDATE"] {
+        let key = key_clause("NEW", shape);
+        let previous = if event == "UPDATE" {
+            format!(
+                "UPDATE _connetto_overlay_tags SET dirty=1 WHERE tbl='{}' AND key={}; ",
+                overlay.replace('\'', "''"),
+                key_clause("OLD", shape)
+            )
+        } else {
+            String::new()
+        };
+        database.batch_execute(&format!(
+            "CREATE TEMP TRIGGER {} AFTER {event} ON {target} \
+             WHEN NOT {WRITE_EXEMPTION_FUNCTION}() AND NOT {UNRECORDED_FUNCTION}() BEGIN \
+             {previous}INSERT INTO _connetto_overlay_tags(tbl,key,writer,seq,dirty) VALUES ('{}',{key},NULL,NULL,1) \
+             ON CONFLICT(tbl,key) DO UPDATE SET dirty=1; END",
+            trigger_name(&format!("tag_{event}"), overlay),
+            overlay.replace('\'', "''"),
+        ))?;
+    }
+    Ok(())
 }
 
 /// The key columns of `columns`, in key order.
@@ -543,10 +698,24 @@ diesel::table! {
         old -> Nullable<Text>,
         /// The row after the write, absent for a delete.
         new -> Nullable<Text>,
+        /// Whether a server-derived run captured the write.
+        marked -> Bool,
+        overlay -> Bool,
+    }
+}
+
+#[cfg(feature = "peer")]
+diesel::table! {
+    _connetto_outbox_blob (seq, col, side) {
+        seq -> BigInt,
+        col -> Text,
+        side -> Text,
+        value -> Binary,
     }
 }
 
 /// One recorded write.
+#[derive(diesel::Queryable)]
 struct Recorded {
     /// The write's place in the outbox.
     seq: i64,
@@ -556,6 +725,8 @@ struct Recorded {
     old: Option<String>,
     /// The row after the write, absent for a delete.
     new: Option<String>,
+    marked: bool,
+    overlay: bool,
 }
 
 /// Every recorded write, oldest first.
@@ -564,19 +735,17 @@ struct Recorded {
 ///
 /// [`ClientError`] when the outbox cannot be read.
 fn recorded(db: &mut SqliteConnection) -> Result<Vec<Recorded>, ClientError> {
-    let rows: Vec<(i64, String, Option<String>, Option<String>)> = _connetto_outbox::table
+    Ok(_connetto_outbox::table
         .select((
             _connetto_outbox::seq,
             _connetto_outbox::tbl,
             _connetto_outbox::old,
             _connetto_outbox::new,
+            _connetto_outbox::marked,
+            _connetto_outbox::overlay,
         ))
         .order(_connetto_outbox::seq)
-        .load(db)?;
-    Ok(rows
-        .into_iter()
-        .map(|(seq, tbl, old, new)| Recorded { seq, tbl, old, new })
-        .collect())
+        .load(db)?)
 }
 
 /// One cell, comparable.
@@ -885,6 +1054,10 @@ impl Shape {
 pub(crate) struct Built {
     /// The upload, empty when the writes cancel out.
     pub(crate) changeset: Vec<u8>,
+    /// Provisional writes excluded from the upload.
+    pub(crate) marked: Vec<u8>,
+    pub(crate) local_changeset: Option<Vec<u8>>,
+    pub(crate) cancelled_overlay: Vec<u8>,
     /// The sequence of the newest write read.
     pub(crate) through: i64,
 }
@@ -908,6 +1081,60 @@ pub(crate) fn build(
     let Some(through) = writes.last().map(|write| write.seq) else {
         return Ok(None);
     };
+    let overlays = crate::overlay::names(db)?;
+    let changeset = fold(db, shared, writes.iter().filter(|write| !write.marked))?;
+    let cancelled_overlay = if changeset.is_empty() {
+        fold(
+            db,
+            shared,
+            writes
+                .iter()
+                .filter(|write| write.marked && overlays.contains(&write.tbl)),
+        )?
+    } else {
+        Vec::new()
+    };
+    let marked = fold(
+        db,
+        shared,
+        writes
+            .iter()
+            .filter(|write| write.marked && !overlays.contains(&write.tbl)),
+    )?;
+    let marked = crate::derived::compose_unsent(db, true, &marked)?.unwrap_or(marked);
+    let local_changeset = writes
+        .iter()
+        .any(|write| write.overlay)
+        .then(|| {
+            fold(
+                db,
+                shared,
+                writes
+                    .iter()
+                    .filter(|write| !write.marked && !write.overlay),
+            )
+        })
+        .transpose()?;
+    let local_changeset = crate::derived::compose_unsent(
+        db,
+        false,
+        local_changeset.as_deref().unwrap_or(&changeset),
+    )?
+    .or(local_changeset);
+    Ok(Some(Built {
+        changeset,
+        marked,
+        local_changeset,
+        cancelled_overlay,
+        through,
+    }))
+}
+
+fn fold<'write>(
+    db: &mut SqliteConnection,
+    shared: &HashSet<String>,
+    writes: impl Iterator<Item = &'write Recorded>,
+) -> Result<Vec<u8>, ClientError> {
     let builder_err =
         |err: sqlite_diff_rs::Error| ClientError::Apply(format!("building the upload: {err}"));
     let mut shapes: HashMap<String, Shape> = HashMap::new();
@@ -978,8 +1205,35 @@ pub(crate) fn build(
             }
         }
     }
-    Ok(Some(Built {
-        changeset: builder.build(),
-        through,
-    }))
+    Ok(builder.build())
+}
+
+#[cfg(feature = "peer")]
+pub(crate) fn latest(database: &mut SqliteConnection) -> Result<i64, ClientError> {
+    Ok(_connetto_outbox::table
+        .select(diesel::dsl::max(_connetto_outbox::seq))
+        .first::<Option<i64>>(database)?
+        .unwrap_or(0))
+}
+
+#[cfg(feature = "peer")]
+pub(crate) fn discard_peer_derived(
+    database: &mut SqliteConnection,
+    shared: &HashSet<String>,
+    after: i64,
+) -> Result<(), ClientError> {
+    let writes = recorded(database)?;
+    let marked = fold(
+        database,
+        shared,
+        writes
+            .iter()
+            .filter(|write| write.seq > after && write.marked),
+    )?;
+    crate::derived::invert(database, shared, &marked)?;
+    diesel::delete(_connetto_outbox_blob::table.filter(_connetto_outbox_blob::seq.gt(after)))
+        .execute(database)?;
+    diesel::delete(_connetto_outbox::table.filter(_connetto_outbox::seq.gt(after)))
+        .execute(database)?;
+    Ok(())
 }

@@ -122,6 +122,16 @@ Rejection rolls back. Each pushed changeset is retained keyed by `client_seq` un
 
 A `MutationReject` carrying `Indeterminate` is not rolled back. The write stays pending, `ClientEvent::MutationDeferred` reports it, and `ConnettoConnection::resend_timer` arms a jittered resend of every pending write. A `RateLimited` naming a pending write arms the same resend at the wait the server named.
 
+`MutationApplied`, `MutationRejected`, `MutationConflict`, `MutationDeferred` and `WriteRestored` identify the answered entry by both `writer` and `client_seq`. A relay follows entry moves through `track_mutation_rekeys` and `take_mutation_rekeys`, retaining that pair until both the answer and the derived-write mark arrive.
+
+`connetto_derived_write` brackets provisional trigger writes, captured separately in `_connetto_derived` and excluded from the upload. `WritesSettled { writer, through_seq, before_patch }` drops that writer's provisional rows through the sequence without acknowledging pending entries. A held mark runs inside the next patch's transaction before its rows, and the attach frontier runs before subscriptions resume. `_connetto_derived_marks` persists the dropped frontier, making repeated and older marks no-ops.
+
+For a shared table, derived writes land in the identity's private overlay over the shared backing table. Ordinary application writes to overlaid keys remain there and upload as logical-table operations, with updates carrying only changed cells. The table's `BEFORE` and `AFTER` triggers run on overlay writes too.
+
+Each overlay row is retained until its latest writing entry settles. A settlement mark or refusal removes that entry's overlay without inverting the backing row, so a server patch received through another identity survives. Server patches, peer entries and inverses target the shared backing table.
+
+An inverse leaves columns touched by later held writes alone, transferring old values only where the per-column images continue. `_connetto_rollback` holds an entry's exact local changeset only when it differs from the upload, including an empty changeset for overlay-only writes. Refusal and snapshot replay use this local changeset, which follows the entry through carry, archive import and retirement.
+
 ## Manual courier audit observations
 
 `ConnettoConnection::begin_courier_audit(author, seqs, deadline, wake)` returns an owned `CourierAuditWait` using an absolute `SystemClock::monotonic()` deadline. Registration can fail with `CourierAuditError` for invalid input, exhausted capacity, an elapsed deadline or an ended session. `CourierAuditWait::wait()` expires without driver progress and reports server refusal, observation failure or session loss. An already-settled outcome takes precedence over expiry when the wait is first polled after its deadline.

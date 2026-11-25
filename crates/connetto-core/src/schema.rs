@@ -173,6 +173,12 @@ pub const AUDIT_TABLE: &str = "rls_audit";
 /// row-level security for them as PostgreSQL lifts it for the table owner.
 pub const WRITE_EXEMPTION_FUNCTION: &str = "connetto_write_exempt";
 
+/// The SQLite function every replica connection registers and the
+/// translated triggers call as `name(1)` before and `name(-1)` after each run
+/// of writes the server derives itself, so the replica keeps those rows out of
+/// its upload (R118 decision 8).
+pub const DERIVED_WRITE_FUNCTION: &str = "connetto_derived_write";
+
 /// The domain tag every bundle hash starts with, so a bundle hash can never
 /// collide with a [`schema_hash`] of the same bytes.
 const BUNDLE_DOMAIN_TAG: &str = "connetto-schema-bundle-v1\0";
@@ -644,6 +650,57 @@ impl fmt::Debug for SchemaBundle {
     }
 }
 
+/// The manifest names used to route a shared table's provisional writes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedOverlay {
+    logical: String,
+    physical: String,
+    overlay: String,
+    shared_write: String,
+}
+
+impl SharedOverlay {
+    /// Retain the translator's table names without normalization.
+    #[must_use]
+    pub fn new(
+        logical: impl Into<String>,
+        physical: impl Into<String>,
+        overlay: impl Into<String>,
+        shared_write: impl Into<String>,
+    ) -> Self {
+        Self {
+            logical: logical.into(),
+            physical: physical.into(),
+            overlay: overlay.into(),
+            shared_write: shared_write.into(),
+        }
+    }
+
+    /// The logical table read by the application.
+    #[must_use]
+    pub fn logical(&self) -> &str {
+        &self.logical
+    }
+
+    /// The backing table in the attached shared store.
+    #[must_use]
+    pub fn physical(&self) -> &str {
+        &self.physical
+    }
+
+    /// The provisional table in the identity's main database.
+    #[must_use]
+    pub fn overlay(&self) -> &str {
+        &self.overlay
+    }
+
+    /// The temporary key table selecting shared rows for peer writes.
+    #[must_use]
+    pub fn shared_write(&self) -> &str {
+        &self.shared_write
+    }
+}
+
 /// The shared store's translated layout: the four SQL programs a device runs to
 /// open a replica whose shared tables live in a separate database file, one for
 /// each freshness situation of the main and shared files.
@@ -653,6 +710,7 @@ pub struct SharedLayout {
     fresh_main: String,
     fresh_shared: String,
     reopen: String,
+    overlays: Vec<SharedOverlay>,
 }
 
 impl SharedLayout {
@@ -670,7 +728,21 @@ impl SharedLayout {
             fresh_main: fresh_main.into(),
             fresh_shared: fresh_shared.into(),
             reopen: reopen.into(),
+            overlays: Vec::new(),
         }
+    }
+
+    /// Attach the translator's shared overlay manifest.
+    #[must_use]
+    pub fn with_overlays(mut self, overlays: impl IntoIterator<Item = SharedOverlay>) -> Self {
+        self.overlays = overlays.into_iter().collect();
+        self
+    }
+
+    /// The shared tables whose provisional writes live in private overlays.
+    #[must_use]
+    pub fn overlays(&self) -> &[SharedOverlay] {
+        &self.overlays
     }
 
     /// The program a device runs to open its replica, given whether each file
@@ -1189,6 +1261,29 @@ mod tests {
     /// a selection that picks the wrong program reads wrong.
     fn layout() -> SharedLayout {
         SharedLayout::new("both", "main", "shared", "reopen")
+    }
+
+    #[test]
+    fn shared_overlay_names_are_preserved_without_changing_the_version() {
+        assert_eq!(layout().overlays(), []);
+        let layout = layout().with_overlays([SharedOverlay::new(
+            "Quoted Name",
+            "Quoted Name_shared",
+            "Quoted Name_overlay",
+            "Quoted Name_shared_write",
+        )]);
+        assert_eq!(layout.overlays().len(), 1);
+        assert_eq!(layout.overlays()[0].logical(), "Quoted Name");
+        assert_eq!(layout.overlays()[0].physical(), "Quoted Name_shared");
+        assert_eq!(layout.overlays()[0].overlay(), "Quoted Name_overlay");
+        assert_eq!(
+            layout.overlays()[0].shared_write(),
+            "Quoted Name_shared_write"
+        );
+        assert_eq!(
+            reference().with_shared_layout(layout).version(),
+            reference().version()
+        );
     }
 
     /// A shared layout and a connection program are device-side artifacts, not

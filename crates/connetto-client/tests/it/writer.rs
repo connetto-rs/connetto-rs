@@ -1427,7 +1427,7 @@ async fn a_grant_below_the_settled_prefix_resends_the_retained_run() {
     assert!(
         !seen
             .iter()
-            .any(|event| matches!(event, ClientEvent::MutationApplied { client_seq: 2 })),
+            .any(|event| matches!(event, ClientEvent::MutationApplied { client_seq: 2, .. })),
         "the re-sent entry raises no new application, saw {seen:?}"
     );
     assert_eq!(writers(&mut conn), vec!["number:1".to_owned()]);
@@ -1529,7 +1529,7 @@ async fn a_resent_entry_answered_indeterminate_is_sent_again_on_the_resend() {
     for _ in 0..16 {
         if matches!(
             conn.pump_one().await.expect("pump"),
-            ClientEvent::MutationDeferred { client_seq: 2 }
+            ClientEvent::MutationDeferred { client_seq: 2, .. }
         ) {
             deferred = true;
             break;
@@ -1551,7 +1551,8 @@ async fn a_resent_entry_answered_indeterminate_is_sent_again_on_the_resend() {
             event,
             ClientEvent::WriteRestored {
                 client_seq: 2,
-                refused: None
+                refused: None,
+                ..
             }
         )),
         "the second answer settles it, saw {seen:?}"
@@ -1581,6 +1582,7 @@ async fn a_resent_entry_answered_forked_moves_the_queue_to_a_fresh_number() {
             ClientEvent::WriteRestored {
                 client_seq: 2,
                 refused: Some(PriorRefusal::Rejected(MutationRejectReason::Forked)),
+                ..
             }
         )),
         "the fork is reported, saw {seen:?}"

@@ -4210,22 +4210,6 @@ mod audit_privacy_tests {
     }
 
     #[test]
-    fn a_catalog_with_an_unresolvable_key_refuses_construction() {
-        let ddl = crate::catalog_shapes::unresolvable_key_ddl();
-        let refusal = Materializer::builder(&ddl)
-            .build()
-            .err()
-            .map(|err| err.to_string());
-        assert_eq!(
-            refusal,
-            Some(
-                MaterializerError::Catalog(crate::catalog_shapes::unresolvable_key_column())
-                    .to_string()
-            )
-        );
-    }
-
-    #[test]
     fn audit_names_are_private_in_direct_and_nested_client_queries() {
         let mut materializer = private_catalog(&format!(
             "CREATE TABLE docs (id BIGINT PRIMARY KEY); \

@@ -479,7 +479,7 @@ async fn a_resend_due_over_a_dead_wire_reconnects_under_the_pump() {
         )));
         loop {
             match events.recv().await.expect("the event stream stays open") {
-                ClientEvent::MutationApplied { client_seq } if client_seq == seq => break,
+                ClientEvent::MutationApplied { client_seq, .. } if client_seq == seq => break,
                 ClientEvent::Stopped { .. } | ClientEvent::Closed => panic!("the pump stopped"),
                 _ => {}
             }

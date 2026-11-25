@@ -4545,7 +4545,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -6966,7 +6966,7 @@ dependencies = [
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#d7590d8bbdc6850c070e0d52fff897ba75ff703f"
+source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#cd8911af3683a8eeaabb28396d1c8ee35d79323a"
 dependencies = [
  "diesel",
  "pg2sqlite-runtime",
@@ -6983,7 +6983,7 @@ dependencies = [
 [[package]]
 name = "pg2sqlite-runtime"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#d7590d8bbdc6850c070e0d52fff897ba75ff703f"
+source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#cd8911af3683a8eeaabb28396d1c8ee35d79323a"
 dependencies = [
  "diesel",
  "diesel-dynamic-schema",
@@ -6993,7 +6993,7 @@ dependencies = [
 [[package]]
 name = "pg_diesel"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#54ed5c1f8de2c712e4ad8cdf18552b32b111d940"
+source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#6cb77360cfee168ae83a4592922194eb2cc1d72e"
 dependencies = [
  "diesel",
  "pg_diesel_core",
@@ -7007,7 +7007,7 @@ dependencies = [
 [[package]]
 name = "pg_diesel_core"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#54ed5c1f8de2c712e4ad8cdf18552b32b111d940"
+source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#6cb77360cfee168ae83a4592922194eb2cc1d72e"
 dependencies = [
  "bigdecimal",
  "diesel",
@@ -7020,7 +7020,7 @@ dependencies = [
 [[package]]
 name = "pg_diesel_pg14"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#54ed5c1f8de2c712e4ad8cdf18552b32b111d940"
+source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#6cb77360cfee168ae83a4592922194eb2cc1d72e"
 dependencies = [
  "bigdecimal",
  "diesel",
@@ -7030,7 +7030,7 @@ dependencies = [
 [[package]]
 name = "pg_diesel_pg15"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#54ed5c1f8de2c712e4ad8cdf18552b32b111d940"
+source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#6cb77360cfee168ae83a4592922194eb2cc1d72e"
 dependencies = [
  "bigdecimal",
  "diesel",
@@ -7040,7 +7040,7 @@ dependencies = [
 [[package]]
 name = "pg_diesel_pg16"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#54ed5c1f8de2c712e4ad8cdf18552b32b111d940"
+source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#6cb77360cfee168ae83a4592922194eb2cc1d72e"
 dependencies = [
  "bigdecimal",
  "diesel",
@@ -7050,7 +7050,7 @@ dependencies = [
 [[package]]
 name = "pg_diesel_pg17"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#54ed5c1f8de2c712e4ad8cdf18552b32b111d940"
+source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#6cb77360cfee168ae83a4592922194eb2cc1d72e"
 dependencies = [
  "bigdecimal",
  "diesel",
@@ -7060,7 +7060,7 @@ dependencies = [
 [[package]]
 name = "pg_diesel_pg18"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#54ed5c1f8de2c712e4ad8cdf18552b32b111d940"
+source = "git+https://github.com/connetto-rs/pg_diesel?branch=main#6cb77360cfee168ae83a4592922194eb2cc1d72e"
 dependencies = [
  "bigdecimal",
  "diesel",
@@ -9316,7 +9316,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9377,7 +9377,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sql-traits?branch=main#710656f838abf04f3b0557a66c5a046133af274f"
+source = "git+https://github.com/connetto-rs/sql-traits?branch=main#32d00b312f5042234400fb81b781992bb58764bb"
 dependencies = [
  "geometric-traits",
  "once_cell",
@@ -9389,6 +9389,7 @@ dependencies = [
  "sqlparser-canonicalize",
  "sqlparser-expr-eval",
  "sqlparser-plpgsql",
+ "sqlparser-plpgsql-dataflow",
  "sqlstate",
  "stacker",
  "thiserror 2.0.21",
@@ -9470,7 +9471,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.64.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#ba850faff0d7bde0193e4c8635fdf5155a801d97"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#c3f0d8e076316a1581ebab839abc70bbf0338b4b"
 dependencies = [
  "log",
  "recursive",
@@ -9492,7 +9493,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-expr-eval"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sqlparser-expr-eval?branch=main#46deb4392399a9658ac504ad39fd32556d4f9475"
+source = "git+https://github.com/connetto-rs/sqlparser-expr-eval?branch=main#bf8d41991d71c5947fe61a91b0f6341b577a4275"
 dependencies = [
  "rpds",
  "sql-values 0.6.0",
@@ -9502,7 +9503,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-plpgsql"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sqlparser-plpgsql?branch=main#f5ea51d2d98a1ce18fc47f74185836165fcac612"
+source = "git+https://github.com/connetto-rs/sqlparser-plpgsql?branch=main#f5debf1c49fe774f3bbfa1b51dc0951c8e24b43a"
 dependencies = [
  "sqlparser",
  "sqlstate",
@@ -9510,9 +9511,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqlparser-plpgsql-dataflow"
+version = "0.1.0"
+source = "git+https://github.com/connetto-rs/sqlparser-plpgsql-dataflow?branch=main#a11eac4e8763ac8ea0b0cc842ae414859d0c789e"
+dependencies = [
+ "sqlparser",
+ "sqlparser-expr-eval",
+ "sqlparser-plpgsql",
+ "sqlstate",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "sqlparser_derive"
 version = "0.7.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#ba850faff0d7bde0193e4c8635fdf5155a801d97"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#c3f0d8e076316a1581ebab839abc70bbf0338b4b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -9546,7 +9559,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10565,7 +10578,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

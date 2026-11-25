@@ -127,6 +127,8 @@ mod app {
 
     impl ConnettoWriterSchema for AppWriters {
         type Id = uuid::Uuid;
+        const WRITERS_TABLE: &'static str = "app_writers";
+        const SETTLED_TABLE: &'static str = "app_settled";
         const TABLES: &'static [&'static str] = &[
             "app_writers",
             "app_settled",
@@ -698,6 +700,28 @@ async fn recreate_registry_over_uuid(pool: &Pool<AsyncPgConnection>) {
     .await;
 }
 
+/// Creates the deployment's own writer and settled tables and publishes them
+/// with full previous images, as the settle marks read them from the stream.
+async fn publish_own_writer_tables(pool: &Pool<AsyncPgConnection>) {
+    for stmt in app::WRITERS_DDL {
+        exec(pool, stmt).await;
+    }
+    for statement in [
+        "ALTER TABLE app_writers REPLICA IDENTITY FULL",
+        "ALTER TABLE app_settled REPLICA IDENTITY FULL",
+    ] {
+        exec(pool, statement).await;
+    }
+    exec(
+        pool,
+        &format!(
+            "ALTER PUBLICATION {} ADD TABLE app_writers, app_settled",
+            connetto_test_harness::PUBLICATION,
+        ),
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn a_deployment_schema_of_its_own_serves_through_the_builder() {
     let _keyring = isolated_session_keyring();
@@ -730,9 +754,7 @@ async fn a_deployment_schema_of_its_own_serves_through_the_builder() {
     ] {
         exec(&pool, stmt).await;
     }
-    for stmt in app::WRITERS_DDL {
-        exec(&pool, stmt).await;
-    }
+    publish_own_writer_tables(&pool).await;
     recreate_registry_over_uuid(&pool).await;
     let listener = TcpListener::bind("127.0.0.1:0")
         .await

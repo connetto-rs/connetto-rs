@@ -1138,6 +1138,7 @@ async fn rejected_write_rolls_back_locally() {
     assert_eq!(
         event,
         ClientEvent::MutationRejected {
+            writer: client.bound_writer().expect("bound writer"),
             client_seq: 1,
             reason: MutationRejectReason::SchemaMismatch,
             rows: vec![AffectedRow {
@@ -1361,6 +1362,7 @@ async fn conflicting_write_rolls_back_and_reports_keys() {
         client_seq,
         rows,
         server_row,
+        ..
     } = event
     else {
         panic!("expected a mutation conflict");

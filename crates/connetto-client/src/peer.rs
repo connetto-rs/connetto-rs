@@ -775,7 +775,7 @@ pub(crate) fn apply_ops<'d>(
                 displaced_seq: Some(cx.seq),
             }
         } else {
-            let backing = crate::backing_of(&cx.config.shared_tables, &table);
+            let backing = crate::peer_backing(cx.config, &table);
             let verdict = crate::replay::apply_peer_op(db, &table_logical, backing, &op)?;
             if verdict == crate::replay::PeerVerdict::Refused {
                 return Ok(Err(PeerRefusal::Policy));

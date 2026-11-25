@@ -312,8 +312,18 @@ fn writing_manager(
     enrolment: Option<DeviceEnrolment<ConnettoDefaults>>,
     session: SessionConfig,
 ) -> Arc<SessionManager<NoSnapshot, RosterAuth, ConnettoDefaults>> {
+    writing_manager_with_catalog(pool, guard, enrolment, session, PG_DDL)
+}
+
+fn writing_manager_with_catalog(
+    pool: &Pool<AsyncPgConnection>,
+    guard: Arc<RequestGuard<String>>,
+    enrolment: Option<DeviceEnrolment<ConnettoDefaults>>,
+    session: SessionConfig,
+    catalog: &str,
+) -> Arc<SessionManager<NoSnapshot, RosterAuth, ConnettoDefaults>> {
     let manager = ManagerBuilder::new(
-        Materializer::builder(PG_DDL)
+        Materializer::builder(catalog)
             .with_write_catalog(writable_catalog())
             .build()
             .expect("build materializer"),
@@ -324,7 +334,7 @@ fn writing_manager(
             .withholding(WITHHELD_ID),
         test_verifier(),
         NoConnector,
-        pg_write_target::<ConnettoDefaults>(pool.clone(), PG_DDL).expect("build write target"),
+        pg_write_target::<ConnettoDefaults>(pool.clone(), catalog).expect("build write target"),
     )
     .with_session(session)
     .with_guard(guard)
@@ -337,6 +347,13 @@ fn writing_manager(
         panic!("the enrolment installs once");
     }
     manager
+}
+
+fn streaming_writer_catalog() -> String {
+    connetto_translate::with_bookkeeping::<connetto_core::bots::TextIds>(
+        &connetto_translate::with_registry::<connetto_core::bots::TextIds>(PG_DDL),
+        true,
+    )
 }
 
 /// A one-connection write pool whose checkout gives up quickly, so a test
@@ -913,7 +930,10 @@ async fn a_good_bind_binds_a_live_enrolment_and_rebinds_at_its_frontier() {
         "the rebind answers the standing frontier"
     );
     client.upload(1, insert_changeset(2, "two", "t1")).await;
-    expect_applied(&mut client, 1).await;
+    let ControlMessage::MutationApplied(applied) = client.next_control().await else {
+        panic!("expected the settled record");
+    };
+    assert_eq!(applied.client_seq, 1);
     client.upload(2, insert_changeset(3, "three", "t2")).await;
     expect_applied(&mut client, 2).await;
     client.upload(3, insert_changeset(4, "four", "t3")).await;
@@ -4285,7 +4305,7 @@ async fn a_real_client_write_settles_the_hash_the_client_stored() {
     pump_until(&mut client, |event| {
         matches!(
             event,
-            ClientEvent::MutationApplied { client_seq } if *client_seq == seq
+            ClientEvent::MutationApplied { client_seq, .. } if *client_seq == seq
         )
     })
     .await;
@@ -4318,4 +4338,380 @@ async fn a_real_client_write_settles_the_hash_the_client_stored() {
         Some(head.to_vec()),
         "the client's chain reaches the writer head the server holds"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fresh_commit_marks_both_writer_sessions_before_their_first_patch() {
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let fixture = Fixture::acquire().await;
+        seed_notes(&fixture).await;
+        fixture.start_replication(&["notes"]).await;
+        let catalog = streaming_writer_catalog();
+        let manager = writing_manager_with_catalog(
+            fixture.admin(),
+            Arc::new(RequestGuard::default()),
+            None,
+            SessionConfig::default(),
+            &catalog,
+        );
+        let (transport, client) = loopback();
+        let author_task = tokio::spawn(manager.clone().serve(transport));
+        let mut author = Client::new(client);
+        let number = author
+            .handshake_with("marker-author", "user:alice")
+            .await
+            .writer
+            .expect("writer grant")
+            .number;
+        let (transport, client) = loopback();
+        let other_task = tokio::spawn(manager.clone().serve(transport));
+        let mut other = Client::new(client);
+        other
+            .handshake_writing(
+                "marker-other",
+                &["user:alice#marker-other"],
+                None,
+                number_writer(number),
+                None,
+            )
+            .await;
+        for client in [&mut author, &mut other] {
+            for label in ["notes-first", "notes-second"] {
+                client.subscribe(label, "SELECT * FROM notes").await;
+                client.expect_snapshot(label).await;
+            }
+        }
+        author.upload(1, insert_changeset(2, "two", "t1")).await;
+        let ControlMessage::MutationApplied(applied) = author.next_control().await else {
+            panic!("expected fresh apply");
+        };
+        assert_eq!(applied.client_seq, 1);
+        let catalog = subql::ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(&catalog)
+            .expect("catalog");
+        let configuration = subql::PgStreamingConfig::new(
+            fixture.admin_url(),
+            connetto_test_harness::SLOT,
+            connetto_test_harness::PUBLICATION,
+        );
+        let mut source = subql::PgStreamingCdcSource::connect(configuration, catalog)
+            .await
+            .expect("stream");
+        let ingest_manager = manager.clone();
+        let mut ingest =
+            tokio::spawn(async move { ingest_manager.ingest(&mut source, &mut |_| {}).await });
+        for client in [&mut author, &mut other] {
+            let frame = tokio::select! {
+                result = &mut ingest => panic!("ingest ended before settling {result:?}"),
+                frame = client.next_control() => frame,
+            };
+            let ControlMessage::WritesSettled(marker) = frame else {
+                panic!("expected settling before the patch");
+            };
+            assert_eq!(
+                marker.writer,
+                connetto_core::messages::WriterRef::Number(number)
+            );
+            assert_eq!(marker.through_seq, 1);
+            assert!(marker.before_patch);
+            for _ in 0..2 {
+                assert!(matches!(
+                    client.recv().await,
+                    Some(IncomingFrame::Bulk(
+                        connetto_core::messages::BulkMessage::LivePatch(_)
+                    ))
+                ));
+            }
+        }
+        author.upload(2, insert_changeset(3, "three", "t2")).await;
+        let mut applied = false;
+        let mut settled = false;
+        let mut patches = 0;
+        while !applied || patches < 2 {
+            match author.recv().await {
+                Some(IncomingFrame::Control(ControlMessage::MutationApplied(answer))) => {
+                    assert_eq!(answer.client_seq, 2);
+                    applied = true;
+                }
+                Some(IncomingFrame::Control(ControlMessage::WritesSettled(marker))) => {
+                    assert_eq!(
+                        marker.writer,
+                        connetto_core::messages::WriterRef::Number(number)
+                    );
+                    assert_eq!(marker.through_seq, 2);
+                    assert!(!settled);
+                    assert!(marker.before_patch);
+                    settled = true;
+                }
+                Some(IncomingFrame::Bulk(connetto_core::messages::BulkMessage::LivePatch(_))) => {
+                    assert!(settled);
+                    patches += 1;
+                }
+                frame => panic!("unexpected frame {frame:?}"),
+            }
+        }
+        author.close().await;
+        other.close().await;
+        author_task
+            .await
+            .expect("author task")
+            .expect("author session");
+        other_task
+            .await
+            .expect("other task")
+            .expect("other session");
+        ingest.abort();
+    })
+    .await
+    .expect("settling deadline");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fresh_commit_without_a_subscription_sends_a_patchless_marker() {
+    patchless_commit(&["notes"]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unpublished_write_settles_through_the_published_settled_row() {
+    patchless_commit(&["_connetto_settled"]).await;
+}
+
+async fn patchless_commit(published: &[&str]) {
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let fixture = Fixture::acquire().await;
+        seed_notes(&fixture).await;
+        fixture.start_replication(published).await;
+        let catalog = streaming_writer_catalog();
+        let manager = writing_manager_with_catalog(
+            fixture.admin(),
+            Arc::new(RequestGuard::default()),
+            None,
+            SessionConfig::default(),
+            &catalog,
+        );
+        let (transport, client) = loopback();
+        let serving = tokio::spawn(manager.clone().serve(transport));
+        let mut author = Client::new(client);
+        author
+            .handshake_with("patchless-author", "user:alice")
+            .await;
+        author.upload(1, insert_changeset(2, "two", "t1")).await;
+        expect_applied(&mut author, 1).await;
+        let catalog = subql::ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(&catalog)
+            .expect("catalog");
+        let configuration = subql::PgStreamingConfig::new(
+            fixture.admin_url(),
+            connetto_test_harness::SLOT,
+            connetto_test_harness::PUBLICATION,
+        );
+        let mut source = subql::PgStreamingCdcSource::connect(configuration, catalog)
+            .await
+            .expect("stream");
+        let ingest_manager = manager.clone();
+        let mut ingest =
+            tokio::spawn(async move { ingest_manager.ingest(&mut source, &mut |_| {}).await });
+        let frame = tokio::select! {
+            result = &mut ingest => panic!("ingest ended before settling {result:?}"),
+            frame = author.next_control() => frame,
+        };
+        let ControlMessage::WritesSettled(marker) = frame else {
+            panic!("expected patchless settling");
+        };
+        assert_eq!(marker.through_seq, 1);
+        assert!(!marker.before_patch);
+        author.close().await;
+        serving.await.expect("author task").expect("author session");
+        ingest.abort();
+    })
+    .await
+    .expect("patchless settling deadline");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_subscription_marks_the_writer_frontier_before_snapshot_rows() {
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let fixture = Fixture::acquire().await;
+        seed_notes(&fixture).await;
+        let catalog = streaming_writer_catalog();
+        let manager = ManagerBuilder::new(
+            Materializer::builder(&catalog)
+                .with_write_catalog(writable_catalog())
+                .build()
+                .expect("materializer"),
+            connetto_server::PgSnapshotSource::from_ddl(fixture.admin().clone(), &catalog)
+                .expect("snapshot source"),
+            RosterAuth::granting("alice"),
+            test_verifier(),
+            NoConnector,
+            pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), &catalog)
+                .expect("write target"),
+        )
+        .build();
+        let (transport, client) = loopback();
+        let serving = tokio::spawn(manager.clone().serve(transport));
+        let mut author = Client::new(client);
+        let number = author
+            .handshake_with("snapshot-author", "user:alice")
+            .await
+            .writer
+            .expect("writer grant")
+            .number;
+        author.upload(1, insert_changeset(2, "two", "t1")).await;
+        expect_applied(&mut author, 1).await;
+        author.subscribe("notes", "SELECT * FROM notes").await;
+        assert!(matches!(
+            author.next_control().await,
+            ControlMessage::SnapshotBegin(_)
+        ));
+        let ControlMessage::WritesSettled(marker) = author.next_control().await else {
+            panic!("expected snapshot frontier");
+        };
+        assert_eq!(
+            marker.writer,
+            connetto_core::messages::WriterRef::Number(number)
+        );
+        assert_eq!(marker.through_seq, 1);
+        assert!(marker.before_patch);
+        assert!(matches!(
+            author.recv().await,
+            Some(IncomingFrame::Bulk(
+                connetto_core::messages::BulkMessage::SnapshotPatch(_)
+            ))
+        ));
+        assert!(matches!(
+            author.next_control().await,
+            ControlMessage::SnapshotEnd(_)
+        ));
+        author.upload(2, insert_changeset(3, "three", "t2")).await;
+        expect_applied(&mut author, 2).await;
+        manager
+            .dispatch_event(&subql::PgChangeEvent::new(
+                pg_walstream::ChangeEvent::truncate(
+                    vec![Arc::from("notes")],
+                    false,
+                    false,
+                    pg_walstream::Lsn::new(1),
+                ),
+                subql::PgCommitPosition::before_commit(subql::PgLsn(u64::MAX - 1)),
+            ))
+            .await
+            .expect("invalidate snapshot");
+        assert!(matches!(
+            author.next_control().await,
+            ControlMessage::FullResyncRequired(_)
+        ));
+        assert!(matches!(
+            author.next_control().await,
+            ControlMessage::SnapshotBegin(_)
+        ));
+        let ControlMessage::WritesSettled(marker) = author.next_control().await else {
+            panic!("expected resnapshot frontier");
+        };
+        assert_eq!(marker.writer, WriterRef::Number(number));
+        assert_eq!(marker.through_seq, 2);
+        assert!(marker.before_patch);
+        assert!(matches!(
+            author.recv().await,
+            Some(IncomingFrame::Bulk(
+                connetto_core::messages::BulkMessage::SnapshotPatch(_)
+            ))
+        ));
+        assert!(matches!(
+            author.next_control().await,
+            ControlMessage::SnapshotEnd(_)
+        ));
+        author.close().await;
+        serving.await.expect("author task").expect("author session");
+    })
+    .await
+    .expect("snapshot frontier deadline");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catchup_marks_the_writer_frontier_before_replayed_rows() {
+    use subql::CdcSource as _;
+    use subql::backend::CdcEvent as _;
+
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let fixture = Fixture::acquire().await;
+        seed_notes(&fixture).await;
+        let manager = writing_manager(
+            fixture.admin(),
+            Arc::new(RequestGuard::default()),
+            None,
+            SessionConfig::default(),
+        );
+        let mut source = subql::PgSqliteEmuSource::open_in_memory(PG_DDL).expect("event source");
+        let mut resume = None;
+        for identifier in [10, 11] {
+            source
+                .execute_sql(&format!(
+                    "INSERT INTO notes VALUES ({identifier}, 'replayed', 't1')"
+                ))
+                .expect("insert event");
+            while let Some(item) = source.next_item().await.expect("source item") {
+                if let subql::SourceItem::Event(event) = item {
+                    manager
+                        .dispatch_event(&event)
+                        .await
+                        .expect("dispatch event");
+                    if identifier == 10 {
+                        resume = Some(connetto_core::Cursor::new(
+                            connetto_server::Position {
+                                system: connetto_server::TimelineHistory::default().system(),
+                                timeline: 1,
+                                at: event.checkpoint().expect("checkpoint"),
+                            }
+                            .to_cursor_bytes(),
+                        ));
+                    }
+                }
+            }
+        }
+        let (transport, mut client) = loopback();
+        let serving = tokio::spawn(manager.clone().serve(transport));
+        let mut handshake = Handshake::new(PROTOCOL_VERSION, "catchup-writer")
+            .with_grant(Grant::new("user:alice"))
+            .with_writer(issue_writer())
+            .with_cursor(resume.expect("resume cursor"))
+            .with_cursor_subjects(core::iter::empty::<&str>());
+        handshake.schema_major = Major::new(1);
+        client
+            .send_control(ControlMessage::Handshake(handshake))
+            .await
+            .expect("handshake");
+        assert!(matches!(
+            client.recv().await.expect("challenge"),
+            Some(IncomingFrame::Control(ControlMessage::Challenge(_)))
+        ));
+        let Some(IncomingFrame::Control(ControlMessage::HandshakeAck(ack))) =
+            client.recv().await.expect("handshake ack")
+        else {
+            panic!("handshake ack");
+        };
+        let number = ack.writer.expect("writer").number;
+        let mut author = Client::new(client);
+        author.upload(1, insert_changeset(2, "two", "t1")).await;
+        expect_applied(&mut author, 1).await;
+        author.subscribe("notes", "SELECT * FROM notes").await;
+        let ControlMessage::WritesSettled(marker) = author.next_control().await else {
+            panic!("catchup frontier");
+        };
+        assert_eq!(marker.writer, WriterRef::Number(number));
+        assert_eq!(marker.through_seq, 1);
+        assert!(marker.before_patch);
+        assert!(matches!(
+            author.recv().await,
+            Some(IncomingFrame::Bulk(
+                connetto_core::messages::BulkMessage::LivePatch(_)
+            ))
+        ));
+        assert!(matches!(
+            author.next_control().await,
+            ControlMessage::SnapshotEnd(_)
+        ));
+        author.close().await;
+        serving.await.expect("author task").expect("author session");
+    })
+    .await
+    .expect("catchup frontier deadline");
 }

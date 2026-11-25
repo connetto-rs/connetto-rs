@@ -251,6 +251,12 @@ pub trait ConnettoWriterSchema: Send + Sync + 'static {
     /// requires to exist (R98 decision 5).
     const TABLES: &'static [&'static str];
 
+    /// Must be included in the replication publication.
+    const WRITERS_TABLE: &'static str;
+
+    /// Must be published so ingestion can observe transaction completion.
+    const SETTLED_TABLE: &'static str;
+
     /// The setting a write transaction binds its writer's number to, beside
     /// the caller's identity, so a deployment stamps its rows with a column
     /// default or trigger reading it.
@@ -539,6 +545,8 @@ macro_rules! connetto_writers_table {
 
         impl $crate::writer_schema::ConnettoWriterSchema for ConnettoWriters {
             type Id = $id;
+            const WRITERS_TABLE: &'static str = "_connetto_writers";
+            const SETTLED_TABLE: &'static str = "_connetto_settled";
             const TABLES: &'static [&'static str] = &[
                 "_connetto_writers",
                 "_connetto_settled",

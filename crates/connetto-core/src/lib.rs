@@ -43,9 +43,9 @@ pub use percent::{percent_decode, percent_encode};
 pub use replica_key::{ReplicaKey, ReplicaKeyParseError};
 pub use schema::{
     AUDIT_TABLE, BOT_LIST_FUNCTION, BOT_LIST_SEPARATOR, BOT_LIST_SETTING, BOT_LIST_WILDCARD,
-    CALLER_FUNCTION, HelperFunction, MAJOR_DIRECTIVE, Major, MajorError, SUBJECTS_FUNCTION,
-    SchemaBundle, SchemaVersion, SharedLayout, TierBoundary, TierHistory, TierHistoryError,
-    UUID_FUNCTION, WRITE_EXEMPTION_FUNCTION, schema_hash,
+    CALLER_FUNCTION, DERIVED_WRITE_FUNCTION, HelperFunction, MAJOR_DIRECTIVE, Major, MajorError,
+    SUBJECTS_FUNCTION, SchemaBundle, SchemaVersion, SharedLayout, SharedOverlay, TierBoundary,
+    TierHistory, TierHistoryError, UUID_FUNCTION, WRITE_EXEMPTION_FUNCTION, schema_hash,
 };
 pub use session_id::{SessionId, SessionIdParseError};
 pub use sql::quote_ident;

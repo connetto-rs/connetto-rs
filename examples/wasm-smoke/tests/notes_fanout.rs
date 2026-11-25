@@ -212,7 +212,7 @@ async fn local_tier_notes_fan_out_across_tabs() {
         .expect("a tab note write must produce a mutation");
     pump_until(
         &mut tab_a,
-        |event| matches!(event, ClientEvent::MutationApplied { client_seq } if *client_seq == seq),
+        |event| matches!(event, ClientEvent::MutationApplied { client_seq, .. } if *client_seq == seq),
     )
     .await;
     stage("hub acknowledged the note");

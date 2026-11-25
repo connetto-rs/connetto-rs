@@ -253,7 +253,7 @@ pub fn status_label(event: &ClientEvent) -> Option<String> {
         ClientEvent::FullResync { sub_id, reason } => {
             Some(format!("{sub_id}: full resync, {}", resync_reason(reason)))
         }
-        ClientEvent::MutationApplied { client_seq } => {
+        ClientEvent::MutationApplied { client_seq, .. } => {
             Some(format!("mutation {client_seq} applied"))
         }
         ClientEvent::MutationRejected {
@@ -1206,6 +1206,7 @@ mod team_lines_tests {
         // The device's own offline note, refused when the server comes back,
         // stands as the same rollback line its peers show.
         let rejected = ClientEvent::MutationRejected {
+            writer: connetto_core::messages::WriterRef::Number(7),
             client_seq: 3,
             reason: connetto_core::messages::MutationRejectReason::Unauthorized,
             rows: vec![connetto_client::AffectedRow {

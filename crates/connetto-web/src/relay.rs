@@ -80,7 +80,7 @@ use connetto_client::reconnect::{ReconnectPolicy, Sleeper, TransportFactory};
 use connetto_client::{
     AffectedRow, ClientError, ClientEvent, ConnettoConnection, DrainTimer, ExportScope,
     GateAskOutcome, GateController, GateSink, ImportChoices, ImportOutcome, KeepaliveTimer,
-    PolicyTables, ResendTimer, ShareKeyTimer, SystemClock, WriterGrant, WriterRequest,
+    PolicyTables, RelayNotice, ResendTimer, ShareKeyTimer, SystemClock, WriterGrant, WriterRequest,
     replay_aborting, replica_schema, subscription_is_aggregate, subscription_tables,
 };
 use connetto_core::messages::{
@@ -91,6 +91,7 @@ use connetto_core::messages::{
     SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionSpec, SyncStatus,
     TabDismissAnswer, TabDismissOutcome, TabDismissRefusal, TabShareKeyAnswer, TabShareKeyChange,
     TabShareKeyOutcome, TabStorageAnswer, TabStorageOutcome, TabStorageUse, UnsyncedWork,
+    WriterRef, WritesSettled,
 };
 use connetto_core::traits::MaybeSend;
 use connetto_core::{Cursor, IncomingFrame, Major, Transport};
@@ -423,6 +424,7 @@ enum TabDeliverable {
     Rows(BulkMessage),
     /// The frame closing a snapshot. Ordered, never charged.
     SnapshotComplete(SnapshotEnd),
+    WritesSettled(WritesSettled),
 }
 
 impl TabDeliverable {
@@ -544,15 +546,21 @@ const SHARED_SCHEMA: &str = "connetto_shared";
 /// The schema the hub's own durable state is attached under.
 const HUB_SCHEMA: &str = "connetto_hub";
 
+struct WriteRoute {
+    tab: TabId,
+    tab_sequence: u64,
+    acknowledged: bool,
+    settled: bool,
+}
+
 /// Core state threaded through the hub loop.
 #[derive(Default)]
 struct HubState {
     tabs: HashMap<TabId, TabState>,
     audits: AuditRequests,
-    /// Upstream push sequence to the owning tab and its sequence, for mapping
-    /// the server's answer back. An entry leaves when the server settles its
-    /// write, like the worker's own pending record, so none is dropped early.
-    seq_map: BTreeMap<u64, (TabId, u64)>,
+    /// Routes remain until both the acknowledgement and settling point arrive.
+    seq_map: BTreeMap<(WriterRef, u64), WriteRoute>,
+    settling_tabs: HashMap<TabId, u64>,
     blank: BlankState,
     /// Lowercased names of the device-private tables the worker connection has
     /// attached, empty when this run serves no tier. Writes to them commit on
@@ -904,6 +912,8 @@ impl RelayHub {
         Ok((
             hub,
             async move {
+                let mut worker = worker;
+                worker.track_relay_notices();
                 let state = initial_hub_state(&worker, reconnect.as_ref(), local_tables);
                 HubRuntime {
                     worker,
@@ -1613,13 +1623,8 @@ where
             tokio::select! {
                 () = &mut content_wait => Wake::Content,
                 event = events.recv() => Wake::Local(event),
-                event = async {
-                    if worker.is_connected() {
-                        worker.pump_one_or(core::future::pending()).await
-                    } else {
-                        worker.pump_one().await.map(Some)
-                    }
-                }, if !retry.flush.is_waiting() && !retry.held_flush.is_waiting() => Wake::Upstream(event),
+                event = worker.pump_relay_step(),
+                    if !retry.flush.is_waiting() && !retry.held_flush.is_waiting() => Wake::Upstream(event),
                 // Always ready, so the walk shares the cycle with every other source
                 // rather than holding it or being starved by it.
                 () = core::future::ready(()), if unverified => Wake::Verify,
@@ -1638,6 +1643,7 @@ where
         {
             self.gate.restore_ask(ask);
         }
+        drain_relay_notices(&mut self.worker, &mut self.state);
         let served = match wake {
             Wake::Content => self.drive_content(reconnect).await,
             Wake::Local(event) => self.serve_local(event).await,
@@ -1831,14 +1837,13 @@ where
                 };
                 // The drop queued its `Offline` on the worker, and the tabs must hear it
                 // before a redial that can hang for as long as the server stays frozen.
-                while let Some(notice) = self
-                    .worker
-                    .pump_one_or(core::future::ready(()))
-                    .await
-                    .ok()
-                    .flatten()
-                {
-                    handle_worker_event(&mut self.worker, &mut self.state, notice)?;
+                loop {
+                    let event = self.worker.pump_one_or(core::future::ready(())).await;
+                    drain_relay_notices(&mut self.worker, &mut self.state);
+                    let Ok(Some(event)) = event else {
+                        break;
+                    };
+                    handle_worker_event(&mut self.worker, &mut self.state, event)?;
                 }
                 if !self.recover(driver).await? {
                     return Ok(false);
@@ -2373,11 +2378,12 @@ where
             tokio::select! {
                 step = transfer_step(&mut transfer, events, serving) => step,
                 () = wait_share_keys(timer), if background => TransferStep::Key,
-                event = worker.pump_one(), if connected => TransferStep::Upstream(event),
+                event = worker.pump_relay_step(), if connected => TransferStep::Upstream(event),
                 outcome = &mut ask_wait, if prompting => TransferStep::Gate(Some(outcome)),
                 completion = state.audits.next() => TransferStep::Audit(completion),
             }
         };
+        drain_relay_notices(worker, state);
         if !matches!(step, TransferStep::Gate(_))
             && let Some(ask) = ask.take()
         {
@@ -2399,16 +2405,16 @@ where
                     background = false;
                 }
             }
-            TransferStep::Key => {}
+            TransferStep::Key | TransferStep::Upstream(Ok(None)) => {}
             TransferStep::Audit(completion) => state.audits.complete(&state.tabs, completion),
             TransferStep::Gate(outcome) => {
                 gate.apply_outcome(&mut ask, outcome);
             }
             TransferStep::Upstream(
-                Ok(ClientEvent::Closed | ClientEvent::ServerClosed { .. })
+                Ok(Some(ClientEvent::Closed | ClientEvent::ServerClosed { .. }))
                 | Err(ClientError::Transport(_) | ClientError::NotConnected),
             ) => worker.disconnect(),
-            TransferStep::Upstream(Ok(event)) => {
+            TransferStep::Upstream(Ok(Some(event))) => {
                 match serve_worker_event(worker, state, Some(content), event) {
                     Ok(wake) => walk.outbox_wake |= wake,
                     Err(error) => {
@@ -2445,7 +2451,7 @@ enum TransferStep {
     Done(Result<(), ContentError>),
     Event(Option<HubEvent>),
     Key,
-    Upstream(Result<ClientEvent, ClientError>),
+    Upstream(Result<Option<ClientEvent>, ClientError>),
     Gate(Option<GateAskOutcome>),
     Audit(AuditCompletion),
 }
@@ -2717,6 +2723,8 @@ where
     state.audits.remove_tab(id);
     state.audits.reap(&state.tabs);
     state.tabs.remove(&id);
+    state.seq_map.retain(|_, route| route.tab != id);
+    state.settling_tabs.remove(&id);
     state.pending_resolve.retain(|resolve| resolve.tab != id);
     state.pending_fetch.retain(|fetch| fetch.tab != id);
     state.fetch_arrived.retain(|(tab, _), _| *tab != id);
@@ -3388,6 +3396,8 @@ fn finish_tab_frame(
             FatalError::new(reason),
         )));
     }
+    state.seq_map.retain(|_, route| route.tab != id);
+    state.settling_tabs.remove(&id);
     state.pending_resolve.retain(|resolve| resolve.tab != id);
     state.pending_fetch.retain(|fetch| fetch.tab != id);
     state.fetch_arrived.retain(|(tab, _), _| *tab != id);
@@ -3531,9 +3541,15 @@ where
                 send_tab_nonfatal(tab, &subscribe.sub_id, SUBSCRIPTION_REFUSED);
                 return Ok(());
             }
-            if let Err(err) =
-                serve_snapshot(worker, blank, local_tables, tab, &subscribe.sub_id, &tables)
-            {
+            if let Err(err) = serve_snapshot(
+                worker,
+                blank,
+                local_tables,
+                tab,
+                &subscribe.sub_id,
+                &tables,
+                None,
+            ) {
                 tracing::warn!(tab = %id, sub_id = %subscribe.sub_id, error = %err, "tab snapshot failed");
                 send_tab_nonfatal(tab, &subscribe.sub_id, SUBSCRIPTION_REFUSED);
                 return Ok(());
@@ -4031,9 +4047,7 @@ where
         (client_id, tab.out.clone(), tab.applied_watermark)
     };
     if watermark.is_some_and(|watermark| tab_seq <= watermark) {
-        // Already applied to the replica by an earlier delivery. The worker
-        // replays its own pending record upstream independently, so a plain
-        // re-acknowledgement is correct here.
+        // The worker owns the durable replay after the tab's copy is retired.
         let _ = out.send(TabOut::Control(ControlMessage::MutationApplied(
             MutationApplied {
                 client_seq: tab_seq,
@@ -4088,8 +4102,17 @@ where
     if let Some(tab) = state.tabs.get_mut(&id) {
         tab.applied_watermark = Some(tab_seq);
     }
+    let writer = worker.mutation_writer();
     if let Some(worker_seq) = worker.push().await.map_err(RelayError::from)? {
-        state.seq_map.insert(worker_seq, (id, tab_seq));
+        state.seq_map.insert(
+            (writer, worker_seq),
+            WriteRoute {
+                tab: id,
+                tab_sequence: tab_seq,
+                acknowledged: false,
+                settled: false,
+            },
+        );
     }
     Ok(())
 }
@@ -5269,6 +5292,28 @@ where
     }
     Ok(wake)
 }
+
+fn drain_relay_notices<U>(worker: &mut ConnettoConnection<U>, state: &mut HubState)
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    for notice in worker.take_relay_notices() {
+        handle_relay_notice(state, notice);
+    }
+}
+
+fn handle_relay_notice(state: &mut HubState, notice: RelayNotice) {
+    match notice {
+        RelayNotice::MutationRekey(rekey) => rekey_tab_mutation(state, rekey),
+        RelayNotice::WritesSettled {
+            writer,
+            through_seq,
+            before_patch,
+        } => forward_writes_settled(state, writer, through_seq, before_patch),
+    }
+}
+
 /// Handle one upstream event from the worker connection.
 #[expect(
     clippy::too_many_lines,
@@ -5283,6 +5328,7 @@ where
     U: Transport,
     U::Error: core::fmt::Display,
 {
+    drain_relay_notices(worker, state);
     route_resolves(state, &event);
     match event {
         ClientEvent::LivePatch {
@@ -5290,31 +5336,37 @@ where
             patchset_zstd,
             ..
         } => forward_live_patch(state, &cursor, &patchset_zstd),
-        ClientEvent::MutationApplied { client_seq } => {
-            // The server's durable confirmation for a forwarded tab write:
-            // map it back so the tab retires its pending record.
-            let Some((tab_id, tab_seq)) = state.seq_map.remove(&client_seq) else {
+        ClientEvent::MutationApplied { writer, client_seq } => {
+            let Some(route) = state.seq_map.get_mut(&(writer, client_seq)) else {
                 return Ok(());
             };
-            if let Some(tab) = state.tabs.get(&tab_id) {
+            route.acknowledged = true;
+            if let Some(tab) = state.tabs.get(&route.tab) {
                 let _ = tab
                     .out
                     .send(TabOut::Control(ControlMessage::MutationApplied(
                         MutationApplied {
-                            client_seq: tab_seq,
+                            client_seq: route.tab_sequence,
                         },
                     )));
+            }
+            if route.settled {
+                state.seq_map.remove(&(writer, client_seq));
             }
             Ok(())
         }
         ClientEvent::MutationRejected {
-            client_seq, reason, ..
-        } => reject_tab_mutation(state, client_seq, reason),
+            writer,
+            client_seq,
+            reason,
+            ..
+        } => reject_tab_mutation(state, writer, client_seq, reason),
         ClientEvent::MutationConflict {
+            writer,
             client_seq,
             rows,
             server_row,
-        } => conflict_tab_mutation(state, client_seq, &rows, server_row),
+        } => conflict_tab_mutation(state, writer, client_seq, &rows, server_row),
         ClientEvent::AggregateColumns { sub_id, columns } => {
             forward_aggregate(state, &sub_id, |tab_sub| {
                 ControlMessage::AggregateColumns(AggregateColumns {
@@ -5345,6 +5397,7 @@ where
             if let Some(reason) = state.resyncing.remove(&sub_id) {
                 resnapshot_after_resync(worker, state, &sub_id, &reason)?;
             }
+            flush_tab_settlements(state);
             Ok(())
         }
         ClientEvent::NonFatal { related_to, detail } => {
@@ -5417,6 +5470,64 @@ fn forward_courier_notice(state: &HubState, notice: &CourierNotice) {
     }
 }
 
+/// Drop earlier provisional effects across writers without acknowledging their pending uploads.
+fn forward_writes_settled(
+    state: &mut HubState,
+    writer: WriterRef,
+    through_seq: u64,
+    before_patch: bool,
+) {
+    state.seq_map.retain(|(route_writer, sequence), route| {
+        if *route_writer != writer || *sequence > through_seq {
+            return true;
+        }
+        if !route.settled {
+            route.settled = true;
+            let frontier = state.settling_tabs.entry(route.tab).or_default();
+            *frontier = (*frontier).max(route.tab_sequence);
+        }
+        !route.acknowledged
+    });
+    if !before_patch {
+        flush_tab_settlements(state);
+    }
+}
+
+/// Flush frontiers whose next worker frame contains no tab rows.
+fn flush_tab_settlements(state: &mut HubState) {
+    for (identifier, through_seq) in state.settling_tabs.drain() {
+        if let Some(tab) = state.tabs.get_mut(&identifier) {
+            enqueue_tab_settlement(tab, through_seq, false);
+        }
+    }
+}
+
+fn rekey_tab_mutation(state: &mut HubState, rekey: connetto_client::MutationRekey) {
+    if let Some(route) = state
+        .seq_map
+        .remove(&(rekey.previous_writer, rekey.previous_seq))
+    {
+        state
+            .seq_map
+            .insert((rekey.writer, rekey.client_seq), route);
+    }
+}
+
+/// Queue a frontier under the writer granted to this tab.
+fn enqueue_tab_settlement(tab: &mut TabState, through_seq: u64, before_patch: bool) {
+    let Some(client_id) = tab.client_id else {
+        return;
+    };
+    enqueue_tab_frame(
+        tab,
+        TabDeliverable::WritesSettled(WritesSettled {
+            writer: WriterRef::Number(tab_writer_number(client_id)),
+            through_seq,
+            before_patch,
+        }),
+    );
+}
+
 /// Forward one patch to every tab that subscribes to a touched table.
 fn forward_live_patch(
     state: &mut HubState,
@@ -5427,16 +5538,21 @@ fn forward_live_patch(
     // Each tab holds ONE replica, so a patch is forwarded at most
     // once per tab, under the first subscription reading a touched
     // table. The tab's own update hook refreshes every affected handle.
-    for tab in state.tabs.values_mut() {
-        let Some(sub) = tab.subs.iter().find(|sub| !sub.tables.is_disjoint(&tables)) else {
-            continue;
-        };
-        let msg = BulkMessage::LivePatch(LivePatch::new(
-            sub.sub_id.clone(),
-            cursor.clone(),
-            patchset_zstd.to_vec(),
-        ));
-        enqueue_tab_frame(tab, TabDeliverable::Rows(msg));
+    for (identifier, tab) in &mut state.tabs {
+        let subscription = tab.subs.iter().find(|sub| !sub.tables.is_disjoint(&tables));
+        let message = subscription.map(|subscription| {
+            BulkMessage::LivePatch(LivePatch::new(
+                subscription.sub_id.clone(),
+                cursor.clone(),
+                patchset_zstd.to_vec(),
+            ))
+        });
+        if let Some(through_seq) = state.settling_tabs.remove(identifier) {
+            enqueue_tab_settlement(tab, through_seq, message.is_some());
+        }
+        if let Some(message) = message {
+            enqueue_tab_frame(tab, TabDeliverable::Rows(message));
+        }
     }
     Ok(())
 }
@@ -5522,6 +5638,7 @@ where
             tab,
             &tab_sub,
             &tab_tables,
+            state.settling_tabs.remove(&tab_id),
         )?;
     }
     Ok(())
@@ -5534,10 +5651,16 @@ where
 )]
 fn reject_tab_mutation(
     state: &mut HubState,
+    writer: WriterRef,
     worker_seq: u64,
     reason: MutationRejectReason,
 ) -> Result<(), RelayError> {
-    let Some((tab_id, tab_seq)) = state.seq_map.remove(&worker_seq) else {
+    let Some(WriteRoute {
+        tab: tab_id,
+        tab_sequence: tab_seq,
+        ..
+    }) = state.seq_map.remove(&(writer, worker_seq))
+    else {
         return Ok(());
     };
     if let Some(tab) = state.tabs.get(&tab_id) {
@@ -5565,11 +5688,17 @@ fn reject_tab_mutation(
 )]
 fn conflict_tab_mutation(
     state: &mut HubState,
+    writer: WriterRef,
     worker_seq: u64,
     rows: &[AffectedRow],
     server_row: Option<ConflictRow>,
 ) -> Result<(), RelayError> {
-    let Some((tab_id, tab_seq)) = state.seq_map.remove(&worker_seq) else {
+    let Some(WriteRoute {
+        tab: tab_id,
+        tab_sequence: tab_seq,
+        ..
+    }) = state.seq_map.remove(&(writer, worker_seq))
+    else {
         return Ok(());
     };
     if let Some(tab) = state.tabs.get(&tab_id) {
@@ -5690,6 +5819,7 @@ fn serve_snapshot<U>(
     tab: &mut TabState,
     sub_id: &str,
     tables: &HashSet<String>,
+    settling_through: Option<u64>,
 ) -> Result<(), RelayError>
 where
     U: Transport,
@@ -5731,6 +5861,9 @@ where
             sub_id: sub_id.to_owned(),
         },
     )));
+    if let Some(through_seq) = settling_through {
+        enqueue_tab_settlement(tab, through_seq, !payloads.is_empty());
+    }
     for payload in payloads {
         enqueue_tab_frame(
             tab,
@@ -5797,6 +5930,11 @@ fn flush_tab_bulk(tab: &mut TabState) {
                 let _ = tab
                     .out
                     .send(TabOut::Control(ControlMessage::SnapshotEnd(end)));
+            }
+            TabDeliverable::WritesSettled(marker) => {
+                let _ = tab
+                    .out
+                    .send(TabOut::Control(ControlMessage::WritesSettled(marker)));
             }
         }
     }
@@ -6123,6 +6261,714 @@ mod tests {
         offline_build(ddl)
             .open_driven()
             .expect("the worker opens offline")
+    }
+
+    #[wasm_bindgen_test]
+    async fn relay_worker_standalone_marker_reaches_tab_without_another_event() {
+        use connetto_core::IncomingFrame;
+        use connetto_core::messages::{ControlMessage, WritesSettled};
+        use connetto_core::test_support::FakeTransport;
+
+        let (mut worker, mut state, mut author, _) = folders_hub();
+        worker.track_relay_notices();
+        worker
+            .attach(FakeTransport::accepting_then_delivering([
+                IncomingFrame::Control(ControlMessage::WritesSettled(WritesSettled {
+                    writer: super::WriterRef::Number(1),
+                    through_seq: 1,
+                    before_patch: false,
+                })),
+            ]))
+            .await
+            .expect("attach worker");
+        settled_route(&mut state, 1, 1, 42);
+        let mut saw_marker = false;
+        for _ in 0..8 {
+            let event = worker.pump_relay_step().await.expect("worker step");
+            super::drain_relay_notices(&mut worker, &mut state);
+            if let Some(event) = event {
+                super::handle_worker_event(&mut worker, &mut state, event).expect("route event");
+                while let Ok(frame) = author.try_recv() {
+                    assert!(matches!(
+                        frame,
+                        super::TabOut::Control(ControlMessage::SyncStatus(_))
+                    ));
+                }
+            } else {
+                saw_marker = true;
+                break;
+            }
+        }
+        assert!(saw_marker);
+        expect_settled(&mut author, tab_writer(&state, 1), 42, false);
+    }
+
+    #[wasm_bindgen_test]
+    async fn relay_disconnected_worker_step_reports_not_connected() {
+        let mut worker = offline_signed_in(DDL);
+        assert!(matches!(
+            worker.pump_relay_step().await,
+            Ok(Some(connetto_client::ClientEvent::SyncStatus(
+                connetto_core::messages::SyncStatus::Offline
+            )))
+        ));
+        assert!(matches!(
+            worker.pump_relay_step().await,
+            Err(connetto_client::ClientError::NotConnected)
+        ));
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keeps the worker marker, relay routing and tab replica in one proof"
+    )]
+    #[wasm_bindgen_test]
+    async fn relay_worker_marker_drops_tab_provisional_rows_before_patch() {
+        use connetto_core::messages::{
+            BulkMessage, ControlMessage, LivePatch, SubscriptionSpec, WritesSettled,
+        };
+        use connetto_core::test_support::FakeTransport;
+        use connetto_core::{Cursor, IncomingFrame};
+        use diesel::{ExpressionMethods, QueryDsl};
+
+        diesel::table! {
+            audit (id) {
+                id -> Integer,
+            }
+        }
+
+        const DERIVED_DDL: &str = "CREATE TABLE actions (id INTEGER PRIMARY KEY);
+            CREATE TABLE audit (id INTEGER PRIMARY KEY);
+            CREATE TRIGGER derive AFTER INSERT ON actions
+            WHEN NOT connetto_write_exempt() BEGIN
+                SELECT connetto_derived_write(1);
+                INSERT INTO audit VALUES (NEW.id);
+                INSERT INTO audit VALUES (NEW.id + 100);
+                SELECT connetto_derived_write(-1);
+            END;";
+        let mut source = SqliteConnection::establish(":memory:").expect("source");
+        source
+            .batch_execute("CREATE TABLE audit (id INTEGER PRIMARY KEY)")
+            .expect("schema");
+        let mut session = source.create_session().expect("session");
+        session.attach_all().expect("capture");
+        diesel::insert_into(audit::table)
+            .values(audit::id.eq(1))
+            .execute(&mut source)
+            .expect("server row");
+        let patch =
+            zstd::encode_all(session.patchset().expect("patch").as_slice(), 0).expect("compress");
+        let mut worker = offline_signed_in(DERIVED_DDL);
+        worker.track_relay_notices();
+        worker
+            .subscribe_spec("audit", SubscriptionSpec::new("SELECT * FROM audit"))
+            .await
+            .expect("worker subscription");
+        worker
+            .attach(FakeTransport::accepting_then_delivering([
+                IncomingFrame::Control(ControlMessage::WritesSettled(WritesSettled {
+                    writer: super::WriterRef::Number(1),
+                    through_seq: 1,
+                    before_patch: true,
+                })),
+                IncomingFrame::Bulk(BulkMessage::LivePatch(LivePatch::new(
+                    "audit",
+                    Cursor::new(Vec::new()),
+                    patch,
+                ))),
+            ]))
+            .await
+            .expect("attach worker");
+        let mut state = super::HubState::default();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        super::attach_tab(&mut state, 1, sender);
+        let tab = state.tabs.get_mut(&1).expect("tab");
+        tab.handshaken = true;
+        tab.client_id = Some(rosetta_uuid::Uuid::from([0; 16]));
+        tab.subs.push(super::TabSub {
+            sub_id: "audit".to_owned(),
+            tables: ["audit".to_owned()].into(),
+        });
+        settled_route(&mut state, 1, 1, 1);
+        let mut saw_marker = false;
+        let mut saw_patch = false;
+        for _ in 0..8 {
+            let event = worker.pump_relay_step().await.expect("worker step");
+            super::drain_relay_notices(&mut worker, &mut state);
+            if let Some(event) = event {
+                let is_patch = matches!(event, connetto_client::ClientEvent::LivePatch { .. });
+                if is_patch {
+                    assert!(saw_marker);
+                }
+                super::handle_worker_event(&mut worker, &mut state, event).expect("route event");
+                if is_patch {
+                    saw_patch = true;
+                    break;
+                }
+            } else {
+                assert_eq!(state.settling_tabs.get(&1), Some(&1));
+                saw_marker = true;
+            }
+        }
+        assert!(saw_patch);
+        let mut frames = Vec::new();
+        while let Ok(frame) = receiver.try_recv() {
+            match frame {
+                super::TabOut::Control(ControlMessage::WritesSettled(marker)) => {
+                    assert_eq!(frames, []);
+                    assert!(marker.before_patch);
+                    frames.push(IncomingFrame::Control(ControlMessage::WritesSettled(
+                        marker,
+                    )));
+                }
+                super::TabOut::Bulk(patch) => frames.push(IncomingFrame::Bulk(patch)),
+                _ => {}
+            }
+        }
+        assert_eq!(frames.len(), 2);
+        let mut replica = offline_signed_in(DERIVED_DDL);
+        replica
+            .subscribe_spec("audit", SubscriptionSpec::new("SELECT * FROM audit"))
+            .await
+            .expect("tab subscription");
+        replica
+            .conn()
+            .batch_execute("INSERT INTO actions VALUES (1)")
+            .expect("local action");
+        assert_eq!(replica.push().await.expect("queue action"), Some(1));
+        replica
+            .attach(FakeTransport::accepting_then_delivering(frames))
+            .await
+            .expect("attach tab");
+        let mut applied = false;
+        for _ in 0..8 {
+            if matches!(
+                replica
+                    .pump_one_or(core::future::pending())
+                    .await
+                    .expect("tab step"),
+                Some(connetto_client::ClientEvent::LivePatch { .. })
+            ) {
+                applied = true;
+                break;
+            }
+        }
+        assert!(applied);
+        assert_eq!(
+            audit::table
+                .count()
+                .get_result::<i64>(replica.conn())
+                .expect("audit rows"),
+            1
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn derived_profile_trace_resets_raw_browser_statements() {
+        let mut worker = offline_signed_in(
+            "CREATE TABLE actions (id INTEGER PRIMARY KEY);
+             CREATE TABLE audit (id INTEGER PRIMARY KEY);
+             CREATE TRIGGER derive AFTER INSERT ON actions
+             WHEN NOT connetto_write_exempt() BEGIN
+                 SELECT connetto_derived_write(1);
+                 INSERT INTO audit VALUES (NEW.id);
+                 SELECT CASE WHEN NEW.id = -1 THEN RAISE(ABORT, 'refused') END;
+                 SELECT connetto_derived_write(-1);
+             END;",
+        );
+        assert!(
+            worker
+                .conn()
+                .batch_execute("INSERT INTO actions VALUES (-1)")
+                .is_err()
+        );
+        worker
+            .conn()
+            .batch_execute("INSERT INTO actions VALUES (1)")
+            .expect("write after failure");
+        assert_eq!(worker.push().await.expect("queue raw write"), Some(1));
+    }
+
+    fn settled_route(state: &mut super::HubState, sequence: u64, tab: u64, tab_sequence: u64) {
+        state.seq_map.insert(
+            (super::WriterRef::Number(1), sequence),
+            super::WriteRoute {
+                tab,
+                tab_sequence,
+                acknowledged: false,
+                settled: false,
+            },
+        );
+    }
+
+    fn expect_settled(
+        receiver: &mut tokio::sync::mpsc::UnboundedReceiver<super::TabOut>,
+        writer: connetto_core::messages::WriterRef,
+        through_seq: u64,
+        before_patch: bool,
+    ) {
+        let super::TabOut::Control(connetto_core::messages::ControlMessage::WritesSettled(marker)) =
+            receiver.try_recv().expect("settling marker")
+        else {
+            panic!("expected settling marker");
+        };
+        assert_eq!(marker.writer, writer);
+        assert_eq!(marker.through_seq, through_seq);
+        assert_eq!(marker.before_patch, before_patch);
+    }
+
+    fn tab_writer(state: &super::HubState, identifier: u64) -> connetto_core::messages::WriterRef {
+        connetto_core::messages::WriterRef::Number(super::tab_writer_number(
+            state.tabs[&identifier].client_id.expect("handshaken tab"),
+        ))
+    }
+
+    #[wasm_bindgen_test]
+    fn relay_later_writer_frontier_drops_earlier_effects_without_acknowledging_them() {
+        let (mut worker, mut state, mut author, _) = folders_hub();
+        let author_writer = tab_writer(&state, 1);
+        settled_route(&mut state, 10, 1, 42);
+        state.seq_map.insert(
+            (super::WriterRef::Number(2), 1),
+            super::WriteRoute {
+                tab: 1,
+                tab_sequence: 43,
+                acknowledged: false,
+                settled: false,
+            },
+        );
+        super::handle_relay_notice(
+            &mut state,
+            connetto_client::RelayNotice::WritesSettled {
+                writer: super::WriterRef::Number(2),
+                through_seq: 1,
+                before_patch: true,
+            },
+        );
+        assert!(author.try_recv().is_err());
+        let changeset = mirror_changeset(|connection| {
+            connection
+                .batch_execute("DELETE FROM folders WHERE id = 1")
+                .expect("delete");
+        });
+        let compressed = std::sync::Arc::<[u8]>::from(
+            zstd::encode_all(changeset.as_slice(), 0).expect("compress"),
+        );
+        super::forward_live_patch(
+            &mut state,
+            &connetto_core::Cursor::new(Vec::new()),
+            &compressed,
+        )
+        .expect("later writer patch");
+        expect_settled(&mut author, author_writer, 43, true);
+        assert!(matches!(
+            author.try_recv().expect("later writer rows"),
+            super::TabOut::Bulk(_)
+        ));
+        let earlier_route = &state.seq_map[&(super::WriterRef::Number(1), 10)];
+        assert!(!earlier_route.acknowledged);
+        assert!(!earlier_route.settled);
+        super::handle_worker_event(
+            &mut worker,
+            &mut state,
+            connetto_client::ClientEvent::MutationApplied {
+                writer: super::WriterRef::Number(1),
+                client_seq: 10,
+            },
+        )
+        .expect("earlier writer answer");
+        assert!(matches!(
+            author.try_recv().expect("earlier writer acknowledgement"),
+            super::TabOut::Control(connetto_core::messages::ControlMessage::MutationApplied(
+                connetto_core::messages::MutationApplied { client_seq: 42 }
+            ))
+        ));
+        assert!(state.seq_map[&(super::WriterRef::Number(1), 10)].acknowledged);
+        assert!(author.try_recv().is_err());
+    }
+
+    #[wasm_bindgen_test]
+    fn relay_settlement_keeps_writers_with_equal_sequences_separate() {
+        let (mut worker, mut state, mut author, mut sibling) = folders_hub();
+        let author_writer = tab_writer(&state, 1);
+        let sibling_writer = tab_writer(&state, 2);
+        settled_route(&mut state, 10, 1, 42);
+        state.seq_map.insert(
+            (super::WriterRef::Number(2), 10),
+            super::WriteRoute {
+                tab: 2,
+                tab_sequence: 43,
+                acknowledged: false,
+                settled: false,
+            },
+        );
+        for (writer, receiver, tab_writer, tab_sequence) in [
+            (super::WriterRef::Number(1), &mut author, author_writer, 42),
+            (
+                super::WriterRef::Number(2),
+                &mut sibling,
+                sibling_writer,
+                43,
+            ),
+        ] {
+            super::handle_relay_notice(
+                &mut state,
+                connetto_client::RelayNotice::WritesSettled {
+                    writer,
+                    through_seq: 10,
+                    before_patch: false,
+                },
+            );
+            expect_settled(receiver, tab_writer, tab_sequence, false);
+            super::handle_worker_event(
+                &mut worker,
+                &mut state,
+                connetto_client::ClientEvent::MutationApplied {
+                    writer,
+                    client_seq: 10,
+                },
+            )
+            .expect("acknowledge writer");
+            let super::TabOut::Control(connetto_core::messages::ControlMessage::MutationApplied(
+                answer,
+            )) = receiver.try_recv().expect("acknowledgement")
+            else {
+                panic!("expected acknowledgement");
+            };
+            assert_eq!(answer.client_seq, tab_sequence);
+            assert!(receiver.try_recv().is_err());
+        }
+        assert!(state.seq_map.is_empty());
+    }
+
+    #[wasm_bindgen_test]
+    fn relay_settlement_follows_issued_and_carried_routes() {
+        let (_, mut state, mut author, _) = folders_hub();
+        let author_writer = tab_writer(&state, 1);
+        state.seq_map.insert(
+            (super::WriterRef::Number(0), 10),
+            super::WriteRoute {
+                tab: 1,
+                tab_sequence: 42,
+                acknowledged: false,
+                settled: false,
+            },
+        );
+        for rekey in [
+            connetto_client::MutationRekey {
+                previous_writer: super::WriterRef::Number(0),
+                previous_seq: 10,
+                writer: super::WriterRef::Number(1),
+                client_seq: 10,
+            },
+            connetto_client::MutationRekey {
+                previous_writer: super::WriterRef::Number(1),
+                previous_seq: 10,
+                writer: super::WriterRef::Number(2),
+                client_seq: 3,
+            },
+        ] {
+            super::rekey_tab_mutation(&mut state, rekey);
+        }
+        super::handle_relay_notice(
+            &mut state,
+            connetto_client::RelayNotice::WritesSettled {
+                writer: super::WriterRef::Number(1),
+                through_seq: 10,
+                before_patch: false,
+            },
+        );
+        assert!(author.try_recv().is_err());
+        super::handle_relay_notice(
+            &mut state,
+            connetto_client::RelayNotice::WritesSettled {
+                writer: super::WriterRef::Number(2),
+                through_seq: 3,
+                before_patch: false,
+            },
+        );
+        expect_settled(&mut author, author_writer, 42, false);
+    }
+
+    #[wasm_bindgen_test]
+    fn relay_resnapshot_settlement_precedes_relevant_rows() {
+        let (mut worker, mut state, mut author, mut sibling) = folders_hub();
+        let author_writer = tab_writer(&state, 1);
+        let sibling_writer = tab_writer(&state, 2);
+        settled_route(&mut state, 10, 1, 42);
+        settled_route(&mut state, 11, 2, 43);
+        state
+            .resync_tables
+            .insert("upstream".to_owned(), ["folders".to_owned()].into());
+        super::handle_worker_event(
+            &mut worker,
+            &mut state,
+            connetto_client::ClientEvent::FullResync {
+                sub_id: "upstream".to_owned(),
+                reason: connetto_core::messages::FullResyncReason::AuthorizationChange,
+            },
+        )
+        .expect("resync event");
+        super::handle_relay_notice(
+            &mut state,
+            connetto_client::RelayNotice::WritesSettled {
+                writer: super::WriterRef::Number(1),
+                through_seq: 11,
+                before_patch: true,
+            },
+        );
+        super::handle_worker_event(
+            &mut worker,
+            &mut state,
+            connetto_client::ClientEvent::SnapshotEnd {
+                sub_id: "upstream".to_owned(),
+            },
+        )
+        .expect("snapshot event");
+        assert!(matches!(
+            author.try_recv().expect("resync"),
+            super::TabOut::Control(connetto_core::messages::ControlMessage::FullResyncRequired(
+                _
+            ))
+        ));
+        assert!(matches!(
+            author.try_recv().expect("begin"),
+            super::TabOut::Control(connetto_core::messages::ControlMessage::SnapshotBegin(_))
+        ));
+        expect_settled(&mut author, author_writer, 42, true);
+        assert!(matches!(
+            author.try_recv().expect("snapshot rows"),
+            super::TabOut::Bulk(connetto_core::messages::BulkMessage::SnapshotPatch(_))
+        ));
+        expect_settled(&mut sibling, sibling_writer, 43, false);
+    }
+
+    #[wasm_bindgen_test]
+    fn relay_settlement_retains_acknowledged_routes() {
+        let (mut worker, mut state, mut author, mut sibling) = folders_hub();
+        let author_writer = tab_writer(&state, 1);
+        let sibling_writer = tab_writer(&state, 2);
+        settled_route(&mut state, 10, 1, 42);
+        settled_route(&mut state, 11, 2, 43);
+        settled_route(&mut state, 12, 1, 44);
+        settled_route(&mut state, 13, 1, 45);
+        super::handle_worker_event(
+            &mut worker,
+            &mut state,
+            connetto_client::ClientEvent::MutationApplied {
+                writer: super::WriterRef::Number(1),
+                client_seq: 10,
+            },
+        )
+        .expect("acknowledge");
+        assert!(matches!(
+            author.try_recv().expect("ack"),
+            super::TabOut::Control(connetto_core::messages::ControlMessage::MutationApplied(
+                connetto_core::messages::MutationApplied { client_seq: 42 }
+            ))
+        ));
+        super::handle_relay_notice(
+            &mut state,
+            connetto_client::RelayNotice::WritesSettled {
+                writer: connetto_core::messages::WriterRef::Number(1),
+                through_seq: 12,
+                before_patch: false,
+            },
+        );
+        expect_settled(&mut author, author_writer, 44, false);
+        expect_settled(&mut sibling, sibling_writer, 43, false);
+        assert!(
+            !state
+                .seq_map
+                .contains_key(&(super::WriterRef::Number(1), 10))
+        );
+        assert!(
+            state
+                .seq_map
+                .contains_key(&(super::WriterRef::Number(1), 11))
+        );
+        assert!(
+            state
+                .seq_map
+                .contains_key(&(super::WriterRef::Number(1), 13))
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn relay_settlement_before_ack_is_idempotent() {
+        let (mut worker, mut state, mut author, _) = folders_hub();
+        let author_writer = tab_writer(&state, 1);
+        settled_route(&mut state, 10, 1, 42);
+        for through_seq in [10, 10, 9] {
+            super::handle_relay_notice(
+                &mut state,
+                connetto_client::RelayNotice::WritesSettled {
+                    writer: connetto_core::messages::WriterRef::Number(1),
+                    through_seq,
+                    before_patch: false,
+                },
+            );
+        }
+        expect_settled(&mut author, author_writer, 42, false);
+        assert!(author.try_recv().is_err());
+        super::handle_worker_event(
+            &mut worker,
+            &mut state,
+            connetto_client::ClientEvent::MutationApplied {
+                writer: super::WriterRef::Number(1),
+                client_seq: 10,
+            },
+        )
+        .expect("acknowledge");
+        assert!(matches!(
+            author.try_recv().expect("ack"),
+            super::TabOut::Control(connetto_core::messages::ControlMessage::MutationApplied(_))
+        ));
+        assert!(state.seq_map.is_empty());
+    }
+
+    #[wasm_bindgen_test]
+    fn relay_ack_requires_a_settlement_marker_to_retire_route() {
+        let (mut worker, mut state, mut author, _) = folders_hub();
+        settled_route(&mut state, 10, 1, 42);
+        super::handle_worker_event(
+            &mut worker,
+            &mut state,
+            connetto_client::ClientEvent::MutationApplied {
+                writer: super::WriterRef::Number(1),
+                client_seq: 10,
+            },
+        )
+        .expect("record answer");
+        assert!(matches!(
+            author.try_recv().expect("ack"),
+            super::TabOut::Control(connetto_core::messages::ControlMessage::MutationApplied(
+                connetto_core::messages::MutationApplied { client_seq: 42 }
+            ))
+        ));
+        assert!(
+            state
+                .seq_map
+                .contains_key(&(super::WriterRef::Number(1), 10))
+        );
+        assert!(author.try_recv().is_err());
+    }
+
+    #[wasm_bindgen_test]
+    fn relay_settlement_follows_tab_patch_routing_and_credits() {
+        let (_, mut state, mut author, mut sibling) = folders_hub();
+        let author_writer = tab_writer(&state, 1);
+        let sibling_writer = tab_writer(&state, 2);
+        let changeset = mirror_changeset(|connection| {
+            connection
+                .batch_execute("DELETE FROM folders WHERE id = 1")
+                .expect("delete");
+        });
+        let compressed = std::sync::Arc::<[u8]>::from(
+            zstd::encode_all(changeset.as_slice(), 0).expect("compress"),
+        );
+        state.tabs.get_mut(&1).expect("author").credits = 0;
+        super::forward_live_patch(
+            &mut state,
+            &connetto_core::Cursor::new(Vec::new()),
+            &compressed,
+        )
+        .expect("older patch");
+        settled_route(&mut state, 10, 1, 42);
+        settled_route(&mut state, 11, 2, 43);
+        super::handle_relay_notice(
+            &mut state,
+            connetto_client::RelayNotice::WritesSettled {
+                writer: connetto_core::messages::WriterRef::Number(1),
+                through_seq: 11,
+                before_patch: true,
+            },
+        );
+        assert!(author.try_recv().is_err());
+        assert!(sibling.try_recv().is_err());
+        super::forward_live_patch(
+            &mut state,
+            &connetto_core::Cursor::new(Vec::new()),
+            &compressed,
+        )
+        .expect("settled patch");
+        expect_settled(&mut sibling, sibling_writer, 43, false);
+        assert!(author.try_recv().is_err());
+        let tab = state.tabs.get_mut(&1).expect("author");
+        tab.credits = 1;
+        super::flush_tab_bulk(tab);
+        assert!(matches!(
+            author.try_recv().expect("older patch"),
+            super::TabOut::Bulk(_)
+        ));
+        expect_settled(&mut author, author_writer, 42, true);
+        assert!(author.try_recv().is_err());
+        tab.credits = 1;
+        super::flush_tab_bulk(tab);
+        assert!(matches!(
+            author.try_recv().expect("settled patch"),
+            super::TabOut::Bulk(_)
+        ));
+    }
+
+    #[wasm_bindgen_test]
+    fn relay_boundaries_preserve_routes_until_a_settlement_marker() {
+        for event in [
+            connetto_client::ClientEvent::SyncStatus(
+                connetto_core::messages::SyncStatus::Connected,
+            ),
+            connetto_client::ClientEvent::FullResync {
+                sub_id: "upstream".to_owned(),
+                reason: connetto_core::messages::FullResyncReason::AuthorizationChange,
+            },
+        ] {
+            let (mut worker, mut state, mut author, _) = folders_hub();
+            settled_route(&mut state, 10, 1, 42);
+            settled_route(&mut state, 11, 1, 43);
+            state
+                .seq_map
+                .get_mut(&(super::WriterRef::Number(1), 10))
+                .expect("route")
+                .acknowledged = true;
+            super::handle_worker_event(&mut worker, &mut state, event).expect("boundary");
+            assert!(author.try_recv().is_err());
+            assert!(
+                state
+                    .seq_map
+                    .contains_key(&(super::WriterRef::Number(1), 11))
+            );
+            assert!(
+                state
+                    .seq_map
+                    .contains_key(&(super::WriterRef::Number(1), 10))
+            );
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn relay_replayed_tab_write_receives_an_ordinary_ack() {
+        let (mut worker, mut state, mut author, _) = folders_hub();
+        state.tabs.get_mut(&1).expect("author").applied_watermark = Some(42);
+        assert!(
+            super::handle_synced_mutation(
+                &mut worker,
+                &mut state,
+                1,
+                42,
+                &[],
+                Vec::new(),
+                None,
+                &mut super::WalkState::default(),
+            )
+            .await
+            .is_ok()
+        );
+        assert!(matches!(
+            author.try_recv().expect("record answer"),
+            super::TabOut::Control(connetto_core::messages::ControlMessage::MutationApplied(
+                connetto_core::messages::MutationApplied { client_seq: 42 }
+            ))
+        ));
     }
 
     /// A sink that drops the gate's transitions, for a runtime under test.

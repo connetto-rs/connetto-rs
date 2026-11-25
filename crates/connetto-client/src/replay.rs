@@ -679,18 +679,26 @@ pub(crate) struct Backing<'a> {
     pub(crate) schema: &'static str,
     /// The lowercased physical table.
     pub(crate) table: &'a str,
+    /// The `TEMP` table selecting keys for shared writes.
+    pub(crate) shared_write: Option<&'a str>,
+}
+
+#[cfg(feature = "peer")]
+diesel::define_sql_function! {
+    fn total_changes() -> BigInt;
 }
 
 /// Run one peer statement, `false` when a constraint or a policy guard
 /// refused it.
 #[cfg(feature = "peer")]
 fn execute_peer(conn: &mut SqliteConnection, (sql, binds): Rendered) -> Result<bool, ClientError> {
+    let before = diesel::select(total_changes()).get_result::<i64>(conn)?;
     let mut query = diesel::sql_query(sql).into_boxed::<diesel::sqlite::Sqlite>();
     for value in &binds {
         query = bind_one(query, value);
     }
     match query.execute(conn) {
-        Ok(_) => Ok(true),
+        Ok(_) => Ok(diesel::select(total_changes()).get_result::<i64>(conn)? > before),
         Err(err) if omit_on_constraint(&err) => Ok(false),
         Err(diesel::result::Error::DatabaseError(_, info))
             if pg2sqlite::prelude::is_policy_refusal(info.message()) =>
@@ -732,21 +740,49 @@ impl<'a> ViewWrite<'a> {
             ChangesetOp::Update { values, .. } => Self::Update(std::borrow::Cow::Owned(
                 values
                     .iter()
-                    .map(|(old, new)| (new.clone(), old.clone()))
+                    .enumerate()
+                    .map(|(column, (old, new))| {
+                        if new.is_none() && op.table().pk_flags()[column] != 0 {
+                            (old.clone(), None)
+                        } else {
+                            (new.clone(), old.clone())
+                        }
+                    })
                     .collect(),
             )),
             ChangesetOp::Delete { old_values, .. } => Self::Insert(old_values),
         }
     }
+
+    fn key_values(
+        &self,
+        section_pk: &[u8],
+        after: bool,
+    ) -> Result<Vec<(usize, &Cell)>, ClientError> {
+        section_pk
+            .iter()
+            .enumerate()
+            .filter(|(_, flag)| **flag != 0)
+            .map(|(column, _)| {
+                let value = match self {
+                    Self::Insert(values) | Self::Delete(values) => values.get(column),
+                    Self::Update(pairs) => pairs.get(column).and_then(|(old, new)| {
+                        if after {
+                            new.as_ref().or(old.as_ref())
+                        } else {
+                            old.as_ref()
+                        }
+                    }),
+                };
+                value.map(|value| (column, value)).ok_or_else(|| {
+                    ClientError::Apply("a peer write has no primary key value".into())
+                })
+            })
+            .collect()
+    }
 }
 
-/// Make one write through the view `table`, the view's guards judging it as
-/// whoever the caller bound.
-///
-/// SQLite counts no change through an `INSTEAD OF` trigger, and a guard may
-/// skip a write silently, so the verdict reads the backing table afterwards:
-/// the write landed when the row stands as it left it. An insert replaces
-/// the row its key names, the view judging that delete too.
+/// Write through the policy view and verify the resulting backing row.
 #[cfg(feature = "peer")]
 fn write_through_view(
     conn: &mut SqliteConnection,
@@ -761,8 +797,11 @@ fn write_through_view(
     let (after, present): (Vec<(usize, Cell)>, bool) = match write {
         ViewWrite::Insert(values) => {
             let key_vals = pk_values_by_column(section_pk, |i| values[i].clone());
-            if !key_vals.is_empty() {
-                execute_peer(conn, render_key_delete(target, table, &key_vals))?;
+            if !key_vals.is_empty()
+                && !execute_peer(conn, render_key_delete(target, table, &key_vals))?
+                && backing_row_matches(conn, target, backing, &key_vals)?
+            {
+                return Ok(PeerVerdict::Refused);
             }
             if !execute_peer(conn, render_insert(target, table, values))? {
                 return Ok(PeerVerdict::Refused);
@@ -806,6 +845,79 @@ fn write_through_view(
     )
 }
 
+#[cfg(feature = "peer")]
+fn shared_write_keys(
+    database: &mut SqliteConnection,
+    target: &Target,
+    scope: &str,
+    keys: &[(usize, &Cell)],
+    register: bool,
+) -> Result<(), ClientError> {
+    let columns = keys
+        .iter()
+        .map(|(column, _)| quote_ident(&target.shape.columns[*column]));
+    let statement = if register {
+        format!(
+            "INSERT INTO {} ({}) VALUES ({})",
+            table_ref("temp", scope),
+            columns.collect::<Vec<_>>().join(", "),
+            vec!["?"; keys.len()].join(", ")
+        )
+    } else {
+        format!(
+            "DELETE FROM {} WHERE {}",
+            table_ref("temp", scope),
+            columns
+                .map(|column| format!("{column} IS ?"))
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        )
+    };
+    // The translated schema supplies the scope table and its key columns at runtime.
+    let mut query = diesel::sql_query(statement).into_boxed::<diesel::sqlite::Sqlite>();
+    for (_, value) in keys {
+        query = bind_one(query, value);
+    }
+    query.execute(database)?;
+    Ok(())
+}
+
+#[cfg(feature = "peer")]
+fn write_with_shared_scope(
+    database: &mut SqliteConnection,
+    target: &Target,
+    table: &str,
+    backing: Backing<'_>,
+    section_pk: &[u8],
+    write: &ViewWrite<'_>,
+) -> Result<PeerVerdict, ClientError> {
+    let Some(scope) = backing.shared_write else {
+        return write_through_view(database, target, table, backing, section_pk, write);
+    };
+    let old_keys = write.key_values(section_pk, false)?;
+    let changed_key = match write {
+        ViewWrite::Update(pairs) => pairs.iter().enumerate().any(|(column, (old, new))| {
+            section_pk.get(column).is_some_and(|flag| *flag != 0) && new.is_some() && new != old
+        }),
+        ViewWrite::Insert(_) | ViewWrite::Delete(_) => false,
+    };
+    let new_keys = changed_key
+        .then(|| write.key_values(section_pk, true))
+        .transpose()?;
+    database.transaction(|database| {
+        shared_write_keys(database, target, scope, &old_keys, true)?;
+        if let Some(keys) = &new_keys {
+            shared_write_keys(database, target, scope, keys, true)?;
+        }
+        let verdict = write_through_view(database, target, table, backing, section_pk, write)?;
+        shared_write_keys(database, target, scope, &old_keys, false)?;
+        if let Some(keys) = &new_keys {
+            shared_write_keys(database, target, scope, keys, false)?;
+        }
+        Ok(verdict)
+    })
+}
+
 /// Apply one op of a peer entry through the view `table`, the view's guards
 /// judging it as whoever the caller's author binding bound (R77). A delete
 /// of a row the receiver does not hold as the op found it is refused, since
@@ -825,13 +937,10 @@ pub(crate) fn apply_peer_op(
         }
     }
     let write = ViewWrite::of(op);
-    write_through_view(conn, &target, table, backing, op.table().pk_flags(), &write)
+    write_with_shared_scope(conn, &target, table, backing, op.table().pk_flags(), &write)
 }
 
-/// Put back the row one peer op changed, in the view `table`'s backing table
-/// (R77). The undo restores the receiver's own store, so the view's read
-/// filter does not hide a row the receiver may not read, and the exempt
-/// writes the caller raised pass the backing table's write guards.
+/// Restore one peer row under the caller's write exemption.
 #[cfg(feature = "peer")]
 pub(crate) fn undo_peer_op(
     conn: &mut SqliteConnection,
@@ -839,15 +948,18 @@ pub(crate) fn undo_peer_op(
     backing: Backing<'_>,
     op: &PeerOp,
 ) -> Result<PeerVerdict, ClientError> {
-    let target = Target {
-        schema: backing.schema,
-        shape: view_target(conn, backing.schema, table)?.shape,
+    let mut target = view_target(conn, backing.schema, table)?;
+    let destination = if backing.shared_write.is_some() {
+        table
+    } else {
+        target.schema = backing.schema;
+        backing.table
     };
     let write = ViewWrite::undoing(op);
-    write_through_view(
+    write_with_shared_scope(
         conn,
         &target,
-        backing.table,
+        destination,
         backing,
         op.table().pk_flags(),
         &write,
@@ -1036,6 +1148,55 @@ mod tests {
             read_notes(native, "main"),
             read_notes(shared, "connetto_shared"),
             "the shared replay must land the rows the native apply lands"
+        );
+    }
+
+    #[cfg(feature = "peer")]
+    #[test]
+    fn peer_update_undo_preserves_unchanged_primary_key() {
+        let mut database = new_conn();
+        database
+            .batch_execute(&format!(
+                "CREATE TABLE notes {NOTES};
+                 INSERT INTO notes VALUES (1, 'one', 'original'), (2, 'two', 'updated');"
+            ))
+            .expect("seed the notes");
+        let mut session = database.create_session().expect("capture session");
+        session.attach_all().expect("capture notes");
+        database
+            .batch_execute("UPDATE notes SET body = 'updated' WHERE id = 1")
+            .expect("update the first note");
+        let changeset = session.changeset().expect("captured update");
+        drop(session);
+        let ParsedDiffSet::Changeset(parsed) =
+            ParsedDiffSet::parse(&changeset).expect("parse the update")
+        else {
+            panic!("expected a changeset");
+        };
+        let operation = parsed.iter().next().expect("one update");
+        let backing = Backing {
+            schema: "main",
+            table: "notes",
+            shared_write: None,
+        };
+        assert_eq!(
+            undo_peer_op(&mut database, "notes", backing, &operation).expect("undo the update"),
+            PeerVerdict::Landed
+        );
+        assert_eq!(
+            read_notes(&mut database, "main"),
+            vec![
+                NoteRow {
+                    id: 1,
+                    title: Some("one".to_owned()),
+                    body: Some("original".to_owned()),
+                },
+                NoteRow {
+                    id: 2,
+                    title: Some("two".to_owned()),
+                    body: Some("updated".to_owned()),
+                },
+            ]
         );
     }
 

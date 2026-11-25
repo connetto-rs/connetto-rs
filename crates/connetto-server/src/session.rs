@@ -21,6 +21,9 @@
 #[cfg(test)]
 mod cursor_lock_tests;
 
+#[cfg(test)]
+mod settle_marker_tests;
+
 mod courier_audit;
 mod input;
 
@@ -115,7 +118,9 @@ use crate::slot::SlotError;
 use crate::throttle::{ReadLimits, Tier};
 use crate::timeline::{Position, TimelineError, TimelineHistory};
 use crate::write_target::{PgWriteTarget, SettleSpec, Settlement, WriteError, WriteOutcome};
-use crate::writer_schema::{SettlePath, SettledOutcome, SettledRow, WriterRow};
+use crate::writer_schema::{
+    ConnettoWriterSchema, SettlePath, SettledOutcome, SettledRow, WriterRow,
+};
 use connetto_core::auth::CapabilityKey;
 use connetto_core::auth::CapabilitySubject;
 
@@ -1615,7 +1620,9 @@ impl SendQueue {
 /// A frame queued for a session's outbound path.
 enum Outbound {
     /// A live row patch (bulk plane, credit-gated).
-    Live(LivePatch),
+    Live(LivePatch, Option<connetto_core::messages::WritesSettled>),
+    SnapshotLive(LivePatch),
+    WritesSettled(connetto_core::messages::WritesSettled),
     /// An aggregate value update (control plane, never credit-gated).
     Aggregate(AggregateUpdate),
     /// A fatal close: the pump sends it as a control frame and ends the
@@ -1716,6 +1723,10 @@ fn budgeted_bytes(patch: &LivePatch) -> u64 {
         .saturating_add(len_bytes(patch.patchset_zstd.len()))
 }
 
+fn settled_bytes(_marker: &connetto_core::messages::WritesSettled) -> u64 {
+    OUTBOUND_ITEM_BYTES
+}
+
 /// The bytes occupied by typed row values and their variable payloads.
 fn aggregate_row_bytes(row: &[SqliteValue]) -> u64 {
     row.iter().fold(0_u64, |bytes, value| {
@@ -1735,7 +1746,11 @@ impl Outbound {
     /// A close counts nothing, so it is never refused.
     fn budgeted(&self) -> u64 {
         match self {
-            Self::Live(patch) => budgeted_bytes(patch),
+            Self::Live(patch, marker) => {
+                budgeted_bytes(patch).saturating_add(marker.as_ref().map_or(0, settled_bytes))
+            }
+            Self::SnapshotLive(patch) => budgeted_bytes(patch),
+            Self::WritesSettled(marker) => settled_bytes(marker),
             Self::Aggregate(update) => OUTBOUND_ITEM_BYTES
                 .saturating_add(len_bytes(update.sub_id.len()))
                 .saturating_add(match &update.change {
@@ -1767,7 +1782,7 @@ impl Outbound {
     /// The bytes released once the run loop has handled this item. A live patch is released later, when it leaves the credit queue for the socket.
     fn released_when_handled(&self) -> u64 {
         match self {
-            Self::Live(_) => 0,
+            Self::Live(..) | Self::SnapshotLive(_) | Self::WritesSettled(_) => 0,
             other => other.budgeted(),
         }
     }
@@ -1923,6 +1938,7 @@ enum Deliverable {
     Budgeted(LivePatch),
     /// The frame closing a snapshot. Ordered, never charged.
     SnapshotComplete(SnapshotEnd),
+    WritesSettled(connetto_core::messages::WritesSettled),
 }
 
 impl Deliverable {
@@ -1938,7 +1954,8 @@ impl Deliverable {
                 Some(&patch.sub_id)
             }
             Self::Rows(BulkMessage::SnapshotPatch(patch)) => Some(&patch.sub_id),
-            Self::Rows(BulkMessage::MutationPatch(_) | BulkMessage::CourierBody(_)) => None,
+            Self::Rows(BulkMessage::MutationPatch(_) | BulkMessage::CourierBody(_))
+            | Self::WritesSettled(_) => None,
             Self::SnapshotComplete(end) => Some(&end.sub_id),
         }
     }
@@ -2169,6 +2186,11 @@ enum WriterKey {
     Number(WriterSecret),
 }
 
+struct WriterSession {
+    connection_num: u64,
+    writer: connetto_core::messages::WriterRef,
+}
+
 struct SessionState<Id, Key> {
     credits: u32,
     pending: VecDeque<Deliverable>,
@@ -2201,6 +2223,7 @@ struct SessionState<Id, Key> {
     writer: Option<BoundWriter<Id>>,
     /// The connetto-minted session id from the verified token.
     session_id: SessionId,
+    connection_num: u64,
     /// The challenge nonce of the round the handshake settled, the message a
     /// device key signs to bind its writer (R75).
     bind_nonce: [u8; 32],
@@ -2688,9 +2711,9 @@ pub struct SessionManager<
     /// or `None` when the deployment wired no registry, in which case every
     /// registration fails closed and is refused without saying why.
     bot_registry: Option<PgBotRegistry<D::Bots>>,
-    /// The sessions bound to each device writer (R75), so a retirement can
-    /// close every connection that writes as the retired writer.
-    writer_sessions: Mutex<HashMap<i64, HashSet<SessionId>>>,
+    /// The live connection bound to each writer and session handle.
+    writer_sessions: Mutex<HashMap<i64, HashMap<SessionId, WriterSession>>>,
+    pending_writes: crate::write_target::PendingWrites,
     /// The tables this process refused, the materializer's own set, so the
     /// ingest loop's gate reads it without the materializer lock.
     refused: RefusedSet,
@@ -2890,6 +2913,7 @@ where
         shutting_down: AtomicBool::new(false),
         bot_registry,
         writer_sessions: Mutex::new(HashMap::new()),
+        pending_writes: crate::write_target::PendingWrites::default(),
     });
     // The sunset watch is the only standing background task; it stands only
     // when a sunset is configured (R107). The provisional certificate
@@ -4067,6 +4091,11 @@ where
         for consumer_id in &applied.refused {
             self.wake_courier_audit_locked(*consumer_id).await?;
         }
+        if self.event_table(event) == D::Writers::SETTLED_TABLE {
+            applied.patches.clear();
+            applied.refused.clear();
+            applied.narrowings = None;
+        }
         // Every patch still owed, paired with the route it goes to now.
         // Collected before the visibility question because that question names
         // every watcher at once.
@@ -4377,7 +4406,8 @@ where
             };
             let live = LivePatch::new(route.label, Cursor::new(cursor), payload);
             // A dropped session receiver just means the client is gone.
-            let _ = route.tx.send(Outbound::Live(live));
+            self.queue_live(event.position().xid(), &route.tx, live)
+                .await;
         }
         Ok(())
     }
@@ -4653,8 +4683,80 @@ where
         }
         let live = LivePatch::new(route.label.clone(), Cursor::new(cursor.to_vec()), payload);
         // A dropped session receiver just means the client is gone.
-        let _ = route.tx.send(Outbound::Live(live));
+        let _ = route.tx.send(Outbound::SnapshotLive(live));
         true
+    }
+
+    async fn queue_live(&self, transaction: PgXid, outbound: &OutboundTx, patch: LivePatch) {
+        if !self.pending_writes.lock().contains_key(&transaction.0) {
+            let _ = outbound.send(Outbound::Live(patch, None));
+            return;
+        }
+        let writers = self.writer_sessions.lock().await;
+        let sessions = self.sessions.lock().await;
+        let mut pending = self.pending_writes.lock();
+        if let Some(write) = pending.get_mut(&transaction.0) {
+            for (writer, sequence) in &write.writers {
+                let Some(bound) = writers.get(writer) else {
+                    continue;
+                };
+                for (session_id, binding) in bound {
+                    let Some(session) = sessions
+                        .get(session_id)
+                        .filter(|session| session.connection_num == binding.connection_num)
+                    else {
+                        continue;
+                    };
+                    if session.tx.tx.same_channel(&outbound.tx)
+                        && write.delivered.insert(session.connection_num)
+                    {
+                        let _ = outbound.send(Outbound::Live(
+                            patch,
+                            Some(connetto_core::messages::WritesSettled {
+                                writer: binding.writer,
+                                through_seq: *sequence,
+                                before_patch: true,
+                            }),
+                        ));
+                        return;
+                    }
+                }
+            }
+        }
+        let _ = outbound.send(Outbound::Live(patch, None));
+    }
+
+    async fn settle_commit(&self, transaction: PgXid) {
+        if !self.pending_writes.lock().contains_key(&transaction.0) {
+            return;
+        }
+        let writers = self.writer_sessions.lock().await;
+        let sessions = self.sessions.lock().await;
+        let Some(mut write) = self.pending_writes.lock().remove(&transaction.0) else {
+            return;
+        };
+        for (writer, sequence) in &write.writers {
+            let Some(bound) = writers.get(writer) else {
+                continue;
+            };
+            for (session_id, binding) in bound {
+                let Some(session) = sessions
+                    .get(session_id)
+                    .filter(|session| session.connection_num == binding.connection_num)
+                else {
+                    continue;
+                };
+                if write.delivered.insert(session.connection_num) {
+                    let _ = session.tx.send(Outbound::WritesSettled(
+                        connetto_core::messages::WritesSettled {
+                            writer: binding.writer,
+                            through_seq: *sequence,
+                            before_patch: false,
+                        },
+                    ));
+                }
+            }
+        }
     }
 
     /// Bring the authorization store level with `event`, if one is maintained.
@@ -4804,6 +4906,7 @@ where
                 Ok(Some(SourceItem::Commit(commit))) => {
                     // Recorded before the acknowledgement, so the slot never resumes past a commit the log does not hold.
                     self.oplog.record_commit(commit).await.map_err(oplog_err)?;
+                    self.settle_commit(commit.position().xid()).await;
                     source
                         .ack(commit.position())
                         .await
@@ -5941,6 +6044,15 @@ where
             self.unregister_connection(session_id, connection_num).await;
             return Err(transport_err(err));
         }
+        if let Some(row) = &writer_row {
+            self.register_writer_session(
+                row.writer,
+                session_id,
+                connection_num,
+                connetto_core::messages::WriterRef::Number(u64::try_from(row.writer).unwrap_or(0)),
+            )
+            .await;
+        }
         Ok(Some(HandshakeOutcome {
             connection_num,
             principal: Arc::new(principal),
@@ -6394,6 +6506,7 @@ where
             pending_header: None,
             writer,
             session_id,
+            connection_num,
             bind_nonce,
             indeterminate: None,
             deferred: BTreeMap::new(),
@@ -6461,21 +6574,21 @@ where
             }
         };
 
-        // Runs on every exit, an error included, so no ended session stays registered.
-        self.unregister_connection(session_id, connection_num).await;
-        // The connection is the window its open questions stay pending, so it
-        // ends with the connection (R77 decision 11).
-        self.drop_provisional_questions(session_id, connection_num)
-            .await;
-        self.drop_courier_audit(session_id, connection_num).await;
-        self.unregister_writer_session(&state).await;
-        // The connection is the window for a caller with no identity, so its
-        // tallies die here and nothing else expires them.
-        self.guard.forget_connection(session_id);
+        self.end_session(state).await;
+        ended
+    }
 
+    async fn end_session(&self, state: SessionState<Id, Key>) {
+        self.unregister_connection(state.session_id, state.connection_num)
+            .await;
+        self.drop_provisional_questions(state.session_id, state.connection_num)
+            .await;
+        self.drop_courier_audit(state.session_id, state.connection_num)
+            .await;
+        self.unregister_writer_session(&state).await;
+        self.guard.forget_connection(state.session_id);
         self.unsubscribe_all(state).await;
         tracing::info!("connection closed");
-        ended
     }
 
     /// Handle one transport read, answering whether the session goes on.
@@ -6510,14 +6623,37 @@ where
         Ok(true)
     }
 
-    async fn unregister_writer_session(&self, state: &SessionState<Id, Key>) {
-        if let Some(BoundWriter {
-            row,
-            key: WriterKey::Device(_),
-        }) = &state.writer
+    async fn register_writer_session(
+        &self,
+        writer: i64,
+        session_id: SessionId,
+        connection_num: u64,
+        identity: connetto_core::messages::WriterRef,
+    ) {
+        let mut writers = self.writer_sessions.lock().await;
+        let sessions = self.sessions.lock().await;
+        if sessions
+            .get(&session_id)
+            .is_some_and(|session| session.connection_num == connection_num)
         {
+            writers.entry(writer).or_default().insert(
+                session_id,
+                WriterSession {
+                    connection_num,
+                    writer: identity,
+                },
+            );
+        }
+    }
+
+    async fn unregister_writer_session(&self, state: &SessionState<Id, Key>) {
+        if let Some(BoundWriter { row, .. }) = &state.writer {
             let mut live = self.writer_sessions.lock().await;
-            if let Some(set) = live.get_mut(&row.writer) {
+            if let Some(set) = live.get_mut(&row.writer)
+                && set
+                    .get(&state.session_id)
+                    .is_some_and(|binding| binding.connection_num == state.connection_num)
+            {
                 set.remove(&state.session_id);
             }
         }
@@ -6536,26 +6672,23 @@ where
         state: &mut SessionState<Id, Key>,
     ) -> Result<bool, SessionError> {
         match outbound {
-            Outbound::Live(patch) => {
-                let budget = self
-                    .guard
-                    .read_limits(Tier::of(&state.principal))
-                    .page_bytes;
-                note_delivered(
-                    state,
-                    &patch.sub_id,
-                    patch.patchset_zstd.len() as u64,
-                    budget,
-                );
+            Outbound::WritesSettled(marker) => {
                 enqueue_and_flush(
                     transport,
                     &mut state.credits,
                     &mut state.pending,
                     &state.outbound.queue,
-                    Deliverable::Budgeted(patch),
+                    Deliverable::WritesSettled(marker),
                 )
                 .await
                 .map_err(transport_err)?;
+            }
+            Outbound::Live(patch, marker) => {
+                self.deliver_live(transport, state, patch, marker).await?;
+            }
+            Outbound::SnapshotLive(patch) => {
+                self.queue_batch_frontier(state).await?;
+                self.deliver_live(transport, state, patch, None).await?;
             }
             Outbound::Aggregate(update) => {
                 transport
@@ -6629,6 +6762,37 @@ where
             }
         }
         Ok(true)
+    }
+
+    async fn deliver_live<T: Transport>(
+        &self,
+        transport: &mut T,
+        state: &mut SessionState<Id, Key>,
+        patch: LivePatch,
+        marker: Option<connetto_core::messages::WritesSettled>,
+    ) -> Result<(), SessionError> {
+        if let Some(marker) = marker {
+            state.pending.push_back(Deliverable::WritesSettled(marker));
+        }
+        let budget = self
+            .guard
+            .read_limits(Tier::of(&state.principal))
+            .page_bytes;
+        note_delivered(
+            state,
+            &patch.sub_id,
+            len_bytes(patch.patchset_zstd.len()),
+            budget,
+        );
+        enqueue_and_flush(
+            transport,
+            &mut state.credits,
+            &mut state.pending,
+            &state.outbound.queue,
+            Deliverable::Budgeted(patch),
+        )
+        .await
+        .map_err(transport_err)
     }
 
     /// Drop every route and registration this connection held.
@@ -7662,17 +7826,19 @@ where
             .await
             .map_err(|err| SessionError::WriteTarget(err.detail()))?;
         // A bind after a number switches the connection to the device writer.
+        self.unregister_writer_session(state).await;
         state.writer = Some(BoundWriter {
             row: row.clone(),
             key: WriterKey::Device(key),
         });
         state.indeterminate = None;
-        self.writer_sessions
-            .lock()
-            .await
-            .entry(row.writer)
-            .or_default()
-            .insert(state.session_id);
+        self.register_writer_session(
+            row.writer,
+            state.session_id,
+            state.connection_num,
+            connetto_core::messages::WriterRef::Device(bind.key_id),
+        )
+        .await;
         Ok(BindVerdict::Writer(WriterOutcome::Bound {
             frontier: u64::try_from(row.frontier).unwrap_or(0),
         }))
@@ -7945,10 +8111,17 @@ where
             .await
             .remove(&row.writer)
             .unwrap_or_default();
-        for session in sessions {
-            let _ = self
-                .close_session(session, FatalErrorReason::WriterRetired)
-                .await;
+        let mut live = self.sessions.lock().await;
+        for (session_id, connection_num) in sessions {
+            if live
+                .get(&session_id)
+                .is_some_and(|session| session.connection_num == connection_num.connection_num)
+                && let Some(session) = live.remove(&session_id)
+            {
+                let _ = session.tx.send(Outbound::Fatal(FatalError::new(
+                    FatalErrorReason::WriterRetired,
+                )));
+            }
         }
         Ok(WriterOutcome::Retired)
     }
@@ -9080,6 +9253,43 @@ where
         Ok(())
     }
 
+    async fn queue_batch_frontier(
+        &self,
+        state: &mut SessionState<Id, Key>,
+    ) -> Result<(), SessionError> {
+        self.refresh_writer_row(state)
+            .await
+            .map_err(|error| SessionError::WriteTarget(error.detail()))?;
+        let Some(bound) = &state.writer else {
+            return Ok(());
+        };
+        if bound.row.frontier == 0 {
+            return Ok(());
+        }
+        let writer = match &bound.key {
+            WriterKey::Number(_) => connetto_core::messages::WriterRef::Number(
+                u64::try_from(bound.row.writer).unwrap_or(0),
+            ),
+            WriterKey::Device(key) => {
+                connetto_core::messages::WriterRef::Device(key.as_slice().try_into().map_err(
+                    |_| SessionError::Protocol("the bound device key is malformed".into()),
+                )?)
+            }
+        };
+        let marker = connetto_core::messages::WritesSettled {
+            writer,
+            through_seq: u64::try_from(bound.row.frontier).unwrap_or(0),
+            before_patch: true,
+        };
+        state
+            .outbound
+            .queue
+            .queued
+            .fetch_add(settled_bytes(&marker), Ordering::AcqRel);
+        state.pending.push_back(Deliverable::WritesSettled(marker));
+        Ok(())
+    }
+
     /// Answer a redelivery at or below the writer's frontier from the settled
     /// record: the stored outcome when the entry stands as it was settled,
     /// a fork when it does not.
@@ -9678,7 +9888,10 @@ where
             RetryPolicy::new().with_max_total_backoff(Some(self.config.write_retry_budget));
         let mut episode = policy.start();
         loop {
-            let outcome = self.target.commit(caller, plan, payload_zstd, settle).await;
+            let outcome = self
+                .target
+                .commit(caller, plan, payload_zstd, settle, &self.pending_writes)
+                .await;
             let retryable = match &outcome {
                 Err(WriteError::Transient(detail)) => Some(detail.clone()),
                 Err(WriteError::Frontier) => None,
@@ -10793,6 +11006,7 @@ where
     ) -> Result<u64, SessionError> {
         let payload = compress(&patchset)?;
         let bytes = payload.len() as u64;
+        self.queue_batch_frontier(state).await?;
         enqueue_and_flush(
             transport,
             &mut state.credits,
@@ -11192,6 +11406,7 @@ where
                         }
                         Err(error) => return Err(error.into()),
                     }
+                    self.queue_batch_frontier(state).await?;
                     // The walk counted the patch against the send budget, and sending it releases the count.
                     enqueue_and_flush(
                         transport,
@@ -12149,6 +12364,13 @@ async fn flush<T: Transport>(
             return Ok(());
         };
         match next {
+            Deliverable::WritesSettled(marker) => {
+                let bytes = settled_bytes(&marker);
+                transport
+                    .send_control(ControlMessage::WritesSettled(marker))
+                    .await?;
+                queue.release(bytes);
+            }
             Deliverable::Rows(msg) => {
                 transport.send_bulk(msg).await?;
                 *credits -= 1;
