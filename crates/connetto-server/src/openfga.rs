@@ -339,12 +339,14 @@ where
             }
             return true;
         }
-        // The cap's list parameter is one value the caller's connections
-        // carry, read through the same function Postgres binds it with, so
-        // the local gate and the row-level rules hold the caller to one list.
+        // One value per entry, as the cap policy's `string_to_array` splits the bound text.
         if self.naming.bot_list_parameter.as_deref() == Some(parameter) {
             let list = crate::capability::bot_list_for(&self.principal);
-            out.push(&list);
+            if !list.is_empty() {
+                for entry in list.split(connetto_core::BOT_LIST_SEPARATOR) {
+                    out.push(entry);
+                }
+            }
             true
         } else {
             false
@@ -2237,6 +2239,11 @@ mod tests {
 
     /// The caller one identity grant would produce.
     fn caller_alice() -> Principal {
+        alice_listing(None)
+    }
+
+    /// Alice's identity, carrying `bot_list` as a bot's session does.
+    fn alice_listing(bot_list: Option<connetto_core::bots::BotList>) -> Principal {
         use connetto_core::SessionId;
         use connetto_core::auth::{AuthContext, Subject, VerifiedSession};
 
@@ -2246,10 +2253,59 @@ mod tests {
             .accept(Subject::Identity(VerifiedSession {
                 context: AuthContext::new("alice"),
                 session_id: handle,
-                bot_list: None,
+                bot_list,
             }))
             .expect("one identity");
         principal
+    }
+
+    /// The cap admits a bot by any one entry of its list, as `string_to_array` splits it.
+    #[tokio::test]
+    async fn the_cap_reads_each_entry_of_a_bots_list() {
+        use connetto_core::bots::{BotList, Verb};
+        use subql::visibility::Verdict;
+
+        let translated = translated(&format!(
+            "{OWN_SHAPE}; CREATE POLICY notes_cap_read ON notes AS RESTRICTIVE FOR SELECT USING (\
+             'notes:read' = ANY(string_to_array(current_setting('app.bot_list', true), ',')) \
+             OR '*' = ANY(string_to_array(current_setting('app.bot_list', true), ',')))"
+        ));
+        let model = installed(&translated);
+        let naming = translated.naming();
+        let (shapes, _translator, _reach) = translated.into_parts();
+        let delegate = OpenFgaPolicy::new(
+            Arc::clone(&shapes),
+            OpenFgaServiceClient::new(Never),
+            "store",
+            &model,
+        )
+        .expect("the policy index is usable");
+        let auth: FgaAuth<String, String, Never> = FgaAuth::new(shapes, delegate, naming);
+        let notes = catalog_helpers::table_id::<Postgres, _>(
+            auth.generation.load().inner.shapes().catalog(),
+            "notes",
+        )
+        .expect("notes is in the catalog");
+        let row = SessionOrderRow {
+            table: notes,
+            owner: "alice",
+        };
+        for (entries, expected) in [
+            (vec![Verb::Read, Verb::Insert], Verdict::Allow),
+            (vec![Verb::Insert], Verdict::Deny),
+        ] {
+            let list = BotList::new(entries.iter().map(|verb| ("notes".to_owned(), *verb)));
+            let watchers = [Arc::new(alice_listing(Some(list)))];
+            let mut verdicts = [Verdict::Deny];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                auth.may_see(&row, &watchers, &mut verdicts),
+            )
+            .await
+            .expect("the gate is answered locally")
+            .expect("the question succeeds");
+            assert_eq!(verdicts, [expected], "a bot listing {entries:?} on notes");
+        }
     }
 
     /// The executor over a transport that never answers.
