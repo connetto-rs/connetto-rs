@@ -12,6 +12,8 @@ A WPA3 join asks the platform for its `setWPA3PersonalPassphrase:` selector, and
 
 `discovery::Bonjour` advertises and browses `_connetto-peer._tcp` through the system's `dns_sd` service for `connetto-peer`'s discovery, since iOS lets an app send and receive raw multicast only under Apple's managed multicast entitlement. An app using it lists the service type in `NSBonjourServices` and sets `NSLocalNetworkUsageDescription`, without which iOS refuses every operation.
 
+`transport` runs the peer link over Network framework on Apple targets alone. `Listener` accepts on an address and hands each ready connection to the node, and `link` dials one. A link reports `PeerToPeer` when its path crosses an `awdl` interface and `Network` otherwise. A connection is configured before it starts and from then on touched only on its own serial queue.
+
 On every target but Apple the functions answer `Unsupported` or empty, and the Bluetooth permission reads `Denied`.
 
 ```rust

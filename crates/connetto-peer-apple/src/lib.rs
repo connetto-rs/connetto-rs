@@ -204,6 +204,13 @@ pub mod discovery {
     pub use crate::platform::bonjour::Bonjour;
 }
 
+/// The peer link's transport through Network framework, every Apple link's
+/// dial and accept (R112 decision 3).
+#[cfg(any(target_os = "ios", target_os = "macos"))]
+pub mod transport {
+    pub use crate::platform::network::{Listener, link};
+}
+
 #[cfg(any(target_os = "ios", target_os = "macos", test))]
 mod route;
 

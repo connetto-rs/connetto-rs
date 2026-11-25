@@ -21,3 +21,8 @@ pub(super) mod hotspot;
     reason = "the CoreLocation calls objc2 marks unsafe, each made on the main thread's one manager"
 )]
 pub(super) mod location;
+#[expect(
+    unsafe_code,
+    reason = "the Network framework calls objc2 marks unsafe and the block recasts around objc2 #890, each sound as its SAFETY comment states"
+)]
+pub(super) mod network;

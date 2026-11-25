@@ -45,8 +45,13 @@ thiserror.workspace = true
 [target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies]
 # The routing table the joined network's gateway is read from.
 libc = "0.2"
-# The dns_sd session the Bonjour discovery serves (R76).
+# The dns_sd session the Bonjour discovery serves (R76), and the node the
+# Network framework transport links through (R112).
 connetto-peer = { path = "../connetto-peer", features = ["discovery"] }
+connetto-core = { workspace = true, features = ["device-cert"] }
+# The peer link's transport, its connections and listener (R112 decision 3).
+objc2-network = { workspace = true, features = ["std", "dispatch2", "libc", "objc2"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 parking_lot = "0.12"
 dispatch2.workspace = true
 block2 = { workspace = true, features = ["alloc"] }
@@ -65,6 +70,9 @@ objc2-core-bluetooth = { workspace = true, features = [
   "CBManager",
 ] }
 if-addrs = "0.15"
+
+[target.'cfg(any(target_os = "ios", target_os = "macos"))'.dev-dependencies]
+connetto-peer = { path = "../connetto-peer", features = ["discovery", "test-support"] }
 
 # The Network Extension join the joiner's device asks iOS for.
 [target.'cfg(target_os = "ios")'.dependencies]

@@ -654,7 +654,7 @@ dependencies = [
  "regex",
  "rustc-hash 2.1.3",
  "shlex",
- "syn 3.0.10",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1587,6 +1587,7 @@ name = "connetto-peer-apple"
 version = "0.0.0"
 dependencies = [
  "block2 0.6.2 (git+https://github.com/madsmtm/objc2?branch=main)",
+ "connetto-core",
  "connetto-peer",
  "dispatch2 0.3.1 (git+https://github.com/madsmtm/objc2?branch=main)",
  "if-addrs",
@@ -1596,9 +1597,11 @@ dependencies = [
  "objc2-core-location",
  "objc2-core-wlan",
  "objc2-foundation 0.3.2 (git+https://github.com/madsmtm/objc2?branch=main)",
+ "objc2-network",
  "objc2-network-extension",
  "parking_lot 0.12.5",
  "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]
@@ -6438,6 +6441,8 @@ version = "0.3.2"
 source = "git+https://github.com/madsmtm/objc2?branch=main#b98d2a3e0f7b7adf83cf12c16e834752f16b0b51"
 dependencies = [
  "bitflags 2.13.2",
+ "dispatch2 0.3.1 (git+https://github.com/madsmtm/objc2?branch=main)",
+ "objc2 0.6.5 (git+https://github.com/madsmtm/objc2?branch=main)",
 ]
 
 [[package]]
@@ -6528,6 +6533,18 @@ checksum = "e48e0b8b339e0d9d2ed4416b7f93f9d4daadff7d4dd797f89867cde11aeac607"
 dependencies = [
  "objc2 0.6.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "objc2-foundation 0.3.2 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "objc2-network"
+version = "0.3.2"
+source = "git+https://github.com/madsmtm/objc2?branch=main#b98d2a3e0f7b7adf83cf12c16e834752f16b0b51"
+dependencies = [
+ "block2 0.6.2 (git+https://github.com/madsmtm/objc2?branch=main)",
+ "dispatch2 0.3.1 (git+https://github.com/madsmtm/objc2?branch=main)",
+ "libc",
+ "objc2 0.6.5 (git+https://github.com/madsmtm/objc2?branch=main)",
+ "objc2-core-foundation 0.3.2 (git+https://github.com/madsmtm/objc2?branch=main)",
 ]
 
 [[package]]

@@ -170,6 +170,7 @@ objc2-core-location = { git = "https://github.com/madsmtm/objc2", branch = "main
 objc2-core-wlan = { git = "https://github.com/madsmtm/objc2", branch = "main", default-features = false }
 objc2-device-check = { git = "https://github.com/madsmtm/objc2", branch = "main", default-features = false }
 objc2-network-extension = { git = "https://github.com/madsmtm/objc2", branch = "main", default-features = false }
+objc2-network = { git = "https://github.com/madsmtm/objc2", branch = "main", default-features = false }
 
 # subql's own [patch] blocks do not reach a consumer, so the same crates are patched here.
 [patch.crates-io]

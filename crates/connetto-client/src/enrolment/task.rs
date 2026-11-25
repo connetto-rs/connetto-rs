@@ -399,9 +399,8 @@ pub(crate) struct Enroller {
     /// task does (R76).
     clock_off: Arc<AtomicBool>,
     #[cfg(feature = "peer")]
-    /// The fingerprint the device serves, its standing the peer node
-    /// reports (R76).
-    peer_serving: watch::Sender<Option<connetto_peer::Fingerprint>>,
+    /// What the device serves, its standing the peer node reports (R76).
+    peer_serving: watch::Sender<Option<Serving>>,
     #[cfg(feature = "peer")]
     peer: Option<Peer>,
     #[cfg(feature = "peer")]
@@ -432,8 +431,8 @@ pub(crate) struct EnrolHandle {
     /// The Bluetooth machine's commands, until it ends with the client (R76).
     bluetooth: mpsc::UnboundedSender<crate::bluetooth::Command>,
     #[cfg(feature = "peer")]
-    /// The fingerprint the device serves, once it serves (R76).
-    peer_serving: watch::Receiver<Option<connetto_peer::Fingerprint>>,
+    /// What the device serves, once it serves (R76).
+    peer_serving: watch::Receiver<Option<Serving>>,
     #[cfg(feature = "peer")]
     /// The port the media frames go to while one lives (R79).
     media: crate::media::MediaSlot,
@@ -596,10 +595,10 @@ impl EnrolHandle {
         }
     }
 
-    /// Where the device's peer listener binds, once the task serves (R76).
+    /// Where the device's peer listener accepts, once the task serves (R76).
     #[cfg(feature = "peer")]
     pub(crate) fn peer_address(&self) -> Option<SocketAddr> {
-        self.peer.local_addr()
+        self.peer_serving.borrow().map(|serving| serving.address)
     }
 
     /// The peers the device's node reports linked, with their links' remote addresses (R76).
@@ -625,12 +624,18 @@ impl EnrolHandle {
                 Err(PeerError::CertificateExpired)
             }
             Standing::ClockOff => Err(PeerError::ClockOutsideWindow),
-            Standing::Fresh | Standing::Aging => match self.peer.link(addr).await {
-                Ok(peer) => Ok(peer),
-                Err(LinkError::NotServing) => Err(PeerError::NoIdentity),
-                Err(LinkError::LinksOff) => Err(PeerError::LinksOff),
-                Err(err) => Err(PeerError::Link(err)),
-            },
+            Standing::Fresh | Standing::Aging => {
+                #[cfg(any(target_os = "ios", target_os = "macos"))]
+                let dialled = connetto_peer_apple::transport::link(&self.peer, addr).await;
+                #[cfg(not(any(target_os = "ios", target_os = "macos")))]
+                let dialled = self.peer.link(addr).await;
+                match dialled {
+                    Ok(peer) => Ok(peer),
+                    Err(LinkError::NotServing) => Err(PeerError::NoIdentity),
+                    Err(LinkError::LinksOff) => Err(PeerError::LinksOff),
+                    Err(err) => Err(PeerError::Link(err)),
+                }
+            }
         }
     }
 
@@ -792,8 +797,18 @@ impl EnrolHandle {
     /// The fingerprint the device serves, once it serves (R76).
     #[cfg(feature = "peer")]
     pub(crate) fn peer_serving_fingerprint(&self) -> Option<connetto_peer::Fingerprint> {
-        *self.peer_serving.borrow()
+        self.peer_serving.borrow().map(|serving| serving.fingerprint)
     }
+}
+
+/// What a serving device offers its peers (R76).
+#[cfg(feature = "peer")]
+#[derive(Debug, Clone, Copy)]
+struct Serving {
+    /// The leaf fingerprint discovery advertises.
+    fingerprint: connetto_peer::Fingerprint,
+    /// Where the peer listener accepts.
+    address: SocketAddr,
 }
 
 /// How long to sleep before looking at `held` again.
@@ -894,6 +909,10 @@ struct Run<L: Link> {
     peer: connetto_peer::Node,
     #[cfg(feature = "peer")]
     peer_listen: SocketAddr,
+    /// The Network framework listener the node accepts through on Apple,
+    /// while the standing serves (R112).
+    #[cfg(all(feature = "peer", any(target_os = "ios", target_os = "macos")))]
+    listener: Option<connetto_peer_apple::transport::Listener>,
     #[cfg(feature = "peer")]
     peer_standing: Standing,
     /// The peer link's events, until the task ends them (R76).
@@ -1379,8 +1398,12 @@ impl<L: Link> Run<L> {
             issuer,
             key,
         };
-        match self.peer.listen(self.peer_listen) {
-            Ok(bound) => {
+        #[cfg(any(target_os = "ios", target_os = "macos"))]
+        let bound = self.listen_apple().await;
+        #[cfg(not(any(target_os = "ios", target_os = "macos")))]
+        let bound = self.peer.listen(self.peer_listen);
+        match bound {
+            Ok(address) => {
                 // Presented after the bind, so a port that will not bind
                 // leaves the node presenting nothing.
                 self.peer.present(identity);
@@ -1394,8 +1417,11 @@ impl<L: Link> Run<L> {
                         ),
                     }
                 }
-                self.enroller.peer_serving.send_replace(Some(fingerprint));
-                self.discovery.serve(bound.port(), fingerprint);
+                self.enroller.peer_serving.send_replace(Some(Serving {
+                    fingerprint,
+                    address,
+                }));
+                self.discovery.serve(address.port(), fingerprint);
             }
             Err(err) => {
                 tracing::warn!(error = %err, "the peer listener could not bind");
@@ -1408,6 +1434,25 @@ impl<L: Link> Run<L> {
         }
     }
 
+    /// Start the Network framework listener, or answer the running one's
+    /// address (R112).
+    #[cfg(all(feature = "peer", any(target_os = "ios", target_os = "macos")))]
+    async fn listen_apple(&mut self) -> std::io::Result<SocketAddr> {
+        let listener = match self.listener.take() {
+            Some(listener) => listener,
+            None => {
+                connetto_peer_apple::transport::Listener::start(
+                    self.peer.clone(),
+                    self.peer_listen,
+                )
+                .await?
+            }
+        };
+        let address = SocketAddr::new(self.peer_listen.ip(), listener.port());
+        self.listener = Some(listener);
+        Ok(address)
+    }
+
     /// Close every peer link with `reason` and take the listener, which is a
     /// no-op when the node serves nothing (R76).
     #[cfg(feature = "peer")]
@@ -1417,6 +1462,10 @@ impl<L: Link> Run<L> {
         #[cfg(all(feature = "peer", target_os = "android"))]
         {
             self.multicast = None;
+        }
+        #[cfg(all(feature = "peer", any(target_os = "ios", target_os = "macos")))]
+        {
+            self.listener = None;
         }
         self.discovery.stop();
         self.peer.stop(reason);
@@ -1537,6 +1586,8 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
         peer: peer.node,
         #[cfg(feature = "peer")]
         peer_listen: peer.listen,
+        #[cfg(all(feature = "peer", any(target_os = "ios", target_os = "macos")))]
+        listener: None,
         #[cfg(feature = "peer")]
         peer_standing: Standing::NoKey,
         #[cfg(feature = "peer")]

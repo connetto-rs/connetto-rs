@@ -1076,7 +1076,7 @@ where
                             Arc::new(crate::hotspot::UnsupportedBackend)
                         }
                     };
-                    let port_node = peer_node.clone();
+                    let port_handle = handle.clone();
                     #[cfg(target_os = "android")]
                     let bind_node = peer_node.clone();
                     let dial_handle = handle.clone();
@@ -1103,7 +1103,7 @@ where
                     let machine = crate::hotspot::Machine::new(
                         backend,
                         device.peer_autolink,
-                        Arc::new(move || port_node.local_addr().map(|addr| addr.port())),
+                        Arc::new(move || port_handle.peer_address().map(|addr| addr.port())),
                         bind,
                         Arc::new(
                             move |addr: SocketAddr,
