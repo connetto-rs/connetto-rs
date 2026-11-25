@@ -49,8 +49,8 @@ pub use connetto_core::bots::{TextIds, UuidIds};
 use connetto_core::sql::quote_ident;
 use connetto_core::{
     AUDIT_TABLE, BOT_LIST_FUNCTION, BOT_LIST_SEPARATOR, BOT_LIST_SETTING, BOT_LIST_WILDCARD,
-    CALLER_FUNCTION, HelperFunction, ReplicaCopy, SUBJECTS_FUNCTION, SchemaBundle, SharedLayout,
-    UUID_FUNCTION, WRITE_EXEMPTION_FUNCTION,
+    CALLER_FUNCTION, DERIVED_WRITE_FUNCTION, HelperFunction, ReplicaCopy, SUBJECTS_FUNCTION,
+    SchemaBundle, SharedLayout, SharedOverlay, UUID_FUNCTION, WRITE_EXEMPTION_FUNCTION,
 };
 /// The caller kinds and the roles they act as, which build scripts pass to
 /// `emit` through [`Documents`], re-exported beside it.
@@ -58,7 +58,9 @@ pub use connetto_core::{CallerKind, KindRoles};
 use diesel::connection::SimpleConnection;
 use diesel::{Connection, SqliteConnection};
 use pg2sqlite::manifest::WrapperKind;
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
+use pg2sqlite::prelude::{
+    Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, TranslationWarning, UuidRepresentation,
+};
 use pg2sqlite::script::{FreshFiles, Script};
 use sql_traits::errors::DeploymentError;
 use sql_traits::prelude::{Deployment, SessionSetting, SetPacking, SettingValue};
@@ -70,7 +72,10 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::{Parser, ParserError};
 use sqlparser::tokenizer::{Location, Token};
 use thiserror::Error;
+mod acknowledge;
 mod boundary;
+
+pub use acknowledge::{Acknowledgements, Unacknowledged, WarningPlace};
 
 diesel::table! {
     /// SQLite's own catalogue, read to list the views a translation built.
@@ -230,6 +235,10 @@ pub enum SchemaError {
     /// The schema source does not declare a usable major.
     #[error("the schema source does not declare a usable major: {0}")]
     Major(#[from] connetto_core::MajorError),
+    /// A warning refuses the build unacknowledged, or an acknowledgement
+    /// names a place no refusing warning holds.
+    #[error(transparent)]
+    Unacknowledged(#[from] Unacknowledged),
 }
 
 /// The tables the schema document creates, in document order.
@@ -602,20 +611,23 @@ impl<'a> Documents<'a> {
 ///
 /// The options are connetto's, not the caller's. They fix the `uuidv4` representation
 /// and function, the `rls_audit` table, the `connetto_write_exempt` function,
-/// the caller, subjects and bot-list mappings built from the core constants,
-/// and the [`deployment`] description. `K` names the capability key type,
+/// the `jsonb` functions and collation, the caller, subjects and bot-list
+/// mappings built from the core constants, and the [`deployment`]
+/// description. `K` names the capability key type,
 /// which fixes the subjects setting and separator the deployment declares.
 /// The documents are translated in the order a migration applies them,
 /// schema, roles, policies, then the [`cap_policies`] the schema and policies
 /// generate, so the replica holds the cap its Postgres source holds. Each
 /// kind's copy is translated as the role that kind acts as, so its policies
 /// and grants are the ones PostgreSQL applies to that kind's callers, and
-/// kinds whose translations are equal share one copy. The schema reaches the
-/// replica translation without its references, which the server alone
-/// enforces, while the bundle keeps the source as written. Every copy's DDL
-/// is applied to a throwaway in-memory database first, so a translation
-/// SQLite refuses is an error here rather than a boot-time failure on the
-/// client.
+/// kinds whose translations are equal share one copy. Each copy runs every
+/// trigger whole and marks the writes the server derives with
+/// [`DERIVED_WRITE_FUNCTION`], so a client keeps them out of its upload. The
+/// schema reaches the replica translation without its references, which the
+/// server alone enforces, while the bundle keeps the source as written. Every
+/// copy's DDL is applied to a throwaway in-memory database first, so a
+/// translation SQLite refuses is an error here rather than a boot-time
+/// failure on the client.
 ///
 /// # Errors
 ///
@@ -627,6 +639,28 @@ impl<'a> Documents<'a> {
 pub fn translate<K: CapabilityKey, Id: BotRegistryIdSql>(
     documents: Documents<'_>,
 ) -> Result<SchemaBundle, SchemaError> {
+    translated::<K, Id>(documents, &[], &[]).map(|report| report.bundle)
+}
+
+/// A translated deployment and every warning pg2sqlite raised translating its
+/// synced tier.
+#[derive(Debug)]
+pub struct TranslationReport {
+    /// The bundle [`translate`] returns.
+    pub bundle: SchemaBundle,
+    /// What the replicas drop, downgrade or leave to the server, in the
+    /// order pg2sqlite met it, each once across the kinds' copies.
+    pub warnings: Vec<TranslationWarning>,
+}
+
+/// As [`translate`], keeping every warning the translation raised.
+///
+/// # Errors
+///
+/// As [`translate`].
+pub fn translate_with_report<K: CapabilityKey, Id: BotRegistryIdSql>(
+    documents: Documents<'_>,
+) -> Result<TranslationReport, SchemaError> {
     translated::<K, Id>(documents, &[], &[])
 }
 
@@ -649,18 +683,20 @@ pub fn translate_shared<K: CapabilityKey, Id: BotRegistryIdSql>(
     shared: &[&str],
 ) -> Result<SchemaBundle, SchemaError> {
     let shared = shared_tables::<Id>(documents.schema, shared)?;
-    translated::<K, Id>(documents, &shared, &[])
+    translated::<K, Id>(documents, &shared, &[]).map(|report| report.bundle)
 }
 
-/// The shared step behind [`translate`], [`translate_shared`] and [`emit`]:
-/// translate the synced tier once per kind, compile each copy's layout when
-/// `shared` is non-empty, and give every copy the local tier's
-/// `tier_functions` beside its own helpers.
+/// The shared step behind [`translate`], [`translate_with_report`],
+/// [`translate_shared`] and [`emit`]: translate the synced tier once per
+/// kind, compile each copy's layout when `shared` is non-empty, and give
+/// every copy the local tier's `tier_functions` beside its own helpers. The
+/// warnings are the unshared translations', since the shared translation
+/// places the same tables elsewhere.
 fn translated<K: CapabilityKey, Id: BotRegistryIdSql>(
     documents: Documents<'_>,
     shared: &[String],
     tier_functions: &[HelperFunction<String>],
-) -> Result<SchemaBundle, SchemaError> {
+) -> Result<TranslationReport, SchemaError> {
     let schema_sql = with_registry::<Id>(documents.schema);
     let policies_sql = documents.policies;
     let mut translator = parsed_documents(&without_references(&schema_sql)?, "")?;
@@ -676,9 +712,15 @@ fn translated<K: CapabilityKey, Id: BotRegistryIdSql>(
     }
     let mut distinct: Vec<std::sync::Arc<ReplicaCopy>> = Vec::with_capacity(CallerKind::ALL.len());
     let mut held = Vec::with_capacity(CallerKind::ALL.len());
+    let mut warnings: Vec<TranslationWarning> = Vec::new();
     for kind in CallerKind::ALL {
-        let copy = kind_copy::<K>(&translator, documents, kind, shared)?
-            .with_helper_functions(tier_functions.iter().cloned());
+        let (copy, kind_warnings) = kind_copy::<K>(&translator, documents, kind, shared)?;
+        for warning in kind_warnings {
+            if !warnings.contains(&warning) {
+                warnings.push(warning);
+            }
+        }
+        let copy = copy.with_helper_functions(tier_functions.iter().cloned());
         let copy = if let Some(seen) = distinct.iter().find(|seen| ***seen == copy) {
             std::sync::Arc::clone(seen)
         } else {
@@ -692,17 +734,21 @@ fn translated<K: CapabilityKey, Id: BotRegistryIdSql>(
     let (_, first) = held.next().expect("CallerKind::ALL names every kind");
     let bundle = SchemaBundle::new(schema_sql, policies_sql, first, None::<&str>)?
         .with_unset_settings(documents.unset_settings);
-    Ok(held.fold(bundle, |bundle, (kind, copy)| bundle.with_copy(kind, copy)))
+    Ok(TranslationReport {
+        bundle: held.fold(bundle, |bundle, (kind, copy)| bundle.with_copy(kind, copy)),
+        warnings,
+    })
 }
 
 /// The copy a caller of `kind` opens, translated as the role that kind acts
-/// as, with its shared store layout when `shared` is non-empty.
+/// as, with its shared store layout when `shared` is non-empty, and the
+/// warnings its translation raised.
 fn kind_copy<K: CapabilityKey>(
     translator: &Pg2Sqlite,
     documents: Documents<'_>,
     kind: CallerKind,
     shared: &[String],
-) -> Result<ReplicaCopy, SchemaError> {
+) -> Result<(ReplicaCopy, Vec<TranslationWarning>), SchemaError> {
     let options = kind_options::<K>(
         documents.reader_role,
         documents.kind_roles,
@@ -734,12 +780,23 @@ fn kind_copy<K: CapabilityKey>(
         let shared_report = translator
             .translate_with_report(&shared_options)
             .map_err(|err| SchemaError::Translate(err.to_string()))?;
-        let layout = shared_layout(&shared_report.script)?;
+        let manifest = translator
+            .translation_manifest(&shared_options)
+            .map_err(|err| SchemaError::Translate(err.to_string()))?;
+        let overlays = manifest.into_iter().filter_map(|entry| {
+            entry
+                .overlay
+                .zip(entry.shared_write)
+                .map(|(overlay, shared_write)| {
+                    SharedOverlay::new(entry.logical, entry.physical, overlay, shared_write)
+                })
+        });
+        let layout = shared_layout(&shared_report.script)?.with_overlays(overlays);
         copy = copy
             .with_shared_layout(layout)
             .with_helper_functions(helper_functions(shared_report.script));
     }
-    Ok(copy)
+    Ok((copy, report.warnings))
 }
 
 /// `schema_sql` with every column `REFERENCES` and table `FOREIGN KEY` clause
@@ -1022,7 +1079,13 @@ fn rerun_history(dir: &Path) -> Result<(), SchemaError> {
 /// validates every DDL against a throwaway SQLite database, checks `shared`
 /// under [`shared_tables`], and writes `connetto-translate.rs` under `OUT_DIR`.
 /// It prints `cargo::rerun-if-changed` for every file it reads, the history
-/// directory's files included.
+/// directory's files included, and a `cargo::warning` for every warning the
+/// translation raised, with the reason `acknowledged` gives for it.
+///
+/// A `LossyDowngrade`, `UnreadableRowKey` or `RlsDeniesEveryRow` warning
+/// refuses the build unless `acknowledged` names its [`WarningPlace`], and an
+/// acknowledgement whose place holds none refuses it too, as an unfulfilled
+/// `#[expect]` does. Every other warning is shown only.
 ///
 /// The application that ships the schema includes the file and reads the
 /// bundle through the module it defines:
@@ -1041,15 +1104,17 @@ fn rerun_history(dir: &Path) -> Result<(), SchemaError> {
 /// # Errors
 ///
 /// As [`translate`] and [`shared_tables`], plus [`SchemaError::MissingOutDir`]
-/// outside a build script, [`SchemaError::Sqlite`] for a refused local tier,
-/// the tier history errors for a build with a tier, and
-/// [`SchemaError::TierHistory`] when the history does not reach the bundle's
-/// major.
+/// outside a build script, [`SchemaError::Unacknowledged`] when `acknowledged`
+/// leaves a refusing warning out or names a place holding none,
+/// [`SchemaError::Sqlite`] for a refused local tier, the tier history errors
+/// for a build with a tier, and [`SchemaError::TierHistory`] when the history
+/// does not reach the bundle's major.
 pub fn emit<K: CapabilityKey, Id: BotRegistryIdSql>(
     sources: [&Path; 3],
     reader_role: &str,
     kind_roles: &KindRoles,
     unset_settings: UnsetSettings,
+    acknowledged: &Acknowledgements,
     tier: Option<&TierSource>,
     shared: &[&str],
 ) -> Result<(), SchemaError> {
@@ -1059,6 +1124,7 @@ pub fn emit<K: CapabilityKey, Id: BotRegistryIdSql>(
         reader_role,
         kind_roles,
         unset_settings,
+        acknowledged,
         tier,
         shared,
         Path::new(&out_dir),
@@ -1071,11 +1137,16 @@ pub fn emit<K: CapabilityKey, Id: BotRegistryIdSql>(
 /// # Errors
 ///
 /// As [`emit`], minus [`SchemaError::MissingOutDir`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Each input is a separate document or declaration of the deployment's build."
+)]
 pub(crate) fn emit_to<K: CapabilityKey, Id: BotRegistryIdSql>(
     sources: [&Path; 3],
     reader_role: &str,
     kind_roles: &KindRoles,
     unset_settings: UnsetSettings,
+    acknowledged: &Acknowledgements,
     tier: Option<&TierSource>,
     shared: &[&str],
     out_dir: &Path,
@@ -1104,13 +1175,23 @@ pub(crate) fn emit_to<K: CapabilityKey, Id: BotRegistryIdSql>(
     let tier_functions = tier
         .as_ref()
         .map_or(&[][..], |(_, (_, functions))| functions);
-    let mut bundle = translated::<K, Id>(
+    let report = translated::<K, Id>(
         Documents::new(&schema_sql, &policies_sql, &roles_sql, reader_role)
             .with_kind_roles(kind_roles)
             .with_unset_settings(unset_settings),
         &shared,
         tier_functions,
     )?;
+    for warning in &report.warnings {
+        let line = match acknowledged.reason_for(warning) {
+            Some(reason) => format!("{warning}, acknowledged: {reason}"),
+            None => warning.to_string(),
+        };
+        // Cargo reads one directive per line.
+        println!("cargo::warning={}", line.replace('\n', " "));
+    }
+    acknowledged.check(&report.warnings)?;
+    let mut bundle = report.bundle;
     if let Some((tier, (tier_ddl, _))) = tier {
         let history = boundary::tier_history(tier.history(), bundle.major(), &tier_ddl)?;
         bundle = bundle
@@ -1123,14 +1204,16 @@ pub(crate) fn emit_to<K: CapabilityKey, Id: BotRegistryIdSql>(
 }
 
 /// The fixed option set every document translates under: the `uuidv4`
-/// representation and function, the `rls_audit` table and the
-/// `connetto_write_exempt` function.
+/// representation and function, the `rls_audit` table, the
+/// `connetto_write_exempt` function and connetto's `jsonb` functions and
+/// collation.
 fn options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_function_name(UUID_FUNCTION)
         .with_rls_audit_table_name(AUDIT_TABLE.to_string())
         .with_rls_exemption_function(WRITE_EXEMPTION_FUNCTION)
+        .with_jsonb_functions(connetto_core::schema::jsonb_functions())
 }
 
 /// The pg2sqlite options a client's query reverse translates under on the
@@ -1164,12 +1247,16 @@ pub fn query_options<K: CapabilityKey>(
 }
 
 /// The [`query_options`] the build translates `kind`'s copy under, acting
-/// as the role `kind` acts as.
+/// as the role `kind` acts as, with every write the server derives from a
+/// client's write marked by [`DERIVED_WRITE_FUNCTION`].
 ///
 /// Acting as the kind's role settles every policy's `TO` clause the way
 /// PostgreSQL settles it for the server's `SET ROLE` to that role, and holds
 /// each table to the role's grants: a table the role cannot read stays out
-/// of the replica, and one it can only read is read-only there.
+/// of the replica, and one it can only read is read-only there. The replica
+/// runs every trigger whole, so a client sees the rows its writes derive at
+/// once, and keeps the marked rows out of its upload, so a client write never
+/// uploads a row its caller may not insert.
 ///
 /// # Errors
 ///
@@ -1181,7 +1268,8 @@ fn kind_options<K: CapabilityKey>(
     kind: CallerKind,
 ) -> Result<Pg2SqliteOptions, SchemaError> {
     Ok(query_options::<K>(reader_role, kind_roles, unset_settings)?
-        .with_acting_role(kind_roles.role(kind)))
+        .with_acting_role(kind_roles.role(kind))
+        .with_server_derived_write_function(DERIVED_WRITE_FUNCTION))
 }
 
 /// Parse the documents into one translator, in the given order.
@@ -1278,20 +1366,26 @@ fn statements_to_ddl<'a>(statements: impl Iterator<Item = &'a Statement>) -> Str
     ddl
 }
 
-/// Apply `ddl` to a throwaway in-memory database and fail when SQLite
-/// refuses it.
+/// A throwaway in-memory database with connetto's `jsonb` functions and
+/// collation registered, as every replica connection has them.
+fn probe(tier: &'static str) -> Result<SqliteConnection, SchemaError> {
+    let refused = |detail: String| SchemaError::Sqlite { tier, detail };
+    let mut probe =
+        SqliteConnection::establish(":memory:").map_err(|err| refused(err.to_string()))?;
+    connetto_core::schema::jsonb_functions()
+        .register(&mut probe)
+        .map_err(|err| refused(err.to_string()))?;
+    Ok(probe)
+}
+
+/// Apply `ddl` to a [`probe`] and fail when SQLite refuses it.
 fn validate(ddl: &str, tier: &'static str) -> Result<(), SchemaError> {
-    let mut probe = SqliteConnection::establish(":memory:").map_err(|err| SchemaError::Sqlite {
-        tier,
-        detail: err.to_string(),
-    })?;
-    probe
+    probe(tier)?
         .batch_execute(ddl)
         .map_err(|err| SchemaError::Sqlite {
             tier,
             detail: err.to_string(),
-        })?;
-    Ok(())
+        })
 }
 
 /// The views a translation creates, read off the `CREATE VIEW` statements it
@@ -1351,26 +1445,36 @@ fn selection(
     Ok(statements_to_ddl(program))
 }
 
-/// Apply `program` to a throwaway in-memory database with the shared store
-/// attached, failing when SQLite refuses it.
+/// Apply `program` to a [`probe`] with the shared store attached, failing
+/// when SQLite refuses it.
 fn validate_shared(program: &str) -> Result<(), SchemaError> {
-    let mut probe = SqliteConnection::establish(":memory:").map_err(|err| SchemaError::Sqlite {
-        tier: "shared store",
-        detail: err.to_string(),
-    })?;
+    let tier = "shared store";
+    let mut probe = probe(tier)?;
     probe
         .batch_execute("ATTACH ':memory:' AS connetto_shared")
+        .and_then(|()| probe.batch_execute(program))
         .map_err(|err| SchemaError::Sqlite {
-            tier: "shared store",
+            tier,
             detail: err.to_string(),
-        })?;
-    probe
-        .batch_execute(program)
-        .map_err(|err| SchemaError::Sqlite {
-            tier: "shared store",
-            detail: err.to_string(),
-        })?;
-    Ok(())
+        })
+}
+
+/// `layout`'s overlays as the entries of a `SharedOverlay::new` argument array.
+fn overlay_literals(layout: &SharedLayout) -> String {
+    layout
+        .overlays()
+        .iter()
+        .map(|overlay| {
+            format!(
+                "connetto_core::SharedOverlay::new({}, {}, {}, {})",
+                raw_literal(overlay.logical()),
+                raw_literal(overlay.physical()),
+                raw_literal(overlay.overlay()),
+                raw_literal(overlay.shared_write()),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The file an application `include!`s.
@@ -1480,11 +1584,12 @@ fn copy_function(index: usize, copy: &ReplicaCopy) -> String {
         .join(", ");
     let layout = copy.shared_layout().map_or_else(String::new, |layout| {
         format!(
-            "\n.with_shared_layout(connetto_core::SharedLayout::new({}, {}, {}, {}))",
+            "\n.with_shared_layout(connetto_core::SharedLayout::new({}, {}, {}, {}).with_overlays([{}]))",
             raw_literal(layout.sql(true, true)),
             raw_literal(layout.sql(true, false)),
             raw_literal(layout.sql(false, true)),
             raw_literal(layout.sql(false, false)),
+            overlay_literals(layout),
         )
     });
     format!(
@@ -1833,6 +1938,86 @@ mod tests {
         }
     }
 
+    /// A policy reading into a `jsonb` column holds on the replica, which
+    /// registers connetto's `jsonb` functions and collation.
+    #[test]
+    fn a_policy_reading_a_jsonb_column_holds_on_the_replica() {
+        let schema = majored("CREATE TABLE docs (id INT PRIMARY KEY, body JSONB NOT NULL);");
+        let policies = "ALTER TABLE docs ENABLE ROW LEVEL SECURITY; \
+                        CREATE POLICY docs_owner ON docs FOR ALL \
+                          USING (body->>'owner' = current_setting('app.user_id', true));";
+        let bundle = translate::<String, TextIds>(documents(&schema, policies))
+            .expect("a jsonb column under a policy translates");
+        let mut conn = SqliteConnection::establish(":memory:").expect("open the replica");
+        let exemption = register_replica_functions(&mut conn, "alice", BOT_LIST_WILDCARD);
+        conn.batch_execute(bundle.copy(CallerKind::Authenticated).replica_ddl())
+            .expect("the replica DDL applies");
+        conn.batch_execute(
+            "INSERT INTO docs (id, body) VALUES \
+             (1, '{\"owner\": \"alice\"}'), (2, '{\"owner\": \"bob\"}')",
+        )
+        .expect("the exempt writes land");
+        exemption.store(false, std::sync::atomic::Ordering::Relaxed);
+        let visible = diesel::select(diesel::dsl::sql::<diesel::sql_types::Text>(
+            "(SELECT group_concat(id) FROM (SELECT id FROM docs ORDER BY id))",
+        ))
+        .get_result::<String>(&mut conn)
+        .expect("the read of the policy view succeeds");
+        assert_eq!(visible, "1", "the policy admits alice's document alone");
+    }
+
+    /// A translated trigger derives its row inside a marked run.
+    #[test]
+    fn the_replica_runs_a_server_derived_write() {
+        let schema = majored(
+            "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT); \
+             CREATE TABLE note_log (id INT PRIMARY KEY); \
+             CREATE FUNCTION log_note() RETURNS TRIGGER LANGUAGE plpgsql SECURITY DEFINER AS $$ \
+               BEGIN INSERT INTO note_log (id) VALUES (NEW.id); RETURN NEW; END $$; \
+             ALTER FUNCTION log_note() OWNER TO trigger_owner; \
+             CREATE TRIGGER notes_log AFTER INSERT ON notes \
+               FOR EACH ROW EXECUTE FUNCTION log_note();",
+        );
+        let roles = "CREATE ROLE app_reader LOGIN;\n\
+                     CREATE ROLE anon NOLOGIN;\n\
+                     CREATE ROLE authenticated NOLOGIN;\n\
+                     CREATE ROLE bot_installation NOLOGIN;\n\
+                     CREATE ROLE bot NOLOGIN;\n\
+                     CREATE ROLE delegated NOLOGIN;\n\
+                     GRANT anon, authenticated, bot_installation, bot, delegated TO app_reader \
+                       WITH INHERIT FALSE, SET TRUE;\n\
+                     CREATE ROLE trigger_owner BYPASSRLS;\n\
+                     GRANT USAGE ON SCHEMA public TO trigger_owner;\n\
+                     GRANT INSERT ON note_log TO trigger_owner;\n\
+                     GRANT USAGE ON SCHEMA public TO anon, authenticated, bot_installation, bot, delegated;\n\
+                     GRANT SELECT, INSERT ON notes TO anon, authenticated, bot_installation, bot, delegated;\n\
+                     GRANT SELECT ON note_log TO anon, authenticated, bot_installation, bot, delegated;";
+        let report =
+            translate_with_report::<String, TextIds>(Documents::new(&schema, "", roles, READER))
+                .expect("a derived write translates");
+        assert!(
+            !report.warnings.iter().any(|warning| matches!(
+                warning,
+                TranslationWarning::LeftToServer { name, .. } if name == "notes_log"
+            )),
+            "the trigger must run on the replica: {:?}",
+            report.warnings
+        );
+        let mut conn = SqliteConnection::establish(":memory:").expect("open the replica");
+        let exemption = register_replica_functions(&mut conn, "alice", BOT_LIST_WILDCARD);
+        conn.batch_execute(report.bundle.copy(CallerKind::Authenticated).replica_ddl())
+            .expect("the replica DDL applies");
+        exemption.store(false, std::sync::atomic::Ordering::Relaxed);
+        conn.batch_execute("INSERT INTO notes (id, body) VALUES (1, 'b')")
+            .expect("the client's write lands");
+        let derived = diesel::select(diesel::dsl::sql::<diesel::sql_types::BigInt>(
+            "(SELECT count(*) FROM note_log)",
+        ))
+        .get_result::<i64>(&mut conn)
+        .expect("the log reads");
+        assert_eq!(derived, 1, "the replica writes the derived row");
+    }
+
     /// The derivation and the database agree on the views over the
     /// deployment's own schema and policies.
     #[test]
@@ -2158,6 +2343,9 @@ mod tests {
     /// Both caller settings always bound, the declaration most tests build.
     const ALWAYS: UnsetSettings = UnsetSettings::ALWAYS_BOUND;
 
+    /// No acknowledgements, so every refusing warning refuses the build.
+    const UNACKNOWLEDGED: Acknowledgements = Acknowledgements::new();
+
     /// A table keyed on a `uuid` owner, with a public flag every caller reads.
     const UUID_OWNER_SCHEMA: &str = "-- connetto:major 1\nCREATE TABLE owned \
                                      (id INT PRIMARY KEY, owner UUID, public BOOLEAN NOT NULL);";
@@ -2251,6 +2439,7 @@ mod tests {
             READER,
             KindRoles::defaults(),
             ALWAYS,
+            &UNACKNOWLEDGED,
             None,
             &[],
             &out,
@@ -2299,6 +2488,7 @@ mod tests {
             READER,
             KindRoles::defaults(),
             ALWAYS,
+            &UNACKNOWLEDGED,
             None,
             &[],
             &out,
@@ -2353,6 +2543,7 @@ mod tests {
             READER,
             KindRoles::defaults(),
             ALWAYS,
+            &UNACKNOWLEDGED,
             Some(&source),
             &[],
             &out,
@@ -2386,6 +2577,7 @@ mod tests {
             READER,
             KindRoles::defaults(),
             ALWAYS,
+            &UNACKNOWLEDGED,
             Some(&source),
             &[],
             &out,
@@ -2420,6 +2612,7 @@ mod tests {
             READER,
             KindRoles::defaults(),
             ALWAYS,
+            &UNACKNOWLEDGED,
             Some(&source),
             &[],
             &out,
@@ -2449,6 +2642,7 @@ mod tests {
             READER,
             KindRoles::defaults(),
             ALWAYS,
+            &UNACKNOWLEDGED,
             Some(&source),
             &[],
             &out,
@@ -2481,6 +2675,7 @@ mod tests {
             READER,
             KindRoles::defaults(),
             ALWAYS,
+            &UNACKNOWLEDGED,
             Some(&source),
             &[],
             &out,
@@ -2672,6 +2867,7 @@ mod tests {
             READER,
             KindRoles::defaults(),
             ALWAYS,
+            &UNACKNOWLEDGED,
             Some(&source),
             &[],
             &out,
@@ -2684,6 +2880,7 @@ mod tests {
             READER,
             KindRoles::defaults(),
             ALWAYS,
+            &UNACKNOWLEDGED,
             Some(&source),
             &[],
             &out,
@@ -2735,6 +2932,7 @@ mod tests {
             READER,
             KindRoles::defaults(),
             ALWAYS,
+            &UNACKNOWLEDGED,
             None,
             &[],
             &out,
@@ -2747,6 +2945,7 @@ mod tests {
             READER,
             KindRoles::defaults(),
             ALWAYS,
+            &UNACKNOWLEDGED,
             None,
             &[],
             &out,
@@ -2777,6 +2976,7 @@ mod tests {
             READER,
             KindRoles::defaults(),
             ALWAYS,
+            &UNACKNOWLEDGED,
             Some(&source),
             &[],
             &out,
@@ -2805,6 +3005,7 @@ mod tests {
             READER,
             KindRoles::defaults(),
             ALWAYS,
+            &UNACKNOWLEDGED,
             None,
             &[],
         )
@@ -2825,6 +3026,7 @@ mod tests {
             READER,
             KindRoles::defaults(),
             ALWAYS,
+            &UNACKNOWLEDGED,
             None,
             &[],
             &out,
@@ -2840,12 +3042,66 @@ mod tests {
             READER,
             KindRoles::defaults(),
             ALWAYS,
+            &UNACKNOWLEDGED,
             None,
             &[],
             &out,
         )
         .expect_err("a directory where the bundle file should be refuses");
         assert!(matches!(err, SchemaError::Io(_)));
+    }
+
+    /// A downgraded column refuses the build until the deployment
+    /// acknowledges that column, and an acknowledgement of a place holding no
+    /// warning refuses it too.
+    #[test]
+    fn emit_refuses_a_downgrade_until_its_place_is_acknowledged() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let (sources, _, _) = emit_inputs(dir.path(), 1);
+        std::fs::write(
+            &sources[0],
+            majored("CREATE TABLE orders (id INT PRIMARY KEY, currency CHAR(3));"),
+        )
+        .expect("the schema source writes");
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).expect("the output directory writes");
+        let emitted = |acknowledged: &Acknowledgements| {
+            emit_to::<String, TextIds>(
+                paths(&sources),
+                READER,
+                KindRoles::defaults(),
+                ALWAYS,
+                acknowledged,
+                None,
+                &[],
+                &out,
+            )
+        };
+        let Err(SchemaError::Unacknowledged(refused)) = emitted(&UNACKNOWLEDGED) else {
+            panic!("an unacknowledged downgrade refuses the build");
+        };
+        assert!(
+            matches!(
+                refused.unacknowledged.as_slice(),
+                [TranslationWarning::LossyDowngrade {
+                    location: pg2sqlite::warnings::DowngradeLocation::Column { table, column },
+                    ..
+                }] if table == "orders" && column == "currency"
+            ),
+            "the column downgrade alone refuses: {refused}"
+        );
+        let currency = Acknowledgements::new().with(
+            WarningPlace::column("orders", "currency"),
+            "currency codes are always three letters",
+        );
+        emitted(&currency).expect("the acknowledged downgrade builds");
+        let Err(SchemaError::Unacknowledged(refused)) =
+            emitted(&currency.with(WarningPlace::table("orders"), "nothing to acknowledge"))
+        else {
+            panic!("an acknowledgement holding no warning refuses the build");
+        };
+        assert_eq!(refused.unacknowledged, []);
+        assert_eq!(refused.unfulfilled, [WarningPlace::table("orders")]);
     }
 
     /// The rendered bundle attaches the tier history the build read, its
@@ -2951,6 +3207,77 @@ mod tests {
         .expect("the schema translates with a shared store")
     }
 
+    #[test]
+    fn shared_derived_tables_carry_the_manifest_overlay_names() {
+        let schema = majored(
+            "CREATE TABLE sources (id INT PRIMARY KEY); \
+             CREATE TABLE entries (id INT PRIMARY KEY, body TEXT); \
+             CREATE FUNCTION derive_entry() RETURNS TRIGGER LANGUAGE plpgsql AS $$ \
+               BEGIN INSERT INTO entries VALUES (NEW.id, 'derived'); RETURN NEW; END $$; \
+             CREATE TRIGGER sources_derive AFTER INSERT ON sources \
+               FOR EACH ROW EXECUTE FUNCTION derive_entry();",
+        );
+        let documents = documents(&schema, "");
+        let bundle = translate_shared::<String, TextIds>(documents, &["entries"])
+            .expect("a shared derived table translates");
+        let layout = bundle
+            .copy(CallerKind::Authenticated)
+            .shared_layout()
+            .expect("the shared layout");
+        let overlays = layout.overlays();
+        assert_eq!(overlays.len(), 1);
+        assert_eq!(overlays[0].logical(), "entries");
+        assert_eq!(overlays[0].physical(), "entries_rls_pg2sqlite_shared");
+        assert_eq!(overlays[0].overlay(), "entries_rls_pg2sqlite_overlay");
+        assert_eq!(
+            overlays[0].shared_write(),
+            "entries_rls_pg2sqlite_shared_write"
+        );
+        let unshared = translate::<String, TextIds>(Documents::new(&schema, "", ROLES, READER))
+            .expect("the unshared schema translates");
+        assert_eq!(bundle.version(), unshared.version());
+        for (fresh_main, fresh_shared) in
+            [(true, true), (true, false), (false, true), (false, false)]
+        {
+            let statements = Parser::parse_sql(
+                &sqlparser::dialect::SQLiteDialect {},
+                layout.sql(fresh_main, fresh_shared),
+            )
+            .expect("the lifecycle program parses");
+            let creates = |table_name: &str| {
+                statements.iter().any(|statement| {
+                    matches!(statement, Statement::CreateTable(table)
+                        if table.name.0.last().and_then(ObjectNamePart::as_ident)
+                            .is_some_and(|name| name.value == table_name))
+                })
+            };
+            assert_eq!(creates(overlays[0].overlay()), fresh_main);
+            assert_eq!(creates(overlays[0].physical()), fresh_shared);
+            assert!(creates(overlays[0].shared_write()));
+        }
+        let mut connection = conn_with_shared(":memory:");
+        let exemption = register_replica_functions(&mut connection, "alice", BOT_LIST_WILDCARD);
+        connection
+            .batch_execute(layout.sql(true, true))
+            .expect("initialize the layout");
+        exemption.store(false, std::sync::atomic::Ordering::Relaxed);
+        connection
+            .batch_execute("INSERT INTO sources VALUES (1)")
+            .expect("derive an entry");
+        let counts = diesel::select(diesel::dsl::sql::<diesel::sql_types::Text>(
+            "(SELECT count(*) FROM entries) || ',' || \
+             (SELECT count(*) FROM main.entries_rls_pg2sqlite_overlay) || ',' || \
+             (SELECT count(*) FROM connetto_shared.entries_rls_pg2sqlite_shared)",
+        ))
+        .get_result::<String>(&mut connection)
+        .expect("read logical and physical rows");
+        assert_eq!(counts, "1,1,0");
+        let rendered = render(&bundle, "");
+        assert!(rendered.contains(
+            ".with_overlays([connetto_core::SharedOverlay::new(r\"entries\", r\"entries_rls_pg2sqlite_shared\", r\"entries_rls_pg2sqlite_overlay\", r\"entries_rls_pg2sqlite_shared_write\")])"
+        ));
+    }
+
     /// A fresh replica connection with the shared store attached from `shared`.
     fn conn_with_shared(shared: &str) -> SqliteConnection {
         let mut conn = SqliteConnection::establish(":memory:").expect("open the replica");
@@ -3002,6 +3329,19 @@ mod tests {
             move || held.load(std::sync::atomic::Ordering::Relaxed),
         )
         .expect("register the write exemption");
+        let mut derived = 0_i32;
+        conn.register_sql_function::<diesel::sql_types::Integer, diesel::sql_types::Integer, _, _, _>(
+            connetto_core::DERIVED_WRITE_FUNCTION,
+            SqliteFunctionBehavior::INNOCUOUS,
+            move |delta: i32| {
+                derived += delta;
+                derived
+            },
+        )
+        .expect("register the derived write function");
+        connetto_core::schema::jsonb_functions()
+            .register(conn)
+            .expect("register the jsonb functions");
         exemption
     }
 

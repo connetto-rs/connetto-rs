@@ -39,7 +39,7 @@ pub enum Artifact<'a> {
     PublishedTable {
         /// The publication the change stream reads.
         publication: &'a str,
-        /// The table a policy reads and the publication must carry.
+        /// Resolved through the connection's `search_path` unless schema-qualified.
         table: &'a str,
     },
     /// Every table the publication carries records the row as it was, which

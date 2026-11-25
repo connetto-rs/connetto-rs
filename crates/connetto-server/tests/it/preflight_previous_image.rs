@@ -183,3 +183,34 @@ async fn publication_membership_resolves_the_qualified_relation() {
         Err(PreflightError::Missing { .. })
     ));
 }
+
+#[tokio::test]
+async fn publication_requires_the_configured_settled_table() {
+    let fixture = Fixture::acquire().await;
+    fixture
+        .setup(&[
+            "CREATE SCHEMA writer_publication",
+            "CREATE TABLE writer_publication.app_writers (writer BIGINT PRIMARY KEY)",
+            "CREATE TABLE writer_publication.app_settled (writer BIGINT, seq BIGINT)",
+            "CREATE PUBLICATION settled_preflight_pub FOR TABLE writer_publication.app_writers",
+        ])
+        .await;
+    let required = [
+        Artifact::Publication("settled_preflight_pub"),
+        Artifact::PublishedTable {
+            publication: "settled_preflight_pub",
+            table: "writer_publication.app_settled",
+        },
+    ];
+    assert!(matches!(
+        preflight::require(fixture.admin(), &required).await,
+        Err(PreflightError::Missing { name, .. })
+            if name == "writer_publication.app_settled"
+    ));
+    fixture
+        .exec("ALTER PUBLICATION settled_preflight_pub ADD TABLE writer_publication.app_settled")
+        .await;
+    preflight::require(fixture.admin(), &required)
+        .await
+        .expect("the configured settled table is published");
+}

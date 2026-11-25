@@ -90,6 +90,11 @@ pub(crate) fn queue<T: Transport>(
         .append_entry(
             &writer,
             &built.changeset,
+            crate::LocalEffects {
+                derived: &built.marked,
+                overlay: &[],
+                local_changeset: built.local_changeset.as_deref(),
+            },
             None,
             Some(captured),
             Some(built.through),
@@ -679,6 +684,7 @@ async fn a_run_reaching_into_an_older_major_drains_its_prefix_first() {
     }
     assert!(
         events.contains(&ClientEvent::WriteRestored {
+            writer: WriterRef::Number(7),
             client_seq: prefix[1],
             refused: None,
         }),

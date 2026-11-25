@@ -50,6 +50,10 @@ rosetta-uuid = ["diesel-pg", "dep:rosetta-uuid"]
 # core stays dependency-light for the browser build, the way `diesel-pg` is,
 # and on for the build step and the client's post-migration DDL check.
 sqlite-shape = ["diesel/sqlite"]
+# pg2sqlite's `jsonb` functions and collation under connetto's names, which
+# every replica connection and the build step's validation connection
+# register. Off by default for the same reason as `sqlite-shape`.
+sqlite-jsonb = ["diesel/sqlite", "pg2sqlite-runtime/diesel"]
 # Fakes the client and browser test suites share, chiefly a transport that answers
 # a handshake and nothing else. Test-only: no production build enables it.
 test-support = []
@@ -68,7 +72,8 @@ serde_bytes.workspace = true
 rmp-serde.workspace = true
 sha2 = { version = "0.10", default-features = false }
 # The helpers a translated replica calls as table-valued functions, which a
-# bundle carries. No features, so no diesel and nothing std.
+# bundle carries, and the `jsonb` functions. No features, so no diesel and
+# nothing std, unless `sqlite-jsonb` asks for its diesel registration.
 pg2sqlite-runtime = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main" }
 # `SessionId` is a uuid: connetto-minted, fixed width, and stored in a native
 # Postgres `uuid` column. No `v4` here, so no `getrandom`: the core never mints

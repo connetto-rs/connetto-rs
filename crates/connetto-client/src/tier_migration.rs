@@ -271,6 +271,8 @@ fn cross(
     if last {
         let migrated = read_tier_shape(tier)?;
         let mut scratch = SqliteConnection::establish(":memory:")?;
+        // A `jsonb` column declares the collation, which must exist to create it.
+        connetto_core::schema::jsonb_functions().register(&mut scratch)?;
         scratch.batch_execute(&plan.ddl)?;
         let expected = read_tier_shape(&mut scratch)?;
         let differences = expected.diff(&migrated);

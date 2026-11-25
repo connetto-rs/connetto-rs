@@ -156,7 +156,7 @@ async fn applied(conn: ConnettoConnection<WebSocketTransport<TcpStream>>, seq: u
     let pump = tokio::spawn(pump);
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if let Ok(ClientEvent::MutationApplied { client_seq }) = events.recv().await
+            if let Ok(ClientEvent::MutationApplied { client_seq, .. }) = events.recv().await
                 && client_seq == seq
             {
                 break;

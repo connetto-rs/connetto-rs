@@ -458,7 +458,7 @@ async fn a_code_pushed_by_the_client_registers_the_bot() {
         .await
         .expect("the push runs")
         .expect("the code change records");
-    let ClientEvent::MutationApplied { client_seq } = pump_until(&mut client, |e| {
+    let ClientEvent::MutationApplied { client_seq, .. } = pump_until(&mut client, |e| {
         matches!(e, ClientEvent::MutationApplied { .. })
     })
     .await
@@ -528,7 +528,7 @@ async fn a_code_with_a_character_outside_the_alphabet_is_refused() {
         .await
         .expect("the push runs")
         .expect("the code change records");
-    let ClientEvent::MutationApplied { client_seq } = pump_until(&mut client, |e| {
+    let ClientEvent::MutationApplied { client_seq, .. } = pump_until(&mut client, |e| {
         matches!(e, ClientEvent::MutationApplied { .. })
     })
     .await
@@ -701,7 +701,7 @@ async fn an_install_for_the_administered_owner_lands_whole() {
         .await
         .expect("the push runs")
         .expect("the add uploads");
-    let ClientEvent::MutationApplied { client_seq } = pump_until(&mut client, |e| {
+    let ClientEvent::MutationApplied { client_seq, .. } = pump_until(&mut client, |e| {
         matches!(e, ClientEvent::MutationApplied { .. })
     })
     .await

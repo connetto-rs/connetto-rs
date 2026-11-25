@@ -1446,3 +1446,225 @@ async fn a_live_client_whose_drain_dial_fails_backs_the_drain_off() {
         "the held write waits for the next dial"
     );
 }
+
+mod major_rebuild_fixture {
+    use super::*;
+
+    diesel::table! {
+        effects (id) {
+            id -> BigInt,
+            label -> Nullable<Text>,
+        }
+    }
+    diesel::table! {
+        #[sql_name = "effects"]
+        rebuilt_effects (id) {
+            id -> BigInt,
+            payload -> BigInt,
+        }
+    }
+    diesel::table! {
+        #[sql_name = "_connetto_overlay_tags"]
+        overlay_tags (tbl, key) {
+            tbl -> Text,
+            key -> Text,
+        }
+    }
+    diesel::table! {
+        #[sql_name = "_connetto_derived"]
+        derived_rows (writer, seq) {
+            writer -> Text,
+            seq -> BigInt,
+        }
+    }
+    diesel::table! {
+        #[sql_name = "_connetto_rollback"]
+        local_changesets (writer, seq) {
+            writer -> Text,
+            seq -> BigInt,
+        }
+    }
+    fn translate(source: &str) -> SyncSchema {
+        SyncSchema::new(
+            connetto_translate::translate_shared::<String, connetto_core::bots::TextIds>(
+                connetto_translate::Documents::new(
+                    source,
+                    "",
+                    connetto_test_harness::FIXTURE_ROLES,
+                    connetto_test_harness::FIXTURE_READER,
+                ),
+                &["effects"],
+            )
+            .expect("translate shared major"),
+        )
+    }
+
+    pub(super) fn schemas() -> (SyncSchema, SyncSchema) {
+        let first = translate(
+            "-- connetto:major 1
+         CREATE TABLE items (id INT PRIMARY KEY, label TEXT);
+         CREATE TABLE effects (id INT PRIMARY KEY, label TEXT);
+         CREATE TABLE provisional (id INT PRIMARY KEY);
+         CREATE FUNCTION derive_effects() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+         BEGIN
+             INSERT INTO effects VALUES (NEW.id, NEW.label);
+             INSERT INTO provisional VALUES (NEW.id);
+             RETURN NEW;
+         END $$;
+         CREATE TRIGGER items_derive AFTER INSERT ON items
+         FOR EACH ROW EXECUTE FUNCTION derive_effects();",
+        );
+        let second = translate(
+            "-- connetto:major 2
+         CREATE TABLE items (id INT PRIMARY KEY, label TEXT, rank INT NOT NULL DEFAULT 0);
+         CREATE TABLE effects (id INT PRIMARY KEY, payload BIGINT NOT NULL);",
+        );
+        (first, second)
+    }
+
+    pub(super) async fn seed_overlay(directory: &TempDir, first: SyncSchema) {
+        let mut connection = open(directory, first).await;
+        write(&mut connection, 1, "offline");
+        diesel::update(effects::table.filter(effects::id.eq(1)))
+            .set(effects::label.eq("application overlay"))
+            .execute(connection.conn())
+            .expect("ordinary overlay write");
+        connection
+            .push()
+            .await
+            .expect("queue old major")
+            .expect("entry");
+        assert_eq!(
+            overlay_tags::table
+                .count()
+                .get_result::<i64>(connection.conn())
+                .expect("tags"),
+            1
+        );
+        assert_eq!(
+            derived_rows::table
+                .count()
+                .get_result::<i64>(connection.conn())
+                .expect("derived"),
+            1
+        );
+        assert_eq!(
+            local_changesets::table
+                .count()
+                .get_result::<i64>(connection.conn())
+                .expect("local"),
+            1
+        );
+    }
+
+    pub(super) fn assert_rebuilt(connection: &mut ConnettoConnection<LoopbackTransport>) {
+        assert_eq!(connection.draining_major(), Some(one()));
+        assert_eq!(
+            rebuilt_effects::table
+                .count()
+                .get_result::<i64>(connection.conn())
+                .expect("effects"),
+            0
+        );
+        assert_eq!(
+            overlay_tags::table
+                .count()
+                .get_result::<i64>(connection.conn())
+                .expect("tags"),
+            0
+        );
+        assert_eq!(
+            derived_rows::table
+                .count()
+                .get_result::<i64>(connection.conn())
+                .expect("derived"),
+            0
+        );
+        assert_eq!(
+            local_changesets::table
+                .count()
+                .get_result::<i64>(connection.conn())
+                .expect("held local"),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_major_rebuild_clears_overlay_effects_and_drains_without_old_layout_inverses() {
+    use major_rebuild_fixture::*;
+
+    let (first, second) = schemas();
+    let directory = tempdir().expect("directory");
+    seed_overlay(&directory, first.clone()).await;
+    let mut connection = open(&directory, second).await;
+    assert_rebuilt(&mut connection);
+
+    write(&mut connection, 1, "offline");
+    diesel::insert_into(rebuilt_effects::table)
+        .values((rebuilt_effects::id.eq(1), rebuilt_effects::payload.eq(42)))
+        .execute(connection.conn())
+        .expect("new-layout row");
+    connection
+        .push()
+        .await
+        .expect("queue current major")
+        .expect("entry");
+    let (transport, mut observed) = server(Answer::Ack {
+        version: first.version(),
+        grant: Some(WriterGrant {
+            number: 9,
+            frontier: 0,
+        }),
+        settle: Settle::Reject,
+    });
+    dial(&mut connection, transport).await;
+    let events = tokio::time::timeout(
+        Duration::from_secs(10),
+        pump_until(&mut connection, drained),
+    )
+    .await
+    .expect("OVERLAY-REBUILD-2 held drain deadline");
+    assert!(events.iter().any(|event| matches!(
+        event, ClientEvent::Held(HeldWork::Rejected { major, .. }) if *major == one()
+    )));
+    assert!(
+        seen(&mut observed)
+            .iter()
+            .any(|message| matches!(message, Seen::Mutation { seq: 1, .. }))
+    );
+    assert!(
+        connection
+            .unsynced()
+            .iter()
+            .all(|entry| entry.major == Some(two()))
+    );
+    assert_eq!(
+        items::table
+            .count()
+            .get_result::<i64>(connection.conn())
+            .expect("current items"),
+        1
+    );
+    assert_eq!(
+        rebuilt_effects::table
+            .select(rebuilt_effects::payload)
+            .first::<i64>(connection.conn())
+            .expect("current effect"),
+        42
+    );
+    assert_eq!(
+        local_changesets::table
+            .count()
+            .get_result::<i64>(connection.conn())
+            .expect("local cleanup"),
+        0
+    );
+    assert_eq!(
+        overlay_tags::table
+            .count()
+            .get_result::<i64>(connection.conn())
+            .expect("tags"),
+        0
+    );
+}

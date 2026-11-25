@@ -2026,7 +2026,7 @@ where
         require_schema_tables::<D>(&pool, bans, device_identity.is_some()).await?;
         let synced = synced_tables::<D>(&schema.pg_ddl)?;
         require_cap_policies(&pool, &synced).await?;
-        let (oplog, lag_watch) = prepare_change_log(
+        let (oplog, lag_watch) = prepare_change_log::<D>(
             &pool,
             &slot,
             &publication,
@@ -2385,7 +2385,7 @@ fn install_device_identity<D: ConnettoSchema>(
 /// slot watch, handing back the watch's stop handle so a refusal after it
 /// started cannot leave it running. Everything here reads or writes connetto's
 /// own bookkeeping, so it runs on the owner pool.
-async fn prepare_change_log(
+async fn prepare_change_log<D: ConnettoSchema>(
     pool: &PgPool,
     slot: &str,
     publication: &str,
@@ -2414,15 +2414,14 @@ async fn prepare_change_log(
             column: "xid_horizon",
         },
         Artifact::Table(&xid_table),
-        // The pending verdicts push on a row the stream must carry (R77
-        // decision 11). The writer and settled tables always stand.
+        // Writer frontiers and transaction-completion markers must reach ingestion.
         Artifact::PublishedTable {
             publication,
-            table: connetto_translate::BOOKKEEPING_TABLES[0],
+            table: D::Writers::WRITERS_TABLE,
         },
         Artifact::PublishedTable {
             publication,
-            table: connetto_translate::BOOKKEEPING_TABLES[1],
+            table: D::Writers::SETTLED_TABLE,
         },
     ];
     // The enrolment table stands only with device identity, so its publication
@@ -2725,9 +2724,14 @@ async fn build_write_side<D: ConnettoSchema>(
     let withdrawals = PgSnapshotSource::from_ddl(pools.owner.clone(), &schema.engine_ddl::<D>())?
         .with_unset_settings(schema.unset);
     // A changed policy makes an existing replica stale, so a client holding one is told through the advertised version.
-    let bundle = connetto_translate::translate::<String, <D::Bots as ConnettoBotSchema>::IdSql>(
-        schema.documents(),
-    )?;
+    let connetto_translate::TranslationReport { bundle, warnings } =
+        connetto_translate::translate_with_report::<String, <D::Bots as ConnettoBotSchema>::IdSql>(
+            schema.documents(),
+        )?;
+    // The client build printed these, and the boot shows the operator the same.
+    for warning in warnings {
+        tracing::warn!(%warning, "the replica translation raised a warning");
+    }
     let facts = FactSource::owner(pools.owner);
     let (auth, upkeep) =
         crate::rules::install_authorization::<D::Id>(&translated, &facts, openfga, &mut None)

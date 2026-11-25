@@ -30,7 +30,7 @@ Planned in [the shared frame design](../../plans/master-implementation-plan.md#s
 - Subscription. [`connetto_core::messages::Subscribe`], [`connetto_core::messages::Unsubscribe`], [`connetto_core::messages::MembershipOpened`]
 - Snapshot and catch-up. [`connetto_core::messages::SnapshotBegin`], [`connetto_core::messages::SnapshotEnd`], [`connetto_core::messages::SnapshotPatch`] on the bulk plane
 - Live delivery. [`connetto_core::messages::LivePatch`] on the bulk plane, [`connetto_core::messages::AggregateColumns`], [`connetto_core::messages::AggregateUpdate`], [`connetto_core::messages::FullResyncRequired`]
-- Mutation. [`connetto_core::messages::MutationHeader`], [`connetto_core::messages::MutationPatch`] on the bulk plane, [`connetto_core::messages::MutationApplied`], [`connetto_core::messages::MutationReject`], [`connetto_core::messages::MutationConflict`]
+- Mutation. [`connetto_core::messages::MutationHeader`], [`connetto_core::messages::MutationPatch`] on the bulk plane, [`connetto_core::messages::MutationApplied`], [`connetto_core::messages::MutationReject`], [`connetto_core::messages::MutationConflict`], [`connetto_core::messages::WritesSettled`]
 - Writer. [`connetto_core::messages::BindDevice`], [`connetto_core::messages::RetireWriter`], [`connetto_core::messages::WriterAnswer`], [`connetto_core::messages::Provenance`]
 - Courier. [`connetto_core::messages::CourierRange`], [`connetto_core::messages::CourierBody`] on the bulk plane, [`connetto_core::messages::CourierAnswer`], [`connetto_core::messages::CourierNotice`], [`connetto_core::messages::CourierNoticeAck`]
 - Courier audit observation. [`connetto_core::messages::CourierAuditRequest`], [`connetto_core::messages::CourierAuditAnswer`], [`connetto_core::messages::CourierAuditCancel`]
@@ -86,6 +86,8 @@ The `schema_version` in `HandshakeAck` hashes the whole translated bundle. [`con
 
 Both sides derive it through one build step. An application's build script runs [`connetto_translate::emit`] over its sources, and `connetto-server` runs [`connetto_translate::translate`] over its own at startup with the pg2sqlite it was built with. Two builds whose sources match but whose translations differ, from two pg2sqlite revisions for instance, therefore present different versions, and the client refuses the handshake as [`connetto_client::ClientError::SchemaOutdated`]. The version rides the ack's one `schema_version` field.
 
+The step prints every warning pg2sqlite raises as a `cargo::warning`, and the server logs the same warnings at startup. A warning that the replica keeps less than PostgreSQL does, a type downgrade, a key column the reader cannot read or a table no policy lets the reader read, refuses the build unless the deployment passes a [`connetto_translate::Acknowledgements`] naming its [`connetto_translate::WarningPlace`] with a reason. An acknowledgement whose place holds no such warning refuses the build too, as an unfulfilled `#[expect]` does. A warning about what the replica leaves to the server is shown only, because the server stays the judge of it, and the server refuses no warning.
+
 A client always declares a version, because the builders take a `SyncSchema` built from a bundle and give no way to leave it out. A server that declares none still skips the check.
 
 ## The application schema major
@@ -126,6 +128,21 @@ Idempotency is per (writer, sequence). A replay reuses the original number, and 
 - Mutations carry a monotonically increasing sequence per writer, `client_seq` in [`connetto_core::messages::MutationHeader`]
 - The server processes writes in sequence order per writer and echoes the sequence in `MutationApplied`, `MutationReject`, and `MutationConflict`
 - The client sends one sequence at a time and does not send a new one until the previous one is answered. A window of N in-flight mutations does not apply, because the client sends patchsets rather than individual mutations, and the sequence is what any such window would have ordered
+- The writer's frontier at attach settles every sequence at or below it before subscriptions are re-declared, including entries whose `MutationApplied` answer comes from a settled record
+
+### Server-derived rows
+
+The replica runs server-derived trigger writes between calls of [`connetto_core::DERIVED_WRITE_FUNCTION`] and keeps them out of the upload. Private-table changes remain provisional until their conflict-aware inverse runs before the server's rows. Shared-table changes live in the writing identity's overlay, apart from the server's backing rows.
+
+- [`connetto_core::messages::WritesSettled`] carries `writer`, `through_seq`, and `before_patch`. The client inverts that writer's held private changesets through `through_seq` newest first, deletes its overlay rows through the same sequence, and records the dropped mark in one transaction. A mark at or below the recorded one is a no-op
+- The server registers every fresh apply's writer, sequence, and transaction before commit. Each live session bound to that writer receives the mark in the ordered queue directly ahead of the transaction's first `LivePatch` with `before_patch`, or at commit without `before_patch` when no row reaches it
+- The publication includes `_connetto_settled`, consumed without fan-out, so a settled write produces a commit item even when it changes no published application table
+- With `before_patch`, the client drops inside the next patch's transaction before its rows. Without it, the client drops on the frame
+- Each catch-up or resnapshot batch is preceded by its writer's mark with `before_patch`. The frontier is read after the batch's rows, or in the same repeatable-read transaction, never before them
+- At attach, the frontier from `WriterGrant` or the `BindDevice` answer drops provisional changes before subscriptions are re-declared
+- On `FullResyncRequired`, resnapshot batches carry these marks and unacknowledged entries reapply their private provisional changes with their primary changes at `SnapshotEnd`, leaving overlays intact
+- A refused or conflicted mutation drops its provisional rows with its own inverse
+- A peer entry (R77) lands with the exemption down, so its triggers run, and the landing inverts the rows they derived before it commits. The receiver gets the server's copies by sync
 
 ### Server to client ordering
 
@@ -151,7 +168,7 @@ The server pauses bulk delivery when credits reach zero and resumes when credits
 
 During catch-up the server applies `AckCredits` as it arrives and holds every other peer frame. [`connetto_server::session::SessionConfig::with_catchup_input_budget`] limits held peer input to 64 KiB by default, measured as tagged `MessagePack` encoded bytes without an encoded copy. Overflow ends only that connection through the protocol-error path, including when one otherwise-valid frame exceeds the holding budget. The bound excludes decoded-object overhead and transport buffers, and it is independent of bulk delivery credits.
 
-`SnapshotEnd` is the one control frame that waits in the queue. It describes rows the client has not received, so releasing it early is a statement the client would act on wrongly. Everything else on the control plane bypasses the queue entirely. Not-rationed and not-ordered are separate properties, and the queue carries both.
+`SnapshotEnd` and `WritesSettled` are the control frames that wait in the queue. Each describes rows relative to the patches around it, so releasing it early is a statement the client would act on wrongly. Everything else on the control plane bypasses the queue entirely. Not-rationed and not-ordered are separate properties, and the queue carries both.
 
 ## Rate limiting
 

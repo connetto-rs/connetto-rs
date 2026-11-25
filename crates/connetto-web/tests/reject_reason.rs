@@ -213,7 +213,7 @@ async fn an_upstream_refusal_reaches_the_tab_with_its_reason() {
         let tab_seq = tab.push().await.expect("push").expect("mutation sent");
         let event = pump_rejection(&mut tab).await;
         assert!(
-            matches!(&event, ClientEvent::MutationRejected { client_seq, reason: r, rows }
+            matches!(&event, ClientEvent::MutationRejected { client_seq, reason: r, rows, .. }
                 if *client_seq == tab_seq
                     && *r == reason
                     && rows.iter().any(|row| row.table == "items"

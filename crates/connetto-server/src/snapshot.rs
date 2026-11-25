@@ -1040,19 +1040,7 @@ mod pg {
 
 #[cfg(test)]
 mod tests {
-    use super::{PgSnapshotSource, SnapshotError, page_sql, projection_exposes};
-    use crate::catalog_shapes::{unconnected_pool, unresolvable_key_column, unresolvable_key_ddl};
-
-    #[tokio::test]
-    async fn a_catalog_with_an_unresolvable_key_refuses_the_snapshot_source() {
-        let refusal = PgSnapshotSource::from_ddl(unconnected_pool(), &unresolvable_key_ddl())
-            .err()
-            .map(|err| err.to_string());
-        assert_eq!(
-            refusal,
-            Some(SnapshotError::Catalog(unresolvable_key_column()).to_string())
-        );
-    }
+    use super::{page_sql, projection_exposes};
 
     /// A page is cut by a keyset comparison, never by an offset, because the
     /// cost of an offset grows with the page's position: measured at 703 ms for

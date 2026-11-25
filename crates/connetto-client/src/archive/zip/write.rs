@@ -111,6 +111,7 @@ fn encode_manifest(archive: &Archive<'_>) -> Result<Vec<u8>, ClientError> {
         schema_fingerprint: archive.fingerprint.clone(),
         major: archive.major,
         account: archive.account.clone(),
+        derived_marks: std::borrow::Cow::Borrowed(&archive.derived_marks),
         compression: "per-entry".to_owned(),
         note: NOTE.to_owned(),
         entries: manifest_entries(archive),
@@ -128,6 +129,13 @@ fn manifest_entries(archive: &Archive<'_>) -> Vec<Entry> {
     }
     if !archive.pending.is_empty() {
         entries.push(encoded_entry("pending", PENDING, "zstd"));
+    }
+    if !archive.held_overlays.is_empty() {
+        entries.push(encoded_entry(
+            "held-overlays",
+            super::super::HELD_OVERLAYS,
+            "zstd",
+        ));
     }
     if !archive.peer_entries.is_empty() {
         entries.push(encoded_entry("peer-entries", PEER_ENTRIES, "zstd"));
@@ -156,6 +164,9 @@ fn write_payloads<W: Write>(
     zip: &mut zip::ZipWriter<zip::write::StreamWriter<W>>,
     archive: &Archive<'_>,
 ) -> Result<(), ClientError> {
+    if !archive.held_overlays.is_empty() {
+        write_entry(zip, super::super::HELD_OVERLAYS, &archive.held_overlays)?;
+    }
     if let Some(rows) = &archive.synced_rows {
         write_entry(zip, SYNCED_ROWS, rows)?;
     }
@@ -232,6 +243,12 @@ pub(super) fn encode_pending(entries: &[super::super::ArchivedEntry]) -> Vec<u8>
                 + 1 // provenance present
                 + 8 // changeset length
                 + entry.changeset.len()
+                + 8 // derived changeset length
+                + entry.derived.len()
+                + 8
+                + entry.overlay.len()
+                + 1
+                + entry.local_changeset.as_ref().map_or(0, |bytes| 8 + bytes.len())
                 + writer_field_len(&entry.writer)
                 + secret_field_len(entry.secret.as_ref())
                 + entry.provenance.as_ref().map_or(0, |prov| {
@@ -266,6 +283,13 @@ pub(super) fn encode_pending(entries: &[super::super::ArchivedEntry]) -> Vec<u8>
         let len = u64::try_from(entry.changeset.len()).expect("slice length exceeds u64");
         out.extend_from_slice(&len.to_be_bytes());
         out.extend_from_slice(&entry.changeset);
+        let length = u64::try_from(entry.derived.len()).expect("slice length exceeds u64");
+        out.extend_from_slice(&length.to_be_bytes());
+        out.extend_from_slice(&entry.derived);
+        let length = u64::try_from(entry.overlay.len()).expect("slice length exceeds u64");
+        out.extend_from_slice(&length.to_be_bytes());
+        out.extend_from_slice(&entry.overlay);
+        write_optional_bytes(&mut out, entry.local_changeset.as_deref());
     }
     out
 }
@@ -377,6 +401,8 @@ mod tests {
                 synced_rows: None,
                 local_rows: None,
                 pending: Vec::new(),
+                derived_marks: Vec::new(),
+                held_overlays: Vec::new(),
                 peer_entries: Vec::new(),
                 peer_cursors: Vec::new(),
                 attachments: std::slice::from_ref(declaration),

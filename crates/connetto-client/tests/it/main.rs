@@ -35,6 +35,8 @@ mod courier_notice;
 
 mod coverage_resync;
 
+mod derived_writes;
+
 mod encrypted_replica;
 
 // Its phases run on Linux's sealed-file keyring, like `linux_custody`.
@@ -146,6 +148,7 @@ mod share_key_relay;
 mod share_key_storage;
 mod share_keys;
 mod shared_coverage;
+mod shared_derived_writes;
 mod shared_holdings;
 mod shared_majors;
 mod shared_outbox;

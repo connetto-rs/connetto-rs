@@ -99,6 +99,17 @@ pub struct MutationApplied {
     pub client_seq: u64,
 }
 
+/// Orders a writer's settled high-water mark before its server-derived rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WritesSettled {
+    /// Writer whose provisional changes are dropped.
+    pub writer: WriterRef,
+    /// Inclusive settled sequence, with marks at or below the dropped mark ignored.
+    pub through_seq: u64,
+    /// Whether to drop inside the next patch's transaction before applying its rows.
+    pub before_patch: bool,
+}
+
 /// Reason the server rejected a mutation before applying it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MutationRejectReason {

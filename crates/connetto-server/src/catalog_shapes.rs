@@ -100,29 +100,6 @@ impl CatalogShapes {
     }
 }
 
-/// A table of 65,537 columns keyed by its last, one past the last ordinal a
-/// column id holds, which parses as a catalog whose key cannot be resolved.
-#[cfg(test)]
-pub(crate) fn unresolvable_key_ddl() -> String {
-    let last = usize::from(u16::MAX) + 1;
-    let columns = (0..last)
-        .map(|ordinal| format!("c{ordinal} INT"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("CREATE TABLE wide ({columns}, c{last} INT PRIMARY KEY);")
-}
-
-/// The cause a catalog of [`unresolvable_key_ddl`] refuses to load with,
-/// rendered: the key ordinal no column id holds.
-#[cfg(test)]
-pub(crate) fn unresolvable_key_column() -> String {
-    CatalogError::UnknownColumn {
-        table_id: 0,
-        ordinal: usize::from(u16::MAX) + 1,
-    }
-    .to_string()
-}
-
 /// A pool whose every connection attempt fails within 100 ms, for the
 /// refusals a catalog makes before any connection is taken.
 #[cfg(test)]

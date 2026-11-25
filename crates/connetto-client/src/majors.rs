@@ -74,7 +74,7 @@ diesel::table! {
 /// bookkeeping and the entries kept for a restore, whose frontiers the server
 /// keeps across majors, and the peer cursors, held peer entries and
 /// retraction log, whose owners settle across majors (R77, R78 decision 7).
-const KEPT: [&str; 12] = [
+const KEPT: [&str; 15] = [
     "_connetto_build",
     "_connetto_build_renames",
     "_connetto_device_certificate",
@@ -84,6 +84,9 @@ const KEPT: [&str; 12] = [
     "_connetto_retraction",
     "_connetto_writers",
     "_connetto_pending",
+    "_connetto_derived",
+    "_connetto_derived_marks",
+    "_connetto_rollback",
     "_connetto_acked",
     "_connetto_retire",
     "_connetto_retired_keys",
@@ -253,6 +256,7 @@ pub(crate) fn prepare_rebuild(
                     .execute(db)?;
                 }
             }
+            rewrite_rollback_major(db, old_major, rewrite)?;
             // A replica older than the retained entries has no table to rewrite.
             if has_table(db, "_connetto_acked")? {
                 crate::acked::rewrite_major(db, old_major, rewrite)?;
@@ -275,6 +279,40 @@ pub(crate) fn prepare_rebuild(
             .execute(db)?;
     }
     drop_synced(db, Store::Account)
+}
+
+fn rewrite_rollback_major(
+    database: &mut SqliteConnection,
+    major: i64,
+    mut rewrite: impl FnMut(Vec<u8>) -> Result<Vec<u8>, ClientError>,
+) -> Result<(), ClientError> {
+    use crate::derived::_connetto_rollback;
+    if !has_table(database, "_connetto_rollback")? {
+        return Ok(());
+    }
+    let entries = _connetto_rollback::table
+        .filter(diesel::dsl::exists(
+            _connetto_pending::table
+                .filter(_connetto_pending::writer.eq(_connetto_rollback::writer))
+                .filter(_connetto_pending::seq.eq(_connetto_rollback::seq))
+                .filter(_connetto_pending::major.eq(major)),
+        ))
+        .select((
+            _connetto_rollback::writer,
+            _connetto_rollback::seq,
+            _connetto_rollback::changeset,
+        ))
+        .load::<(String, i64, Vec<u8>)>(database)?;
+    for (writer, sequence, changeset) in entries {
+        diesel::update(
+            _connetto_rollback::table
+                .filter(_connetto_rollback::writer.eq(writer))
+                .filter(_connetto_rollback::seq.eq(sequence)),
+        )
+        .set(_connetto_rollback::changeset.eq(rewrite(changeset)?))
+        .execute(database)?;
+    }
+    Ok(())
 }
 
 /// Whether a rebuild ever held work on this replica.
@@ -351,6 +389,9 @@ struct SchemaObject {
 
 /// Clear one cache while retaining its build record and any account-owned work.
 pub(crate) fn drop_synced(db: &mut SqliteConnection, store: Store) -> Result<(), ClientError> {
+    if matches!(store, Store::Account) && has_table(db, "_connetto_derived")? {
+        diesel::delete(crate::derived::_connetto_derived::table).execute(db)?;
+    }
     let (schema, query, kept): (&str, &str, &[&str]) = match store {
         Store::Account => (
             "main",
@@ -527,4 +568,149 @@ pub(crate) fn remember_shared_generation(
     .bind::<diesel::sql_types::Binary, _>(&attached.generation)
     .execute(db)?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::derived::_connetto_derived;
+
+    #[test]
+    fn account_rebuild_clears_derived_rows_and_preserves_local_changesets() {
+        let mut database = SqliteConnection::establish(":memory:").expect("database");
+        database
+            .batch_execute(
+                "CREATE TABLE _connetto_derived (writer TEXT, seq INTEGER, changeset BLOB); \
+                 INSERT INTO _connetto_derived VALUES ('number:1', 1, X'0102'); \
+                 CREATE TABLE _connetto_derived_marks (writer TEXT PRIMARY KEY, through_seq INTEGER NOT NULL); \
+                 INSERT INTO _connetto_derived_marks VALUES ('number:1', 37); \
+                 CREATE TABLE _connetto_rollback (writer TEXT, seq INTEGER, changeset BLOB); \
+                 INSERT INTO _connetto_rollback VALUES ('number:1', 2, X'0304'); \
+                 CREATE TABLE application_rows (id INTEGER PRIMARY KEY)",
+            )
+            .expect("schema");
+        drop_synced(&mut database, Store::Account).expect("clear account");
+        assert_eq!(
+            _connetto_derived::table
+                .select(_connetto_derived::changeset)
+                .load::<Vec<u8>>(&mut database)
+                .expect("derived rows"),
+            Vec::<Vec<u8>>::new()
+        );
+        assert_eq!(
+            crate::derived::dropped_mark(&mut database, "number:1").expect("dropped mark"),
+            37
+        );
+        assert_eq!(
+            crate::derived::_connetto_rollback::table
+                .select(crate::derived::_connetto_rollback::changeset)
+                .first::<Vec<u8>>(&mut database)
+                .expect("local changeset"),
+            vec![3, 4],
+        );
+        assert!(!has_table(&mut database, "application_rows").expect("table lookup"));
+    }
+
+    #[test]
+    fn account_rebuild_clears_pending_and_acknowledged_derived_rows() {
+        let mut database = SqliteConnection::establish(":memory:").expect("database");
+        database
+            .batch_execute(
+                "CREATE TABLE _connetto_derived (writer TEXT, seq INTEGER, changeset BLOB); \
+                 CREATE TABLE _connetto_pending (writer TEXT, seq INTEGER, major INTEGER); \
+                 CREATE TABLE _connetto_acked (writer TEXT, seq INTEGER, major INTEGER); \
+                 INSERT INTO _connetto_pending VALUES ('number:1', 1, 2), ('number:1', 3, 1); \
+                 INSERT INTO _connetto_acked VALUES ('number:1', 2, 2); \
+                 INSERT INTO _connetto_derived VALUES \
+                 ('number:1', 1, X'01'), ('number:1', 2, X'02'), ('number:1', 3, X'03')",
+            )
+            .expect("schema");
+        drop_synced(&mut database, Store::Account).expect("clear account");
+        assert_eq!(
+            _connetto_derived::table
+                .order(_connetto_derived::seq)
+                .select(_connetto_derived::changeset)
+                .load::<Vec<u8>>(&mut database)
+                .expect("derived rows"),
+            Vec::<Vec<u8>>::new()
+        );
+    }
+
+    #[test]
+    fn account_rebuild_drops_overlays_and_keeps_held_local_changesets() {
+        use crate::derived::_connetto_rollback;
+        let mut database = SqliteConnection::establish(":memory:").expect("database");
+        database
+            .batch_execute(crate::overlay::DDL)
+            .expect("metadata");
+        database
+            .batch_execute(crate::derived::DDL)
+            .expect("derived metadata");
+        database.batch_execute(
+            "CREATE TABLE sample_overlay (id INTEGER PRIMARY KEY NOT NULL); \
+             INSERT INTO sample_overlay VALUES (17); \
+             INSERT INTO _connetto_overlays VALUES ('sample', 'sample_backing', 'sample_overlay'); \
+             INSERT INTO _connetto_overlay_tags (tbl, key, writer, seq) VALUES ('sample_overlay', '(\"id\" IS 17)', 'number:1', 7); \
+             INSERT INTO _connetto_rollback VALUES ('number:1', 7, X'0102'); \
+             CREATE TABLE application_rows (id INTEGER PRIMARY KEY)"
+        ).expect("schema");
+        drop_synced(&mut database, Store::Account).expect("rebuild");
+        assert!(!has_table(&mut database, "sample_overlay").expect("overlay lookup"));
+        assert!(!has_table(&mut database, "_connetto_overlay_tags").expect("tag lookup"));
+        assert!(!has_table(&mut database, "_connetto_overlays").expect("registry lookup"));
+        assert_eq!(
+            _connetto_rollback::table
+                .select(_connetto_rollback::changeset)
+                .first::<Vec<u8>>(&mut database)
+                .expect("local writes"),
+            vec![1, 2]
+        );
+        assert!(!has_table(&mut database, "application_rows").expect("table lookup"));
+    }
+
+    #[test]
+    fn local_write_rewrite_selects_capture_major() {
+        use crate::derived::_connetto_rollback;
+        let mut database = SqliteConnection::establish(":memory:").expect("database");
+        database
+            .batch_execute(crate::derived::DDL)
+            .expect("metadata");
+        database
+            .batch_execute(crate::META_DDL)
+            .expect("queue metadata");
+        for (sequence, major, value) in [(1_i64, 2_i64, 1_u8), (2, 1, 2)] {
+            diesel::insert_into(_connetto_pending::table)
+                .values((
+                    _connetto_pending::writer.eq("number:1"),
+                    _connetto_pending::seq.eq(sequence),
+                    _connetto_pending::major.eq(major),
+                    _connetto_pending::changeset.eq(&[value][..]),
+                    _connetto_pending::entry_hash.eq(&[0_u8; 32][..]),
+                    _connetto_pending::position.eq(sequence),
+                ))
+                .execute(&mut database)
+                .expect("pending entry");
+            diesel::insert_into(_connetto_rollback::table)
+                .values((
+                    _connetto_rollback::writer.eq("number:1"),
+                    _connetto_rollback::seq.eq(sequence),
+                    _connetto_rollback::changeset.eq(&[value][..]),
+                ))
+                .execute(&mut database)
+                .expect("local changeset");
+        }
+        rewrite_rollback_major(&mut database, 2, |mut changeset| {
+            changeset.push(9);
+            Ok(changeset)
+        })
+        .expect("rewrite");
+        assert_eq!(
+            _connetto_rollback::table
+                .order(_connetto_rollback::seq)
+                .select(_connetto_rollback::changeset)
+                .load::<Vec<u8>>(&mut database)
+                .expect("local writes"),
+            vec![vec![1, 9], vec![2]]
+        );
+    }
 }

@@ -95,7 +95,9 @@ use super::{
     error::{FatalError, NonFatalError, RateLimited},
     flow::{AckCredits, Ping, Pong},
     handshake::{Handshake, HandshakeAck},
-    mutation::{HeldWork, MutationApplied, MutationConflict, MutationHeader, MutationReject},
+    mutation::{
+        HeldWork, MutationApplied, MutationConflict, MutationHeader, MutationReject, WritesSettled,
+    },
     provisional::{ProvisionalStatus, ProvisionalVerdicts},
     reconnect::FullResyncRequired,
     registration::{BotRegistered, Challenge, RegisterBot},
@@ -147,6 +149,8 @@ pub enum ControlMessage {
     MutationReject(MutationReject),
     /// Server reports that a mutation collided with a newer server-side row.
     MutationConflict(MutationConflict),
+    /// Server marks the writer's settled frontier in the ordered row stream.
+    WritesSettled(WritesSettled),
 
     /// Server declares a computed subscription's columns, once per
     /// registration and ahead of its first `AggregateUpdate`.

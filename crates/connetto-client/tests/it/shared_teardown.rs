@@ -107,6 +107,83 @@ async fn a_forced_departure_undoes_its_unsent_shared_writes() {
 }
 
 #[tokio::test]
+async fn departure_inverts_queued_and_unpushed_derived_shared_updates() {
+    for (queued, acknowledged) in [(false, false), (true, false), (true, true)] {
+        let directory = tempfile::tempdir().unwrap();
+        let keys = super::support::SharedKeys::default();
+        let mut alice = connect(
+            directory.path(),
+            keys.clone(),
+            "alice",
+            vec![snapshot("a", &[1])],
+        )
+        .await;
+        subscribe(&mut alice, "a", "SELECT * FROM tags").await;
+        let answers = if acknowledged {
+            vec![connetto_core::traits::IncomingFrame::Control(
+                connetto_core::messages::ControlMessage::MutationApplied(
+                    connetto_core::messages::MutationApplied { client_seq: 1 },
+                ),
+            )]
+        } else {
+            Vec::new()
+        };
+        let mut bob = connect(directory.path(), keys, "bob", answers).await;
+        bob.change_schema(
+            "CREATE TABLE local_source (id INTEGER PRIMARY KEY);
+                 CREATE TEMP TRIGGER derived_update AFTER INSERT ON local_source
+                 WHEN NOT connetto_write_exempt() BEGIN
+                     SELECT connetto_derived_write(1);
+                     UPDATE tags SET label = 'provisional' WHERE id = 1;
+                     SELECT connetto_derived_write(-1);
+                 END;",
+        )
+        .unwrap();
+        bob.conn()
+            .batch_execute(
+                "INSERT INTO tags VALUES (5, 'unsent');
+                 INSERT INTO local_source VALUES (1);",
+            )
+            .unwrap();
+        if queued {
+            assert!(bob.push().await.unwrap().is_some());
+        }
+        if acknowledged {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let event = bob.pump_one().await.unwrap();
+                    if matches!(
+                        event,
+                        connetto_client::ClientEvent::MutationApplied { client_seq: 1, .. }
+                    ) {
+                        break;
+                    }
+                    assert!(
+                        !matches!(event, connetto_client::ClientEvent::Closed),
+                        "departure acknowledgement was not delivered"
+                    );
+                }
+            })
+            .await
+            .expect("DERIVED-DEPARTURE acknowledgement deadline");
+        }
+        bob.leave_shared_store(!acknowledged).unwrap();
+        let label: String = diesel::select(diesel::dsl::sql::<diesel::sql_types::Text>(
+            "(SELECT label FROM tags WHERE id = 1)",
+        ))
+        .get_result(alice.conn())
+        .unwrap();
+        assert_eq!(label, "tag-1", "departure restores the held derived row");
+        let marks: i64 = diesel::select(diesel::dsl::sql::<diesel::sql_types::BigInt>(
+            "(SELECT count(*) FROM _connetto_derived)",
+        ))
+        .get_result(bob.conn())
+        .unwrap();
+        assert_eq!(marks, 0);
+    }
+}
+
+#[tokio::test]
 async fn a_live_identity_undoes_a_closed_identitys_shared_queue() {
     let directory = tempfile::tempdir().unwrap();
     let keys = super::support::SharedKeys::default();

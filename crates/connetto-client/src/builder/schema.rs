@@ -36,9 +36,10 @@ pub enum TierStepRefused {
 /// since each replica file holds one kind only.
 ///
 /// Every build registers `uuidv4()`, because a synced column `DEFAULT` may
-/// call it and a device without a server still has to mint the id. It also
-/// registers each helper any kind's DDL calls as a table-valued function.
-/// The application adds its own functions with
+/// call it and a device without a server still has to mint the id, and the
+/// `jsonb` functions and collation the translation names, so any deployment
+/// may declare `jsonb`. It also registers each helper any kind's DDL calls as
+/// a table-valued function. The application adds its own functions with
 /// [`with_sql_functions`](Self::with_sql_functions).
 #[derive(Clone)]
 pub struct SyncSchema {
@@ -60,12 +61,12 @@ pub struct SyncSchema {
 
 impl SyncSchema {
     /// Wrap a translated schema, opening the anonymous copy, and register
-    /// `uuidv4()` and its helpers.
+    /// connetto's own functions and the helpers.
     #[must_use]
     pub fn new(bundle: SchemaBundle) -> Self {
         let kind = CallerKind::Anon;
         let policy_tables = policy_tables_of(bundle.copy(kind));
-        let sql_functions = uuidv4_installer().merged(helper_installer(&bundle));
+        let sql_functions = connetto_installers().merged(helper_installer(&bundle));
         Self {
             bundle,
             kind,
@@ -109,7 +110,7 @@ impl SyncSchema {
             .map(|tier| format!("{}\n{tier}", self.copy().replica_ddl()))
     }
 
-    /// Add the application's own function installers alongside `uuidv4()`.
+    /// Add the application's own function installers alongside connetto's.
     #[must_use]
     pub fn with_sql_functions(mut self, functions: SqlFunctions) -> Self {
         self.sql_functions = self.sql_functions.merged(functions);
@@ -261,7 +262,7 @@ impl SyncSchema {
         &self.policy_tables
     }
 
-    /// The function installers, `uuidv4()` first and the application's after.
+    /// The function installers, connetto's first and the application's after.
     #[must_use]
     pub fn sql_functions(&self) -> &SqlFunctions {
         &self.sql_functions
@@ -274,17 +275,21 @@ impl SyncSchema {
     }
 }
 
-/// The installer that registers `uuidv4()`.
-fn uuidv4_installer() -> SqlFunctions {
-    SqlFunctions::new().with(Arc::new(|conn| {
-        // diesel's own registrar seam, hidden API by design, since the function
-        // is client-side only and must exist before any DDL runs.
-        conn.register_noarg_sql_function::<diesel::sql_types::Binary, _, _>(
-            UUID_FUNCTION,
-            diesel::sqlite::SqliteFunctionBehavior::INNOCUOUS,
-            || uuid::Uuid::new_v4().into_bytes(),
-        )
-    }))
+/// The installers that register `uuidv4()` and the `jsonb` set.
+fn connetto_installers() -> SqlFunctions {
+    SqlFunctions::new()
+        .with(Arc::new(|conn| {
+            // diesel's own registrar seam, hidden API by design, since the
+            // function is client-side only and must exist before any DDL runs.
+            conn.register_noarg_sql_function::<diesel::sql_types::Binary, _, _>(
+                UUID_FUNCTION,
+                diesel::sqlite::SqliteFunctionBehavior::INNOCUOUS,
+                || uuid::Uuid::new_v4().into_bytes(),
+            )
+        }))
+        .with(Arc::new(|conn| {
+            connetto_core::schema::jsonb_functions().register(conn)
+        }))
 }
 
 /// The RLS split `copy` renames its tables through.

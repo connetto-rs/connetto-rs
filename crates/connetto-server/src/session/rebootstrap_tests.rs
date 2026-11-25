@@ -81,6 +81,7 @@ fn state() -> State {
         pending_header: None,
         deferred: BTreeMap::new(),
         session_id,
+        connection_num: 0,
         writer: None,
         bind_nonce: [0; 32],
         indeterminate: None,

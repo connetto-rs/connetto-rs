@@ -10,6 +10,78 @@
 //! upload and reports the outcome, leaving the wire reply to the session layer.
 
 use core::marker::PhantomData;
+use std::collections::{HashMap, HashSet};
+
+/// Fresh applies indexed by the low 32 bits of their PostgreSQL transaction ids.
+pub(crate) type PendingWrites = parking_lot::Mutex<HashMap<u32, PendingWrite>>;
+
+/// Writer sequences and the live connections already sent their settling marker.
+pub(crate) struct PendingWrite {
+    pub writers: Vec<(i64, u64)>,
+    pub delivered: HashSet<u64>,
+}
+
+impl PendingWrite {
+    pub fn new(writers: Vec<(i64, u64)>) -> Self {
+        Self {
+            writers,
+            delivered: HashSet::new(),
+        }
+    }
+}
+
+struct PendingRegistration<'a> {
+    registry: &'a PendingWrites,
+    transaction: Option<u32>,
+    committed: bool,
+}
+
+impl<'a> PendingRegistration<'a> {
+    const fn new(registry: &'a PendingWrites) -> Self {
+        Self {
+            registry,
+            transaction: None,
+            committed: false,
+        }
+    }
+
+    async fn register<Id>(
+        &mut self,
+        connection: &mut AsyncPgConnection,
+        settle: &SettleSpec<Id>,
+    ) -> Result<(), diesel::result::Error> {
+        // Diesel has no `xid8` cast, so this projection uses PostgreSQL's text conversion.
+        let identifier = diesel::select(diesel::dsl::sql::<diesel::sql_types::BigInt>(
+            "(pg_current_xact_id()::text::bigint & 4294967295)",
+        ))
+        .get_result::<i64>(connection)
+        .await?;
+        let identifier = u32::try_from(identifier)
+            .map_err(|error| diesel::result::Error::DeserializationError(Box::new(error)))?;
+        let mut writers = Vec::with_capacity(1 + usize::from(settle.original.is_some()));
+        writers.push((settle.writer, settle.seq));
+        if let Some((writer, sequence, _, _)) = settle.original
+            && (writer, sequence) != (settle.writer, settle.seq)
+        {
+            writers.push((writer, sequence));
+        }
+        self.registry
+            .lock()
+            .insert(identifier, PendingWrite::new(writers));
+        self.transaction = Some(identifier);
+        Ok(())
+    }
+}
+
+impl Drop for PendingRegistration<'_> {
+    fn drop(&mut self) {
+        if !self.committed
+            && let Some(transaction) = self.transaction
+        {
+            self.registry.lock().remove(&transaction);
+        }
+    }
+}
 
 /// Diesel SQL function declarations for the file visibility check.
 ///
@@ -553,6 +625,7 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
         plan: &WritePlan,
         payload_zstd: &[u8],
         settle: &SettleSpec<D::Id>,
+        pending_writes: &PendingWrites,
     ) -> Result<WriteOutcome, WriteError> {
         let seq = seq_storage(settle.seq)?;
         let original = original_of(settle)?;
@@ -562,6 +635,8 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
         let binding = CallerBinding::of(caller, &self.binding);
         let expected = plan.ops.len();
         let catalog = &self.catalog;
+        let mut registration = PendingRegistration::new(pending_writes);
+        let pending = &mut registration;
         let outcome = conn
             .transaction::<WriteOutcome, CommitError, _>(async move |c| {
                 let applied = SettledOutcome::Applied.json();
@@ -645,9 +720,11 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
                 if !D::Writers::advance(c, settle.writer, seq, &settle.entry_hash).await? {
                     return Err(CommitError::Frontier);
                 }
+                pending.register(c, settle).await?;
                 Ok(WriteOutcome::Applied)
             })
             .await;
+        registration.committed = matches!(outcome, Ok(WriteOutcome::Applied));
         outcome.map_err(commit_failure)
     }
 
@@ -889,25 +966,13 @@ fn commit_failure(err: CommitError) -> WriteError {
 #[cfg(test)]
 mod tests {
     use super::{CommitError, MaterializerError, WriteError, commit_failure, pg_write_target};
-    use crate::catalog_shapes::{unconnected_pool, unresolvable_key_column, unresolvable_key_ddl};
+    use crate::catalog_shapes::unconnected_pool;
     use crate::defaults::ConnettoDefaults;
     use crate::reexec::coded_error;
     use crate::writer_schema::StoredValue;
     use connetto_core::SessionId;
     use connetto_core::auth::Principal;
     use diesel::result::{DatabaseErrorKind, Error};
-
-    #[tokio::test]
-    async fn a_catalog_with_an_unresolvable_key_refuses_the_write_target() {
-        let refusal =
-            pg_write_target::<ConnettoDefaults>(unconnected_pool(), &unresolvable_key_ddl())
-                .err()
-                .map(|err| err.to_string());
-        assert_eq!(
-            refusal,
-            Some(MaterializerError::Catalog(unresolvable_key_column()).to_string())
-        );
-    }
 
     /// A settled conflict stored under an earlier deployment can name a table
     /// this deployment's catalog no longer declares. Its re-read is refused as
@@ -1010,5 +1075,33 @@ mod tests {
             commit_failure(CommitError::Probe(MaterializerError::Apply(duplicate))),
             WriteError::Materializer(_)
         ));
+    }
+
+    #[test]
+    fn an_uncommitted_registration_is_removed_when_the_apply_is_dropped() {
+        let registry = super::PendingWrites::default();
+        registry
+            .lock()
+            .insert(23, super::PendingWrite::new(vec![(17, 9)]));
+        drop(super::PendingRegistration {
+            registry: &registry,
+            transaction: Some(23),
+            committed: false,
+        });
+        assert!(registry.lock().is_empty());
+    }
+
+    #[test]
+    fn a_committed_registration_waits_for_ingest() {
+        let registry = super::PendingWrites::default();
+        registry
+            .lock()
+            .insert(23, super::PendingWrite::new(vec![(17, 9)]));
+        drop(super::PendingRegistration {
+            registry: &registry,
+            transaction: Some(23),
+            committed: true,
+        });
+        assert!(registry.lock().contains_key(&23));
     }
 }

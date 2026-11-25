@@ -36,7 +36,7 @@ use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{
     Backoff, Cursor, Major, PROTOCOL_VERSION, RetryPolicy, SchemaVersion, quote_ident,
 };
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use core::time::Duration;
 use diesel::connection::SimpleConnection;
 use diesel::connection::{
@@ -81,6 +81,8 @@ pub mod builder;
 pub mod cipher;
 mod clock;
 mod courier_audit;
+mod derived;
+mod derived_composition;
 #[cfg(feature = "device-identity")]
 pub mod device_key;
 mod drain;
@@ -107,6 +109,8 @@ mod memory_stores;
 #[cfg(all(feature = "peer", target_os = "android"))]
 mod multicast;
 mod outbox;
+mod overlay;
+mod overlay_archive;
 #[cfg(feature = "peer")]
 pub mod peer;
 mod pending;
@@ -1218,8 +1222,26 @@ impl ClientConfig {
     /// Fold the device's storage layout into the open configuration.
     fn with_storage_schema(mut self, schema: &SyncSchema) -> Self {
         self.shared_layout = schema.shared_layout().cloned().map(Arc::new);
-        if self.shared_layout.is_some() {
+        if let Some(layout) = &self.shared_layout {
             self.shared_tables = schema.shared_tables().map(str::to_lowercase).collect();
+            for overlay in layout.overlays() {
+                let logical = overlay.logical().to_lowercase();
+                let physical = overlay.physical().to_lowercase();
+                if let Some(previous) = self
+                    .policy_tables
+                    .to_physical
+                    .insert(logical.clone(), physical.clone())
+                {
+                    self.shared_tables.remove(&previous);
+                    self.policy_tables.to_logical.remove(&previous);
+                    self.policy_tables.views.insert(previous);
+                } else {
+                    self.policy_tables.views.insert(logical.clone());
+                }
+                self.shared_tables.remove(&logical);
+                self.shared_tables.insert(physical.clone());
+                self.policy_tables.to_logical.insert(physical, logical);
+            }
         }
         self.connection_ddl =
             (!schema.connection_ddl().is_empty()).then(|| Arc::from(schema.connection_ddl()));
@@ -1402,6 +1424,37 @@ enum Boot<'a> {
     Existing(&'a str),
 }
 
+/// A pending mutation whose writer identity changed.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MutationRekey {
+    /// The writer before the move.
+    pub previous_writer: WriterRef,
+    /// The sequence before the move.
+    pub previous_seq: u64,
+    /// The writer after the move.
+    pub writer: WriterRef,
+    /// The sequence after the move.
+    pub client_seq: u64,
+}
+
+/// Relay bookkeeping drained after each protocol step.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayNotice {
+    /// A pending mutation changed its writer identity.
+    MutationRekey(MutationRekey),
+    /// Provisional effects settle before the next patch or immediately.
+    WritesSettled {
+        /// The writer whose provisional effects settled.
+        writer: WriterRef,
+        /// The highest settled sequence of that writer.
+        through_seq: u64,
+        /// Whether settlement runs inside the next row batch.
+        before_patch: bool,
+    },
+}
+
 /// One observable outcome of [`ConnettoConnection::pump_one`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientEvent {
@@ -1511,6 +1564,8 @@ pub enum ClientEvent {
     /// The server confirmed a mutation as durably applied. Its pending
     /// record is retired, so it will never replay.
     MutationApplied {
+        /// The writer whose mutation was answered.
+        writer: WriterRef,
         /// The applied mutation's sequence number.
         client_seq: u64,
     },
@@ -1519,6 +1574,8 @@ pub enum ClientEvent {
     /// answered before the restore, so nothing rolls back and no
     /// application is raised again.
     WriteRestored {
+        /// The writer whose mutation was answered.
+        writer: WriterRef,
         /// The re-sent entry's sequence number.
         client_seq: u64,
         /// The restored server's refusal, absent when it applied the entry.
@@ -1530,6 +1587,8 @@ pub enum ClientEvent {
     Held(HeldWork),
     /// The server refused a mutation and the client rolled it back locally.
     MutationRejected {
+        /// The writer whose mutation was answered.
+        writer: WriterRef,
         /// The rejected mutation's sequence number.
         client_seq: u64,
         /// The server's reason for refusing the write.
@@ -1544,11 +1603,15 @@ pub enum ClientEvent {
     /// [`MutationConflict`](Self::MutationConflict) for the same sequence
     /// settles it.
     MutationDeferred {
+        /// The writer whose mutation was answered.
+        writer: WriterRef,
         /// The deferred mutation's sequence number.
         client_seq: u64,
     },
     /// The server reported a conflict on a prior mutation.
     MutationConflict {
+        /// The writer whose mutation was answered.
+        writer: WriterRef,
         /// The conflicting mutation's sequence number.
         client_seq: u64,
         /// Rows the conflicting write touched, rolled back locally.
@@ -2136,6 +2199,7 @@ struct WriteFlags {
     /// Raised by [`UnrecordedWrites`], read through
     /// [`outbox::UNRECORDED_FUNCTION`] by the outbox triggers alone.
     unrecorded: AtomicBool,
+    derived: AtomicI32,
 }
 
 /// Holds the write exemption for a write connetto makes itself, so the
@@ -2209,7 +2273,26 @@ fn backing_of<'t>(shared: &HashSet<String>, table: &'t str) -> replay::Backing<'
     replay::Backing {
         schema: shared_route(shared)(table).unwrap_or("main"),
         table,
+        shared_write: None,
     }
+}
+
+/// Where a peer op on `table` lands, with the overlaid table's shared-write
+/// key table, so the op reaches the shared rows under the view's guards.
+#[cfg(feature = "peer")]
+fn peer_backing<'t>(config: &'t ClientConfig, table: &'t str) -> replay::Backing<'t> {
+    let mut backing = backing_of(&config.shared_tables, table);
+    backing.shared_write = config
+        .shared_layout
+        .as_ref()
+        .and_then(|layout| {
+            layout
+                .overlays()
+                .iter()
+                .find(|overlay| overlay.physical().eq_ignore_ascii_case(table))
+        })
+        .map(connetto_core::schema::SharedOverlay::shared_write);
+    backing
 }
 
 /// Undo the shared part of each changeset in `newest_first`, in that order,
@@ -2640,7 +2723,29 @@ fn register_write_flags(
         SqliteFunctionBehavior::INNOCUOUS,
         move || unrecorded.unrecorded.load(Ordering::Relaxed),
     )
-    .map_err(|e| ClientError::Session(format!("registering the unrecorded function: {e}")))
+    .map_err(|error| {
+        ClientError::Session(format!("registering the unrecorded function: {error}"))
+    })?;
+    let derived = Arc::clone(flags);
+    db.register_sql_function::<diesel::sql_types::Integer, diesel::sql_types::Integer, _, _, _>(
+        connetto_core::DERIVED_WRITE_FUNCTION,
+        SqliteFunctionBehavior::INNOCUOUS,
+        move |delta: i32| {
+            if delta == 0 {
+                derived.derived.load(Ordering::Relaxed)
+            } else {
+                derived.derived.fetch_add(delta, Ordering::Relaxed) + delta
+            }
+        },
+    )
+    .map_err(|error| ClientError::Session(format!("registering the derived function: {error}")))?;
+    let traced = Arc::clone(flags);
+    db.on_trace(diesel::sqlite::SqliteTraceFlags::PROFILE, move |event| {
+        if matches!(event, diesel::sqlite::SqliteTraceEvent::Profile { .. }) {
+            traced.derived.store(0, Ordering::Relaxed);
+        }
+    });
+    Ok(())
 }
 
 /// Whether `name` is SQLite's or connetto's own, rather than the application's.
@@ -2976,6 +3081,7 @@ struct PeerApplyFrame {
     receiver: String,
     /// The receiver's subject values, restored when the author's bind ends.
     subjects: Option<(String, Option<String>)>,
+    write_flags: Arc<WriteFlags>,
 }
 
 /// How a landed entry is stored when the receiver does not hold it yet.
@@ -2989,6 +3095,7 @@ struct EntryToStore<'a> {
     received_at: i64,
     /// The replica-wide append position it takes.
     position: i64,
+    write_flags: &'a Arc<WriteFlags>,
 }
 
 /// Land one parsed peer entry as `cx.author` in a transaction of its own, a
@@ -3013,6 +3120,7 @@ fn land_peer_entry(
     let bound = peer::AuthorBinding::new(db, cx.author, cx.config.caller.as_ref(), subjects)?;
     let mut refusal = None;
     let tx = bound.db.transaction::<_, ClientError, _>(|db| {
+        let before = outbox::latest(db)?;
         let rows = match peer::apply_ops(db, diff.iter(), cx)? {
             Ok(rows) => rows,
             Err(cause) => {
@@ -3039,6 +3147,10 @@ fn land_peer_entry(
             };
         if let Some(cursor) = cursor {
             exchange::store_cursor(db, &cx.author.key_id, cursor)?;
+        }
+        {
+            let _exempt = ExemptWrites::raise(store.write_flags);
+            outbox::discard_peer_derived(db, &cx.config.shared_tables, before)?;
         }
         Ok((rows, position))
     });
@@ -3072,6 +3184,22 @@ fn adjudicate_provisional(
     provisional::adjudicate_entry(db, author, seq)?;
     holdings::release_provisional(db, config, &settled)?;
     Ok(!settled.is_empty())
+}
+
+#[cfg(feature = "peer")]
+fn confirm_written_rows(
+    database: &mut SqliteConnection,
+    config: &ClientConfig,
+    changeset: &[u8],
+) -> Result<Vec<provisional::ProvisionalRow>, ClientError> {
+    let keys = provisional::written_keys(changeset)?;
+    let cleared = provisional::clear_written(database, &keys)?;
+    let released: Vec<_> = cleared
+        .iter()
+        .map(|row| (row.table.clone(), row.key.clone()))
+        .collect();
+    holdings::release_provisional(database, config, &released)?;
+    Ok(cleared)
 }
 
 /// One re-applied entry's author, its sequence and the rows it lands, which
@@ -3257,6 +3385,7 @@ fn reapply_archived_entry(
                 body,
                 received_at: entry.received_at,
                 position: *next_position,
+                write_flags: &frame.write_flags,
             };
             let Err(_) = land_peer_entry(db, &cx, frame.subjects.as_ref(), &diff, &store, None)?
                 .map(|(rows, position)| {
@@ -3747,6 +3876,13 @@ fn writer_from_id(id: &str) -> Option<WriterRef> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct LocalEffects<'changeset> {
+    derived: &'changeset [u8],
+    overlay: &'changeset [u8],
+    local_changeset: Option<&'changeset [u8]>,
+}
+
 /// One queued write of one writer.
 #[derive(Debug, Clone)]
 struct PendingEntry {
@@ -4018,7 +4154,7 @@ fn delete_pending(
             .filter(_connetto_pending::seq.eq(seq_storage(seq)?)),
     )
     .execute(db)?;
-    Ok(())
+    derived::delete_local_changeset(db, &id, seq_storage(seq)?)
 }
 
 /// How one queued entry settled for good, applied or refused.
@@ -4088,6 +4224,7 @@ fn delete_writer_pending(db: &mut SqliteConnection, writer: &WriterRef) -> Resul
     let id = writer_id(writer);
     diesel::delete(_connetto_pending::table.filter(_connetto_pending::writer.eq(&id)))
         .execute(db)?;
+    derived::delete_writer(db, &id)?;
     Ok(())
 }
 
@@ -4103,6 +4240,7 @@ fn rekey_writer(
     diesel::update(_connetto_pending::table.filter(_connetto_pending::writer.eq(&from_id)))
         .set(_connetto_pending::writer.eq(&to_id))
         .execute(db)?;
+    derived::rekey(db, &from_id, &to_id)?;
     diesel::update(_connetto_writers::table.filter(_connetto_writers::id.eq(&from_id)))
         .set(_connetto_writers::id.eq(&to_id))
         .execute(db)?;
@@ -4325,10 +4463,18 @@ fn load_writer_queues(
             }
         }
     }
+    let derived_position: Option<i64> = derived::_connetto_derived::table
+        .select(diesel::dsl::max(derived::_connetto_derived::position))
+        .first(db)?;
+    let derived_position = derived_position
+        .map(u64::try_from)
+        .transpose()
+        .map_err(|error| ClientError::Protocol(error.to_string()))?;
     let next_position = queues
         .values()
         .flat_map(|queue| queue.pending.values())
         .map(|entry| entry.position)
+        .chain(derived_position)
         .max()
         .map_or(1, |position| position + 1);
     Ok((queues, next_position))
@@ -5155,6 +5301,8 @@ pub struct ConnettoConnection<T: Transport> {
     /// connetto writes and the translated schema's fail-closed write guards
     /// admit connetto's own writes and nobody else's.
     write_flags: Arc<WriteFlags>,
+    derived_settlements: Vec<(WriterRef, u64)>,
+    relay_notices: Option<Vec<RelayNotice>>,
     /// Raised while [`change_schema`](Self::change_schema) runs, the only time
     /// the authorizer admits DDL on an application table in `main`.
     schema_open: Arc<AtomicBool>,
@@ -5354,10 +5502,15 @@ fn install_replica_metadata(
     check_recorded_tables(db, "main", &config.unrecorded_tables)?;
     db.batch_execute(META_DDL)?;
     db.batch_execute(outbox::OUTBOX_DDL)?;
+    db.batch_execute(derived::DDL)?;
+    overlay::install(db, config.shared_layout.as_deref())?;
     db.batch_execute(acked::ACKED_DDL)?;
     let added = [
         "ALTER TABLE _connetto_meta ADD COLUMN cursor_subjects BLOB",
         "ALTER TABLE _connetto_pending ADD COLUMN major INTEGER",
+        "ALTER TABLE _connetto_outbox ADD COLUMN marked INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE _connetto_outbox ADD COLUMN overlay INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE _connetto_derived ADD COLUMN position INTEGER NOT NULL DEFAULT 0",
         acked::VERSION_COLUMN,
         acked::DISMISSED_COLUMN,
     ]
@@ -5713,6 +5866,8 @@ where
             #[cfg(feature = "device-identity")]
             retired_keys,
             dirty,
+            derived_settlements: Vec::new(),
+            relay_notices: None,
             write_flags,
             schema_open,
             changed,
@@ -5961,6 +6116,7 @@ where
     /// keeps whatever it had, so a caller can try again with another
     /// transport, and one that had nothing stays usable for local reads.
     pub async fn attach(&mut self, mut transport: T) -> Result<(), ClientError> {
+        self.derived_settlements.clear();
         let now = clock::now_secs(&mut self.db)?;
         // Durable authorization is loaded before the first handshake.
         self.prepare_share_keys().await?;
@@ -6009,6 +6165,9 @@ where
             self.abandon_rewound(rewound)?;
             return Err(ClientError::WriterRewound { writer: rewound });
         }
+        if let (Some(writer), Some(frontier)) = (bound, frontier) {
+            self.drop_derived_through(writer, frontier)?;
+        }
         self.run = Some(Run {
             session_handle: ack.session_handle,
             resume_token: ack.resume_token,
@@ -6056,13 +6215,7 @@ where
         self.plan_bind().await?;
         // A retirement owed before the last connection is re-sent here, queued
         // behind any bind so the connection is bound before it retires.
-        for (writer, secret) in load_retires(&mut self.db)? {
-            self.writer_tasks.push_back(WriterTask {
-                kind: WriterTaskKind::Retire(writer, secret),
-                request_id: writer_request_id(),
-                deadline: crate::away::SystemClock.monotonic() + WRITER_ANSWER_WAIT,
-            });
-        }
+        self.queue_retirements()?;
         self.flush_writer_tasks().await?;
         self.resume_attach().await?;
         // The deployment's courier path stands from the ack, the session's
@@ -6073,6 +6226,17 @@ where
         // the resync's retained ones beside them when the row owes them.
         #[cfg(feature = "peer")]
         self.plan_provisional_asks().await?;
+        Ok(())
+    }
+
+    fn queue_retirements(&mut self) -> Result<(), ClientError> {
+        for (writer, secret) in load_retires(&mut self.db)? {
+            self.writer_tasks.push_back(WriterTask {
+                kind: WriterTaskKind::Retire(writer, secret),
+                request_id: writer_request_id(),
+                deadline: crate::away::SystemClock.monotonic() + WRITER_ANSWER_WAIT,
+            });
+        }
         Ok(())
     }
 
@@ -6355,6 +6519,16 @@ where
                     .remove(&unissued())
                     .unwrap_or_else(WriterQueue::fresh);
                 queue.secret = secret;
+                if let Some(rekeys) = &mut self.relay_notices {
+                    rekeys.extend(queue.pending.keys().map(|sequence| {
+                        RelayNotice::MutationRekey(MutationRekey {
+                            previous_writer: unissued(),
+                            previous_seq: *sequence,
+                            writer: number,
+                            client_seq: *sequence,
+                        })
+                    }));
+                }
                 self.writers.insert(number, queue);
                 Ok(Some(number))
             }
@@ -8482,6 +8656,7 @@ where
                 if self.rewound(&writer, frontier) && !self.arm_restore(writer, frontier)? {
                     return self.retire_device(Carry::Abandoned);
                 }
+                self.drop_derived_through(writer, frontier)?;
                 let queue = self
                     .writers
                     .entry(writer)
@@ -8529,14 +8704,25 @@ where
     fn retire_number(&mut self, number: WriterRef) -> Result<(), ClientError> {
         let secret = self.writers.get(&number).and_then(|queue| queue.secret);
         let _suspended = ExemptWrites::raise(&self.write_flags);
-        persist_retire(&mut self.db, &number, secret.as_ref())?;
-        drop_writer_state(&mut self.db, &number)?;
+        self.db.transaction::<_, ClientError, _>(|database| {
+            persist_retire(database, &number, secret.as_ref())?;
+            derived::drop_writer(database, &self.config.shared_tables, &writer_id(&number))?;
+            drop_writer_state(database, &number)
+        })?;
         self.writer_tasks.push_back(WriterTask {
             kind: WriterTaskKind::Retire(number, secret),
             request_id: writer_request_id(),
             deadline: crate::away::SystemClock.monotonic() + WRITER_ANSWER_WAIT,
         });
-        self.writers.remove(&number);
+        if let Some(queue) = self.writers.remove(&number)
+            && let Some(notices) = &mut self.relay_notices
+        {
+            notices.push(RelayNotice::WritesSettled {
+                writer: number,
+                through_seq: queue.next_seq.saturating_sub(1),
+                before_patch: false,
+            });
+        }
         Ok(())
     }
 
@@ -8673,6 +8859,13 @@ where
                     ..entry.record()
                 };
                 persist_pending(db, target, placement.seq, &record)?;
+                derived::move_entry(
+                    db,
+                    &writer_id(&placement.source),
+                    seq_storage(placement.original_seq)?,
+                    &writer_id(target),
+                    seq_storage(placement.seq)?,
+                )?;
                 delete_pending(db, &placement.source, placement.original_seq)?;
             }
             if !plan.is_empty() {
@@ -8690,6 +8883,7 @@ where
                     persist_retired_key(db, *key)?;
                 }
                 if emptied.contains(writer) {
+                    derived::drop_writer(db, &self.config.shared_tables, &writer_id(writer))?;
                     drop_writer_state(db, writer)?;
                 }
             }
@@ -8703,6 +8897,14 @@ where
             queue.next_seq = next_seq;
             queue.head = head;
             for placement in plan {
+                if let Some(rekeys) = &mut self.relay_notices {
+                    rekeys.push(RelayNotice::MutationRekey(MutationRekey {
+                        previous_writer: placement.source,
+                        previous_seq: placement.original_seq,
+                        writer: *target,
+                        client_seq: placement.seq,
+                    }));
+                }
                 let mut entry = self
                     .writers
                     .get_mut(&placement.source)
@@ -8716,9 +8918,21 @@ where
             }
             self.writers.insert(*target, queue);
         }
+        self.finish_carried_writers(dead, &emptied);
+        Ok(())
+    }
+
+    fn finish_carried_writers(&mut self, dead: &[WriterRef], emptied: &[WriterRef]) {
         for writer in dead {
-            if emptied.contains(writer) {
-                self.writers.remove(writer);
+            if emptied.contains(writer)
+                && let Some(queue) = self.writers.remove(writer)
+                && let Some(notices) = &mut self.relay_notices
+            {
+                notices.push(RelayNotice::WritesSettled {
+                    writer: *writer,
+                    through_seq: queue.next_seq.saturating_sub(1),
+                    before_patch: false,
+                });
             }
             if matches!(writer, WriterRef::Device(_)) {
                 // The connection the exclusion ran on may die before the
@@ -8734,7 +8948,6 @@ where
                 self.retired_keys.insert(*key);
             }
         }
-        Ok(())
     }
 
     /// The writer a tail travels to when its writer dies: a live number when
@@ -8788,6 +9001,7 @@ where
         &mut self,
         writer: &WriterRef,
         changeset: &[u8],
+        local: LocalEffects<'_>,
         provenance: Option<Provenance>,
         major: Option<Major>,
         outbox_through: Option<i64>,
@@ -8814,18 +9028,20 @@ where
         let unsent = if self.config.shared_tables.is_empty() {
             None
         } else {
-            let queued: Vec<Vec<u8>> = self
+            let mut queued: Vec<Vec<u8>> = self
                 .writers
                 .values()
                 .flat_map(|queue| queue.pending.values())
                 .map(|entry| entry.changeset.clone())
                 .collect();
+            queued.extend(derived::all_changesets(&mut self.db)?);
             Some(spare_clauses(
                 &mut self.db,
-                queued
-                    .iter()
-                    .map(Vec::as_slice)
-                    .chain(core::iter::once(changeset)),
+                queued.iter().map(Vec::as_slice).chain(
+                    [changeset, local.derived]
+                        .into_iter()
+                        .filter(|changeset| !changeset.is_empty()),
+                ),
             )?)
         };
         {
@@ -8834,8 +9050,32 @@ where
             self.db.transaction::<(), ClientError, _>(|db| {
                 persist_writer_state(db, writer, seq + 1, &hash)?;
                 persist_pending(db, writer, seq, &entry.record())?;
+                derived::store(
+                    db,
+                    &writer_id(writer),
+                    seq_storage(seq)?,
+                    seq_storage(position)?,
+                    local.derived,
+                )?;
+                if let Some(changeset) = local.local_changeset {
+                    derived::store_local_changeset(
+                        db,
+                        &writer_id(writer),
+                        seq_storage(seq)?,
+                        changeset,
+                        &entry.changeset,
+                    )?;
+                }
+                overlay_archive::import_entry(
+                    db,
+                    local.overlay,
+                    &writer_id(writer),
+                    seq_storage(seq)?,
+                )?;
                 if let Some(through) = outbox_through {
+                    overlay::assign_pending(db, &writer_id(writer), seq_storage(seq)?)?;
                     outbox::clear_through(db, through)?;
+                    derived::clear_unsent(db)?;
                 }
                 if let Some(mut unsent) = unsent {
                     merge_clauses(
@@ -10063,6 +10303,7 @@ where
     /// Writes here are captured for upload on the next [`push`](Self::push).
     /// `CREATE`, `ALTER` and `DROP` of a synced table are refused here and go
     /// through [`change_schema`](Self::change_schema).
+    /// The replica connection's SQLite trace callback belongs to connetto.
     pub const fn conn(&mut self) -> &mut SqliteConnection {
         &mut self.db
     }
@@ -10110,6 +10351,30 @@ where
     #[must_use]
     pub const fn has_ever_synced(&self) -> bool {
         self.last_cursor.is_some()
+    }
+    /// The writer selected for the next locally queued mutation.
+    pub fn mutation_writer(&mut self) -> WriterRef {
+        self.choose_writer()
+    }
+
+    /// The writer bound to the current upstream session.
+    #[must_use]
+    pub const fn bound_writer(&self) -> Option<WriterRef> {
+        self.bound_writer
+    }
+    /// Enable relay bookkeeping notifications.
+    #[doc(hidden)]
+    pub fn track_relay_notices(&mut self) {
+        self.relay_notices.get_or_insert_with(Vec::new);
+    }
+
+    /// Drain relay bookkeeping after each protocol step, before forwarding its event.
+    #[doc(hidden)]
+    pub fn take_relay_notices(&mut self) -> Vec<RelayNotice> {
+        self.relay_notices
+            .as_mut()
+            .map(core::mem::take)
+            .unwrap_or_default()
     }
 
     /// The (writer, sequence) pairs of entries captured locally but not yet
@@ -10440,6 +10705,7 @@ where
             body,
             received_at: frame.now,
             position: i64::try_from(self.peer_next_position).unwrap_or(i64::MAX),
+            write_flags: &frame.write_flags,
         };
         // The author's ops are judged by the guards and never uploaded as this
         // device's own.
@@ -10553,6 +10819,7 @@ where
             now,
             receiver: self.account().unwrap_or_default(),
             subjects,
+            write_flags: Arc::clone(&self.write_flags),
         })
     }
 
@@ -10627,7 +10894,7 @@ where
                     config,
                     &[(record.table.clone(), record.key.clone())],
                 )?;
-                let backing = backing_of(&config.shared_tables, &record.table);
+                let backing = peer_backing(config, &record.table);
                 if replay::undo_peer_op(db, logical_table, backing, &ops[index])?
                     == replay::PeerVerdict::Refused
                 {
@@ -10871,6 +11138,8 @@ where
                 account: self.account(),
                 synced_rows,
                 local_rows,
+                derived_marks: derived::all_marks(&mut self.db)?,
+                held_overlays: overlay_archive::export_held(&mut self.db)?,
                 pending: {
                     let mut queued: Vec<_> = self
                         .writers
@@ -10885,6 +11154,9 @@ where
                                         hash: entry.hash,
                                         major: entry.major,
                                         changeset: entry.changeset.clone(),
+                                        derived: Vec::new(),
+                                        overlay: Vec::new(),
+                                        local_changeset: None,
                                         secret: queue.secret,
                                         provenance: entry.provenance,
                                     },
@@ -10893,6 +11165,24 @@ where
                         })
                         .collect();
                     queued.sort_unstable_by_key(|(position, _)| *position);
+                    for (_, entry) in &mut queued {
+                        entry.derived = derived::load(
+                            &mut self.db,
+                            &writer_id(&entry.writer),
+                            seq_storage(entry.seq)?,
+                        )?
+                        .unwrap_or_default();
+                        entry.overlay = overlay_archive::export_entry(
+                            &mut self.db,
+                            &writer_id(&entry.writer),
+                            seq_storage(entry.seq)?,
+                        )?;
+                        entry.local_changeset = derived::load_local_changeset(
+                            &mut self.db,
+                            &writer_id(&entry.writer),
+                            seq_storage(entry.seq)?,
+                        )?;
+                    }
                     queued.into_iter().map(|(_, entry)| entry).collect()
                 },
                 peer_entries,
@@ -11067,6 +11357,10 @@ where
                 // inside a self-referencing table can refuse a whole archive,
                 // and an orphan still aborts the import (R92 decision 3).
                 db.batch_execute("PRAGMA defer_foreign_keys = ON")?;
+                for (writer, through) in &plan.archive.derived_marks {
+                    derived::drop_through(db, shared, &writer_id(writer), seq_storage(*through)?)?;
+                }
+                overlay_archive::import_held(db, &plan.archive.held_overlays)?;
                 for row in &plan.rows {
                     if choices.answer(row.collision) == Keep::Mine {
                         outcome.rows_kept += 1;
@@ -11106,20 +11400,21 @@ where
                     // never held is omitted rather than failing: the cache is
                     // not imported, so it may not be here, and the server
                     // settles the write when it goes up.
-                    db.apply_changeset(&entry.changeset, |_| ConflictAction::Omit)
-                        .map_err(|err| {
-                            ClientError::Import(format!("applying a restored write: {err}"))
-                        })?;
-                    if !shared.is_empty() {
-                        replay::apply(
-                            db,
-                            &entry.changeset,
-                            replay::Policy::Omit,
-                            &shared_route(shared),
-                        )
-                        .map_err(|err| {
-                            ClientError::Import(format!("applying a restored write: {err}"))
-                        })?;
+                    let primary = entry.local_changeset.as_deref().unwrap_or(&entry.changeset);
+                    for changeset in [primary, entry.derived.as_slice()] {
+                        if changeset.is_empty() {
+                            continue;
+                        }
+                        db.apply_changeset(changeset, rollback_omit)
+                            .map_err(|error| ClientError::Import(error.to_string()))?;
+                        if !shared.is_empty() {
+                            replay::apply(
+                                db,
+                                changeset,
+                                replay::Policy::Omit,
+                                &shared_route(shared),
+                            )?;
+                        }
                     }
                     outcome.writes_restored += 1;
                 }
@@ -11214,7 +11509,18 @@ where
                     secret: entry.secret,
                 })
             });
-            self.append_entry(&target, &entry.changeset, provenance, entry.major, None)?;
+            self.append_entry(
+                &target,
+                &entry.changeset,
+                LocalEffects {
+                    derived: &entry.derived,
+                    overlay: &entry.overlay,
+                    local_changeset: entry.local_changeset.as_deref(),
+                },
+                provenance,
+                entry.major,
+                None,
+            )?;
             restored += 1;
         }
         Ok(restored)
@@ -11653,63 +11959,73 @@ where
     /// [`ClientError`] on a transport, apply, or protocol failure.
     pub async fn pump_one(&mut self) -> Result<ClientEvent, ClientError> {
         loop {
-            self.check_share_key_deadlines();
-            self.step_share_keys().await?;
-            self.check_writer_deadlines();
-            #[cfg(feature = "peer")]
-            {
-                self.check_provisional_deadlines()?;
-                self.flush_provisional_asks().await?;
-                self.check_courier_deadline().await?;
-                self.flush_courier_ranges().await?;
-            }
-            self.check_drain_deadline().await;
-            self.step_drain_share_keys().await?;
-            if let Some(notice) = self.notices.pop_front() {
-                return Ok(notice);
-            }
-            #[cfg(feature = "peer")]
-            let arrived = match (
-                self.wire.as_mut(),
-                self.drain.wire_mut(),
-                self.courier_wire.as_mut(),
-            ) {
-                (None, None, None) => return Err(ClientError::NotConnected),
-                (Some(wire), None, None) => Arrived::Main(wire.transport.recv().await),
-                (None, Some(drain), None) => Arrived::Drain(drain.recv().await),
-                (None, None, Some(courier)) => Arrived::Courier(courier.recv().await),
-                (Some(wire), Some(drain), None) => tokio::select! {
-                    frame = wire.transport.recv() => Arrived::Main(frame),
-                    frame = drain.recv() => Arrived::Drain(frame),
-                },
-                (Some(wire), None, Some(courier)) => tokio::select! {
-                    frame = wire.transport.recv() => Arrived::Main(frame),
-                    frame = courier.recv() => Arrived::Courier(frame),
-                },
-                (None, Some(drain), Some(courier)) => tokio::select! {
-                    frame = drain.recv() => Arrived::Drain(frame),
-                    frame = courier.recv() => Arrived::Courier(frame),
-                },
-                (Some(wire), Some(drain), Some(courier)) => tokio::select! {
-                    frame = wire.transport.recv() => Arrived::Main(frame),
-                    frame = drain.recv() => Arrived::Drain(frame),
-                    frame = courier.recv() => Arrived::Courier(frame),
-                },
-            };
-            #[cfg(not(feature = "peer"))]
-            let arrived = match (self.wire.as_mut(), self.drain.wire_mut()) {
-                (None, None) => return Err(ClientError::NotConnected),
-                (Some(wire), None) => Arrived::Main(wire.transport.recv().await),
-                (None, Some(drain)) => Arrived::Drain(drain.recv().await),
-                (Some(wire), Some(drain)) => tokio::select! {
-                    frame = wire.transport.recv() => Arrived::Main(frame),
-                    frame = drain.recv() => Arrived::Drain(frame),
-                },
-            };
-            if let Some(event) = self.on_arrival(arrived).await? {
+            if let Some(event) = self.pump_relay_step().await? {
                 return Ok(event);
             }
         }
+    }
+
+    /// Reads one protocol step, allowing relay bookkeeping to drain between frames.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`pump_one`](Self::pump_one).
+    #[doc(hidden)]
+    pub async fn pump_relay_step(&mut self) -> Result<Option<ClientEvent>, ClientError> {
+        self.check_share_key_deadlines();
+        self.step_share_keys().await?;
+        self.check_writer_deadlines();
+        #[cfg(feature = "peer")]
+        {
+            self.check_provisional_deadlines()?;
+            self.flush_provisional_asks().await?;
+            self.check_courier_deadline().await?;
+            self.flush_courier_ranges().await?;
+        }
+        self.check_drain_deadline().await;
+        self.step_drain_share_keys().await?;
+        if let Some(notice) = self.notices.pop_front() {
+            return Ok(Some(notice));
+        }
+        #[cfg(feature = "peer")]
+        let arrived = match (
+            self.wire.as_mut(),
+            self.drain.wire_mut(),
+            self.courier_wire.as_mut(),
+        ) {
+            (None, None, None) => return Err(ClientError::NotConnected),
+            (Some(wire), None, None) => Arrived::Main(wire.transport.recv().await),
+            (None, Some(drain), None) => Arrived::Drain(drain.recv().await),
+            (None, None, Some(courier)) => Arrived::Courier(courier.recv().await),
+            (Some(wire), Some(drain), None) => tokio::select! {
+                frame = wire.transport.recv() => Arrived::Main(frame),
+                frame = drain.recv() => Arrived::Drain(frame),
+            },
+            (Some(wire), None, Some(courier)) => tokio::select! {
+                frame = wire.transport.recv() => Arrived::Main(frame),
+                frame = courier.recv() => Arrived::Courier(frame),
+            },
+            (None, Some(drain), Some(courier)) => tokio::select! {
+                frame = drain.recv() => Arrived::Drain(frame),
+                frame = courier.recv() => Arrived::Courier(frame),
+            },
+            (Some(wire), Some(drain), Some(courier)) => tokio::select! {
+                frame = wire.transport.recv() => Arrived::Main(frame),
+                frame = drain.recv() => Arrived::Drain(frame),
+                frame = courier.recv() => Arrived::Courier(frame),
+            },
+        };
+        #[cfg(not(feature = "peer"))]
+        let arrived = match (self.wire.as_mut(), self.drain.wire_mut()) {
+            (None, None) => return Err(ClientError::NotConnected),
+            (Some(wire), None) => Arrived::Main(wire.transport.recv().await),
+            (None, Some(drain)) => Arrived::Drain(drain.recv().await),
+            (Some(wire), Some(drain)) => tokio::select! {
+                frame = wire.transport.recv() => Arrived::Main(frame),
+                frame = drain.recv() => Arrived::Drain(frame),
+            },
+        };
+        self.on_arrival(arrived).await
     }
 
     /// Reads one cancel-safe protocol step, returning `None` on cancellation or a frame without a client event.
@@ -12107,14 +12423,26 @@ where
             return Ok(None);
         };
         if built.changeset.is_empty() {
-            self.db
-                .transaction(|db| outbox::clear_through(db, built.through))?;
+            let _exempt = ExemptWrites::raise(&self.write_flags);
+            let shared = &self.config.shared_tables;
+            self.db.transaction::<_, ClientError, _>(|database| {
+                derived::invert(database, shared, &built.marked)?;
+                derived::invert(database, shared, &built.cancelled_overlay)?;
+                overlay::drop_unqueued(database)?;
+                outbox::clear_through(database, built.through)?;
+                derived::clear_unsent(database)
+            })?;
             return Ok(None);
         }
         let writer = self.choose_writer();
         self.append_entry(
             &writer,
             &built.changeset,
+            LocalEffects {
+                derived: &built.marked,
+                overlay: &[],
+                local_changeset: built.local_changeset.as_deref(),
+            },
             None,
             self.config.schema_major,
             Some(built.through),
@@ -12216,6 +12544,7 @@ where
         client_seq: u64,
         refused: &PriorRefusal,
     ) -> Result<Vec<AffectedRow>, ClientError> {
+        self.queue_outbox()?;
         let Some(queue) = self.writers.get_mut(&writer) else {
             return Ok(Vec::new());
         };
@@ -12223,8 +12552,18 @@ where
             return Ok(Vec::new());
         };
         let rows = affected_rows(&entry.changeset, &self.config.policy_tables)?;
-        let inverse = invert_changeset(&entry.changeset)
-            .map_err(|err| ClientError::Apply(format!("inverting rejected changeset: {err}")))?;
+        let local = derived::local_changeset(
+            &mut self.db,
+            &writer_id(&writer),
+            seq_storage(client_seq)?,
+            &entry.changeset,
+        )?;
+        let inverse = if local.is_empty() {
+            Vec::new()
+        } else {
+            invert_changeset(&local)
+                .map_err(|err| ClientError::Apply(format!("inverting rejected changeset: {err}")))?
+        };
         let shared = &self.config.shared_tables;
         let settled = Settled {
             refused: Some(refused),
@@ -12234,11 +12573,14 @@ where
         {
             let _suspended = ExemptWrites::raise(&self.write_flags);
             self.db.transaction::<_, ClientError, _>(|db| {
+                derived::drop_entry(db, shared, &writer_id(&writer), seq_storage(client_seq)?)?;
                 settle_pending(db, &writer, client_seq, &entry, &settled)?;
-                db.apply_changeset(&inverse, rollback_omit)
-                    .map_err(|err| ClientError::Apply(err.to_string()))?;
-                if !shared.is_empty() {
-                    replay::apply(db, &inverse, replay::Policy::Omit, &shared_route(shared))?;
+                if !inverse.is_empty() {
+                    db.apply_changeset(&inverse, rollback_omit)
+                        .map_err(|err| ClientError::Apply(err.to_string()))?;
+                    if !shared.is_empty() {
+                        replay::apply(db, &inverse, replay::Policy::Omit, &shared_route(shared))?;
+                    }
                 }
                 Ok(())
             })?;
@@ -12335,6 +12677,11 @@ where
     /// still has to re-run when the membership moves (R27).
     pub(crate) fn take_changed_unfiltered(&mut self) -> Vec<String> {
         let tables = &self.config.policy_tables;
+        let overlays = self
+            .config
+            .shared_layout
+            .as_ref()
+            .map_or(&[][..], |layout| layout.overlays());
         let mut named: Vec<String> = self
             .changed
             .lock()
@@ -12343,7 +12690,10 @@ where
                     .filter(|name| !is_internal_table(name))
                     .map(|name| match tables.logical(&name) {
                         Some(logical) => logical.to_owned(),
-                        None => name,
+                        None => overlays
+                            .iter()
+                            .find(|overlay| overlay.overlay().eq_ignore_ascii_case(&name))
+                            .map_or(name, |overlay| overlay.logical().to_owned()),
                     })
                     .collect()
             })
@@ -12502,6 +12852,22 @@ where
             ControlMessage::MutationApplied(ack) => {
                 self.mutation_applied(ack.client_seq).await.map(Some)
             }
+            ControlMessage::WritesSettled(settled) => {
+                if settled.before_patch {
+                    self.derived_settlements
+                        .push((settled.writer, settled.through_seq));
+                } else {
+                    self.drop_derived_through(settled.writer, settled.through_seq)?;
+                }
+                if let Some(notices) = &mut self.relay_notices {
+                    notices.push(RelayNotice::WritesSettled {
+                        writer: settled.writer,
+                        through_seq: settled.through_seq,
+                        before_patch: settled.before_patch,
+                    });
+                }
+                Ok(None)
+            }
             ControlMessage::MutationReject(reject) => {
                 self.mutation_rejected(&reject).await.map(Some)
             }
@@ -12520,6 +12886,7 @@ where
                 #[cfg(feature = "device-identity")]
                 self.finish_number_tail().await?;
                 Ok(Some(ClientEvent::MutationConflict {
+                    writer,
                     client_seq: conflict.client_seq,
                     rows,
                     server_row: conflict.server_row,
@@ -12731,7 +13098,31 @@ where
         self.settle_resend();
         #[cfg(feature = "device-identity")]
         self.finish_number_tail().await?;
-        Ok(ClientEvent::MutationApplied { client_seq })
+        Ok(ClientEvent::MutationApplied {
+            writer: writer.ok_or_else(|| {
+                ClientError::Protocol(
+                    "an application answer arrived without a bound writer".to_owned(),
+                )
+            })?,
+            client_seq,
+        })
+    }
+
+    fn drop_derived_through(&mut self, writer: WriterRef, through: u64) -> Result<(), ClientError> {
+        let writer = writer_id(&writer);
+        let through = seq_storage(through)?;
+        if through <= derived::dropped_mark(&mut self.db, &writer)?
+            || !derived::has_held_through(&mut self.db, &writer, through)?
+        {
+            return Ok(());
+        }
+        let shared = &self.config.shared_tables;
+        let exemption = ExemptWrites::raise(&self.write_flags);
+        self.db.transaction::<_, ClientError, _>(|database| {
+            derived::drop_through(database, shared, &writer, through)
+        })?;
+        drop(exemption);
+        self.record_unsent()
     }
 
     /// Roll back an entry the server refused, or keep it for a resend when the
@@ -12764,7 +13155,12 @@ where
                 self.mark_deferred(client_seq);
                 self.defer_pending(None);
             }
-            return Ok(ClientEvent::MutationDeferred { client_seq });
+            return Ok(ClientEvent::MutationDeferred {
+                writer: writer.ok_or_else(|| {
+                    ClientError::Protocol("a deferral arrived without a bound writer".to_owned())
+                })?,
+                client_seq,
+            });
         }
         // Another entry stands at a sequence the restore re-sent, so the run
         // is not this writer's history any more and the writer moves on.
@@ -12774,6 +13170,7 @@ where
         {
             self.move_rewound_writer_on(writer)?;
             return Ok(ClientEvent::WriteRestored {
+                writer,
                 client_seq,
                 refused: Some(PriorRefusal::Rejected(MutationRejectReason::Forked)),
             });
@@ -12790,6 +13187,9 @@ where
         #[cfg(feature = "device-identity")]
         self.finish_number_tail().await?;
         Ok(ClientEvent::MutationRejected {
+            writer: writer.ok_or_else(|| {
+                ClientError::Protocol("a refusal arrived without a bound writer".to_owned())
+            })?,
             client_seq,
             reason: reject.reason.clone(),
             rows,
@@ -12859,6 +13259,7 @@ where
             self.offer_changed(&writer);
         }
         Ok(Some(ClientEvent::WriteRestored {
+            writer,
             client_seq,
             refused: refused.cloned(),
         }))
@@ -12873,6 +13274,10 @@ where
         let Some(entries) = self.retained_run(&writer, frontier)? else {
             return Ok(false);
         };
+        {
+            let _exemption = ExemptWrites::raise(&self.write_flags);
+            derived::record_mark(&mut self.db, &writer_id(&writer), seq_storage(frontier)?)?;
+        }
         self.restore = Some(Box::new(Restore {
             writer,
             entries: entries.into_iter().collect(),
@@ -13092,12 +13497,13 @@ where
     /// changeset, whose op carries the backing table's own schema, so the
     /// primary-key columns and ordinals come straight from it.
     fn pending_spare(&mut self) -> Result<HashMap<String, Vec<String>>, ClientError> {
-        let changesets: Vec<Vec<u8>> = self
+        let mut changesets: Vec<Vec<u8>> = self
             .writers
             .values()
             .flat_map(|queue| queue.pending.values())
             .map(|entry| entry.changeset.clone())
             .collect();
+        changesets.extend(derived::all_changesets(&mut self.db)?);
         let mut spare = spare_clauses(&mut self.db, changesets.iter().map(Vec::as_slice))?;
         merge_clauses(
             &mut spare,
@@ -13138,28 +13544,59 @@ where
         if self.config.shared_tables.is_empty() {
             return Ok(SharedDeparture::NotShared);
         }
-        let (unpushed, mut queued): (Vec<u8>, Vec<&PendingEntry>) = if discard_unsent {
-            (
-                outbox::build(&mut self.db, &self.config.shared_tables)?
-                    .map(|built| built.changeset)
-                    .unwrap_or_default(),
-                self.writers
-                    .values()
-                    .flat_map(|queue| queue.pending.values())
-                    .collect(),
-            )
+        let unpushed = if discard_unsent {
+            outbox::build(&mut self.db, &self.config.shared_tables)?
         } else {
-            (Vec::new(), Vec::new())
+            None
         };
-        queued.sort_by_key(|entry| core::cmp::Reverse(entry.position));
-        let newest_first = (!unpushed.is_empty())
-            .then_some(unpushed.as_slice())
-            .into_iter()
-            .chain(queued.into_iter().map(|entry| entry.changeset.as_slice()));
+        let mut queued: Vec<_> = self
+            .writers
+            .iter()
+            .filter(|_| discard_unsent)
+            .flat_map(|(writer, queue)| {
+                queue
+                    .pending
+                    .iter()
+                    .map(move |(sequence, entry)| (writer, sequence, entry))
+            })
+            .collect();
+        queued.sort_by_key(|(_, _, entry)| core::cmp::Reverse(entry.position));
         let config = &self.config;
         let _suspended = ExemptWrites::raise(&self.write_flags);
         let remain = self.db.immediate_transaction(|db| {
-            undo_shared(db, &config.shared_tables, newest_first)?;
+            if let Some(captured) = unpushed {
+                derived::invert(db, &config.shared_tables, &captured.marked)?;
+                let primary = captured
+                    .local_changeset
+                    .as_deref()
+                    .unwrap_or(&captured.changeset);
+                if !primary.is_empty() {
+                    undo_shared(db, &config.shared_tables, [primary])?;
+                }
+                outbox::clear_through(db, captured.through)?;
+                derived::clear_unsent(db)?;
+                overlay::drop_unqueued(db)?;
+            }
+            for (writer, sequence, entry) in queued {
+                derived::drop_entry(
+                    db,
+                    &config.shared_tables,
+                    &writer_id(writer),
+                    seq_storage(*sequence)?,
+                )?;
+                let local = derived::local_changeset(
+                    db,
+                    &writer_id(writer),
+                    seq_storage(*sequence)?,
+                    &entry.changeset,
+                )?;
+                undo_shared(db, &config.shared_tables, [local.as_ref()])?;
+                derived::delete_local_changeset(db, &writer_id(writer), seq_storage(*sequence)?)?;
+            }
+            for (writer, sequence) in derived::acknowledged(db)? {
+                derived::drop_entry(db, &config.shared_tables, &writer, sequence)?;
+            }
+            overlay::clear(db)?;
             presence::depart(db, config, &config.client_id)
         })?;
         Ok(if remain {
@@ -13378,18 +13815,38 @@ where
     /// exemption is raised, so re-applying records nothing and the outbox
     /// keeps the unpushed writes for the push that uploads them.
     fn reapply_pending(&mut self) -> Result<(), ClientError> {
-        let mut queued: Vec<(u64, Vec<u8>)> = self
-            .writers
-            .values()
-            .flat_map(|queue| queue.pending.values())
-            .map(|entry| (entry.position, entry.changeset.clone()))
+        let mut ordered = Vec::new();
+        for (writer, queue) in &self.writers {
+            for (sequence, entry) in &queue.pending {
+                let marked =
+                    derived::load(&mut self.db, &writer_id(writer), seq_storage(*sequence)?)?
+                        .unwrap_or_default();
+                let local = derived::local_changeset(
+                    &mut self.db,
+                    &writer_id(writer),
+                    seq_storage(*sequence)?,
+                    &entry.changeset,
+                )?
+                .into_owned();
+                ordered.push((entry.position, local, marked));
+            }
+        }
+        ordered.sort_unstable_by_key(|(position, _, _)| *position);
+        let mut queued: Vec<Vec<u8>> = ordered
+            .into_iter()
+            .flat_map(|(_, changeset, marked)| [changeset, marked])
+            .filter(|changeset| !changeset.is_empty())
             .collect();
-        queued.sort_unstable_by_key(|(position, _)| *position);
-        let mut queued: Vec<Vec<u8>> = queued.into_iter().map(|(_, changeset)| changeset).collect();
         if let Some(built) = outbox::build(&mut self.db, &self.config.shared_tables)?
             && !built.changeset.is_empty()
         {
-            queued.push(built.changeset);
+            let local = built.local_changeset.unwrap_or(built.changeset);
+            if !local.is_empty() {
+                queued.push(local);
+            }
+            if !built.marked.is_empty() {
+                queued.push(built.marked);
+            }
         }
         if queued.is_empty() {
             return Ok(());
@@ -13447,6 +13904,9 @@ where
         cursor: Option<&Cursor>,
         addressed_to: &str,
     ) -> Result<(), ClientError> {
+        if !self.derived_settlements.is_empty() {
+            self.queue_outbox()?;
+        }
         let bytes = zstd::decode_all(payload_zstd)?;
         let parsed = ParsedDiffSet::parse(&bytes).ok();
         let set = match &parsed {
@@ -13481,6 +13941,9 @@ where
         #[cfg(feature = "peer")]
         let replacing = cursor.is_none() && self.resyncing.contains(addressed_to);
         let applied = deleting_transaction(&mut self.db, config, |conn| {
+            for (writer, through) in &self.derived_settlements {
+                derived::drop_through(conn, shared, &writer_id(writer), seq_storage(*through)?)?;
+            }
             let held = match set {
                 Some(set) => Some(holdings::PatchHoldings::read(conn, config, set)?),
                 None => None,
@@ -13510,14 +13973,7 @@ where
                     // is a resync's replacement (R77 decisions 13 and 14).
                     #[cfg(feature = "peer")]
                     if !replacing {
-                        let keys = provisional::written_keys(&bytes)?;
-                        let cleared = provisional::clear_written(conn, &keys)?;
-                        let released: Vec<(String, Vec<KeyValue>)> = cleared
-                            .iter()
-                            .map(|row| (row.table.clone(), row.key.clone()))
-                            .collect();
-                        holdings::release_provisional(conn, config, &released)?;
-                        confirmed = Some(cleared);
+                        confirmed = Some(confirm_written_rows(conn, config, &bytes)?);
                     }
                     if let Some(held) = &held
                         && holdings::is_holder(conn, addressed_to)?
@@ -13545,6 +14001,7 @@ where
             stage.clear();
         }
         applied?;
+        self.derived_settlements.clear();
         #[cfg(feature = "peer")]
         if let Some(rows) = confirmed.filter(|rows| !rows.is_empty()) {
             let rows = rows
@@ -13715,6 +14172,317 @@ mod tests {
     const DDL: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY)";
 
     #[test]
+    fn derived_capture_separates_rows_and_resets_after_failed_trigger() {
+        let schema = "CREATE TABLE t (id INTEGER PRIMARY KEY);
+            CREATE TABLE audit (id INTEGER PRIMARY KEY);
+            CREATE TRIGGER derive AFTER INSERT ON t
+            WHEN NOT connetto_write_exempt() BEGIN
+                SELECT connetto_derived_write(1);
+                INSERT INTO audit VALUES (NEW.id);
+                SELECT CASE WHEN NEW.id = 2 THEN RAISE(ABORT, 'refused') END;
+                SELECT connetto_derived_write(-1);
+            END;";
+        let mut connection = ConnettoConnection::<FakeTransport>::open(
+            &Replica::in_memory(),
+            schema,
+            &ClientConfig::new("derived"),
+            None,
+        )
+        .expect("open");
+        connection
+            .batch_execute("INSERT INTO t VALUES (1)")
+            .expect("write");
+        assert!(
+            connection
+                .batch_execute("INSERT INTO t VALUES (2)")
+                .is_err()
+        );
+        connection
+            .batch_execute("INSERT INTO t VALUES (3)")
+            .expect("next write");
+        let captured = outbox::build(&mut connection.db, &HashSet::new())
+            .expect("capture")
+            .expect("writes");
+        let uploaded =
+            affected_rows(&captured.changeset, &connection.config.policy_tables).expect("rows");
+        assert_eq!(uploaded.len(), 2);
+        assert!(uploaded.iter().all(|row| row.table == "t"));
+    }
+
+    fn acknowledged_derived_writer() -> ConnettoConnection<FakeTransport> {
+        let mut connection = ConnettoConnection::open(
+            &Replica::in_memory(),
+            "CREATE TABLE source (id INTEGER PRIMARY KEY);
+             CREATE TABLE effect (id INTEGER PRIMARY KEY, value INTEGER NOT NULL);
+             INSERT INTO effect VALUES (1, 0);
+             CREATE TRIGGER derive AFTER INSERT ON source
+             WHEN NOT connetto_write_exempt() BEGIN
+                 SELECT connetto_derived_write(1);
+                 UPDATE effect SET value = NEW.id WHERE id = 1;
+                 SELECT connetto_derived_write(-1);
+             END;",
+            &ClientConfig::new("retiring-derived"),
+            None,
+        )
+        .expect("open");
+        for sequence in 1..=2 {
+            connection
+                .batch_execute(&format!("INSERT INTO source VALUES ({sequence})"))
+                .expect("derive");
+            let captured = outbox::build(&mut connection.db, &HashSet::new())
+                .expect("capture")
+                .expect("entry");
+            derived::store(
+                &mut connection.db,
+                &writer_id(&WriterRef::Number(7)),
+                sequence,
+                sequence,
+                &captured.marked,
+            )
+            .expect("persist marked rows");
+            outbox::clear_through(&mut connection.db, captured.through).expect("clear capture");
+        }
+        let mut queue = WriterQueue::fresh();
+        queue.next_seq = 3;
+        connection.writers.insert(WriterRef::Number(7), queue);
+        connection.next_position = 3;
+        connection
+    }
+
+    #[test]
+    fn carried_pending_entry_keeps_derived_capture_and_rekey_notice() {
+        let mut connection = acknowledged_derived_writer();
+        connection.track_relay_notices();
+        connection
+            .batch_execute("INSERT INTO source VALUES (3)")
+            .expect("third write");
+        let sequence = connection.queue_outbox().expect("queue").expect("entry");
+        connection
+            .carry_matching(
+                &[WriterRef::Number(7)],
+                &WriterRef::Number(8),
+                Carry::Named,
+                |_| true,
+            )
+            .expect("carry");
+        assert_eq!(
+            connection.take_relay_notices(),
+            vec![
+                RelayNotice::MutationRekey(MutationRekey {
+                    previous_writer: WriterRef::Number(7),
+                    previous_seq: sequence,
+                    writer: WriterRef::Number(8),
+                    client_seq: 1,
+                }),
+                RelayNotice::WritesSettled {
+                    writer: WriterRef::Number(7),
+                    through_seq: sequence,
+                    before_patch: false,
+                },
+            ]
+        );
+        assert_eq!(connection.take_relay_notices(), Vec::<RelayNotice>::new());
+        connection
+            .drop_derived_through(WriterRef::Number(8), 1)
+            .expect("carried mark");
+        assert_retired_derived_rows(&mut connection);
+    }
+
+    #[test]
+    fn rekeyed_writer_keeps_its_derived_high_water() {
+        let mut connection = acknowledged_derived_writer();
+        connection
+            .drop_derived_through(WriterRef::Number(7), 1)
+            .expect("first mark");
+        derived::rekey(&mut connection.db, "number:7", "number:8").expect("rekey");
+        assert_eq!(
+            derived::dropped_mark(&mut connection.db, "number:7").expect("old"),
+            0
+        );
+        assert_eq!(
+            derived::dropped_mark(&mut connection.db, "number:8").expect("new"),
+            1
+        );
+        connection
+            .drop_derived_through(WriterRef::Number(8), 2)
+            .expect("second mark");
+        assert_retired_derived_rows(&mut connection);
+    }
+
+    #[test]
+    fn sequential_marks_compose_derived_insert_update_and_delete_insert() {
+        for (initial, first, second, expected) in [
+            (
+                "",
+                "INSERT INTO effect VALUES (1, 1)",
+                "UPDATE effect SET value = 2",
+                None,
+            ),
+            (
+                "INSERT INTO effect VALUES (1, 0);",
+                "DELETE FROM effect",
+                "INSERT INTO effect VALUES (1, 2)",
+                Some(0_i64),
+            ),
+        ] {
+            let schema = format!(
+                "CREATE TABLE source (id INTEGER PRIMARY KEY);
+                 CREATE TABLE effect (id INTEGER PRIMARY KEY, value INTEGER NOT NULL);
+                 {initial}
+                 CREATE TRIGGER first_write AFTER INSERT ON source
+                 WHEN NEW.id = 1 AND NOT connetto_write_exempt() BEGIN
+                     SELECT connetto_derived_write(1);
+                     {first};
+                     SELECT connetto_derived_write(-1);
+                 END;
+                 CREATE TRIGGER second_write AFTER INSERT ON source
+                 WHEN NEW.id = 2 AND NOT connetto_write_exempt() BEGIN
+                     SELECT connetto_derived_write(1);
+                     {second};
+                     SELECT connetto_derived_write(-1);
+                 END;"
+            );
+            let mut connection = ConnettoConnection::<FakeTransport>::open(
+                &Replica::in_memory(),
+                &schema,
+                &ClientConfig::new("composed-derived"),
+                None,
+            )
+            .expect("open");
+            for sequence in 1..=2 {
+                connection
+                    .batch_execute(&format!("INSERT INTO source VALUES ({sequence})"))
+                    .expect("derive");
+                let captured = outbox::build(&mut connection.db, &HashSet::new())
+                    .expect("capture")
+                    .expect("entry");
+                derived::store(
+                    &mut connection.db,
+                    "number:7",
+                    sequence,
+                    sequence,
+                    &captured.marked,
+                )
+                .expect("store");
+                outbox::clear_through(&mut connection.db, captured.through).expect("clear");
+            }
+            connection
+                .drop_derived_through(WriterRef::Number(7), 1)
+                .expect("first mark");
+            connection
+                .drop_derived_through(WriterRef::Number(7), 2)
+                .expect("second mark");
+            let value: Option<i64> =
+                diesel::select(diesel::dsl::sql::<
+                    diesel::sql_types::Nullable<diesel::sql_types::BigInt>,
+                >("(SELECT value FROM effect WHERE id = 1)"))
+                .get_result(&mut connection.db)
+                .expect("value");
+            assert_eq!(value, expected);
+        }
+    }
+
+    fn assert_retired_derived_rows(connection: &mut ConnettoConnection<FakeTransport>) {
+        let value: i64 = diesel::select(diesel::dsl::sql::<diesel::sql_types::BigInt>(
+            "(SELECT value FROM effect WHERE id = 1)",
+        ))
+        .get_result(&mut connection.db)
+        .expect("effect value");
+        assert_eq!(
+            value, 0,
+            "retirement inverts acknowledged runs newest first"
+        );
+        assert_eq!(
+            derived::all_changesets(&mut connection.db).expect("marks"),
+            Vec::<Vec<u8>>::new(),
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "device-identity")]
+    fn number_retirement_inverts_acknowledged_derived_rows() {
+        let mut connection = acknowledged_derived_writer();
+        connection
+            .retire_number(WriterRef::Number(7))
+            .expect("retire");
+        assert_retired_derived_rows(&mut connection);
+    }
+
+    #[test]
+    fn carried_writer_retirement_inverts_acknowledged_derived_rows() {
+        let mut connection = acknowledged_derived_writer();
+        connection
+            .carry_matching(
+                &[WriterRef::Number(7)],
+                &WriterRef::Number(8),
+                Carry::Named,
+                |_| true,
+            )
+            .expect("carry");
+        assert_retired_derived_rows(&mut connection);
+    }
+
+    #[test]
+    fn derived_high_water_is_persisted_and_older_marks_are_noops() {
+        let mut connection = acknowledged_derived_writer();
+        assert_eq!(load_writer_queues(&mut connection.db).expect("reload").1, 3);
+        let writer = WriterRef::Number(7);
+        connection.drop_derived_through(writer, 2).expect("drop");
+        assert_retired_derived_rows(&mut connection);
+        assert_eq!(
+            derived::dropped_mark(&mut connection.db, &writer_id(&writer)).unwrap(),
+            2
+        );
+        connection
+            .drop_derived_through(writer, 1)
+            .expect("older mark");
+        connection
+            .drop_derived_through(writer, 2)
+            .expect("duplicate mark");
+        assert_eq!(
+            derived::dropped_mark(&mut connection.db, &writer_id(&writer)).unwrap(),
+            2
+        );
+        assert_retired_derived_rows(&mut connection);
+    }
+
+    #[test]
+    fn sequential_marks_compose_overlapping_derived_updates() {
+        let mut connection = acknowledged_derived_writer();
+        connection
+            .drop_derived_through(WriterRef::Number(7), 1)
+            .expect("first mark");
+        connection
+            .drop_derived_through(WriterRef::Number(7), 2)
+            .expect("second mark");
+        assert_retired_derived_rows(&mut connection);
+    }
+
+    #[test]
+    fn composed_derived_inverse_preserves_an_intervening_echo() {
+        let mut connection = acknowledged_derived_writer();
+        connection
+            .drop_derived_through(WriterRef::Number(7), 1)
+            .expect("first mark");
+        {
+            let _exemption = ExemptWrites::raise(&connection.write_flags);
+            connection
+                .db
+                .batch_execute("UPDATE effect SET value = 1 WHERE id = 1")
+                .unwrap();
+        }
+        connection
+            .drop_derived_through(WriterRef::Number(7), 2)
+            .expect("second mark");
+        let value: i64 = diesel::select(diesel::dsl::sql::<diesel::sql_types::BigInt>(
+            "(SELECT value FROM effect WHERE id = 1)",
+        ))
+        .get_result(&mut connection.db)
+        .unwrap();
+        assert_eq!(value, 1);
+    }
+
+    #[test]
     fn writer_id_round_trips_through_writer_from_id() {
         let device = [0xab; 32];
         let spelled = writer_id(&WriterRef::Device(device));
@@ -13812,7 +14580,18 @@ mod tests {
             .expect("read the outbox")
             .expect("the write is recorded");
         let first = conn
-            .append_entry(&writer, &built.changeset, None, None, Some(built.through))
+            .append_entry(
+                &writer,
+                &built.changeset,
+                LocalEffects {
+                    derived: &built.marked,
+                    overlay: &[],
+                    local_changeset: built.local_changeset.as_deref(),
+                },
+                None,
+                None,
+                Some(built.through),
+            )
             .expect("queue the write");
         conn.db
             .batch_execute("INSERT INTO t (id) VALUES (2)")
@@ -13821,7 +14600,18 @@ mod tests {
             .expect("read the outbox")
             .expect("the second write is recorded");
         let second = conn
-            .append_entry(&writer, &built.changeset, None, None, Some(built.through))
+            .append_entry(
+                &writer,
+                &built.changeset,
+                LocalEffects {
+                    derived: &built.marked,
+                    overlay: &[],
+                    local_changeset: built.local_changeset.as_deref(),
+                },
+                None,
+                None,
+                Some(built.through),
+            )
             .expect("queue the second write");
         // A deferral whose writes went out again after its schedule had grown.
         let mut episode = RESEND_POLICY.start();
@@ -14052,6 +14842,8 @@ mod tests {
             synced_rows: None,
             local_rows: Some(rows),
             pending: Vec::new(),
+            derived_marks: Vec::new(),
+            held_overlays: Vec::new(),
             peer_entries: Vec::new(),
             peer_cursors: Vec::new(),
             attachments: &[],
@@ -14242,8 +15034,19 @@ mod tests {
             let built = outbox::build(&mut conn.db, &conn.config.shared_tables)
                 .expect("read the outbox")
                 .expect("the write is recorded");
-            conn.append_entry(&device, &built.changeset, None, None, Some(built.through))
-                .expect("queue the write");
+            conn.append_entry(
+                &device,
+                &built.changeset,
+                LocalEffects {
+                    derived: &built.marked,
+                    overlay: &[],
+                    local_changeset: built.local_changeset.as_deref(),
+                },
+                None,
+                None,
+                Some(built.through),
+            )
+            .expect("queue the write");
         }
         conn.bound_writer = Some(device);
         for client_seq in [1, 2] {
@@ -14308,6 +15111,7 @@ mod tests {
         assert_eq!(
             event,
             Some(ClientEvent::WriteRestored {
+                writer: device,
                 client_seq: 2,
                 refused: Some(refused.clone()),
             })

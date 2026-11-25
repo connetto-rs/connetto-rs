@@ -251,7 +251,7 @@ async fn a_write_answered_applied_but_lost_is_resent_and_reported_applied() {
     let mut applied = Vec::new();
     loop {
         match conn.pump_one().await.expect("pump") {
-            ClientEvent::MutationApplied { client_seq } => applied.push(client_seq),
+            ClientEvent::MutationApplied { client_seq, .. } => applied.push(client_seq),
             ClientEvent::SyncStatus(_) => {}
             other => {
                 assert_eq!(

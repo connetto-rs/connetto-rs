@@ -116,6 +116,12 @@ pub(crate) fn depart_alone(
         crate::cipher::unlock(&mut db, key)?;
     }
     crate::harden::harden_replica_connection(&mut db)?;
+    // The departure writes shared rows, whose indexes, triggers and defaults
+    // may call connetto's or the application's functions.
+    config
+        .sql_functions
+        .install(&mut db)
+        .map_err(|e| ClientError::Session(e.to_string()))?;
     let store = utf8(store)?;
     crate::harden::attach_keyed_in_window(
         &mut db,
