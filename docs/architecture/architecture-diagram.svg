@@ -436,7 +436,7 @@
       <text x="315" y="28" text-anchor="middle" font-size="9" fill="#555">pg2sqlite translates PG DDL to replica DDL plus translation manifest</text>
       <text x="315" y="41" text-anchor="middle" font-size="8.5" fill="#555">translation emits fail-closed write guards, server applies land exempt (connetto_write_exempt), R40</text>
       <text x="315" y="54" text-anchor="middle" font-size="8.5" fill="#4CAF50">one schema contract for deployment tables, R98</text>
-      <text x="315" y="67" text-anchor="middle" font-size="8.5" fill="#C62828">R107: a running server notices a schema change and refuses the table</text>
+      <text x="315" y="67" text-anchor="middle" font-size="8.5" fill="#4CAF50">a running server refuses a changed table and follows the live rules, R107</text>
       <text x="315" y="80" text-anchor="middle" font-size="8.5" fill="#C62828">R108: one translation per kind of caller, a client opens its replica with its own</text>
     </g>
 
