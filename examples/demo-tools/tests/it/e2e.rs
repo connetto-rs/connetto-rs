@@ -429,7 +429,7 @@ pub(super) fn spawn_server_cfg(
         .env("CONNETTO_WRITABLE", writable)
         .env("CONNETTO_SLOT", SLOT)
         .env("CONNETTO_PUBLICATION", PUBLICATION)
-        .stdout(Stdio::null())
+        .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     if let Some(reader) = reader_url {
         command.env("CONNETTO_READER_URL", reader);
