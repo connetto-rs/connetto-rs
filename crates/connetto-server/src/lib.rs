@@ -56,6 +56,7 @@ pub mod epoch;
 pub mod fence;
 pub mod guard;
 mod key_filter;
+pub mod kind_grants;
 mod manager_builder;
 pub mod materializer;
 pub mod openfga;

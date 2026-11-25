@@ -101,7 +101,10 @@ use super::{
     registration::{BotRegistered, Challenge, RegisterBot},
     share_keys::{ReplaceShareKeys, ShareKeysReplaced, TabShareKeyAnswer, TabShareKeyChange},
     storage::{TabStorageAnswer, TabStorageUse},
-    subscription::{MembershipOpened, SnapshotBegin, SnapshotEnd, Subscribe, Unsubscribe},
+    subscription::{
+        MembershipOpened, SnapshotBegin, SnapshotEnd, Subscribe, SubscriptionNotGranted,
+        Unsubscribe,
+    },
     unsynced::{TabDismissAnswer, TabDismissRefusal, UnsyncedWork},
     writer::{BindDevice, RetireWriter, WriterAnswer},
 };
@@ -136,6 +139,9 @@ pub enum ControlMessage {
     SnapshotBegin(SnapshotBegin),
     /// Server marks the end of an initial snapshot.
     SnapshotEnd(SnapshotEnd),
+    /// Server refuses a subscription, or ends a live one, because the
+    /// caller's kind may not read a table it names (R108).
+    SubscriptionNotGranted(SubscriptionNotGranted),
 
     /// Client announces a mutation upload. The matching bulk frame carries
     /// the patchset bytes.

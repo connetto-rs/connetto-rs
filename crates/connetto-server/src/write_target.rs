@@ -28,13 +28,18 @@ mod visibility {
     }
 }
 
+use std::collections::HashMap;
+
 use connetto_core::auth::Principal;
 use connetto_core::messages::{ConflictRow, WriterSecret};
+use diesel::pg::Pg;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use sqlite_diff_rs::{Adapter, Binder, Value};
 use sqlparser::dialect::PostgreSqlDialect;
+use subql::backend::Postgres;
 use subql::patchset::{ApplyError, PgAdapter, apply_diffset_bytes_async_with_catalog};
-use subql::{NoRefusals, ParserDB};
+use subql::{NoRefusals, ParserDB, catalog_helpers};
 
 use crate::audit::ConnettoAuditSchema;
 use crate::capability::{BindingSettings, CallerBinding};
@@ -46,7 +51,8 @@ use crate::writer_schema::{
 use connetto_core::auth::CapabilityKey;
 
 use crate::materializer::{
-    ConflictProbe, MaterializerError, PlannedConflict, ServerRow, WritePlan, probe_conflict_pg,
+    ConflictProbe, MaterializerError, PlannedConflict, PlannedWrite, ServerRow, WritePlan,
+    probe_conflict_pg,
 };
 /// The outcome of committing one mutation upload.
 #[derive(Debug)]
@@ -269,17 +275,23 @@ impl From<ApplyError> for CommitError {
 }
 
 /// Apply an upload's diffset bytes on `conn`, counting the rows it changed.
+/// An insert leaves out every `NULL` column `plan` left unassigned.
 ///
 /// No drift guard refuses tables on this path, so the view refuses none.
 async fn apply_upload(
     catalog: &ParserDB,
+    plan: &WritePlan,
     bytes: &[u8],
     conn: &mut AsyncPgConnection,
 ) -> Result<usize, CommitError> {
-    let adapter = PgAdapter::new(catalog)
-        .map_err(|e| CommitError::Probe(MaterializerError::Catalog(e.to_string())))?;
+    let unassigned = unassigned_columns(catalog, plan);
+    let adapter = UnassignedNulls {
+        inner: PgAdapter::new(catalog)
+            .map_err(|e| CommitError::Probe(MaterializerError::Catalog(e.to_string())))?,
+        unassigned: &unassigned,
+    };
     Ok(
-        apply_diffset_bytes_async_with_catalog::<subql::backend::Postgres, _, _, _, _, _>(
+        apply_diffset_bytes_async_with_catalog::<Postgres, _, _, _, _, _>(
             catalog,
             bytes,
             &NoRefusals,
@@ -288,6 +300,74 @@ async fn apply_upload(
         )
         .await?,
     )
+}
+
+/// The column ordinals each table's inserts in `plan` leave unassigned,
+/// sorted, keyed by the table's catalog name.
+fn unassigned_columns(catalog: &ParserDB, plan: &WritePlan) -> HashMap<String, Vec<usize>> {
+    let mut unassigned: HashMap<String, Vec<usize>> = HashMap::new();
+    for op in &plan.ops {
+        let PlannedWrite::Insert { new, assigned } = &op.write else {
+            continue;
+        };
+        if assigned.len() == new.len() {
+            continue;
+        }
+        let Some(table) = catalog_helpers::table_name::<Postgres, _>(catalog, op.table_id) else {
+            continue;
+        };
+        let left_out = unassigned.entry(table).or_default();
+        for ordinal in 0..new.len() {
+            if !assigned
+                .iter()
+                .any(|column| usize::from(*column) == ordinal)
+                && let Err(at) = left_out.binary_search(&ordinal)
+            {
+                left_out.insert(at, ordinal);
+            }
+        }
+    }
+    unassigned
+}
+
+/// The catalog's Postgres adapter, leaving out of an insert each `NULL`
+/// column the write plan left unassigned, so the row takes the column's
+/// default and the caller's role needs no `INSERT` on it (R108 decision 8).
+struct UnassignedNulls<'plan, 'db> {
+    inner: PgAdapter<'db, ParserDB>,
+    unassigned: &'plan HashMap<String, Vec<usize>>,
+}
+
+impl<S, B> Adapter<Pg, S, B> for UnassignedNulls<'_, '_>
+where
+    S: AsRef<str> + Sync,
+    B: AsRef<[u8]> + Sync,
+{
+    fn column_name(&self, table_name: &str, column_index: usize) -> &str {
+        Adapter::<Pg, S, B>::column_name(&self.inner, table_name, column_index)
+    }
+
+    fn bind<'value>(
+        &self,
+        table_name: &str,
+        column_index: usize,
+        value: &'value Value<S, B>,
+    ) -> diesel::QueryResult<Box<dyn Binder<Pg> + Send + 'value>> {
+        self.inner.bind(table_name, column_index, value)
+    }
+
+    fn omits_from_insert(
+        &self,
+        table_name: &str,
+        column_index: usize,
+        value: &Value<S, B>,
+    ) -> bool {
+        matches!(value, Value::Null)
+            && self
+                .unassigned
+                .get(table_name)
+                .is_some_and(|columns| columns.binary_search(&column_index).is_ok())
+    }
 }
 
 /// Whether Postgres refused a statement with `42501` (`insufficient_privilege`).
@@ -635,7 +715,7 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
                         return Ok(conflict_outcome(conflict, row));
                     }
                 }
-                let affected = apply_upload(catalog, &bytes, c).await?;
+                let affected = apply_upload(catalog, plan, &bytes, c).await?;
                 if affected < expected {
                     return Err(CommitError::Denied);
                 }

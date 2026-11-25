@@ -62,8 +62,8 @@ pub use storage::{
     SharedStoreUse, StorageUse, StoreBytes, TabStorageAnswer, TabStorageOutcome, TabStorageUse,
 };
 pub use subscription::{
-    MembershipOpened, SnapshotBegin, SnapshotEnd, SqliteValue, Subscribe, SubscriptionSpec,
-    Unsubscribe,
+    MembershipOpened, SnapshotBegin, SnapshotEnd, SqliteValue, Subscribe, SubscriptionNotGranted,
+    SubscriptionSpec, Unsubscribe,
 };
 pub use unsynced::{
     FileState, KeyValue, RowOp, TabDismissAnswer, TabDismissOutcome, TabDismissRefusal,

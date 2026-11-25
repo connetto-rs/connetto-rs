@@ -160,6 +160,10 @@ pub enum MaterializerError {
     /// live shape no longer matches the catalog (R107 decision 6).
     #[error("subscription reads the refused table `{0}`")]
     RefusedRead(String),
+    /// A client subscription reads a column the caller's kind holds no
+    /// `SELECT` on (R108).
+    #[error("subscription reads what its caller's kind may not: {0:?}")]
+    NotGranted(crate::kind_grants::NotGranted),
     /// A database read the engine drove through its connector failed for one
     /// subscription, carrying the class the session's three dispositions act
     /// on (R89 decision 1).
@@ -620,6 +624,11 @@ where
     reads: HashMap<SubscriptionId, Vec<TableId>>,
     rules_generation: u64,
     rules_snapshots: HashMap<SubscriptionId, u64>,
+    /// What each caller kind's role holds on every served table, read from
+    /// the last live database the server followed. `None` before one is
+    /// followed or for a deployment mapping no caller, where the database
+    /// alone answers.
+    grants: Option<crate::kind_grants::KindGrants>,
 }
 
 /// How the client's caller functions reverse translate into the session
@@ -749,6 +758,7 @@ impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
             reads: HashMap::new(),
             rules_generation: 0,
             rules_snapshots: HashMap::new(),
+            grants: None,
         })
     }
 
@@ -1199,22 +1209,27 @@ where
             consumer_id,
             self.request(consumer_id, Some(CallerKind::Authenticated), select_sql),
             ReadBudget::new(core::time::Duration::from_secs(5)),
+            None,
         )
     }
 
     /// Register one built [`SubscriptionRequest`], classifying the engine's
     /// tier into a [`Registration`]. `budget` bounds every database read the
-    /// engine will ever run for this subscription.
+    /// engine will ever run for this subscription, and `reader` names the
+    /// caller's kind and the tables the statement reads, whose privileges the
+    /// registration is checked against.
     fn register_request(
         &mut self,
         consumer_id: u64,
         request: SubscriptionRequest<DefaultIds, Postgres>,
         budget: ReadBudget,
+        reader: Option<(CallerKind, &[TableId])>,
     ) -> Result<Registration, MaterializerError> {
         self.register_request_with(
             consumer_id,
             request,
             crate::reexec::ConnettoReadSetup::of(budget),
+            reader,
         )
     }
 
@@ -1222,16 +1237,29 @@ where
     /// engine's tier into a [`Registration`]. The setup is stored as the
     /// subscription's auth context and re-presented to the connector on every
     /// read, which is what carries a per-viewer identity (R85).
+    ///
+    /// A registration reading a column the caller's kind holds no `SELECT` on
+    /// is withdrawn and refused, since `PostgreSQL` would refuse its reads.
     fn register_request_with<R>(
         &mut self,
         consumer_id: u64,
         request: R,
         setup: crate::reexec::ConnettoReadSetup,
+        reader: Option<(CallerKind, &[TableId])>,
     ) -> Result<Registration, MaterializerError>
     where
         R: subql::RegistrationRequest<DefaultIds, Postgres>,
     {
         let registered = self.engine.register(request, setup)?;
+        if let (Some((kind, tables)), Some(grants)) = (reader, &self.grants)
+            && let Err(refusal) = tables.iter().try_for_each(|table| {
+                grants.read(kind, *table, registered.columns_read.get(*table))
+            })
+        {
+            self.engine
+                .unregister_subscription(registered.subscription_id);
+            return Err(MaterializerError::NotGranted(refusal));
+        }
         let subscription_id = registered.subscription_id;
         let needs_layout = match &registered.tier {
             Tier::InProcess(served) => served.aggregate_bootstrap.is_some(),
@@ -1403,9 +1431,30 @@ where
         rules: Arc<R>,
         policy_reads: &[rls2fga::types::PolicyReads],
     ) {
+        self.follow_grants(&*rules);
         self.engine.follow_access_rules(rules);
         self.policy_readers = PolicyReaders::of(policy_reads, &self.catalog);
         self.rules_generation = self.rules_generation.wrapping_add(1);
+    }
+
+    /// Read what each caller kind's role holds from `live`, which every later
+    /// subscription and write is checked against.
+    pub(crate) fn follow_grants<R: DatabaseLike>(&mut self, live: &R) {
+        self.grants = self.caller.as_ref().map(|caller| {
+            crate::kind_grants::KindGrants::of(&self.catalog, live, &caller.kind_roles)
+        });
+    }
+
+    /// The first op of `plan` a caller of `kind` holds no privilege for.
+    pub(crate) fn write_not_granted(
+        &self,
+        plan: &WritePlan,
+        kind: CallerKind,
+    ) -> Option<crate::kind_grants::NotGranted> {
+        let grants = self.grants.as_ref()?;
+        plan.ops
+            .iter()
+            .find_map(|op| grants.write(kind, op.table_id, &op.write).err())
     }
 
     /// Registrations whose initial read belongs to an earlier generation.
@@ -2225,14 +2274,16 @@ where
         Ok(())
     }
 
-    /// Parse a Zstd-compressed mutation upload into schema-resolved ops.
+    /// Parse a Zstd-compressed mutation upload from a caller of `kind` into
+    /// schema-resolved ops.
     ///
     /// Classifies each op, extracts its primary key and, for version-bearing
     /// updates and deletes, the read that detects a stale-version conflict.
-    /// Rejects a mutation whose target table is not writable, whose table
-    /// shape disagrees with the catalog's, or an update or delete uploaded as
-    /// a patchset (patchsets carry no prior image, so a conflict cannot be
-    /// detected).
+    /// An insert's `NULL` in a column `kind` holds no `INSERT` on is left
+    /// unassigned (R108 decision 8). Rejects a mutation whose target table is
+    /// not writable, whose table shape disagrees with the catalog's, or an
+    /// update or delete uploaded as a patchset (patchsets carry no prior
+    /// image, so a conflict cannot be detected).
     ///
     /// # Errors
     ///
@@ -2240,7 +2291,11 @@ where
     /// [`MaterializerError::Parse`] when the bytes are not a diffset,
     /// [`MaterializerError::NotWritable`], [`MaterializerError::SchemaMismatch`],
     /// or [`MaterializerError::MissingVersion`].
-    pub(crate) fn plan_write(&self, payload_zstd: &[u8]) -> Result<WritePlan, MaterializerError> {
+    pub(crate) fn plan_write(
+        &self,
+        payload_zstd: &[u8],
+        kind: CallerKind,
+    ) -> Result<WritePlan, MaterializerError> {
         let bytes = decompress(payload_zstd)?;
         let parsed = ParsedDiffSet::parse(&bytes)
             .map_err(|err| MaterializerError::Parse(format!("{err}")))?;
@@ -2255,6 +2310,11 @@ where
                 for op in diff.iter() {
                     ops.push(self.plan_patchset_op(&op)?);
                 }
+            }
+        }
+        if let Some(grants) = &self.grants {
+            for op in &mut ops {
+                grants.unassign_ungranted_nulls(kind, op.table_id, &mut op.write);
             }
         }
         Ok(WritePlan { ops })
@@ -2688,26 +2748,29 @@ where
         let request = self
             .request(consumer_id, kind, pg_sql)
             .binds(wire_binds(binds));
-        let registered = match self.register_request(consumer_id, seeded(request, seed), budget) {
-            Err(MaterializerError::Register(subql::RegisterError::AggregatorOnRlsTable {
-                ..
-            })) if viewer.is_some() => {
-                let setup = viewer.expect("matched Some above");
-                let request = self
-                    .request(consumer_id, kind, pg_sql)
-                    .binds(wire_binds(binds));
-                let mut registered = self.register_request_with(
-                    consumer_id,
-                    seeded(request, retry_seed).database_reads_per_consumer(),
-                    setup,
-                )?;
-                if let Registration::Computed(capture) = &mut registered {
-                    capture.per_viewer = true;
+        let reader = kind.map(|kind| (kind, reads.as_slice()));
+        let registered =
+            match self.register_request(consumer_id, seeded(request, seed), budget, reader) {
+                Err(MaterializerError::Register(subql::RegisterError::AggregatorOnRlsTable {
+                    ..
+                })) if viewer.is_some() => {
+                    let setup = viewer.expect("matched Some above");
+                    let request = self
+                        .request(consumer_id, kind, pg_sql)
+                        .binds(wire_binds(binds));
+                    let mut registered = self.register_request_with(
+                        consumer_id,
+                        seeded(request, retry_seed).database_reads_per_consumer(),
+                        setup,
+                        reader,
+                    )?;
+                    if let Registration::Computed(capture) = &mut registered {
+                        capture.per_viewer = true;
+                    }
+                    registered
                 }
-                registered
-            }
-            other => other?,
-        };
+                other => other?,
+            };
         let sub_id = registered.subscription_id();
         self.reads.insert(sub_id, reads);
         Ok(registered)
@@ -4395,7 +4458,7 @@ mod write_column_tests {
     fn plan(bytes: &[u8]) -> PlannedWrite {
         let payload = compress(bytes).expect("compress");
         let mut plan = materializer()
-            .plan_write(&payload)
+            .plan_write(&payload, connetto_core::CallerKind::Authenticated)
             .expect("the upload plans");
         assert_eq!(plan.ops.len(), 1);
         plan.ops.remove(0).write

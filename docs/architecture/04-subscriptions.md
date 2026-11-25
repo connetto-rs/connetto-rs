@@ -31,7 +31,9 @@ The client sends `Subscribe { sub_id, spec }`. The server reverse translates the
 
 Two gates can answer `RateLimited` with a wait instead of serving. A reader-share permit is taken before the creation allowance, so a subscribe the share defers has spent nothing and its retry is not refused by count. A per-tier per-minute meter on subscription creation (`subscription` in [guard.rs](../../crates/connetto-server/src/guard.rs)) refuses a caller at its allowance and answers the same frame with the wait.
 
-On any failure, before or after registration, the server answers one `NonFatalError` frame whose `detail` is the fixed [`connetto_core::messages::SUBSCRIPTION_REFUSED`] text and does not add the subscription. The cause never reaches the wire and goes to the structured log, because a detail that varied with the cause would tell a caller which stage refused and so whether a table it guessed exists.
+A subscription reading a table or a column the caller's kind holds no `SELECT` on is refused before registration with [`connetto_core::messages::SubscriptionNotGranted`], naming the table and the kind, whenever some kind may read the table, since every client copy already shows such a table. [08](08-authorization.md) owns the rule.
+
+On any other failure, before or after registration, the server answers one `NonFatalError` frame whose `detail` is the fixed [`connetto_core::messages::SUBSCRIPTION_REFUSED`] text and does not add the subscription. The cause never reaches the wire and goes to the structured log, because a detail that varied with the cause would tell a caller which stage refused and so whether a table it guessed exists.
 
 ### Snapshot delivery
 

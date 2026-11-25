@@ -1,6 +1,6 @@
 //! The schema half of a client build.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use connetto_core::schema::UUID_FUNCTION;
@@ -95,6 +95,24 @@ impl SyncSchema {
     #[must_use]
     pub const fn kind(&self) -> CallerKind {
         self.kind
+    }
+
+    /// The tables another kind's copy carries and this kind's lacks, keyed
+    /// lowercased, since SQLite table names are ASCII-case-insensitive, each
+    /// with its source name.
+    pub(crate) fn withheld_tables(&self) -> HashMap<String, String> {
+        let own: HashSet<String> = self
+            .copy()
+            .tables()
+            .iter()
+            .map(|table| table.to_lowercase())
+            .collect();
+        CallerKind::ALL
+            .into_iter()
+            .flat_map(|kind| self.bundle.copy(kind).tables())
+            .map(|table| (table.to_lowercase(), table.clone()))
+            .filter(|(folded, _)| !own.contains(folded))
+            .collect()
     }
 
     /// The copy this client opens.

@@ -80,7 +80,7 @@ use connetto_client::reconnect::{ReconnectPolicy, Sleeper, TransportFactory};
 use connetto_client::{
     AffectedRow, ClientError, ClientEvent, ConnettoConnection, DrainTimer, ExportScope,
     GateAskOutcome, GateController, GateSink, ImportChoices, ImportOutcome, KeepaliveTimer,
-    PolicyTables, ResendTimer, ShareKeyTimer, SystemClock, WriterGrant, WriterRequest,
+    PolicyTables, Refused, ResendTimer, ShareKeyTimer, SystemClock, WriterGrant, WriterRequest,
     replay_aborting, replica_schema, subscription_is_aggregate, subscription_tables,
 };
 use connetto_core::messages::{
@@ -88,9 +88,10 @@ use connetto_core::messages::{
     CourierAuditRequest, CourierNotice, FatalError, FatalErrorReason, FullResyncReason,
     FullResyncRequired, GateState, HandshakeAck, LivePatch, MutationApplied, MutationConflict,
     MutationReject, MutationRejectReason, NonFatalError, Pong, RateLimited, SUBSCRIPTION_REFUSED,
-    SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionSpec, SyncStatus,
-    TabDismissAnswer, TabDismissOutcome, TabDismissRefusal, TabShareKeyAnswer, TabShareKeyChange,
-    TabShareKeyOutcome, TabStorageAnswer, TabStorageOutcome, TabStorageUse, UnsyncedWork,
+    SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionNotGranted, SubscriptionSpec,
+    SyncStatus, TabDismissAnswer, TabDismissOutcome, TabDismissRefusal, TabShareKeyAnswer,
+    TabShareKeyChange, TabShareKeyOutcome, TabStorageAnswer, TabStorageOutcome, TabStorageUse,
+    UnsyncedWork,
 };
 use connetto_core::traits::MaybeSend;
 use connetto_core::{Cursor, IncomingFrame, Major, Transport};
@@ -583,10 +584,10 @@ struct HubState {
     /// rather than restating one cause as another.
     resyncing: HashMap<String, FullResyncReason>,
     /// Upstream subscriptions the server has refused, keyed by the worker's
-    /// upstream sub id, each with the tables that subscription backs. A tab
-    /// reading a table every upstream for it has been refused gets the
-    /// server's fixed phrase instead of a snapshot that never arrives.
-    refused_upstreams: HashMap<String, HashSet<String>>,
+    /// upstream sub id, each with how. A tab reading a table every upstream
+    /// for it has been refused gets the server's answer instead of a snapshot
+    /// that never arrives.
+    refused_upstreams: HashMap<String, Refused>,
 
     /// Resolves waiting on a server ticket answer, each with the tab and
     /// request to answer and the `performance.now` instant its wait ends.
@@ -1294,11 +1295,11 @@ where
         }
         // The worker already recorded the upstream subscriptions the server
         // refused before the hub existed, so later tabs learn of them.
-        for sub_id in worker.refused_subscriptions() {
-            if let Some(tables) = state.resync_tables.get(sub_id) {
+        for (sub_id, refused) in worker.refused_subscriptions() {
+            if state.resync_tables.contains_key(sub_id) {
                 state
                     .refused_upstreams
-                    .insert(sub_id.clone(), tables.clone());
+                    .insert(sub_id.clone(), refused.clone());
             }
         }
     }
@@ -3498,7 +3499,7 @@ async fn handle_tab_subscribe<U>(
     agg_routes: &mut HashMap<String, AggRoute>,
     blank: &mut BlankState,
     local_tables: &HashSet<String>,
-    refused_tables: &HashSet<String>,
+    refused_tables: &HashMap<String, Refused>,
     tab: &mut TabState,
     id: TabId,
     subscribe: Subscribe,
@@ -3524,11 +3525,11 @@ where
                 }
             };
             // The server itself refuses any subscription reading a table it
-            // cannot serve, so the hub answers the same fixed phrase and no
+            // cannot serve, so the hub answers what the server answered and no
             // snapshot, rather than an empty one.
-            if !tables.is_disjoint(refused_tables) {
+            if let Some(refused) = tables.iter().find_map(|table| refused_tables.get(table)) {
                 tracing::warn!(tab = %id, sub_id = %subscribe.sub_id, "tab subscription reads a fully refused upstream");
-                send_tab_nonfatal(tab, &subscribe.sub_id, SUBSCRIPTION_REFUSED);
+                send_tab_refusal(tab, &subscribe.sub_id, refused);
                 return Ok(());
             }
             if let Err(err) =
@@ -3549,25 +3550,29 @@ where
 }
 
 /// The tables whose covering upstream subscriptions the server has all
-/// refused, so the hub can never serve them a snapshot and answers a tab
-/// reading one with the server's fixed phrase.
-fn fully_refused_tables(state: &HubState) -> HashSet<String> {
-    let mut coverers: HashMap<String, HashSet<String>> = HashMap::new();
+/// refused, so the hub can never serve them a snapshot, each with the refusal
+/// of its covering upstream first by sub id that a tab reading it is answered.
+fn fully_refused_tables(state: &HubState) -> HashMap<String, Refused> {
+    let mut coverers: HashMap<&str, Vec<&str>> = HashMap::new();
     for (sub_id, tables) in &state.resync_tables {
         for table in tables {
             coverers
-                .entry(table.clone())
+                .entry(table.as_str())
                 .or_default()
-                .insert(sub_id.clone());
+                .push(sub_id.as_str());
         }
     }
     coverers
         .into_iter()
-        .filter(|(_, subs)| {
-            subs.iter()
-                .all(|sub_id| state.refused_upstreams.contains_key(sub_id))
+        .filter_map(|(table, subs)| {
+            let mut refusals = subs
+                .into_iter()
+                .map(|sub_id| Some((sub_id, state.refused_upstreams.get(sub_id)?)))
+                .collect::<Option<Vec<_>>>()?;
+            refusals.sort_unstable_by_key(|(sub_id, _)| *sub_id);
+            let (_, refused) = refusals.first()?;
+            Some((table.to_owned(), (*refused).clone()))
         })
-        .map(|(table, _)| table)
         .collect()
 }
 
@@ -5351,6 +5356,14 @@ where
             forward_worker_nonfatal(state, related_to.as_deref(), &detail);
             Ok(())
         }
+        ClientEvent::SubscriptionNotGranted {
+            sub_id,
+            table,
+            kind,
+        } => {
+            forward_worker_refusal(state, &sub_id, &Refused::NotGranted { table, kind });
+            Ok(())
+        }
         ClientEvent::RateLimited {
             related_to,
             retry_after_ms,
@@ -5602,6 +5615,25 @@ fn send_tab_nonfatal(tab: &TabState, related_to: &str, detail: &str) {
     )));
 }
 
+/// Send one tab the refusal of its subscription `related_to`, the fixed phrase
+/// or the typed frame naming the table and the kind, as the server sent it.
+fn send_tab_refusal(tab: &TabState, related_to: &str, refused: &Refused) {
+    match refused {
+        Refused::Fixed => send_tab_nonfatal(tab, related_to, SUBSCRIPTION_REFUSED),
+        Refused::NotGranted { table, kind } => {
+            let _ = tab
+                .out
+                .send(TabOut::Control(ControlMessage::SubscriptionNotGranted(
+                    SubscriptionNotGranted {
+                        sub_id: related_to.to_owned(),
+                        table: table.clone(),
+                        kind: *kind,
+                    },
+                )));
+        }
+    }
+}
+
 /// Send a rate-limit refusal to one tab, correlated to the tab's own sub id.
 ///
 /// The session stays alive. The tab may retry after `retry_after_ms`.
@@ -5637,7 +5669,7 @@ fn forward_worker_nonfatal(state: &mut HubState, related_to: Option<&str>, detai
     if detail == SUBSCRIPTION_REFUSED {
         state
             .refused_upstreams
-            .insert(upstream.to_owned(), tables.clone());
+            .insert(upstream.to_owned(), Refused::Fixed);
     }
     for tab in state.tabs.values() {
         for sub in &tab.subs {
@@ -5646,6 +5678,31 @@ fn forward_worker_nonfatal(state: &mut HubState, related_to: Option<&str>, detai
             }
         }
     }
+}
+
+/// Forward the server's refusal of one worker upstream subscription to the tab
+/// subscriptions it concerns, as [`forward_worker_nonfatal`] does, and record
+/// it so a tab arriving later is answered the same.
+fn forward_worker_refusal(state: &mut HubState, upstream: &str, refused: &Refused) {
+    if let Some(route) = state.agg_routes.get(upstream) {
+        if let Some(tab) = state.tabs.get(&route.tab) {
+            send_tab_refusal(tab, &route.tab_sub, refused);
+        }
+        return;
+    }
+    let Some(tables) = state.resync_tables.get(upstream) else {
+        return;
+    };
+    for tab in state.tabs.values() {
+        for sub in &tab.subs {
+            if !sub.tables.is_disjoint(tables) {
+                send_tab_refusal(tab, &sub.sub_id, refused);
+            }
+        }
+    }
+    state
+        .refused_upstreams
+        .insert(upstream.to_owned(), refused.clone());
 }
 
 /// Forward the worker's own rate-limit refusal to the tab subscriptions it
@@ -7005,7 +7062,7 @@ mod tests {
             &mut HashMap::new(),
             &mut blank,
             &local,
-            &std::collections::HashSet::new(),
+            &HashMap::new(),
             &mut tab,
             1,
             subscribe,

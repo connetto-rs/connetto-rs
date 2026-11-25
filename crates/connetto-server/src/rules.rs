@@ -119,6 +119,8 @@ pub(crate) enum BootRules {
     Unplannable {
         /// The tables whose live rules differ from the documents'.
         changed: Vec<String>,
+        /// The database read, whose privileges each caller kind still holds.
+        database: Arc<LiveDatabase>,
     },
 }
 
@@ -147,7 +149,7 @@ impl BootRules {
             }
             Err(error) => {
                 tracing::error!(error = %error, "live authorization rules cannot be planned");
-                Ok((documents, Self::Unplannable { changed }))
+                Ok((documents, Self::Unplannable { changed, database }))
             }
         }
     }

@@ -13,7 +13,7 @@ use connetto_server::builder::{
     Database, OidcProvider, OpenFga, ServerBuilder, ServerSchema, TokenKeys,
 };
 use connetto_server::epoch::POLICY_CHANGES_TRIGGER_DDL;
-use connetto_server::{OidcProviderConfig, WebSocketTransport};
+use connetto_server::{OidcProviderConfig, RuntimeWritableCatalog, WebSocketTransport};
 use connetto_test_harness::relay::Relay;
 use connetto_test_harness::server_fixture::{
     PG_DDL, PG_SERIAL, exec, mint_token, reset_fixture, served_major, signing_keys, with_user_url,
@@ -30,7 +30,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use super::lifecycle::{BOUND, admin_pool, next_control, wait_ready};
 
-const NEVER: Duration = Duration::from_secs(3600);
+pub(super) const NEVER: Duration = Duration::from_secs(3600);
 const KEEP_DDL: &str = "CREATE TABLE keep (id INT PRIMARY KEY, body TEXT, order_id INT);";
 const POLICY: &str = "ALTER TABLE orders ENABLE ROW LEVEL SECURITY;\n\
     CREATE POLICY orders_live ON orders USING (quantity > 0);";
@@ -52,9 +52,9 @@ fn policies(helper: bool) -> String {
     }
 }
 
-type Client = WebSocketTransport<TcpStream>;
+pub(super) type Client = WebSocketTransport<TcpStream>;
 
-struct Running {
+pub(super) struct Running {
     address: String,
     token: String,
     user: String,
@@ -67,7 +67,7 @@ struct Running {
 }
 
 impl Running {
-    async fn start(fixture: &Fixture, interval: Duration, helper: bool) -> Self {
+    pub(super) async fn start(fixture: &Fixture, interval: Duration, helper: bool) -> Self {
         Self::start_over(
             fixture,
             interval,
@@ -114,6 +114,7 @@ impl Running {
         .publication(PUBLICATION)
         .oplog_table(OPLOG_TABLE)
         .drift_reconciliation(interval)
+        .writable(RuntimeWritableCatalog::builder().writable("orders").build())
         .oidc_providers(vec![OidcProvider::Generic(
             OidcProviderConfig::new(
                 MOCK_OAUTH_PROVIDER,
@@ -147,15 +148,36 @@ impl Running {
     }
 
     async fn connect(&self, identity: &str, cursor: Option<Cursor>) -> Client {
+        self.connect_as(identity, Some(&self.token), cursor).await
+    }
+
+    /// A connection holding no login, so it acts as the anonymous kind.
+    pub(super) async fn connect_anonymous(&self, identity: &str) -> Client {
+        self.connect_as(identity, None, None).await
+    }
+
+    /// A signed-in connection carrying the run's token.
+    pub(super) async fn connect_signed_in(&self, identity: &str) -> Client {
+        self.connect(identity, None).await
+    }
+
+    async fn connect_as(
+        &self,
+        identity: &str,
+        token: Option<&str>,
+        cursor: Option<Cursor>,
+    ) -> Client {
         tokio::time::timeout(BOUND, async {
             let stream = TcpStream::connect(&self.address).await.expect("connect");
             let mut client =
                 WebSocketTransport::connect(&format!("ws://{}/sync", self.address), stream)
                     .await
                     .expect("websocket");
-            let mut handshake = Handshake::new(PROTOCOL_VERSION, identity)
-                .with_major(served_major())
-                .with_grant(Grant::new(&self.token));
+            let mut handshake =
+                Handshake::new(PROTOCOL_VERSION, identity).with_major(served_major());
+            if let Some(token) = token {
+                handshake = handshake.with_grant(Grant::new(token));
+            }
             if let Some(cursor) = cursor {
                 handshake = handshake
                     .with_cursor(cursor)
@@ -179,7 +201,7 @@ impl Running {
         .expect("bounded connection")
     }
 
-    async fn stop(mut self) {
+    pub(super) async fn stop(mut self) {
         self.shutdown
             .take()
             .expect("shutdown sender")
@@ -229,7 +251,7 @@ impl Drop for Running {
     }
 }
 
-async fn setup(fixture: &Fixture, helper: bool) {
+pub(super) async fn setup(fixture: &Fixture, helper: bool) {
     let pool = admin_pool(fixture).await;
     exec(
         &pool,
@@ -264,7 +286,7 @@ async fn setup(fixture: &Fixture, helper: bool) {
     fixture.provision_auth_tables().await;
 }
 
-async fn subscribe(client: &mut Client, subscription: &str, table: &str) {
+pub(super) async fn subscribe(client: &mut Client, subscription: &str, table: &str) {
     client
         .send_control(ControlMessage::Subscribe(Subscribe {
             sub_id: subscription.to_owned(),
@@ -292,7 +314,7 @@ fn inserted_ids(bytes: &[u8]) -> BTreeSet<i64> {
         .collect()
 }
 
-async fn snapshot(client: &mut Client, subscription: &str) -> (BTreeSet<i64>, Cursor) {
+pub(super) async fn snapshot(client: &mut Client, subscription: &str) -> (BTreeSet<i64>, Cursor) {
     tokio::time::timeout(BOUND, async {
         let ControlMessage::SnapshotBegin(begin) = next_control(client).await else {
             panic!("expected snapshot begin");
@@ -326,7 +348,7 @@ async fn snapshot(client: &mut Client, subscription: &str) -> (BTreeSet<i64>, Cu
     .expect("bounded snapshot")
 }
 
-async fn replacement(client: &mut Client, subscription: &str) -> BTreeSet<i64> {
+pub(super) async fn replacement(client: &mut Client, subscription: &str) -> BTreeSet<i64> {
     let ControlMessage::FullResyncRequired(resync) = next_control(client).await else {
         panic!("expected authorization replacement");
     };
@@ -563,6 +585,18 @@ async fn unsupported_live_policy_refuses_only_its_table() {
     fixture
         .exec("INSERT INTO keep VALUES (2, 'still flowing')")
         .await;
+    assert_eq!(
+        next_live_patch(&mut client, "keep").await,
+        BTreeSet::from([2]),
+        "sibling keeps flowing",
+    );
+    drop(client);
+    server.stop().await;
+}
+
+/// The ids the next live patch of `subscription` inserts, passing over
+/// revocation updates.
+pub(super) async fn next_live_patch(client: &mut Client, subscription: &str) -> BTreeSet<i64> {
     tokio::time::timeout(BOUND, async {
         loop {
             match client
@@ -572,19 +606,16 @@ async fn unsupported_live_policy_refuses_only_its_table() {
                 .expect("open transport")
             {
                 IncomingFrame::Bulk(BulkMessage::LivePatch(patch)) => {
-                    assert_eq!(patch.sub_id, "keep");
-                    assert_eq!(inserted_ids(&patch.patchset_zstd), BTreeSet::from([2]));
-                    break;
+                    assert_eq!(patch.sub_id, subscription);
+                    return inserted_ids(&patch.patchset_zstd);
                 }
                 IncomingFrame::Control(ControlMessage::RevocationUpdate(_)) => {}
-                other => panic!("unexpected sibling frame {other:?}"),
+                other => panic!("unexpected live frame {other:?}"),
             }
         }
     })
     .await
-    .expect("sibling keeps flowing");
-    drop(client);
-    server.stop().await;
+    .expect("a live patch arrives")
 }
 
 #[tokio::test]

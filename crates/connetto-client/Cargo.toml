@@ -42,7 +42,6 @@ device-identity = ["native-auth", "connetto-core/device-cert", "dep:ring", "dep:
 # a second, server-independent channel, and dials them.
 peer = [
   "device-identity",
-  "dep:pg2sqlite",
   "dep:connetto-peer",
   "dep:connetto-exchange",
   "dep:btleplug",
@@ -172,9 +171,10 @@ connetto-peer = { path = "../connetto-peer", optional = true, features = ["disco
 # The exchange's messages and state machine, which the enrolment task drives
 # over the peer link (R77).
 connetto-exchange = { workspace = true, optional = true }
-# A peer apply tells a write guard's policy refusal apart from any other
-# failed write by the message the translated guards raise (R77).
-pg2sqlite = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main", default-features = false, optional = true }
+# A peer apply skips a write guard's refusal (R77) and a local write names
+# the privilege the kind lacks (R108), each telling the refusal apart from
+# other failed writes by the message the translated guards raise.
+pg2sqlite = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main", default-features = false }
 # Registers the helpers a translated replica calls as table-valued functions.
 pg2sqlite-runtime = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main", features = ["diesel"] }
 # The page codec, one per target, both selected here rather than by a feature

@@ -181,6 +181,7 @@ fn encode_reject_reason(out: &mut Vec<u8>, reason: &MutationRejectReason) {
         MutationRejectReason::Other { detail } => (4, Some(detail)),
         MutationRejectReason::Indeterminate => (5, None),
         MutationRejectReason::Forked => (6, None),
+        MutationRejectReason::NotGranted { table, .. } => (7, Some(table)),
     };
     out.push(tag);
     if let Some(detail) = detail {
@@ -190,6 +191,9 @@ fn encode_reject_reason(out: &mut Vec<u8>, reason: &MutationRejectReason) {
                 .to_be_bytes(),
         );
         out.extend_from_slice(detail.as_bytes());
+    }
+    if let MutationRejectReason::NotGranted { kind, .. } = reason {
+        out.push(u8::try_from(kind.index()).expect("five kinds fit u8"));
     }
 }
 
@@ -478,6 +482,18 @@ mod tests {
             MutationRejectReason::Other { detail: detail() },
             MutationRejectReason::Indeterminate,
             MutationRejectReason::Forked,
+            MutationRejectReason::NotGranted {
+                table: "notes".to_owned(),
+                kind: crate::CallerKind::Anon,
+            },
+            MutationRejectReason::NotGranted {
+                table: "notes".to_owned(),
+                kind: crate::CallerKind::Authenticated,
+            },
+            MutationRejectReason::NotGranted {
+                table: "secrets".to_owned(),
+                kind: crate::CallerKind::Anon,
+            },
         ];
         let messages: Vec<Vec<u8>> = reasons
             .iter()

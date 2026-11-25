@@ -10,6 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::CallerKind;
 use crate::cursor::Cursor;
 
 /// One value in one of the five SQLite storage classes. A subscription's
@@ -78,6 +79,23 @@ pub struct Unsubscribe {
     /// Id of the subscription being cancelled. Server tolerates unknown ids
     /// silently (idempotent).
     pub sub_id: String,
+}
+
+/// Server refuses a subscription, or ends a live one, because the caller's
+/// kind holds no privilege to read a table it names (R108).
+///
+/// Only a table some kind's client copy carries is named here, since every
+/// application binary already ships every kind's copy. A table no kind may
+/// read is refused with the fixed [`SUBSCRIPTION_REFUSED`](super::SUBSCRIPTION_REFUSED)
+/// instead, which discloses nothing about whether it exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubscriptionNotGranted {
+    /// The refused subscription.
+    pub sub_id: String,
+    /// The table the kind may not read, by its catalog name.
+    pub table: String,
+    /// The caller's kind.
+    pub kind: CallerKind,
 }
 
 /// Server announces a membership subscription it opened on the client's

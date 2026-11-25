@@ -725,6 +725,7 @@ fn kind_copy<K: CapabilityKey>(
         .collect::<Vec<(String, String)>>();
     let views = view_names(report.script.iter());
     let mut copy = ReplicaCopy::new(replica_ddl, pairs, views)
+        .with_tables(manifest.iter().map(|entry| entry.logical.clone()))
         .with_connection_ddl(connection_ddl)
         .with_helper_functions(helper_functions(report.script))
         .with_shared_tables(shared.iter().cloned());
@@ -1490,6 +1491,7 @@ fn copy_function(index: usize, copy: &ReplicaCopy) -> String {
     format!(
         "/// The replica the kinds holding copy {index} open.\n\
          fn copy_{index}() -> connetto_core::ReplicaCopy {{\n\
+         const TABLES: &[&str] = {};\n\
          const POLICY_TABLES: &[(&str, &str)] = &[{tables}];\n\
          const POLICY_VIEWS: &[&str] = {};\n\
          const SHARED_TABLES: &[&str] = {};\n\
@@ -1499,6 +1501,7 @@ fn copy_function(index: usize, copy: &ReplicaCopy) -> String {
              POLICY_TABLES.iter().copied(),\n\
              POLICY_VIEWS.iter().copied(),\n\
          )\n\
+         .with_tables(TABLES.iter().copied())\n\
          .with_shared_tables(SHARED_TABLES.iter().copied())\n\
          .with_connection_ddl({})\n\
          .with_helper_functions(HELPER_FUNCTIONS.iter().map(\n\
@@ -1510,6 +1513,7 @@ fn copy_function(index: usize, copy: &ReplicaCopy) -> String {
              }},\n\
          )){layout}\n\
          }}\n",
+        borrowed_slice(copy.tables()),
         borrowed_slice(copy.policy_views()),
         borrowed_slice(copy.shared_tables()),
         helper_function_literals(copy),
