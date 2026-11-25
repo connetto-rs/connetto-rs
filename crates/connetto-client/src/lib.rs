@@ -613,6 +613,9 @@ pub enum PeerError {
     /// socket (R77 slice 8).
     #[error("the device's peer links are off")]
     LinksOff,
+    /// Discovery holds no peer under the fingerprint (R112).
+    #[error("no found peer carries the fingerprint")]
+    NotFound,
     /// The dial failed.
     #[error(transparent)]
     Link(#[from] LinkError),
@@ -1725,11 +1728,10 @@ pub enum ClientEvent {
         /// Why the bind failed.
         error: String,
     },
-    /// Discovery found a peer instance at `address` (R76).
+    /// Discovery found a peer instance, linked by its fingerprint through
+    /// `link_found` (R76, R112).
     #[cfg(feature = "peer")]
     PeerFound {
-        /// The resolved address to dial.
-        address: SocketAddr,
         /// The instance's leaf fingerprint.
         fingerprint: connetto_peer::Fingerprint,
     },

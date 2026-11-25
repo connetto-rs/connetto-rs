@@ -1980,6 +1980,8 @@ fn peer_with(authority: &Authority, autolink: bool, port: u16) -> Peer {
         discovery_events: discovery_events_rx,
         #[cfg(all(feature = "peer", target_os = "android"))]
         java: None,
+        #[cfg(all(feature = "peer", any(target_os = "ios", target_os = "macos")))]
+        advertise: connetto_peer_apple::discovery::AdvertiseSlot::default(),
     }
 }
 
@@ -3867,10 +3869,7 @@ fn reports_found(state: &Arc<Mutex<FakeState>>, fingerprint: connetto_peer::Fing
     state.lock().emitted.iter().any(|event| {
         matches!(
             event,
-            ClientEvent::PeerFound {
-                fingerprint: found,
-                ..
-            } if *found == fingerprint
+            ClientEvent::PeerFound { fingerprint: found } if *found == fingerprint
         )
     })
 }
@@ -3984,7 +3983,8 @@ async fn two_clients_discover_each_other_and_autolink() {
 }
 
 /// Two clients on loopback with autolink off report each other found and link
-/// only the one that calls `link_peer` (R76 proof 4).
+/// only the one that calls `link_found` with the found fingerprint (R76 proof
+/// 4, R112 decision 5).
 #[cfg(feature = "peer")]
 #[tokio::test]
 #[expect(
@@ -4093,19 +4093,16 @@ async fn clients_without_autolink_report_and_link_only_on_the_call() {
             "autolink off dials nothing"
         );
     }
-    let address = state_a
-        .lock()
-        .emitted
-        .iter()
-        .find_map(|event| match event {
-            ClientEvent::PeerFound {
-                address,
-                fingerprint,
-            } if *fingerprint == fp_b => Some(*address),
-            _ => None,
-        })
-        .expect("the found report carries the other's address");
-    handle_a.link_peer(address).await.expect("the call links");
+    assert!(
+        matches!(
+            handle_a
+                .link_found(connetto_peer::Fingerprint::new([0x5a; 32]))
+                .await,
+            Err(PeerError::NotFound)
+        ),
+        "a fingerprint nothing advertises is not found"
+    );
+    handle_a.link_found(fp_b).await.expect("the call links");
     poll_until(|| reports_linked(&state_a)).await;
     poll_until(|| reports_linked(&state_b)).await;
 
@@ -4564,6 +4561,8 @@ async fn a_peer_listener_that_will_not_bind_reports_the_failure() {
         discovery_events: discovery_events_rx,
         #[cfg(all(feature = "peer", target_os = "android"))]
         java: None,
+        #[cfg(all(feature = "peer", any(target_os = "ios", target_os = "macos")))]
+        advertise: connetto_peer_apple::discovery::AdvertiseSlot::default(),
     };
     let link = FakeLink {
         state: Arc::clone(&state),

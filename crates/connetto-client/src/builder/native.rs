@@ -1002,18 +1002,31 @@ where
                 #[cfg(feature = "peer")]
                 let peer_node = node.clone();
                 #[cfg(feature = "peer")]
+                let discovery = connetto_peer::Discovery::new(
+                    node.clone(),
+                    device.peer_autolink,
+                    discovery_events,
+                );
+                // Apple advertises through the peer listener and browses
+                // through Network framework, reaching peer-to-peer Wi-Fi
+                // (R112 decision 5).
+                #[cfg(all(feature = "peer", any(target_os = "ios", target_os = "macos")))]
+                let advertise = connetto_peer_apple::discovery::AdvertiseSlot::default();
+                #[cfg(all(feature = "peer", any(target_os = "ios", target_os = "macos")))]
+                let discovery = discovery.with_dns_sd(Arc::new(
+                    connetto_peer_apple::discovery::Network::new(advertise.clone()),
+                ));
+                #[cfg(feature = "peer")]
                 let peer = Peer {
-                    node: node.clone(),
-                    discovery: platform_discovery(connetto_peer::Discovery::new(
-                        node,
-                        device.peer_autolink,
-                        discovery_events,
-                    )),
+                    node,
+                    discovery,
                     listen: device.peer_listen,
                     events: peer_events_rx,
                     discovery_events: discovery_events_rx,
                     #[cfg(all(feature = "peer", target_os = "android"))]
                     java: device.java.clone(),
+                    #[cfg(all(feature = "peer", any(target_os = "ios", target_os = "macos")))]
+                    advertise,
                 };
                 let (enroller, handle) = Enroller::new(
                     Arc::clone(&keys),
@@ -1512,19 +1525,6 @@ fn share_keys<K: StorageMarker>(
         })
 }
 
-/// Discovery through the system Bonjour service on iOS, which grants an app no raw multicast, and through `mdns-sd` elsewhere (R76).
-#[cfg(feature = "peer")]
-fn platform_discovery(discovery: connetto_peer::Discovery) -> connetto_peer::Discovery {
-    #[cfg(target_os = "ios")]
-    {
-        discovery.with_dns_sd(Arc::new(connetto_peer_apple::discovery::Bonjour))
-    }
-    #[cfg(not(target_os = "ios"))]
-    {
-        discovery
-    }
-}
-
 /// A running native connetto client.
 ///
 /// The platform-neutral client a build's terminal returns, with what the
@@ -1787,6 +1787,25 @@ where
     ) -> Result<connetto_core::device_cert::DeviceIdentity, PeerError> {
         match &self.device {
             Some(device) => device.link_peer(addr).await,
+            None => Err(PeerError::NoIdentity),
+        }
+    }
+
+    /// Link the peer discovery found under `fingerprint`, refusing by this
+    /// device's standing as [`Self::link_peer`] does (R112).
+    ///
+    /// # Errors
+    ///
+    /// The standing refusals of [`Self::link_peer`], [`PeerError::NotFound`]
+    /// when discovery holds no peer under `fingerprint`, and
+    /// [`PeerError::Link`] for a failed dial.
+    #[cfg(feature = "peer")]
+    pub async fn link_found(
+        &self,
+        fingerprint: connetto_peer::Fingerprint,
+    ) -> Result<connetto_core::device_cert::DeviceIdentity, PeerError> {
+        match &self.device {
+            Some(device) => device.link_found(fingerprint).await,
             None => Err(PeerError::NoIdentity),
         }
     }
@@ -3111,6 +3130,8 @@ mod tests {
             listen: "127.0.0.1:0".parse().expect("loopback"),
             events: node_events_rx,
             discovery_events: discovery_events_rx,
+            #[cfg(any(target_os = "ios", target_os = "macos"))]
+            advertise: connetto_peer_apple::discovery::AdvertiseSlot::default(),
         };
         let (enroller, device) = Enroller::new(
             Arc::new(NowhereKeys),
@@ -3288,6 +3309,15 @@ mod tests {
                 Err(crate::PeerError::NoIdentity)
             ),
             "the device holds no certificate to present"
+        );
+        assert!(
+            matches!(
+                client
+                    .link_found(connetto_peer::Fingerprint::new([1; 32]))
+                    .await,
+                Err(crate::PeerError::NoIdentity)
+            ),
+            "the device holds no certificate to present to a found peer"
         );
 
         tokio::time::timeout(Duration::from_secs(10), client.close())

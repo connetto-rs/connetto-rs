@@ -318,6 +318,10 @@ pub(crate) struct Peer {
     /// (R76).
     #[cfg(all(feature = "peer", target_os = "android"))]
     pub(crate) java: Option<Arc<dyn crate::device_key::JavaAccess>>,
+    /// The listener's advertisement discovery registers through on Apple
+    /// (R112 decision 5).
+    #[cfg(all(feature = "peer", any(target_os = "ios", target_os = "macos")))]
+    pub(crate) advertise: connetto_peer_apple::discovery::AdvertiseSlot,
 }
 
 /// The next peer-link event, or nothing when the build has no peer link (R76).
@@ -425,6 +429,9 @@ pub(crate) struct EnrolHandle {
     #[cfg(feature = "peer")]
     peer: connetto_peer::Node,
     #[cfg(feature = "peer")]
+    /// The links to the peers discovery found, by fingerprint (R112).
+    found: connetto_peer::FoundLinks,
+    #[cfg(feature = "peer")]
     /// The hotspot machine's commands, until it ends with the client (R76).
     hotspot: mpsc::UnboundedSender<crate::hotspot::Command>,
     #[cfg(feature = "peer")]
@@ -472,6 +479,8 @@ impl Enroller {
         #[cfg(feature = "peer")]
         let peer_node = peer.node.clone();
         #[cfg(feature = "peer")]
+        let found = peer.discovery.found_links();
+        #[cfg(feature = "peer")]
         let (peer_serving, peer_serving_rx) = watch::channel(None);
         #[cfg(feature = "peer")]
         let media = crate::media::MediaSlot::default();
@@ -508,6 +517,8 @@ impl Enroller {
                 clock_off,
                 #[cfg(feature = "peer")]
                 peer: peer_node,
+                #[cfg(feature = "peer")]
+                found,
                 #[cfg(feature = "peer")]
                 hotspot,
                 #[cfg(feature = "peer")]
@@ -612,8 +623,33 @@ impl EnrolHandle {
     /// (R76).
     #[cfg(feature = "peer")]
     pub(crate) async fn link_peer(&self, addr: SocketAddr) -> Result<DeviceIdentity, PeerError> {
-        // A copy, so no watch guard is held across the dial.
-        let held = self.published.borrow().clone();
+        self.may_link()?;
+        #[cfg(any(target_os = "ios", target_os = "macos"))]
+        let dialled = connetto_peer_apple::transport::link(&self.peer, addr).await;
+        #[cfg(not(any(target_os = "ios", target_os = "macos")))]
+        let dialled = self.peer.link(addr).await;
+        dialled.map_err(peer_error)
+    }
+
+    /// Link the found peer carrying `fingerprint`, refusing by the device's
+    /// standing as [`Self::link_peer`] does (R112).
+    #[cfg(feature = "peer")]
+    pub(crate) async fn link_found(
+        &self,
+        fingerprint: connetto_peer::Fingerprint,
+    ) -> Result<DeviceIdentity, PeerError> {
+        self.may_link()?;
+        match self.found.link(fingerprint).await {
+            Ok(peer) => Ok(peer),
+            Err(connetto_peer::LinkFoundError::NotFound) => Err(PeerError::NotFound),
+            Err(connetto_peer::LinkFoundError::Link(err)) => Err(peer_error(err)),
+        }
+    }
+
+    /// Refuse a dial by the device's standing before any socket opens.
+    #[cfg(feature = "peer")]
+    fn may_link(&self) -> Result<(), PeerError> {
+        let held = self.published.borrow();
         match Standing::of_leaf(held.as_ref(), SystemTime::now()) {
             Standing::NoKey => Err(PeerError::NoIdentity),
             Standing::Expired if self.clock_off.load(Ordering::Acquire) => {
@@ -624,21 +660,22 @@ impl EnrolHandle {
                 Err(PeerError::CertificateExpired)
             }
             Standing::ClockOff => Err(PeerError::ClockOutsideWindow),
-            Standing::Fresh | Standing::Aging => {
-                #[cfg(any(target_os = "ios", target_os = "macos"))]
-                let dialled = connetto_peer_apple::transport::link(&self.peer, addr).await;
-                #[cfg(not(any(target_os = "ios", target_os = "macos")))]
-                let dialled = self.peer.link(addr).await;
-                match dialled {
-                    Ok(peer) => Ok(peer),
-                    Err(LinkError::NotServing) => Err(PeerError::NoIdentity),
-                    Err(LinkError::LinksOff) => Err(PeerError::LinksOff),
-                    Err(err) => Err(PeerError::Link(err)),
-                }
-            }
+            Standing::Fresh | Standing::Aging => Ok(()),
         }
     }
+}
 
+/// The client's answer to a failed dial (R76).
+#[cfg(feature = "peer")]
+fn peer_error(err: LinkError) -> PeerError {
+    match err {
+        LinkError::NotServing => PeerError::NoIdentity,
+        LinkError::LinksOff => PeerError::LinksOff,
+        err => PeerError::Link(err),
+    }
+}
+
+impl EnrolHandle {
     /// Host this device's hotspot, its beacon's outcome beside the offer,
     /// within the machines' bounds (R76).
     #[cfg(feature = "peer")]
@@ -797,7 +834,9 @@ impl EnrolHandle {
     /// The fingerprint the device serves, once it serves (R76).
     #[cfg(feature = "peer")]
     pub(crate) fn peer_serving_fingerprint(&self) -> Option<connetto_peer::Fingerprint> {
-        self.peer_serving.borrow().map(|serving| serving.fingerprint)
+        self.peer_serving
+            .borrow()
+            .map(|serving| serving.fingerprint)
     }
 }
 
@@ -913,6 +952,10 @@ struct Run<L: Link> {
     /// while the standing serves (R112).
     #[cfg(all(feature = "peer", any(target_os = "ios", target_os = "macos")))]
     listener: Option<connetto_peer_apple::transport::Listener>,
+    /// Where discovery finds the listener to advertise, filled while the
+    /// listener stands (R112 decision 5).
+    #[cfg(all(feature = "peer", any(target_os = "ios", target_os = "macos")))]
+    advertise: connetto_peer_apple::discovery::AdvertiseSlot,
     #[cfg(feature = "peer")]
     peer_standing: Standing,
     /// The peer link's events, until the task ends them (R76).
@@ -1438,15 +1481,16 @@ impl<L: Link> Run<L> {
     /// address (R112).
     #[cfg(all(feature = "peer", any(target_os = "ios", target_os = "macos")))]
     async fn listen_apple(&mut self) -> std::io::Result<SocketAddr> {
-        let listener = match self.listener.take() {
-            Some(listener) => listener,
-            None => {
-                connetto_peer_apple::transport::Listener::start(
-                    self.peer.clone(),
-                    self.peer_listen,
-                )
-                .await?
-            }
+        let listener = if let Some(listener) = self.listener.take() {
+            listener
+        } else {
+            let listener = connetto_peer_apple::transport::Listener::start(
+                self.peer.clone(),
+                self.peer_listen,
+            )
+            .await?;
+            self.advertise.fill(listener.advertiser());
+            listener
         };
         let address = SocketAddr::new(self.peer_listen.ip(), listener.port());
         self.listener = Some(listener);
@@ -1466,6 +1510,7 @@ impl<L: Link> Run<L> {
         #[cfg(all(feature = "peer", any(target_os = "ios", target_os = "macos")))]
         {
             self.listener = None;
+            self.advertise.clear();
         }
         self.discovery.stop();
         self.peer.stop(reason);
@@ -1588,6 +1633,8 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
         peer_listen: peer.listen,
         #[cfg(all(feature = "peer", any(target_os = "ios", target_os = "macos")))]
         listener: None,
+        #[cfg(all(feature = "peer", any(target_os = "ios", target_os = "macos")))]
+        advertise: peer.advertise,
         #[cfg(feature = "peer")]
         peer_standing: Standing::NoKey,
         #[cfg(feature = "peer")]
@@ -1746,9 +1793,8 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
                 #[cfg(feature = "peer")]
                 if let Some(event) = discovery {
                     match event {
-                        DiscoveryEvent::Found { address, fingerprint } => {
-                            run.link
-                                .emit(ClientEvent::PeerFound { address, fingerprint });
+                        DiscoveryEvent::Found { fingerprint } => {
+                            run.link.emit(ClientEvent::PeerFound { fingerprint });
                         }
                         DiscoveryEvent::Gone { fingerprint } => {
                             run.link.emit(ClientEvent::PeerGone { fingerprint });

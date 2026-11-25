@@ -198,17 +198,19 @@ pub mod hotspot {
     }
 }
 
-/// Peer discovery through the system Bonjour service, which needs no multicast entitlement for the declared service type (R76).
+/// Peer discovery through Network framework, the listener's Bonjour
+/// advertisement beside a browser whose found endpoints the device dials
+/// (R112 decision 5).
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 pub mod discovery {
-    pub use crate::platform::bonjour::Bonjour;
+    pub use crate::platform::discovery::{AdvertiseSlot, Network};
 }
 
 /// The peer link's transport through Network framework, every Apple link's
 /// dial and accept (R112 decision 3).
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 pub mod transport {
-    pub use crate::platform::network::{Listener, link};
+    pub use crate::platform::network::{Advertiser, Listener, link};
 }
 
 #[cfg(any(target_os = "ios", target_os = "macos", test))]

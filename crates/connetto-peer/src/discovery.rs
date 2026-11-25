@@ -7,10 +7,11 @@ use ring::rand::{SecureRandom, SystemRandom};
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
-use tokio::sync::mpsc;
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
 use connetto_core::device_cert::DeviceIdentity;
@@ -31,18 +32,75 @@ const SERVICE_TYPE: &str = "_connetto-peer._tcp.local.";
 const TXT_VERSION: &str = "v";
 /// The TXT key the leaf fingerprint rides under.
 const TXT_FINGERPRINT: &str = "fp";
+/// How long a lookup waits for the runner's answer.
+const LOOKUP_WITHIN: Duration = Duration::from_secs(5);
+
+/// The dial a found instance's reach runs, answering the linked peer.
+pub type DialFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<DeviceIdentity, LinkError>> + Send + 'a>>;
+
+/// How a found instance is reached, as the DNS-SD service resolved it.
+pub trait Dial: std::fmt::Debug + Send + Sync {
+    /// Dial `node` to the instance, answering the peer's identity.
+    fn dial<'a>(&'a self, node: &'a Node) -> DialFuture<'a>;
+}
+
+/// The reach a resolve reports, shared by the policy and the dials.
+pub type Reach = Arc<dyn Dial>;
+
+/// A reach through socket addresses, dialled `IPv4` first.
+///
+/// An address that does not answer moves the dial to the next, and any
+/// other failure ends it.
+#[derive(Debug, Clone)]
+pub struct Addresses(pub Vec<SocketAddr>);
+
+impl Dial for Addresses {
+    fn dial<'a>(&'a self, node: &'a Node) -> DialFuture<'a> {
+        Box::pin(async move {
+            let ipv4 = self.0.iter().filter(|address| address.is_ipv4());
+            let ipv6 = self.0.iter().filter(|address| !address.is_ipv4());
+            let mut last = None;
+            for address in ipv4.chain(ipv6) {
+                match node.link(*address).await {
+                    Ok(peer) => return Ok(peer),
+                    Err(err) if is_soft(&err) => last = Some(err),
+                    Err(err) => return Err(err),
+                }
+            }
+            Err(last.unwrap_or_else(|| {
+                LinkError::Unreachable(io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    "the instance resolved at no address",
+                ))
+            }))
+        })
+    }
+}
+
+/// A dial failure that leaves the instance to its retry, the peer not
+/// having refused it.
+fn is_soft(err: &LinkError) -> bool {
+    matches!(
+        err,
+        LinkError::Unreachable(_)
+            | LinkError::Timeout
+            | LinkError::NotServing
+            | LinkError::LinksOff
+    )
+}
 
 /// What a DNS-SD session reports about the service type it browses.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum DnsSdEvent {
-    /// The instance `name` stands at `addresses` with its TXT pairs, the full set replacing any earlier one.
+    /// The instance `name` resolved with its TXT pairs, its reach replacing any earlier one.
     Resolved {
         /// The instance's name, as the session reports it.
         name: String,
         /// The instance's TXT pairs, a key without a value carrying none.
         txt: Vec<(String, Option<Vec<u8>>)>,
-        /// Every address the instance answers at, with its port.
-        addresses: Vec<SocketAddr>,
+        /// How the instance is reached.
+        reach: Reach,
     },
     /// The instance `name` left.
     Removed {
@@ -127,11 +185,13 @@ impl DnsSd for MdnsSd {
                                     .iter()
                                     .map(|pair| (pair.key().to_owned(), pair.val().map(<[u8]>::to_vec)))
                                     .collect(),
-                                addresses: resolved
-                                    .addresses
-                                    .iter()
-                                    .map(|ip| SocketAddr::new(ip.to_ip_addr(), resolved.port))
-                                    .collect(),
+                                reach: Arc::new(Addresses(
+                                    resolved
+                                        .addresses
+                                        .iter()
+                                        .map(|ip| SocketAddr::new(ip.to_ip_addr(), resolved.port))
+                                        .collect(),
+                                )),
                                 name: resolved.fullname,
                             },
                             ServiceEvent::ServiceRemoved(_service_type, fullname) => {
@@ -196,10 +256,8 @@ impl Drop for MdnsSdSession {
 /// What discovery tells the device about the instances it sees.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiscoveryEvent {
-    /// An instance was found or resolved.
+    /// An instance was found, or re-advertised under a fresh name.
     Found {
-        /// The resolved address to dial.
-        address: SocketAddr,
         /// The instance's leaf fingerprint.
         fingerprint: Fingerprint,
     },
@@ -208,6 +266,53 @@ pub enum DiscoveryEvent {
         /// The instance's leaf fingerprint.
         fingerprint: Fingerprint,
     },
+}
+
+/// Why a found peer did not link.
+#[derive(Debug, thiserror::Error)]
+pub enum LinkFoundError {
+    /// Discovery holds no instance under the fingerprint.
+    #[error("no found peer carries the fingerprint")]
+    NotFound,
+    /// The dial to the found peer failed.
+    #[error(transparent)]
+    Link(#[from] LinkError),
+}
+
+/// The links a device opens to the peers discovery found, by fingerprint.
+#[derive(Debug, Clone)]
+pub struct FoundLinks {
+    /// The node the dials run on.
+    node: Node,
+    /// The runner's commands, held weak so the lookups never keep it.
+    commands: mpsc::WeakUnboundedSender<Command>,
+}
+
+impl FoundLinks {
+    /// Link the found peer carrying `fingerprint`, answering its identity.
+    ///
+    /// # Errors
+    ///
+    /// [`LinkFoundError::NotFound`] when discovery holds no instance under
+    /// `fingerprint`, [`LinkFoundError::Link`] when the dial fails.
+    pub async fn link(&self, fingerprint: Fingerprint) -> Result<DeviceIdentity, LinkFoundError> {
+        let commands = self.commands.upgrade().ok_or(LinkFoundError::NotFound)?;
+        let (answer, reach) = oneshot::channel();
+        commands
+            .send(Command::LinkFound {
+                fp: fingerprint,
+                answer,
+            })
+            .map_err(|_| LinkFoundError::NotFound)?;
+        drop(commands);
+        let reach = tokio::time::timeout(LOOKUP_WITHIN, reach)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten()
+            .ok_or(LinkFoundError::NotFound)?;
+        Ok(reach.dial(&self.node).await?)
+    }
 }
 
 /// The discovery driver, one device's side of the browse.
@@ -263,6 +368,13 @@ enum Command {
     Links {
         /// The standing the links came to.
         on: bool,
+    },
+    /// The device asks for the reach under `fp`, to link it.
+    LinkFound {
+        /// The found instance's fingerprint.
+        fp: Fingerprint,
+        /// Where the reach goes, none when no instance carries `fp`.
+        answer: oneshot::Sender<Option<Reach>>,
     },
 }
 
@@ -342,6 +454,15 @@ impl Discovery {
         let _ = self.tx.send(Command::Stop);
     }
 
+    /// The links to the peers discovery finds, opened by fingerprint.
+    #[must_use]
+    pub fn found_links(&self) -> FoundLinks {
+        FoundLinks {
+            node: self.node.clone(),
+            commands: self.tx.downgrade(),
+        }
+    }
+
     /// The device's peer links standing, off dialing nothing of the found
     /// peers and on dialing them at once (R77 slice 8).
     pub fn set_peer_links(&self, on: bool) {
@@ -391,6 +512,11 @@ async fn run(
             Some(Command::Serve { port, own }) => (port, own),
             Some(Command::Links { on }) => {
                 links_on = on;
+                continue;
+            }
+            // Nothing serves, so nothing is found.
+            Some(Command::LinkFound { answer, .. }) => {
+                let _ = answer.send(None);
                 continue;
             }
             // Nothing serves, so the events nothing serves wait, and a stop
@@ -499,13 +625,13 @@ async fn serve_round(
                             // The ended dial frees its place, and the due
                             // dials take their turn.
                             for queued in policy.due(now) {
-                                spawn_dial(node, commands_tx, queued, policy.addresses(&queued));
+                                spawn_dial(node, commands_tx, policy, queued);
                             }
                         }
                         Command::RetryDue => {
                             let now = Instant::now();
                             for fp in policy.due(now) {
-                                spawn_dial(node, commands_tx, fp, policy.addresses(&fp));
+                                spawn_dial(node, commands_tx, policy, fp);
                             }
                         }
                         // The coming on resets the backoff and dials the
@@ -513,8 +639,11 @@ async fn serve_round(
                         Command::Links { on } => {
                             let now = Instant::now();
                             for fp in policy.set_links(on, now) {
-                                spawn_dial(node, commands_tx, fp, policy.addresses(&fp));
+                                spawn_dial(node, commands_tx, policy, fp);
                             }
+                        }
+                        Command::LinkFound { fp, answer } => {
+                            let _ = answer.send(policy.reach(&fp));
                         }
                     }
                 }
@@ -524,12 +653,12 @@ async fn serve_round(
                         break false;
                     };
                     match event {
-                        DnsSdEvent::Resolved { name, txt, addresses } => {
+                        DnsSdEvent::Resolved { name, txt, reach } => {
                             let Some(fp) = fingerprint_of(&txt) else {
                                 continue;
                             };
                             names.insert(name.clone(), fp);
-                            let actions = policy.found(&name, fp, &addresses);
+                            let actions = policy.found(&name, fp, reach);
                             apply(&actions, fp, node, commands_tx, events, policy);
                         }
                         DnsSdEvent::Removed { name } => {
@@ -618,17 +747,14 @@ fn apply(
 ) {
     for action in actions {
         match action {
-            Action::Found(address) => {
-                let _ = events.send(DiscoveryEvent::Found {
-                    address: *address,
-                    fingerprint: fp,
-                });
+            Action::Found => {
+                let _ = events.send(DiscoveryEvent::Found { fingerprint: fp });
             }
             Action::Gone => {
                 let _ = events.send(DiscoveryEvent::Gone { fingerprint: fp });
             }
             Action::Dial => {
-                spawn_dial(node, commands_tx, fp, policy.addresses(&fp));
+                spawn_dial(node, commands_tx, policy, fp);
             }
             // The browse owns its own restart, the monitor's branch.
             Action::Browse => {}
@@ -673,55 +799,33 @@ fn arm_retry(
     }
 }
 
-/// A dial the policy started, over the instance's addresses `IPv4` first.
+/// A dial the policy started, through the instance's reach.
 fn spawn_dial(
     node: &Node,
     commands_tx: &mpsc::WeakUnboundedSender<Command>,
+    policy: &Policy,
     fp: Fingerprint,
-    addresses: Vec<SocketAddr>,
 ) {
     let node = node.clone();
     let commands_tx = commands_tx.clone();
+    let reach = policy.reach(&fp);
     tokio::spawn(async move {
-        let outcome = dial(&node, addresses).await;
+        // A dial the off standing refused in the same gap is no refusal of
+        // the instance, so the peer stays waiting its retry.
+        let outcome = match reach {
+            Some(reach) => match reach.dial(&node).await {
+                Ok(_) => DialOutcome::Linked,
+                Err(err) if is_soft(&err) => DialOutcome::Unreachable,
+                Err(_) => DialOutcome::Refused,
+            },
+            None => DialOutcome::Unreachable,
+        };
         // The driver is gone, so its dial's result lands nowhere.
         let Some(commands_tx) = commands_tx.upgrade() else {
             return;
         };
         let _ = commands_tx.send(Command::DialOutcome { fp, outcome });
     });
-}
-
-/// Dial the instance's addresses, `IPv4` first, until one answers.
-async fn dial(node: &Node, addresses: Vec<SocketAddr>) -> DialOutcome {
-    let mut ordered: Vec<SocketAddr> = Vec::new();
-    let mut rest: Vec<SocketAddr> = Vec::new();
-    for address in &addresses {
-        if address.is_ipv4() {
-            ordered.push(*address);
-        } else {
-            rest.push(*address);
-        }
-    }
-    ordered.extend(rest);
-    for address in ordered {
-        // A dial the off standing refused in the same gap is no refusal of
-        // the instance, so the peer stays waiting its retry.
-        let linked = match node.link(address).await {
-            Ok(_) => true,
-            Err(
-                LinkError::Unreachable(_)
-                | LinkError::Timeout
-                | LinkError::NotServing
-                | LinkError::LinksOff,
-            ) => false,
-            Err(_) => return DialOutcome::Refused,
-        };
-        if linked {
-            return DialOutcome::Linked;
-        }
-    }
-    DialOutcome::Unreachable
 }
 
 /// The random instance name a registration announces under.
@@ -799,9 +903,10 @@ mod tests {
     /// aborts the earlier timer, and the round's end aborts the rest.
     #[tokio::test]
     async fn a_replaced_retry_timer_aborts_its_predecessor() {
-        use super::{Command, arm_retry};
+        use super::{Addresses, Command, arm_retry};
         use crate::policy::{DialOutcome, FIRST_WAIT, Policy};
         use std::collections::HashMap;
+        use std::sync::Arc;
         use std::time::{Duration, Instant};
         use tokio::sync::mpsc;
 
@@ -809,9 +914,8 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let weak = tx.downgrade();
         let fp = Fingerprint::new([1; 32]);
-        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 443));
         let mut policy = Policy::new(Fingerprint::new([0; 32]), true);
-        policy.found("n", fp, &[addr]);
+        policy.found("n", fp, Arc::new(Addresses(Vec::new())));
         // The dial ends unreachable, so the first retry is due after the
         // first wait, and the next outcome moves the deadline.
         policy.dial_result(Instant::now(), fp, DialOutcome::Unreachable);

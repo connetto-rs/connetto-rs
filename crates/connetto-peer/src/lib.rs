@@ -52,7 +52,8 @@ pub use node::{Liveness, Medium, Node, PeerLink, SocketPrep};
 
 #[cfg(feature = "discovery")]
 pub use discovery::{
-    DNS_SD_SERVICE, Discovery, DiscoveryEvent, DnsSd, DnsSdEvent, DnsSdSession, DnsSdSink,
+    Addresses, DNS_SD_SERVICE, Dial, DialFuture, Discovery, DiscoveryEvent, DnsSd, DnsSdEvent,
+    DnsSdSession, DnsSdSink, FoundLinks, LinkFoundError, Reach,
 };
 #[cfg(feature = "discovery")]
 pub use fingerprint::Fingerprint;

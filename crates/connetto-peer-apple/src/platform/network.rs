@@ -6,7 +6,7 @@
 //! threads.
 
 use std::cell::Cell;
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -22,9 +22,10 @@ use connetto_peer::{LinkError, Medium, Node};
 use dispatch2::{DispatchData, DispatchQueue, DispatchRetained};
 use objc2_network::{
     _nw_content_context_default_stream, _nw_content_context_final_send,
-    _nw_parameters_configure_protocol_disable, NWConnection, NWContentContext, NWEndpoint,
-    NWError, NWInterface, NWListener, NWObject, NWParameters, NWProtocolOptions, NWRetained,
-    nw_connection_state_t, nw_endpoint_type_t, nw_error_domain_t, nw_listener_state_t,
+    _nw_parameters_configure_protocol_disable, NWAdvertiseDescriptor, NWConnection,
+    NWContentContext, NWEndpoint, NWError, NWInterface, NWListener, NWObject, NWParameters,
+    NWProtocolOptions, NWRetained, NWTxtRecord, nw_connection_state_t, nw_endpoint_type_t,
+    nw_error_domain_t, nw_listener_state_t,
 };
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -44,7 +45,7 @@ const READY_WITHIN: Duration = Duration::from_secs(10);
 const PEER_TO_PEER_PREFIX: &[u8] = b"awdl";
 
 /// A retained Network object, moved across threads only to reach its queue.
-struct Queued<T: NWObject + ?Sized>(NWRetained<T>);
+pub(super) struct Queued<T: NWObject + ?Sized>(pub(super) NWRetained<T>);
 
 // SAFETY: retaining and releasing a Network object is an atomic reference
 // count, and every other call on a started object runs on its serial queue.
@@ -58,20 +59,22 @@ impl<T: NWObject + ?Sized> Clone for Queued<T> {
 
 impl<T: NWObject + ?Sized> Queued<T> {
     /// The object, for work running on its queue.
-    fn on_queue(&self) -> &T {
+    pub(super) fn on_queue(&self) -> &T {
         &self.0
     }
 }
 
 /// Reinterpret a block that spells C `bool` as `u8`, which `block2` cannot
-/// encode (objc2 #890).
+/// encode (objc2 #890), or a pointer Network may pass as NULL as a raw one.
 ///
 /// # Safety
 ///
 /// `From` and `To` differ only where `To` has `bool` and `From` has `u8`,
-/// which share the C calling convention on Apple's targets, and a returned
-/// `u8` is 0 or 1.
-unsafe fn recast<'a, From, To>(block: &'a Block<'static, From>) -> &'a Block<'static, To> {
+/// or `To` has `NonNull<T>` and `From` has `*const T`, which share the C
+/// calling convention on Apple's targets, and a returned `u8` is 0 or 1.
+pub(super) unsafe fn recast<'a, From, To>(
+    block: &'a Block<'static, From>,
+) -> &'a Block<'static, To> {
     let block: *const Block<'static, From> = block;
     // SAFETY: `Block` is a marker over the same heap block, and the caller
     // guarantees the two signatures are ABI-identical.
@@ -288,14 +291,14 @@ fn io_error(error: &NWError) -> io::Error {
 }
 
 /// The error a state handler names, or one naming `what` without it.
-fn state_error(error: *mut NWError, what: &str) -> io::Error {
+pub(super) fn state_error(error: *mut NWError, what: &str) -> io::Error {
     // SAFETY: Network passes a live error or NULL for the handler call.
     unsafe { error.as_ref() }.map_or_else(|| io::Error::other(what.to_owned()), io_error)
 }
 
 /// TCP for the link, without Network's TLS since the link runs its own, and
 /// with peer-to-peer interfaces allowed.
-fn parameters() -> NWRetained<NWParameters> {
+pub(super) fn parameters() -> NWRetained<NWParameters> {
     let tcp = RcBlock::new(|options: NonNull<NWProtocolOptions>| {
         // SAFETY: Network passes live TCP options for the block's call.
         unsafe { options.as_ref() }.tcp_set_no_delay(true);
@@ -336,9 +339,22 @@ fn medium_of(connection: &NWConnection) -> Medium {
     }
 }
 
-/// Start `connection` on its own queue, answering its stream at once and its
-/// medium once it is ready, or why it never was.
-fn open(connection: &NWConnection) -> (NwStream, oneshot::Receiver<io::Result<Medium>>) {
+/// The address a ready connection's path sends to, when it names one.
+fn remote_of(connection: &NWConnection) -> Option<SocketAddr> {
+    let endpoint = connection.current_path()?.effective_remote_endpoint()?;
+    (endpoint.r#type() == nw_endpoint_type_t::address).then(|| endpoint.address())
+}
+
+/// What a connection that became ready runs over and whom it reached.
+struct Ready {
+    medium: Medium,
+    /// The address the connection's path sends to, when it names one.
+    remote: Option<SocketAddr>,
+}
+
+/// Start `connection` on its own queue, answering its stream at once and
+/// what it runs over once it is ready, or why it never was.
+fn open(connection: &NWConnection) -> (NwStream, oneshot::Receiver<io::Result<Ready>>) {
     let queue = DispatchQueue::new(Some(c"connetto.peer.connection"), None);
     let shared = Arc::new(Mutex::new(Shared::default()));
     let (ready_tx, ready_rx) = oneshot::channel();
@@ -348,7 +364,10 @@ fn open(connection: &NWConnection) -> (NwStream, oneshot::Receiver<io::Result<Me
     let handler = RcBlock::new(move |state: nw_connection_state_t, error: *mut NWError| {
         if state == nw_connection_state_t::ready {
             if let Some(ready) = ready.take() {
-                let _ = ready.send(Ok(medium_of(&this)));
+                let _ = ready.send(Ok(Ready {
+                    medium: medium_of(&this),
+                    remote: remote_of(&this),
+                }));
             }
         } else if state == nw_connection_state_t::waiting
             || state == nw_connection_state_t::failed
@@ -374,16 +393,27 @@ fn open(connection: &NWConnection) -> (NwStream, oneshot::Receiver<io::Result<Me
     (stream, ready_rx)
 }
 
-/// Wait up to the ready bound for a connection's medium.
-async fn ready(ready: oneshot::Receiver<io::Result<Medium>>) -> Result<Medium, LinkError> {
+/// Wait up to the ready bound for a connection to become ready.
+async fn ready(ready: oneshot::Receiver<io::Result<Ready>>) -> Result<Ready, LinkError> {
     match tokio::time::timeout(READY_WITHIN, ready).await {
-        Ok(Ok(Ok(medium))) => Ok(medium),
+        Ok(Ok(Ok(ready))) => Ok(ready),
         Ok(Ok(Err(error))) => Err(LinkError::Unreachable(error)),
         Ok(Err(_)) => Err(LinkError::Unreachable(io::Error::other(
             "the connection ended before it was ready",
         ))),
         Err(_) => Err(LinkError::Timeout),
     }
+}
+
+/// Refuse a dial as [`Node::link`] does before any connection opens.
+fn may_dial(node: &Node) -> Result<(), LinkError> {
+    if !node.peer_links_on() {
+        return Err(LinkError::LinksOff);
+    }
+    if node.identity().is_none() {
+        return Err(LinkError::NotServing);
+    }
+    Ok(())
 }
 
 /// Dial `addr` through Network framework and link the peer there, refusing
@@ -393,19 +423,44 @@ async fn ready(ready: oneshot::Receiver<io::Result<Medium>>) -> Result<Medium, L
 ///
 /// [`LinkError`] naming the failed phase or the refusal.
 pub async fn link(node: &Node, addr: SocketAddr) -> Result<DeviceIdentity, LinkError> {
-    if !node.peer_links_on() {
-        return Err(LinkError::LinksOff);
-    }
-    if node.identity().is_none() {
-        return Err(LinkError::NotServing);
-    }
+    may_dial(node)?;
     let (stream, readiness) = {
         let endpoint = NWEndpoint::new_address(addr);
         let connection = NWConnection::new(&endpoint, &parameters());
         open(&connection)
     };
-    let medium = ready(readiness).await?;
+    let medium = ready(readiness).await?.medium;
     node.link_over(stream, addr, medium).await
+}
+
+/// A browse result's endpoint, an immutable value Network only reads.
+pub(super) struct Endpoint(pub(super) NWRetained<NWEndpoint>);
+
+// SAFETY: an endpoint is an immutable value object, and Network only reads it
+// when a connection is created to it.
+unsafe impl Send for Endpoint {}
+// SAFETY: as for `Send`, nothing mutates an endpoint after it is created.
+unsafe impl Sync for Endpoint {}
+
+/// Dial a found `endpoint` through Network framework and link the peer
+/// there, refusing as [`Node::link`] does before any connection opens. The
+/// link names the address the ready path reached.
+pub(super) async fn link_endpoint(
+    node: &Node,
+    endpoint: &Endpoint,
+) -> Result<DeviceIdentity, LinkError> {
+    may_dial(node)?;
+    let (stream, readiness) = {
+        let connection = NWConnection::new(&endpoint.0, &parameters());
+        open(&connection)
+    };
+    let ready = ready(readiness).await?;
+    let remote = ready.remote.ok_or_else(|| {
+        LinkError::Unreachable(io::Error::other(
+            "the ready connection names no remote address",
+        ))
+    })?;
+    node.link_over(stream, remote, ready.medium).await
 }
 
 /// A Network framework listener handing every connection that becomes ready
@@ -486,13 +541,77 @@ impl Listener {
     pub fn port(&self) -> u16 {
         self.port
     }
+
+    /// The advertisement of this listener's service.
+    pub fn advertiser(&self) -> Advertiser {
+        Advertiser {
+            listener: self.network.lock().clone(),
+            queue: self.queue.clone(),
+        }
+    }
+}
+
+/// The Bonjour advertisement of a [`Listener`]'s service, set and withdrawn
+/// on the listener's queue.
+#[derive(Clone)]
+pub struct Advertiser {
+    listener: Queued<NWListener>,
+    queue: DispatchRetained<DispatchQueue>,
+}
+
+impl std::fmt::Debug for Advertiser {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Advertiser").finish_non_exhaustive()
+    }
+}
+
+impl Advertiser {
+    /// Advertise the listener as the instance `name` of `service` in the
+    /// `local.` domain with the TXT pairs `txt`, replacing any earlier
+    /// advertisement.
+    ///
+    /// # Errors
+    ///
+    /// When Network refuses the name, the service type or a TXT key.
+    pub fn advertise(&self, service: &str, name: &str, txt: &[(&str, &str)]) -> io::Result<()> {
+        let invalid = |what: &str| io::Error::new(io::ErrorKind::InvalidInput, what.to_owned());
+        let name = CString::new(name).map_err(|_| invalid("the instance name holds a NUL"))?;
+        let service = CString::new(service).map_err(|_| invalid("the service holds a NUL"))?;
+        let descriptor =
+            NWAdvertiseDescriptor::new_bonjour_service(Some(&name), &service, Some(c"local."))
+                .ok_or_else(|| invalid("Network refused the advertisement"))?;
+        let record = NWTxtRecord::new_dictionary();
+        for (key, value) in txt {
+            let key = CString::new(*key).map_err(|_| invalid("a TXT key holds a NUL"))?;
+            // SAFETY: the value points at `value.len()` live bytes, which
+            // Network copies before the call returns.
+            if !unsafe { record.set_key(&key, value.as_ptr(), value.len()) } {
+                return Err(invalid("Network refused a TXT key"));
+            }
+        }
+        descriptor.set_txt_record_object(Some(&record));
+        let descriptor = Queued(descriptor);
+        let listener = self.listener.clone();
+        self.queue.exec_async(move || {
+            listener
+                .on_queue()
+                .set_advertise_descriptor(Some(descriptor.on_queue()));
+        });
+        Ok(())
+    }
+
+    /// End the advertisement.
+    pub fn withdraw(&self) {
+        let listener = self.listener.clone();
+        self.queue
+            .exec_async(move || listener.on_queue().set_advertise_descriptor(None));
+    }
 }
 
 impl Drop for Listener {
     fn drop(&mut self) {
         let listener = self.network.get_mut().clone();
-        self.queue
-            .exec_async(move || listener.on_queue().cancel());
+        self.queue.exec_async(move || listener.on_queue().cancel());
     }
 }
 
@@ -511,8 +630,8 @@ fn accept(node: &Node, runtime: &tokio::runtime::Handle, connection: &NWConnecti
     runtime.spawn(async move {
         // A connection that loses Network's race fails before it is ready and
         // is dropped here.
-        if let Ok(medium) = ready(readiness).await {
-            node.accept_over(stream, remote, medium).await;
+        if let Ok(ready) = ready(readiness).await {
+            node.accept_over(stream, remote, ready.medium).await;
         }
     });
 }

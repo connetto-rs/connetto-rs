@@ -20,7 +20,7 @@ use crate::Discovery;
 use crate::DiscoveryEvent;
 use crate::Fingerprint;
 use crate::PeerEvent;
-use crate::discovery::{DnsSd, DnsSdEvent, DnsSdSession, DnsSdSink};
+use crate::discovery::{Addresses, DnsSd, DnsSdEvent, DnsSdSession, DnsSdSink, LinkFoundError};
 use crate::test_support::{
     Deployment, Peer, events, loopback_multicast, node, serve, whole_second,
 };
@@ -50,24 +50,15 @@ async fn forward(
     }
 }
 
-/// Wait for the instance `fingerprint` to be found, answering its address.
-async fn await_found(
-    rx: &mut mpsc::UnboundedReceiver<DiscoveryEvent>,
-    fingerprint: Fingerprint,
-) -> SocketAddr {
+/// Wait for the instance `fingerprint` to be found.
+async fn await_found(rx: &mut mpsc::UnboundedReceiver<DiscoveryEvent>, fingerprint: Fingerprint) {
     loop {
         let event = time::timeout(WAIT, rx.recv())
             .await
             .expect("discovery reports within the bound")
             .expect("the channel stays open");
-        match event {
-            DiscoveryEvent::Found {
-                address,
-                fingerprint: found,
-            } if found == fingerprint => {
-                return address;
-            }
-            _ => {}
+        if event == (DiscoveryEvent::Found { fingerprint }) {
+            return;
         }
     }
 }
@@ -156,9 +147,9 @@ async fn two_nodes_discover_each_other_and_autolink() {
     da.serve(a_addr.port(), alice_fp);
     db.serve(b_addr.port(), bob_fp);
 
-    // Each side reports the other at its bound address, and the dial lands.
-    assert_eq!(await_found(&mut da_rx, bob_fp).await, b_addr);
-    assert_eq!(await_found(&mut db_rx, alice_fp).await, a_addr);
+    // Each side reports the other, and the dial lands.
+    await_found(&mut da_rx, bob_fp).await;
+    await_found(&mut db_rx, alice_fp).await;
     await_linked(&mut a_events, &bob.identity).await;
     await_linked(&mut b_events, &alice.identity).await;
 
@@ -224,22 +215,18 @@ async fn a_renewal_re_registers_under_a_new_fingerprint() {
     // Bob's browse sees the old instance gone and the new one found, in
     // either order, and the link's renewal reaches his node.
     let mut gone = false;
-    let mut found = None;
-    while !gone || found.is_none() {
+    let mut found = false;
+    while !gone || !found {
         let event = time::timeout(WAIT, db_rx.recv())
             .await
             .expect("discovery reports within the bound")
             .expect("the channel stays open");
         match event {
             DiscoveryEvent::Gone { fingerprint: g } if g == alice_fp => gone = true,
-            DiscoveryEvent::Found {
-                address,
-                fingerprint: f,
-            } if f == renewed_fp => found = Some(address),
+            DiscoveryEvent::Found { fingerprint: f } if f == renewed_fp => found = true,
             _ => {}
         }
     }
-    assert_eq!(found, Some(a_addr));
     let deadline = Instant::now() + WAIT;
     loop {
         if bob_node.peer_fingerprint(&alice.identity) == Some(renewed_fp) {
@@ -432,7 +419,7 @@ fn resolved(fingerprint: Fingerprint, address: SocketAddr) -> DnsSdEvent {
     DnsSdEvent::Resolved {
         name: "peer".to_owned(),
         txt: vec![("fp".to_owned(), Some(fingerprint.to_string().into_bytes()))],
-        addresses: vec![address],
+        reach: Arc::new(Addresses(vec![address])),
     }
 }
 
@@ -470,7 +457,6 @@ async fn a_platform_dns_sd_service_serves_in_place_of_mdns() {
     assert_eq!(
         next_found(&mut s.found).await,
         DiscoveryEvent::Found {
-            address: PEER_AT,
             fingerprint: s.other,
         }
     );
@@ -522,7 +508,6 @@ async fn an_off_standing_reports_without_dialing_and_dials_at_the_resume() {
     assert_eq!(
         next_found(&mut found).await,
         DiscoveryEvent::Found {
-            address: b_addr,
             fingerprint: bob_fp,
         },
         "the found peer reports"
@@ -579,7 +564,6 @@ async fn an_off_standing_set_before_the_serve_holds_through_it() {
     assert_eq!(
         next_found(&mut found).await,
         DiscoveryEvent::Found {
-            address: b_addr,
             fingerprint: bob_fp,
         },
         "the found peer reports"
@@ -686,12 +670,97 @@ async fn an_instance_without_a_readable_fingerprint_is_not_found() {
         sink(DnsSdEvent::Resolved {
             name: "unreadable".to_owned(),
             txt: vec![("fp".to_owned(), value)],
-            addresses: vec![PEER_AT],
+            reach: Arc::new(Addresses(vec![PEER_AT])),
         });
     }
     sink(resolved(s.other, PEER_AT));
     assert!(matches!(
         next_found(&mut s.found).await,
-        DiscoveryEvent::Found { fingerprint, .. } if fingerprint == s.other
+        DiscoveryEvent::Found { fingerprint } if fingerprint == s.other
     ));
+}
+
+/// With autolink off a found peer reports by its fingerprint alone and
+/// links only when the device asks for it by that fingerprint (R112
+/// decision 5).
+#[tokio::test]
+async fn a_found_peer_links_by_its_fingerprint_on_the_call() {
+    let (deployment, alice, bob) = pair(whole_second());
+    let (a_tx, _a_rx) = events();
+    let alice_node = node(deployment.root_der(), a_tx);
+    let a_addr = serve(&alice_node, &alice);
+    let (b_tx, mut b_rx) = events();
+    let bob_node = node(deployment.root_der(), b_tx);
+    let b_addr = serve(&bob_node, &bob);
+    let alice_fp = Fingerprint::of(&alice.leaf);
+    let bob_fp = Fingerprint::of(&bob.leaf);
+
+    let (sinks_tx, mut sinks) = mpsc::unbounded_channel();
+    let service = ScriptedDnsSd {
+        sinks: sinks_tx,
+        calls: Arc::default(),
+        refused_opens: parking_lot::Mutex::new(0),
+        refuse_register: false,
+    };
+    let (found_tx, mut found) = mpsc::unbounded_channel();
+    let discovery =
+        Discovery::new(alice_node.clone(), false, found_tx).with_dns_sd(Arc::new(service));
+    let links = discovery.found_links();
+    discovery.serve(a_addr.port(), alice_fp);
+    let mut sink = next_sink(&mut sinks).await;
+
+    sink(resolved(bob_fp, b_addr));
+    assert_eq!(
+        next_found(&mut found).await,
+        DiscoveryEvent::Found {
+            fingerprint: bob_fp
+        },
+        "the found peer reports by its fingerprint"
+    );
+    time::sleep(Duration::from_millis(500)).await;
+    while let Ok(event) = b_rx.try_recv() {
+        assert!(
+            !matches!(event, PeerEvent::Linked { .. }),
+            "autolink off dials nothing"
+        );
+    }
+
+    let linked = links.link(bob_fp).await.expect("the found peer links");
+    assert_eq!(linked, bob.identity, "the call answers the peer's identity");
+    await_linked(&mut b_rx, &alice.identity).await;
+
+    discovery.stop();
+    alice_node.stop(CloseReason::Closed);
+    bob_node.stop(CloseReason::Closed);
+}
+
+/// A fingerprint discovery holds no instance under answers not found, before
+/// any find and after the instance's removal (R112 decision 5).
+#[tokio::test]
+async fn a_fingerprint_discovery_does_not_hold_answers_not_found() {
+    let mut s = scripted(0, false);
+    let links = s.discovery.found_links();
+    s.discovery.serve(4000, s.own);
+    let mut sink = next_sink(&mut s.sinks).await;
+    assert!(
+        matches!(links.link(s.other).await, Err(LinkFoundError::NotFound)),
+        "nothing is found before the find"
+    );
+
+    sink(resolved(s.other, PEER_AT));
+    next_found(&mut s.found).await;
+    sink(DnsSdEvent::Removed {
+        name: "peer".to_owned(),
+    });
+    assert_eq!(
+        next_found(&mut s.found).await,
+        DiscoveryEvent::Gone {
+            fingerprint: s.other
+        }
+    );
+    assert!(
+        matches!(links.link(s.other).await, Err(LinkFoundError::NotFound)),
+        "a removed peer is no longer found"
+    );
+    s.discovery.stop();
 }

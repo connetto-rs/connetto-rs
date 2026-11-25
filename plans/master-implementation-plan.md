@@ -1440,16 +1440,19 @@ Apple devices only join ([R77 decision 23](https://github.com/connetto-rs/connet
 2. **Apple devices discover through Network framework alone.** On iOS, iPadOS and macOS, `NWListener`'s Bonjour advertisement and `NWBrowser`, both with `includePeerToPeer`, replace the `dns_sd` backend on iOS and `mdns-sd` on macOS. The advertisement keeps `_connetto-peer._tcp` and the TXT record of `v` and `fp`, one browse covers a shared network and peer-to-peer Wi-Fi, and a found peer is dialled as the endpoint it was found as. Joining a hotspot through the Bluetooth beacon and the exchange is unchanged, and so are discovery and autolink rules. A second peer-to-peer browse beside the existing stacks and `dns_sd` with its peer-to-peer flag were rejected.
 3. **The link is generic over its byte stream, with TCP as one transport.** `Node`'s handshake, TLS, certificate checks and frames run over any `AsyncRead` and `AsyncWrite` a transport hands in. TCP sockets are one transport, and `NWConnection` behind an adapter in `connetto-peer-apple` is another. On Apple devices every link dials and accepts through Network framework, peer-to-peer, shared Wi-Fi and the hotspot gateway alike. A second link entry beside the TCP path, and TCP sockets dialled at `awdl0` addresses with `SO_RECV_ANYIF`, were rejected.
 4. **The link reports the address and the medium.** A linked peer's remote stays a `SocketAddr`, the TCP stream's peer address or the `NWConnection`'s connected address, and the link's read gains the medium, peer-to-peer Wi-Fi or a network, read from the connection's interface, so `NativeClient::linked_peers` and the test harness can assert a peer-to-peer link. An opaque per-transport description was rejected.
+5. **Discovery reports a found peer by its fingerprint, and a found peer links by it.** `ClientEvent::PeerFound` carries the leaf fingerprint alone on every platform, and `NativeClient::link_found(fingerprint)` dials the instance the way discovery found it, refusing with `PeerError::NotFound` when discovery holds no instance under that fingerprint. `link_peer(addr)` stays for addresses from outside discovery, the hotspot gateway and a typed address. An address in the event was rejected, since an Apple-found peer has none before it connects and an instance answers at several.
+6. **A found instance carries the dial that reaches it.** The DNS-SD service that reports an instance hands over its reach, a TCP address list dialled `IPv4` first from `mdns-sd` and the Bonjour endpoint dialled through Network framework on Apple, and autolink and `link_found` both dial through it. A separate dialer beside the DNS-SD service was rejected.
+7. **Apple's advertisement rides on the link's listener.** `transport::Listener` advertises the service and its TXT record. The enrolment task hands the listener's advertiser to the Apple discovery service through a shared slot when the listener starts and takes it back at stop, and discovery's registration posts the descriptor on the listener's queue. Discovery owning the listener was rejected, since accepting links does not depend on discovery.
 
 ### Steps
 
 1. The gate runs. Done 2026-11-05, findings 5 to 7.
-2. The open points settled with the maintainer. Done 2026-11-05, decisions 1 to 4.
+2. The open points settled with the maintainer. Done 2026-11-05, decisions 1 to 4, and 2026-11-25, decisions 5 to 7.
 3. connetto's own objc2 crates on `main` (decision 1), with `connetto-peer-apple` moved to `main`'s API.
 4. The stream-generic link in `connetto-peer` (decision 3) and the medium in its read (decision 4), proven in process over TCP and over an in-memory stream.
 5. Network framework discovery and transport in `connetto-peer-apple` (decisions 2 and 3), and the demos' Apple flow taking it, proven on the iPhone, the iPad and the Mac.
 
-Steps 3, 4 and 5 are one pull request each, in that order, and step 5 may split once more into discovery and transport if it outgrows one review.
+Steps 3, 4 and 5 are one pull request each, in that order, and step 5 splits into the transport (decision 3) and then discovery (decisions 2, 5, 6 and 7).
 
 ### Proof
 
