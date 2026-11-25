@@ -208,8 +208,8 @@ async fn run() -> Result<()> {
     let policies_sql = read_ddl("CONNETTO_POLICIES_SQL").unwrap_or_default();
     let roles_sql = read_ddl("CONNETTO_ROLES_SQL").context("set CONNETTO_ROLES_SQL")?;
     let reader_role = std::env::var("CONNETTO_READER_ROLE").context("set CONNETTO_READER_ROLE")?;
-    let bundle = connetto_schema::translate::<String, connetto_core::bots::TextIds>(
-        connetto_schema::Documents::new(&schema_sql, &policies_sql, &roles_sql, &reader_role),
+    let bundle = connetto_translate::translate::<String, connetto_core::bots::TextIds>(
+        connetto_translate::Documents::new(&schema_sql, &policies_sql, &roles_sql, &reader_role),
     )
     .map_err(|err| anyhow!("translating CONNETTO_SCHEMA_SQL: {err}"))?;
 

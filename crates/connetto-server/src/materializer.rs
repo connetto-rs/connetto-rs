@@ -31,8 +31,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use connetto_core::messages::{AggregateChange, ColumnType, MutationPatch, SqliteValue};
-use connetto_core::quote_ident;
 use connetto_core::write::{VersionColumn, WritableCatalog};
+use connetto_core::{CallerKind, KindRoles, quote_ident};
 use diesel::query_builder::{BoxedSqlQuery, SqlQuery};
 use diesel::sql_types::{BigInt, Binary, Double, Nullable, Text};
 use diesel::{QueryableByName, SqliteConnection, sql_query};
@@ -419,6 +419,17 @@ pub enum Registration {
     Computed(ComputedCapture),
 }
 
+impl Registration {
+    /// The engine-assigned identity of either kind of registration.
+    #[must_use]
+    pub fn subscription_id(&self) -> SubscriptionId {
+        match self {
+            Self::Row(subscription) => *subscription,
+            Self::Computed(capture) => capture.subscription_id,
+        }
+    }
+}
+
 /// A server-computed subscription awaiting its first answer.
 pub struct ComputedCapture {
     /// Engine-assigned identity, one id space with row subscriptions.
@@ -607,6 +618,8 @@ where
     /// The tables each registered subscription reads, for tearing down every
     /// subscription a refusal reaches.
     reads: HashMap<SubscriptionId, Vec<TableId>>,
+    rules_generation: u64,
+    rules_snapshots: HashMap<SubscriptionId, u64>,
 }
 
 /// How the client's caller functions reverse translate into the session
@@ -618,24 +631,35 @@ pub struct CallerMappings {
     /// carries them inside the server's assembly future.
     options: Box<Pg2SqliteOptions>,
     subjects_setting: &'static str,
-    /// The role every caller's reads run as, which subql plans each
-    /// membership term for.
+    /// The role each kind's reads run as, which subql plans each membership
+    /// term for.
+    kind_roles: KindRoles,
+    /// The role connetto's own filters run as.
     reader_role: String,
 }
 
 impl CallerMappings {
-    /// The caller functions of a deployment whose server reads as
-    /// `reader_role`, with the settings `Key` binds.
+    /// The caller functions of a deployment whose server logs in as
+    /// `reader_role` and reads as the role `kind_roles` names for each
+    /// caller's kind, with the settings `Key` binds, `unset` naming the ones
+    /// a caller may leave unset.
     ///
     /// # Errors
     ///
-    /// As [`connetto_schema::deployment`].
+    /// As [`connetto_translate::deployment`].
     pub fn of<Key: connetto_core::auth::CapabilityKey>(
         reader_role: &str,
-    ) -> Result<Self, connetto_schema::SchemaError> {
+        kind_roles: &KindRoles,
+        unset: connetto_core::auth::UnsetSettings,
+    ) -> Result<Self, connetto_translate::SchemaError> {
         Ok(Self {
-            options: Box::new(connetto_schema::query_options::<Key>(reader_role)?),
+            options: Box::new(connetto_translate::query_options::<Key>(
+                reader_role,
+                kind_roles,
+                unset,
+            )?),
             subjects_setting: Key::SETTING,
+            kind_roles: kind_roles.clone(),
             reader_role: reader_role.to_owned(),
         })
     }
@@ -700,6 +724,11 @@ impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
             })?;
             private_tables.push((id, *name));
         }
+        if let Some(marker) =
+            catalog_helpers::table_id::<Postgres, _>(&catalog, crate::epoch::POLICY_CHANGES_TABLE)
+        {
+            private_tables.push((marker, crate::epoch::POLICY_CHANGES_TABLE));
+        }
         let policy_readers = PolicyReaders::of(&policy_reads, &catalog);
         let mut engine = SubscriptionEngine::new(catalog.clone(), PostgreSqlDialect {});
         if let Some(translator) = translator {
@@ -718,11 +747,13 @@ impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
             refused: RefusedSet::default(),
             policy_readers,
             reads: HashMap::new(),
+            rules_generation: 0,
+            rules_snapshots: HashMap::new(),
         })
     }
 
-    /// Register a subscription from the client's SQLite-dialect `SELECT` and
-    /// its bind values.
+    /// Register a subscription from a caller of `kind`'s SQLite-dialect
+    /// `SELECT` and its bind values.
     ///
     /// The query is reverse translated to Postgres against this materializer's
     /// catalog with its `?` and `?N` placeholders mapped to `$N`, and the
@@ -742,13 +773,14 @@ impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
     pub fn register_sqlite(
         &mut self,
         consumer_id: u64,
+        kind: CallerKind,
         sqlite_sql: &str,
         binds: &[SqliteValue],
         budget: ReadBudget,
     ) -> Result<SqliteRegistration, MaterializerError> {
         let pg_sql = self.translate_subscription_sql(sqlite_sql)?;
         let registration =
-            self.register_translated(consumer_id, &pg_sql, binds, None, budget, None)?;
+            self.register_translated(consumer_id, Some(kind), &pg_sql, binds, None, budget, None)?;
         Ok(SqliteRegistration {
             registration,
             pg_sql,
@@ -1126,20 +1158,29 @@ where
         &self.shapes
     }
 
-    /// A request for `sql`, planned for the reader role every caller's reads
-    /// run as, or for no role when the deployment maps no caller.
-    fn request(&self, consumer_id: u64, sql: &str) -> SubscriptionRequest<DefaultIds, Postgres> {
+    /// A request for `sql`, planned for the role a caller of `kind` reads
+    /// as, the reader for a filter of connetto's own when `kind` is `None`,
+    /// or for no role when the deployment maps no caller.
+    fn request(
+        &self,
+        consumer_id: u64,
+        kind: Option<CallerKind>,
+        sql: &str,
+    ) -> SubscriptionRequest<DefaultIds, Postgres> {
         let request = SubscriptionRequest::new(consumer_id, sql);
         match &self.caller {
-            Some(caller) => request.acting_role(caller.reader_role.as_str()),
+            Some(caller) => request.acting_role(match kind {
+                Some(kind) => caller.kind_roles.role(kind),
+                None => caller.reader_role.as_str(),
+            }),
             None => request,
         }
     }
 
-    /// Register a subscription for `consumer_id` from a SQL `SELECT`, with a
-    /// generous default read budget. Tests and doc examples only: a session
-    /// registers through [`Self::register_translated`] with its caller's tier
-    /// budget.
+    /// Register a subscription for `consumer_id` from a SQL `SELECT`, planned
+    /// for a signed-in caller, with a generous default read budget. Tests and
+    /// doc examples only: a session registers through
+    /// [`Self::register_translated`] with its caller's kind and tier budget.
     ///
     /// A row subscription returns [`Registration::Row`] with its
     /// [`SubscriptionId`]. Every other accepted shape returns
@@ -1156,7 +1197,7 @@ where
     ) -> Result<Registration, MaterializerError> {
         self.register_request(
             consumer_id,
-            self.request(consumer_id, select_sql),
+            self.request(consumer_id, Some(CallerKind::Authenticated), select_sql),
             ReadBudget::new(core::time::Duration::from_secs(5)),
         )
     }
@@ -1226,6 +1267,8 @@ where
             );
             self.storage_layouts.insert(subscription_id, layout);
         }
+        self.rules_snapshots
+            .insert(subscription_id, self.rules_generation);
         Ok(match registered.tier {
             Tier::InProcess(served) => match served.aggregate_bootstrap {
                 Some(bootstrap) => Registration::Computed(ComputedCapture {
@@ -1294,6 +1337,7 @@ where
     /// resolves whichever registry holds the id (U7).
     pub fn unregister(&mut self, sub_id: SubscriptionId) -> bool {
         self.reads.remove(&sub_id);
+        self.rules_snapshots.remove(&sub_id);
         self.storage_layouts.remove(&sub_id);
         self.computed_columns.remove(&sub_id);
         self.engine.unregister_subscription(sub_id)
@@ -1351,6 +1395,63 @@ where
             .filter(|(_, reads)| reads.iter().any(|read| ids.contains(read)))
             .map(|(sub_id, _)| *sub_id)
             .collect()
+    }
+
+    /// Replace the access rules and policy readers under the dispatch gate.
+    pub(crate) fn follow_access_rules<R: DatabaseLike + 'static>(
+        &mut self,
+        rules: Arc<R>,
+        policy_reads: &[rls2fga::types::PolicyReads],
+    ) {
+        self.engine.follow_access_rules(rules);
+        self.policy_readers = PolicyReaders::of(policy_reads, &self.catalog);
+        self.rules_generation = self.rules_generation.wrapping_add(1);
+    }
+
+    /// Registrations whose initial read belongs to an earlier generation.
+    pub(crate) fn older_rules_snapshots(&self) -> Vec<SubscriptionId> {
+        self.rules_snapshots
+            .iter()
+            .filter(|(_, generation)| **generation != self.rules_generation)
+            .map(|(subscription, _)| *subscription)
+            .collect()
+    }
+
+    /// Track a replacement read without overwriting an older registration generation.
+    pub(crate) fn begin_rules_snapshot(&mut self, subscription: SubscriptionId) {
+        self.rules_snapshots
+            .entry(subscription)
+            .or_insert(self.rules_generation);
+    }
+
+    /// Finish an initial read and report whether its rules changed.
+    pub(crate) fn finish_rules_snapshot(&mut self, subscription: SubscriptionId) -> bool {
+        self.rules_snapshots
+            .remove(&subscription)
+            .is_some_and(|generation| generation != self.rules_generation)
+    }
+
+    /// Include every policy reader reached transitively by these tables.
+    pub(crate) fn rules_reach(&self, tables: &[String]) -> Vec<String> {
+        let mut reached = tables.to_vec();
+        let mut index = 0;
+        while index < reached.len() {
+            if let Some(table) = catalog_helpers::table_id_for_name::<Postgres, _>(
+                &self.catalog,
+                TargetName::new(&reached[index], true),
+            ) {
+                for reader in self.policy_readers.of_table(table) {
+                    if let Some(name) =
+                        catalog_helpers::table_name::<Postgres, _>(&self.catalog, reader)
+                        && !reached.contains(&name)
+                    {
+                        reached.push(name);
+                    }
+                }
+            }
+            index += 1;
+        }
+        reached
     }
 
     /// Install a fold's seed rows, read by the session through its own
@@ -2167,6 +2268,13 @@ where
 
     /// Whether a client may write `table` at all, judged before its op is planned.
     fn write_target(&self, table: &str) -> Result<(), MaterializerError> {
+        if self.table_id(table).is_ok_and(|identity| {
+            self.audit_tables.iter().any(|(private, name)| {
+                *private == identity && *name == crate::epoch::POLICY_CHANGES_TABLE
+            })
+        }) {
+            return Err(MaterializerError::NotWritable(table.to_owned()));
+        }
         if !self.write.is_writable(table) && !registry_table(table) {
             return Err(MaterializerError::NotWritable(table.to_owned()));
         }
@@ -2491,12 +2599,15 @@ where
     pub fn describe_terms(
         &self,
         consumer_id: u64,
+        kind: CallerKind,
         pg_sql: &str,
         binds: &[SqliteValue],
         subscriber: Option<PgValue<Postgres>>,
         subjects: Vec<PgValue<Postgres>>,
     ) -> Result<Vec<subql::term::TermDescription>, MaterializerError> {
-        let mut request = self.request(consumer_id, pg_sql).binds(wire_binds(binds));
+        let mut request = self
+            .request(consumer_id, Some(kind), pg_sql)
+            .binds(wire_binds(binds));
         if subscriber.is_some() || !subjects.is_empty() {
             if let Some(subscriber) = subscriber {
                 request = request.subscriber(subscriber);
@@ -2509,7 +2620,9 @@ where
     }
 
     /// Register a pre-translated Postgres `SELECT`, optionally seeded with the
-    /// caller's subjects and the values its membership terms currently admit.
+    /// caller's subjects and the values its membership terms currently admit,
+    /// planned for the role a caller of `kind` reads as, or for the reader
+    /// itself when `kind` is `None`, for a filter of connetto's own.
     ///
     /// The seed rides the registration itself because subql maintains the
     /// membership sets from the change stream only after it. A membership term
@@ -2536,9 +2649,14 @@ where
     /// # Panics
     ///
     /// Does not panic in practice. The `viewer.expect` on the retry path is reached only when the `viewer.is_some()` match arm condition is true, which guarantees `viewer` is `Some`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the consumer, its kind, the query, its binds, the seed, the budget and the viewer are independent inputs of one registration"
+    )]
     pub fn register_translated(
         &mut self,
         consumer_id: u64,
+        kind: Option<CallerKind>,
         pg_sql: &str,
         binds: &[SqliteValue],
         seed: Option<TermSeed>,
@@ -2567,13 +2685,17 @@ where
             return Err(MaterializerError::RefusedRead(name));
         }
         let retry_seed = viewer.as_ref().and_then(|_| seed.clone());
-        let request = self.request(consumer_id, pg_sql).binds(wire_binds(binds));
+        let request = self
+            .request(consumer_id, kind, pg_sql)
+            .binds(wire_binds(binds));
         let registered = match self.register_request(consumer_id, seeded(request, seed), budget) {
             Err(MaterializerError::Register(subql::RegisterError::AggregatorOnRlsTable {
                 ..
             })) if viewer.is_some() => {
                 let setup = viewer.expect("matched Some above");
-                let request = self.request(consumer_id, pg_sql).binds(wire_binds(binds));
+                let request = self
+                    .request(consumer_id, kind, pg_sql)
+                    .binds(wire_binds(binds));
                 let mut registered = self.register_request_with(
                     consumer_id,
                     seeded(request, retry_seed).database_reads_per_consumer(),
@@ -2586,10 +2708,7 @@ where
             }
             other => other?,
         };
-        let sub_id = match &registered {
-            Registration::Row(sub_id) => *sub_id,
-            Registration::Computed(capture) => capture.subscription_id,
-        };
+        let sub_id = registered.subscription_id();
         self.reads.insert(sub_id, reads);
         Ok(registered)
     }
@@ -2732,7 +2851,7 @@ fn private_relations<DB: DatabaseLike, V: sqlparser::ast::Visit>(
         let Some(ident) = name.0.last().and_then(|part| part.as_ident()) else {
             return core::ops::ControlFlow::Continue(());
         };
-        if let Some(table) = connetto_schema::BOOKKEEPING_TABLES
+        if let Some(table) = connetto_translate::BOOKKEEPING_TABLES
             .iter()
             .find(|table| ident.value.eq_ignore_ascii_case(table))
         {
@@ -2754,7 +2873,7 @@ fn private_relations<DB: DatabaseLike, V: sqlparser::ast::Visit>(
 }
 
 /// Reverse translate one SQLite-dialect statement into Postgres against
-/// `catalog`, the caller's SQLite functions mapped to the settings the server
+/// `catalog`, the SQLite caller functions mapped to the settings the server
 /// binds. Placeholders translate as syntax, values never enter the SQL.
 ///
 /// # Errors
@@ -2776,7 +2895,7 @@ pub(crate) fn translate_select(
     let statement = statements.remove(0);
     let unmapped;
     let options = if let Some(caller) = caller {
-        &caller.options
+        &*caller.options
     } else {
         unmapped = Pg2SqliteOptions::default();
         &unmapped
@@ -3481,6 +3600,49 @@ mod membership_term_tests {
 
     use subql::{ChangeEvent, PgCommitPosition, PgLsn, PgXid};
 
+    #[test]
+    fn a_follow_identifies_snapshots_registered_under_older_rules() {
+        let mut materializer = Materializer::builder(SCHEMA).build().expect("catalog");
+        let subscription = materializer
+            .register(1, "SELECT * FROM docs")
+            .expect("registration")
+            .subscription_id();
+        let rules = Arc::new(ParserDB::parse::<PostgreSqlDialect>(SCHEMA).expect("rules catalog"));
+        materializer.follow_access_rules(rules, &[]);
+        materializer.begin_rules_snapshot(subscription);
+        assert_eq!(materializer.older_rules_snapshots(), vec![subscription]);
+        assert!(materializer.finish_rules_snapshot(subscription));
+        assert_eq!(
+            materializer.older_rules_snapshots(),
+            Vec::<SubscriptionId>::new()
+        );
+    }
+
+    #[test]
+    fn a_completed_snapshot_is_not_an_inflight_rules_race() {
+        let mut materializer = Materializer::builder(SCHEMA).build().expect("catalog");
+        let subscription = materializer
+            .register(1, "SELECT * FROM docs")
+            .expect("registration")
+            .subscription_id();
+        assert!(!materializer.finish_rules_snapshot(subscription));
+        let rules = Arc::new(ParserDB::parse::<PostgreSqlDialect>(SCHEMA).expect("rules catalog"));
+        materializer.follow_access_rules(rules, &[]);
+        assert_eq!(
+            materializer.older_rules_snapshots(),
+            Vec::<SubscriptionId>::new()
+        );
+        materializer.begin_rules_snapshot(subscription);
+        assert_eq!(
+            materializer.older_rules_snapshots(),
+            Vec::<SubscriptionId>::new()
+        );
+        let rules = Arc::new(ParserDB::parse::<PostgreSqlDialect>(SCHEMA).expect("rules catalog"));
+        materializer.follow_access_rules(rules, &[]);
+        assert_eq!(materializer.older_rules_snapshots(), vec![subscription]);
+        assert!(materializer.finish_rules_snapshot(subscription));
+    }
+
     /// The motivating pair: a guarded table filtered through a membership.
     const SCHEMA: &str = "CREATE TABLE docs (id BIGINT PRIMARY KEY, project_id BIGINT NOT NULL);\nCREATE TABLE project_members (project_id BIGINT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (project_id, user_id));";
 
@@ -3491,12 +3653,14 @@ mod membership_term_tests {
     const CLIENT_SQL: &str = "SELECT * FROM docs WHERE project_id IN (SELECT project_id FROM project_members WHERE user_id = current_app_user())";
 
     /// The reader role the test deployments create, and their roles document.
-    const READER: &str = "app_reader";
-    const ROLES: &str = "CREATE ROLE app_reader LOGIN;";
+    const READER: &str = connetto_test_harness::FIXTURE_READER;
+    const ROLES: &str = connetto_test_harness::FIXTURE_ROLES;
+    /// The kind every test caller acts as, a signed-in user.
+    const KIND: CallerKind = CallerKind::Authenticated;
 
     fn materializer(caller: Option<CallerMappings>) -> Materializer {
         let translator = Translated::of::<String, crate::defaults::ConnettoDefaults>(
-            connetto_schema::Documents::new(SCHEMA, POLICIES, ROLES, READER),
+            connetto_translate::Documents::new(SCHEMA, POLICIES, ROLES, READER),
             true,
         )
         .expect("the motivating policy translates")
@@ -3515,7 +3679,7 @@ mod membership_term_tests {
     /// beside the schema, as the server's own catalog does.
     fn materializer_over(policies: &str) -> Materializer {
         let translator = Translated::of::<String, crate::defaults::ConnettoDefaults>(
-            connetto_schema::Documents::new(SCHEMA, policies, ROLES, READER),
+            connetto_translate::Documents::new(SCHEMA, policies, ROLES, READER),
             true,
         )
         .expect("the policies translate")
@@ -3529,7 +3693,12 @@ mod membership_term_tests {
     }
 
     fn mapping() -> CallerMappings {
-        CallerMappings::of::<String>(READER).expect("the test deployment's description holds")
+        CallerMappings::of::<String>(
+            READER,
+            KindRoles::defaults(),
+            connetto_core::auth::UnsetSettings::ALWAYS_BOUND,
+        )
+        .expect("the test deployment's description holds")
     }
 
     // The whole happy path at this seam: the caller rewrites, the canonical
@@ -3546,7 +3715,7 @@ mod membership_term_tests {
             "the mapping must rewrite the caller, got {pg_sql}"
         );
         let terms = mat
-            .describe_terms(1, &pg_sql, &[], None, Vec::new())
+            .describe_terms(1, KIND, &pg_sql, &[], None, Vec::new())
             .expect("the canonical shape describes");
         let [term] = terms.as_slice() else {
             panic!("one canonical term describes, got {terms:?}");
@@ -3590,6 +3759,7 @@ mod membership_term_tests {
         };
         let registration = match mat.register_translated(
             1,
+            Some(KIND),
             &pg_sql,
             &[],
             Some(seed),
@@ -3602,7 +3772,7 @@ mod membership_term_tests {
         assert!(matches!(registration, Registration::Row(_)));
     }
 
-    // The term is planned for the reader role every caller acts as, so a
+    // The term is planned for the role the caller's kind acts as, so a
     // membership table whose read rules leave that role every row serves the
     // term as a table without row-level security does.
     #[test]
@@ -3616,10 +3786,10 @@ mod membership_term_tests {
             .translate_subscription_sql(CLIENT_SQL)
             .expect("the caller function reverse translates");
         let expected = unguarded
-            .describe_terms(1, &pg_sql, &[], None, Vec::new())
+            .describe_terms(1, KIND, &pg_sql, &[], None, Vec::new())
             .expect("the term describes without row-level security");
         let described = guarded
-            .describe_terms(1, &pg_sql, &[], None, Vec::new())
+            .describe_terms(1, KIND, &pg_sql, &[], None, Vec::new())
             .unwrap_or_else(|err| panic!("an open membership table must serve, got {err}"));
         assert_eq!(described, expected);
         let seed = TermSeed {
@@ -3633,6 +3803,7 @@ mod membership_term_tests {
         let registration = guarded
             .register_translated(
                 1,
+                Some(KIND),
                 &pg_sql,
                 &[],
                 Some(seed),
@@ -3654,6 +3825,7 @@ mod membership_term_tests {
             .expect("translates");
         let refused = mat.register_translated(
             1,
+            Some(KIND),
             &pg_sql,
             &[],
             None,
@@ -3695,6 +3867,7 @@ mod membership_term_tests {
         assert!(
             mat.register_sqlite(
                 1,
+                KIND,
                 CLIENT_SQL,
                 &[],
                 ReadBudget::new(core::time::Duration::from_secs(5))
@@ -3713,6 +3886,7 @@ mod membership_term_tests {
         assert!(
             mat.describe_terms(
                 1,
+                KIND,
                 "SELECT * FROM docs WHERE project_id > 5",
                 &[],
                 None,
@@ -3723,7 +3897,7 @@ mod membership_term_tests {
             "a comparison against a literal is not a membership subquery"
         );
         let joined = "SELECT * FROM docs WHERE project_id IN (SELECT pm.project_id FROM project_members pm JOIN docs d ON d.project_id = pm.project_id WHERE pm.user_id = current_setting('app.user_id', true))";
-        let described = mat.describe_terms(1, joined, &[], None, Vec::new());
+        let described = mat.describe_terms(1, KIND, joined, &[], None, Vec::new());
         assert!(
             matches!(described, Err(MaterializerError::Register(_))),
             "a subquery joining a second table is outside the shape subql compiles, \
@@ -3743,7 +3917,7 @@ mod membership_term_tests {
 
     fn own_materializer() -> Materializer {
         let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
-            connetto_schema::Documents::new(OWN_DDL, OWN_POLICIES, ROLES, READER),
+            connetto_translate::Documents::new(OWN_DDL, OWN_POLICIES, ROLES, READER),
             true,
         )
         .expect("the own-shape policy translates");
@@ -3773,6 +3947,7 @@ mod membership_term_tests {
         let terms = mat
             .describe_terms(
                 consumer_id,
+                KIND,
                 OWN_QUERY,
                 &[],
                 Some(subscriber.clone()),
@@ -3787,6 +3962,7 @@ mod membership_term_tests {
         let registration = mat
             .register_translated(
                 consumer_id,
+                Some(KIND),
                 OWN_QUERY,
                 &[],
                 Some(seed),
@@ -3878,6 +4054,7 @@ mod membership_term_tests {
             let terms = mat
                 .describe_terms(
                     consumer_id,
+                    KIND,
                     QUERY,
                     &[],
                     Some(subscriber.clone()),
@@ -3896,6 +4073,7 @@ mod membership_term_tests {
             let registration = mat
                 .register_translated(
                     consumer_id,
+                    Some(KIND),
                     QUERY,
                     &[],
                     Some(seed),
@@ -4056,6 +4234,27 @@ mod audit_privacy_tests {
     }
 
     #[test]
+    fn policy_marker_subscriptions_are_private() {
+        let materializer = Materializer::builder(crate::epoch::POLICY_CHANGES_DDL)
+            .with_write_catalog(
+                RuntimeWritableCatalog::builder()
+                    .writable(crate::epoch::POLICY_CHANGES_TABLE)
+                    .build(),
+            )
+            .build()
+            .expect("marker catalog");
+        assert!(matches!(
+            materializer.translate_subscription_sql("SELECT * FROM connetto_policy_changes"),
+            Err(MaterializerError::AuditRead(table))
+                if table == crate::epoch::POLICY_CHANGES_TABLE
+        ));
+        assert!(matches!(
+            materializer.write_target(crate::epoch::POLICY_CHANGES_TABLE),
+            Err(MaterializerError::NotWritable(_))
+        ));
+    }
+
+    #[test]
     fn a_catalog_with_an_unresolvable_key_refuses_construction() {
         let ddl = crate::catalog_shapes::unresolvable_key_ddl();
         let refusal = Materializer::builder(&ddl)
@@ -4098,6 +4297,7 @@ mod audit_privacy_tests {
         materializer
             .register_translated(
                 1,
+                None,
                 "SELECT * FROM private_receipts",
                 &[],
                 None,
@@ -4122,6 +4322,7 @@ mod audit_privacy_tests {
             materializer
                 .register_sqlite(
                     2,
+                    CallerKind::Authenticated,
                     "SELECT * FROM catalog.\"Audit.Space\".\"Receipt.Log\"",
                     &[],
                     ReadBudget::new(core::time::Duration::from_secs(5)),
@@ -4146,6 +4347,7 @@ mod audit_privacy_tests {
         assert!(matches!(
             materializer.register_sqlite(
                 1,
+                CallerKind::Authenticated,
                 sql,
                 &[],
                 ReadBudget::new(core::time::Duration::from_secs(5)),
@@ -4280,20 +4482,24 @@ mod drift_refusal_tests {
          CREATE TABLE docs (id BIGINT PRIMARY KEY, team BIGINT);\n\
          CREATE TABLE notes (id BIGINT PRIMARY KEY, body TEXT);";
 
-    /// The `docs` policy reads `memberships`, as rls2fga reports it.
-    fn materializer() -> Materializer {
-        let table = |name: &str| {
+    /// `table`'s policy reading `reads`, as rls2fga reports it.
+    fn policy(table: &str, reads: &[&str]) -> rls2fga::types::PolicyReads {
+        let id = |name: &str| {
             rls2fga::types::TableId::from_stored(Some("public".to_owned()), name.to_owned())
         };
-        let reads = [rls2fga::types::PolicyReads {
-            name: "docs_read".to_owned(),
-            table: table("docs"),
+        rls2fga::types::PolicyReads {
+            name: format!("{table}_read"),
+            table: id(table),
             command: rls2fga::types::PolicyCommand::Select,
-            reads: vec![table("docs"), table("memberships")],
+            reads: reads.iter().map(|name| id(name)).collect(),
             unresolved: Vec::new(),
-        }];
+        }
+    }
+
+    /// The `docs` policy reads `memberships`.
+    fn materializer() -> Materializer {
         Materializer::builder(DDL)
-            .with_policy_reads(&reads)
+            .with_policy_reads(&[policy("docs", &["docs", "memberships"])])
             .build()
             .expect("the catalog parses")
     }
@@ -4342,6 +4548,26 @@ mod drift_refusal_tests {
         assert!(!materializer.refused().refuses("docs"));
     }
 
+    #[test]
+    fn a_rules_change_reaches_the_readers_of_its_readers_under_the_followed_rules() {
+        let mut materializer = materializer();
+        let rules = Arc::new(ParserDB::parse::<PostgreSqlDialect>(DDL).expect("rules catalog"));
+        materializer.follow_access_rules(
+            rules,
+            &[policy("docs", &["memberships"]), policy("notes", &["docs"])],
+        );
+        assert_eq!(
+            materializer.rules_reach(&["memberships".to_owned()]),
+            ["memberships", "docs", "notes"]
+        );
+        assert_eq!(materializer.rules_reach(&["notes".to_owned()]), ["notes"]);
+        assert_eq!(
+            materializer.rules_reach(&["absent".to_owned()]),
+            ["absent"],
+            "a name the catalog cannot place reaches no reader"
+        );
+    }
+
     /// Register `sql` the way a session's subscribe does.
     fn subscribe(
         materializer: &mut Materializer,
@@ -4350,6 +4576,7 @@ mod drift_refusal_tests {
     ) -> Result<Registration, MaterializerError> {
         materializer.register_translated(
             consumer_id,
+            Some(CallerKind::Authenticated),
             sql,
             &[],
             None,

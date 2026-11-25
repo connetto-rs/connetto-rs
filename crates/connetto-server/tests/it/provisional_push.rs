@@ -999,7 +999,7 @@ async fn preflight_refuses_a_publication_without_the_bookkeeping_tables() {
         fixture.admin(),
         &[Artifact::PublishedTable {
             publication: PUBLICATION,
-            table: connetto_schema::BOOKKEEPING_TABLES[0],
+            table: connetto_translate::BOOKKEEPING_TABLES[0],
         }],
     )
     .await
@@ -1008,10 +1008,10 @@ async fn preflight_refuses_a_publication_without_the_bookkeeping_tables() {
         panic!("expected the missing replicated table, got {missing:?}");
     };
     assert_eq!(*noun, "replicated table");
-    assert_eq!(*name, connetto_schema::BOOKKEEPING_TABLES[0]);
+    assert_eq!(*name, connetto_translate::BOOKKEEPING_TABLES[0]);
 
     // The deployment adds the tables, and the same check passes.
-    for table in connetto_schema::BOOKKEEPING_TABLES {
+    for table in connetto_translate::BOOKKEEPING_TABLES {
         fixture
             .exec(&format!(
                 "ALTER PUBLICATION {PUBLICATION} ADD TABLE {table}"
@@ -1026,15 +1026,15 @@ async fn preflight_refuses_a_publication_without_the_bookkeeping_tables() {
         &[
             Artifact::PublishedTable {
                 publication: PUBLICATION,
-                table: connetto_schema::BOOKKEEPING_TABLES[0],
+                table: connetto_translate::BOOKKEEPING_TABLES[0],
             },
             Artifact::PublishedTable {
                 publication: PUBLICATION,
-                table: connetto_schema::BOOKKEEPING_TABLES[1],
+                table: connetto_translate::BOOKKEEPING_TABLES[1],
             },
             Artifact::PublishedTable {
                 publication: PUBLICATION,
-                table: connetto_schema::BOOKKEEPING_TABLES[2],
+                table: connetto_translate::BOOKKEEPING_TABLES[2],
             },
             Artifact::PreviousImages {
                 publication: PUBLICATION,

@@ -67,6 +67,9 @@ serde.workspace = true
 serde_bytes.workspace = true
 rmp-serde.workspace = true
 sha2 = { version = "0.10", default-features = false }
+# The helpers a translated replica calls as table-valued functions, which a
+# bundle carries. No features, so no diesel and nothing std.
+pg2sqlite-runtime = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main" }
 # `SessionId` is a uuid: connetto-minted, fixed width, and stored in a native
 # Postgres `uuid` column. No `v4` here, so no `getrandom`: the core never mints
 # one, it only carries an id the server handed it, which keeps the browser wasm

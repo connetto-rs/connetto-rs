@@ -65,9 +65,11 @@ fn skd_schema() -> SyncSchema {
         SchemaBundle::new(
             "-- connetto:major 1",
             "",
-            SKD_DDL,
-            Vec::<(String, String)>::new(),
-            vec!["visible".to_owned()],
+            connetto_core::ReplicaCopy::new(
+                SKD_DDL,
+                Vec::<(String, String)>::new(),
+                vec!["visible".to_owned()],
+            ),
             None::<&str>,
         )
         .expect("the source declares major 1"),
@@ -104,6 +106,7 @@ struct SwapLog {
     replaced_acks: RefCell<Vec<String>>,
     major: Cell<Option<connetto_core::Major>>,
     hold_handshake: Cell<bool>,
+    ticket_grants: Cell<u32>,
 }
 
 impl SwapLog {
@@ -310,6 +313,14 @@ impl Transport for Upstream {
         } else {
             self.incoming.next().await
         };
+        if matches!(
+            &frame,
+            Some(IncomingFrame::Control(ControlMessage::ContentTicketGrant(
+                _
+            )))
+        ) {
+            self.log.ticket_grants.set(self.log.ticket_grants.get() + 1);
+        }
         // Record the swap's answer only when the worker actually receives it.
         if let Some(IncomingFrame::Control(ControlMessage::ShareKeysReplaced(ack))) = &frame {
             self.log
@@ -1213,9 +1224,11 @@ async fn a_held_ticket_keeps_its_request_through_the_swap() {
             SchemaBundle::new(
                 "-- connetto:major 1",
                 "",
-                PHOTOS_DDL,
-                Vec::<(String, String)>::new(),
-                Vec::<String>::new(),
+                connetto_core::ReplicaCopy::new(
+                    PHOTOS_DDL,
+                    Vec::<(String, String)>::new(),
+                    Vec::<String>::new(),
+                ),
                 None::<&str>,
             )
             .expect("the source declares major 1"),
@@ -1404,9 +1417,11 @@ async fn a_held_upload_still_reads_the_swap_answer() {
             SchemaBundle::new(
                 "-- connetto:major 1",
                 "",
-                PHOTOS_DDL,
-                Vec::<(String, String)>::new(),
-                Vec::<String>::new(),
+                connetto_core::ReplicaCopy::new(
+                    PHOTOS_DDL,
+                    Vec::<(String, String)>::new(),
+                    Vec::<String>::new(),
+                ),
                 None::<&str>,
             )
             .expect("the source declares major 1"),
@@ -1635,9 +1650,11 @@ fn held_schema(major: u32) -> SyncSchema {
         SchemaBundle::new(
             format!("-- connetto:major {major}"),
             "",
-            PHOTOS_DDL,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                PHOTOS_DDL,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             None::<&str>,
         )
         .expect("the source declares its major"),
@@ -1671,6 +1688,7 @@ fn held_peer(peers: &RefCell<Vec<HeldPeer>>, hold_attach: bool) -> Upstream {
     reason = "keeps both replica majors and the hub lifetime in one scope"
 )]
 async fn held_major_file_after_expiry(hold_attach: bool) {
+    connetto_web::logging::init_console();
     let serial = locks::hold_lock(DB_ALIVE_LOCK).await;
     let name = if hold_attach {
         "skd-held-attach"
@@ -1869,7 +1887,11 @@ async fn held_major_file_after_expiry(hold_attach: bool) {
     );
     assert!(
         drained,
-        "the file settles under major 1, hub ended {ended:?}"
+        "the file settles under major 1, hub ended {ended:?}, uploads {}, grants {}, tickets {:?}, peers {}",
+        uploaded.borrow().len(),
+        drain.log.ticket_grants.get(),
+        drain.tickets.borrow(),
+        peers.borrow().len(),
     );
     assert_eq!(uploaded.borrow().as_slice(), &[photo.to_vec()]);
     assert_eq!(drain.tickets.borrow().as_slice(), request_id.as_slice());

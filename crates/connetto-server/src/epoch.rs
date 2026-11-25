@@ -18,6 +18,37 @@ pub const EPOCH_DDL: &str = "CREATE TABLE IF NOT EXISTS connetto_epoch (\
     singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton), \
     system_identifier TEXT NOT NULL)";
 
+/// The published singleton marking changes to live authorization rules.
+pub const POLICY_CHANGES_TABLE: &str = "connetto_policy_changes";
+
+/// The migration creating and seeding [`POLICY_CHANGES_TABLE`] with full previous images.
+pub const POLICY_CHANGES_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS public.connetto_policy_changes (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    changed BOOLEAN NOT NULL DEFAULT FALSE
+);
+INSERT INTO public.connetto_policy_changes (singleton) VALUES (TRUE)
+    ON CONFLICT (singleton) DO NOTHING;
+ALTER TABLE public.connetto_policy_changes REPLICA IDENTITY FULL;";
+
+/// The optional superuser-installed trigger marking function DDL and privilege changes in their transaction.
+pub const POLICY_CHANGES_TRIGGER_DDL: &str = "\
+CREATE OR REPLACE FUNCTION public.connetto_mark_policy_changes()
+RETURNS event_trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $connetto$
+BEGIN
+    UPDATE public.connetto_policy_changes SET changed = NOT changed WHERE singleton;
+END;
+$connetto$;
+CREATE EVENT TRIGGER connetto_policy_changes_trigger
+    ON ddl_command_end
+    WHEN TAG IN ('CREATE FUNCTION', 'ALTER FUNCTION', 'DROP FUNCTION',
+                 'ALTER ROUTINE', 'DROP ROUTINE', 'GRANT', 'REVOKE')
+    EXECUTE FUNCTION public.connetto_mark_policy_changes();";
+
 diesel::table! {
     /// The cluster the deployment last served from.
     connetto_epoch (singleton) {
@@ -158,6 +189,96 @@ pub const fn revocation(settled: Epoch, check: StreamCheck, found: Found) -> Opt
 mod tests {
     use super::{Epoch, Found, Revocation, revocation};
     use crate::session::StreamCheck;
+
+    diesel::table! {
+        connetto_policy_changes (singleton) {
+            singleton -> Bool,
+            changed -> Bool,
+        }
+    }
+
+    async fn marker(fixture: &connetto_test_harness::Fixture) -> (bool, bool) {
+        use diesel_async::RunQueryDsl;
+
+        let mut connection = fixture.admin().get().await.expect("admin connection");
+        let rows = connetto_policy_changes::table
+            .load::<(bool, bool)>(&mut connection)
+            .await
+            .expect("marker row");
+        assert_eq!(rows.len(), 1);
+        rows[0]
+    }
+
+    #[tokio::test]
+    async fn policy_marker_is_singleton_published_and_has_previous_images() {
+        use diesel::ExpressionMethods;
+        use diesel_async::RunQueryDsl;
+
+        let fixture = connetto_test_harness::Fixture::acquire().await;
+        fixture.setup(&[super::POLICY_CHANGES_DDL]).await;
+        fixture.setup(&[super::POLICY_CHANGES_DDL]).await;
+        assert_eq!(marker(&fixture).await, (true, false));
+        let mut connection = fixture.admin().get().await.expect("admin connection");
+        assert!(
+            diesel::insert_into(connetto_policy_changes::table)
+                .values(connetto_policy_changes::singleton.eq(false))
+                .execute(&mut connection)
+                .await
+                .is_err()
+        );
+        assert!(
+            diesel::insert_into(connetto_policy_changes::table)
+                .values(connetto_policy_changes::singleton.eq(true))
+                .execute(&mut connection)
+                .await
+                .is_err()
+        );
+        drop(connection);
+        fixture.start_replication(&[]).await;
+        crate::preflight::require(
+            fixture.admin(),
+            &[
+                crate::preflight::Artifact::PublishedTable {
+                    publication: connetto_test_harness::PUBLICATION,
+                    table: super::POLICY_CHANGES_TABLE,
+                },
+                crate::preflight::Artifact::PreviousImages {
+                    publication: connetto_test_harness::PUBLICATION,
+                },
+            ],
+        )
+        .await
+        .expect("published marker has full previous images");
+    }
+
+    #[tokio::test]
+    async fn policy_trigger_marks_function_and_privilege_changes_transactionally() {
+        let fixture = connetto_test_harness::Fixture::acquire().await;
+        fixture.setup(&[super::POLICY_CHANGES_DDL]).await;
+        fixture.setup(&[super::POLICY_CHANGES_TRIGGER_DDL]).await;
+        let mut previous = marker(&fixture).await;
+        for statement in [
+            "CREATE FUNCTION public.marker_helper() RETURNS BOOLEAN LANGUAGE SQL AS 'SELECT TRUE'",
+            "CREATE OR REPLACE FUNCTION public.marker_helper() RETURNS BOOLEAN LANGUAGE SQL AS 'SELECT FALSE'",
+            "ALTER FUNCTION public.marker_helper() IMMUTABLE",
+            "GRANT EXECUTE ON FUNCTION public.marker_helper() TO PUBLIC",
+            "REVOKE EXECUTE ON FUNCTION public.marker_helper() FROM PUBLIC",
+            "DROP FUNCTION public.marker_helper()",
+        ] {
+            fixture.exec(statement).await;
+            let current = marker(&fixture).await;
+            assert_eq!(current, (true, !previous.1), "{statement}");
+            previous = current;
+        }
+        fixture
+            .exec("BEGIN; CREATE FUNCTION public.marker_rolled_back() RETURNS BOOLEAN LANGUAGE SQL AS 'SELECT TRUE'; ROLLBACK")
+            .await;
+        assert_eq!(marker(&fixture).await, previous);
+        fixture
+            .exec("CREATE TABLE marker_unrelated (id INTEGER)")
+            .await;
+        assert_eq!(marker(&fixture).await, previous);
+    }
 
     const fn check(gap: Option<u64>) -> StreamCheck {
         StreamCheck { system: 9, gap }

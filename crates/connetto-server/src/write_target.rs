@@ -37,7 +37,7 @@ use subql::patchset::{ApplyError, PgAdapter, apply_diffset_bytes_async_with_cata
 use subql::{NoRefusals, ParserDB};
 
 use crate::audit::ConnettoAuditSchema;
-use crate::capability::CallerBinding;
+use crate::capability::{BindingSettings, CallerBinding};
 use crate::catalog_shapes::CatalogShapes;
 use crate::schema::ConnettoSchema;
 use crate::writer_schema::{
@@ -211,8 +211,8 @@ pub struct PgWriteTarget<D> {
     /// Every catalog table's columns, which a settled conflict's re-read
     /// projects.
     shapes: CatalogShapes,
-    /// The setting a policy reads the caller's identity from.
-    user_setting: std::sync::Arc<str>,
+    /// How a policy reads the caller.
+    binding: BindingSettings,
     /// The deployment's writer schema, carried only in the type system so
     /// `commit` names its writer tables. `fn() -> D` keeps the target
     /// `Send`/`Sync` regardless of `D`.
@@ -234,7 +234,7 @@ pub fn pg_write_target<D: ConnettoSchema>(
     let shapes =
         CatalogShapes::of(&catalog).map_err(|err| MaterializerError::Catalog(err.to_string()))?;
     Ok(PgWriteTarget {
-        user_setting: connetto_core::auth::DEFAULT_USER_SETTING.into(),
+        binding: BindingSettings::default(),
         pool,
         catalog,
         shapes,
@@ -307,17 +307,32 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
     /// already name things its own way can rename both.
     #[must_use]
     pub fn with_user_setting(mut self, setting: impl Into<std::sync::Arc<str>>) -> Self {
-        self.user_setting = setting.into();
+        self.binding = self.binding.with_user(setting.into());
         self
     }
 
-    /// The setting this target binds the caller's identity to.
+    /// Bind `unset` the way the deployment's policies read an absent caller,
+    /// `''` for a setting they may find unset.
+    #[must_use]
+    pub fn with_unset_settings(mut self, unset: connetto_core::auth::UnsetSettings) -> Self {
+        self.binding = self.binding.with_unset(unset);
+        self
+    }
+
+    /// Switch every caller's transaction to the role `kind_roles` names for
+    /// the caller's kind, returning to the reader for connetto's bookkeeping.
+    #[must_use]
+    pub fn with_kind_roles(mut self, kind_roles: connetto_core::KindRoles) -> Self {
+        self.binding = self.binding.with_kind_roles(kind_roles);
+        self
+    }
+
+    /// How this target binds the caller.
     ///
-    /// The one configured name for it, so the per-viewer read and the ticket
-    /// path cannot bind under a different name than the write and the
-    /// visibility check.
-    pub(crate) fn user_setting(&self) -> std::sync::Arc<str> {
-        std::sync::Arc::clone(&self.user_setting)
+    /// The one configured binding, so the per-viewer read and the ticket path
+    /// cannot bind differently from the write and the visibility check.
+    pub(crate) const fn binding(&self) -> &BindingSettings {
+        &self.binding
     }
 
     /// A fresh number writer issued for the account `user_id` at frontier 0,
@@ -461,7 +476,7 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
             .select_list_named(&self.catalog, table)
             .map_err(|err| WriteError::Backend(err.to_string()))?;
         let mut conn = self.pool.get().await.map_err(pool_failure)?;
-        CallerBinding::of(caller, std::sync::Arc::clone(&self.user_setting))
+        CallerBinding::of(caller, &self.binding)
             .apply(&mut conn)
             .await
             .map_err(WriteError::from)?;
@@ -544,7 +559,7 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
         let bytes = crate::materializer::decompress(payload_zstd)
             .map_err(|err| WriteError::Backend(format!("decompress: {err}")))?;
         let mut conn = self.pool.get().await.map_err(pool_failure)?;
-        let binding = CallerBinding::of(caller, std::sync::Arc::clone(&self.user_setting));
+        let binding = CallerBinding::of(caller, &self.binding);
         let expected = plan.ops.len();
         let catalog = &self.catalog;
         let outcome = conn
@@ -606,6 +621,8 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
                                 .collect(),
                         };
                         let text = outcome.json();
+                        // connetto's bookkeeping is the reader's, never a kind's.
+                        crate::capability::reset_role(c).await?;
                         D::Writers::settle_outcome(c, settle.writer, seq, &text).await?;
                         if let Some((writer, oseq, _, _)) = original {
                             D::Writers::settle_outcome(c, writer, oseq, &text).await?;
@@ -622,6 +639,7 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
                 if affected < expected {
                     return Err(CommitError::Denied);
                 }
+                crate::capability::reset_role(c).await?;
                 Self::advance_original(c, original).await?;
                 Self::courier_notice(c, settle, seq, &applied).await?;
                 if !D::Writers::advance(c, settle.writer, seq, &settle.entry_hash).await? {
@@ -804,7 +822,7 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
         caller: &Principal<D::Id, Key>,
     ) -> Result<bool, WriteError> {
         use visibility::connetto_visible_files;
-        let binding = CallerBinding::of(caller, std::sync::Arc::clone(&self.user_setting));
+        let binding = CallerBinding::of(caller, &self.binding);
         let mut conn = self.pool.get().await.map_err(pool_failure)?;
         // file_id is [u8; 32] (Copy): derive bytes twice inside the async
         // block so no clone is needed across the await.
@@ -834,7 +852,7 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
         caller: &Principal<D::Id, Key>,
     ) -> Result<Option<String>, WriteError> {
         use visibility::connetto_file_owner;
-        let binding = CallerBinding::of(caller, std::sync::Arc::clone(&self.user_setting));
+        let binding = CallerBinding::of(caller, &self.binding);
         let mut conn = self.pool.get().await.map_err(pool_failure)?;
         conn.transaction::<Option<String>, diesel::result::Error, _>(async move |c| {
             binding.apply(c).await?;

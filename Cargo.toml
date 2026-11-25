@@ -4,7 +4,7 @@ members = [
   # The architecture chapters as rustdoc, so the docs build checks every symbol they cite.
   "crates/connetto-architecture",
   "crates/connetto-core",
-  "crates/connetto-schema",
+  "crates/connetto-translate",
   "crates/connetto-server",
   "crates/connetto-client",
   "crates/connetto-dioxus",
@@ -47,7 +47,8 @@ homepage = "https://github.com/connetto-rs/connetto-rs"
 [workspace.dependencies]
 connetto-core = { path = "crates/connetto-core", version = "0.0.0" }
 connetto-exchange = { path = "crates/connetto-exchange", version = "0.0.0" }
-connetto-schema = { path = "crates/connetto-schema", version = "0.0.0" }
+connetto-translate = { path = "crates/connetto-translate", version = "0.0.0" }
+arc-swap = "1.9"
 
 # axum without its default `tower-log`, which turns on `tracing`'s `log`
 # bridge. The server installs its own tracing subscriber, so the bridge is
@@ -148,7 +149,7 @@ tokio = { version = "1", features = [
 ] }
 thiserror = "2"
 rustls-platform-verifier = "0.7.1"
-# Routed to diesel's main branch by the [patch] block below, for what diesel has merged and not yet released.
+# Routed to the diesel fork's `future` branch by the [patch] blocks below.
 diesel = { version = "2", features = ["sqlite"] }
 
 serde = { version = "1", features = ["derive"] }
@@ -172,14 +173,17 @@ objc2-network-extension = { git = "https://github.com/madsmtm/objc2", branch = "
 
 # subql's own [patch] blocks do not reach a consumer, so the same crates are patched here.
 [patch.crates-io]
-diesel = { git = "https://github.com/diesel-rs/diesel" }
-# Live in diesel-rs, named as `diesel` is above, so they build against that one diesel.
-diesel-async = { git = "https://github.com/diesel-rs/diesel" }
-diesel-dynamic-schema = { git = "https://github.com/diesel-rs/diesel" }
+# The diesel fork's `future` branch carries diesel main plus #5395 and #5396, the
+# SQLite table-valued functions pg2sqlite's helpers register through, until they merge.
+diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
+# Live in diesel's repository, named as `diesel` is above, so they build against that one diesel.
+diesel-async = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
+diesel-dynamic-schema = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
+sqlstate = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
 sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
 sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
-# Until a pg_walstream release carries the startup metadata API subql main
-# uses (isdaniel/pg-walstream #141) and `ChangeEvent::xid`.
+# Until a pg_walstream release emits a Relation event for every pgoutput
+# Relation message (isdaniel/pg-walstream #173), so a rules follow sees each one.
 pg_walstream = { git = "https://github.com/isdaniel/pg-walstream", branch = "main" }
 # Until a sql-values release carries PostgreSQL's bpchar, which rls2fga main uses.
 sql-values = { git = "https://github.com/connetto-rs/sql-values", branch = "main" }
@@ -199,6 +203,11 @@ android-native-keyring-store = { git = "https://github.com/LucaCappelletti94/and
 # R53 and R74, until released: the fork's `future` branch, the sealed and
 # Windows Hello store stack merged with the TPM signing key (upstream #19).
 windows-native-keyring-store = { git = "https://github.com/LucaCappelletti94/windows-native-keyring-store", rev = "8a8ffde9913b36bd464c8cd5dd24bf80e39dce37" }
+
+# pg2sqlite-runtime names diesel-dynamic-schema from diesel-rs, so it follows the
+# fork as well and one diesel builds.
+[patch."https://github.com/diesel-rs/diesel"]
+diesel-dynamic-schema = { git = "https://github.com/LucaCappelletti94/diesel", branch = "future" }
 
 [workspace.lints.rust]
 missing_docs = "forbid"

@@ -97,7 +97,7 @@ fn statements(document: &str) -> Vec<String> {
 /// gate it.
 /// Returns the admin pool and the writer pool.
 async fn setup(fixture: &Fixture) -> (Pool<AsyncPgConnection>, Pool<AsyncPgConnection>) {
-    let cap = connetto_schema::cap_policies::<connetto_core::bots::TextIds>(
+    let cap = connetto_translate::cap_policies::<connetto_core::bots::TextIds>(
         DEPLOYMENT_DDL,
         MEMBERSHIP_POLICY,
     )
@@ -169,8 +169,8 @@ fn manager(
 /// tables and rule with the registry and the cap connetto appends.
 fn bundle() -> SyncSchema {
     SyncSchema::new(
-        connetto_schema::translate::<String, connetto_core::bots::TextIds>(
-            connetto_schema::Documents::new(
+        connetto_translate::translate::<String, connetto_core::bots::TextIds>(
+            connetto_translate::Documents::new(
                 DEPLOYMENT_DDL,
                 MEMBERSHIP_POLICY,
                 connetto_test_harness::FIXTURE_ROLES,
@@ -185,8 +185,8 @@ fn bundle() -> SyncSchema {
 /// so the row uploads and the fixture's rule is the one that refuses it.
 fn bundle_without_membership_rule() -> SyncSchema {
     SyncSchema::new(
-        connetto_schema::translate::<String, connetto_core::bots::TextIds>(
-            connetto_schema::Documents::new(
+        connetto_translate::translate::<String, connetto_core::bots::TextIds>(
+            connetto_translate::Documents::new(
                 DEPLOYMENT_DDL,
                 "",
                 connetto_test_harness::FIXTURE_ROLES,

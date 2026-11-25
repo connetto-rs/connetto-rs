@@ -66,8 +66,12 @@ diesel::table! {
 fn options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_deployment(
-            connetto_schema::deployment::<String>(connetto_test_harness::FIXTURE_READER)
-                .expect("the deployment description builds"),
+            connetto_translate::deployment::<String>(
+                connetto_test_harness::FIXTURE_READER,
+                connetto_core::KindRoles::defaults(),
+                connetto_translate::UnsetSettings::ALWAYS_BOUND,
+            )
+            .expect("the deployment description builds"),
         )
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_function_name("uuidv4")

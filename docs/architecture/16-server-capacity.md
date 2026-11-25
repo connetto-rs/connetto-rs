@@ -22,7 +22,7 @@ The server builds three Postgres pools through `build_pool` in [mod.rs](../../cr
 
 The **owner pool** carries the authentication store, audit writes and every read of the facts behind the authorization store, which must see every row ([08-authorization.md](08-authorization.md)). Row-level security does not apply to it, which is the entire reason the reader-role pools exist, and the server refuses to start when it would, a table forcing row-level security or a role that does not own the table.
 
-The **re-execution pool** connects as the reader role and carries the computed reads that run under a caller's binding, the session's scalar and seed first answers and the engine-driven re-reads. It is a pool of their own, sized at the owner pool's, so a re-execution hold never reaches the gated reader pool the reserve splits. It is the reader role so the caller's policies scope the rows a read answers.
+The **re-execution pool** connects as the reader role and carries the computed reads that run under a caller's binding, the session's scalar and seed first answers and the engine-driven re-reads. It is a pool of their own, sized at the owner pool's, so a re-execution hold never reaches the gated reader pool the reserve splits. It is the reader role so each read can switch to the caller's kind role and the caller's policies scope the rows it answers.
 
 The **reader pool** connects as a role that row-level security does apply to, and `demo-server` refuses to start without it. It carries everything a caller's own request touches. Every visibility question, every snapshot read, every mutation apply, and the durable watermark read the handshake performs before it can complete.
 

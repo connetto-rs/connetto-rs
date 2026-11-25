@@ -65,18 +65,20 @@ diesel::define_sql_function! {
 fn options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_deployment(
-            connetto_schema::deployment::<String>(connetto_test_harness::FIXTURE_READER)
-                .expect("the deployment description builds"),
+            connetto_translate::deployment::<String>(
+                connetto_test_harness::FIXTURE_READER,
+                connetto_core::KindRoles::defaults(),
+                connetto_translate::UnsetSettings::ALWAYS_BOUND,
+            )
+            .expect("the deployment description builds"),
         )
         .with_session_variable(SessionVariableMapping::new(
             "app.user_id",
             "current_app_user",
         ))
         .with_rls_audit_table_name("rls_audit".to_string())
-        // The download boundary: the apply below holds this function true
-        // while it lands server-authoritative rows, exactly as connetto's
-        // own apply does through its suspension guard.
-        .with_write_exemption_function(connetto_core::WRITE_EXEMPTION_FUNCTION)
+        // The apply below holds this function true, as connetto's own apply does.
+        .with_rls_exemption_function(connetto_core::WRITE_EXEMPTION_FUNCTION)
 }
 
 /// Translate `ddl` and execute every emitted statement on a fresh in-memory

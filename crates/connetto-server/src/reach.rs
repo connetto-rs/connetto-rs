@@ -17,7 +17,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use rls2fga::generator::json_model::{AuthorizationModel, TypeDefinition, Userset};
-use rls2fga::types::{ActionAnswer, ActionRelations, ActionStatement, RowNaming};
+use rls2fga::types::{ActionAnswer, ActionRelations, ActionStatement, ColumnAnswer, RowNaming};
 
 /// Why the generated rules could not be turned into a reach index.
 #[derive(Debug, thiserror::Error)]
@@ -114,8 +114,14 @@ impl GrantReach {
             }
             let mut depends = HashSet::new();
             let mut seen = HashSet::new();
-            for relation in read_relations(entry)? {
-                walk_relation(&types, &type_name, &relation, &mut seen, &mut depends)?;
+            for root in read_relations(&type_name, &entry.answer)? {
+                walk_relation(
+                    &types,
+                    &root.type_name,
+                    &root.relation,
+                    &mut seen,
+                    &mut depends,
+                )?;
             }
             for kind in depends {
                 let entry = reached.entry(kind).or_default();
@@ -181,20 +187,53 @@ impl GrantReach {
     }
 }
 
-/// The relations a read answer says must grant.
-fn read_relations(entry: &ActionRelations) -> Result<Vec<String>, ReachError> {
-    match &entry.answer {
+/// The relations a read answer says must grant, each on the type that
+/// defines it.
+///
+/// `type_name` is the row type the answer belongs to. A column answer names
+/// its column relations on the gate's type, so every relation carries the
+/// type it is defined on.
+fn read_relations(type_name: &str, answer: &ActionAnswer) -> Result<Vec<FactKind>, ReachError> {
+    let unknown = || ReachError::UnknownAnswer {
+        type_name: type_name.to_owned(),
+        answer: format!("{answer:?}"),
+    };
+    match answer {
         ActionAnswer::Judged(judgements) => Ok(judgements
             .iter()
-            .map(|judgement| judgement.relation.to_string())
+            .map(|judgement| FactKind {
+                type_name: type_name.to_owned(),
+                relation: judgement.relation.to_string(),
+            })
             .collect()),
         // The database restricts nothing here, so no grant reaches it, and the
         // model refusing every row means no grant changes what is delivered.
         ActionAnswer::Unrestricted | ActionAnswer::Denied => Ok(Vec::new()),
-        other => Err(ReachError::UnknownAnswer {
-            type_name: entry.type_name.to_string(),
-            answer: format!("{other:?}"),
-        }),
+        // A row is delivered with the columns the caller may read, so a grant
+        // moving any column relation changes the delivery as a row grant does.
+        // `on_table` counts too: it answers every column no column grant names.
+        ActionAnswer::ByColumn(ColumnAnswer {
+            rows,
+            gate,
+            commands,
+        }) => {
+            let (gate_type, _) = gate.split_once(':').ok_or_else(unknown)?;
+            let mut roots = read_relations(type_name, rows)?;
+            for command in commands {
+                roots.extend(
+                    command
+                        .columns
+                        .values()
+                        .chain([&command.on_table])
+                        .map(|relation| FactKind {
+                            type_name: gate_type.to_owned(),
+                            relation: relation.to_string(),
+                        }),
+                );
+            }
+            Ok(roots)
+        }
+        _ => Err(unknown()),
     }
 }
 
@@ -347,12 +386,17 @@ mod tests {
                      AND team_members.member = current_setting('app.user_id', true)));",
     );
 
-    fn reach(shape: (&str, &str)) -> GrantReach {
+    fn reach(shape: (&str, &str)) -> std::sync::Arc<GrantReach> {
+        reach_as(shape, connetto_test_harness::FIXTURE_ROLES)
+    }
+
+    /// The same, with `roles` as the roles document instead of the fixture's.
+    fn reach_as(shape: (&str, &str), roles: &str) -> std::sync::Arc<GrantReach> {
         Translated::of::<String, crate::defaults::ConnettoDefaults>(
-            connetto_schema::Documents::new(
+            connetto_translate::Documents::new(
                 shape.0,
                 shape.1,
-                connetto_test_harness::FIXTURE_ROLES,
+                roles,
                 connetto_test_harness::FIXTURE_READER,
             ),
             true,
@@ -369,7 +413,7 @@ mod tests {
     #[test]
     fn a_membership_fact_reaches_the_guarded_table() {
         let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
-            connetto_schema::Documents::new(
+            connetto_translate::Documents::new(
                 CROSS_TABLE.0,
                 CROSS_TABLE.1,
                 connetto_test_harness::FIXTURE_ROLES,
@@ -507,6 +551,45 @@ mod tests {
             reach.tables_for("docs:1", "no_access"),
             Vec::<String>::new(),
             "and neither does a relation the rules never mention"
+        );
+    }
+
+    /// A reader role holding `SELECT` on some columns only gets a column
+    /// answer, whose column relations hang on the table's gate object rather
+    /// than on its rows. A grant or withdrawal of one changes which columns a
+    /// subscriber may read, so it reaches the table as a row grant does, and
+    /// the row relations keep reaching it beside them.
+    #[test]
+    fn a_column_grant_reaches_the_table_beside_its_rows() {
+        let reach = reach_as(
+            (
+                "CREATE TABLE docs(id INT PRIMARY KEY, owner TEXT NOT NULL, title TEXT, body TEXT);
+                 ALTER TABLE docs ENABLE ROW LEVEL SECURITY;",
+                "CREATE POLICY docs_p ON docs FOR SELECT USING (\
+                   owner = current_setting('app.user_id', true));",
+            ),
+            "CREATE ROLE app_reader LOGIN;\n\
+             CREATE ROLE anon NOLOGIN;\n\
+             CREATE ROLE authenticated NOLOGIN;\n\
+             CREATE ROLE bot_installation NOLOGIN;\n\
+             CREATE ROLE bot NOLOGIN;\n\
+             CREATE ROLE delegated NOLOGIN;\n\
+             GRANT anon, authenticated, bot_installation, bot, delegated TO app_reader \
+               WITH INHERIT FALSE, SET TRUE;\n\
+             GRANT USAGE ON SCHEMA public TO anon, authenticated, bot_installation, bot, delegated;\n\
+             GRANT SELECT (id, title) ON docs TO anon, authenticated, bot_installation, bot, delegated;",
+        );
+        for relation in ["can_select_id", "can_select_title", "can_select_on_table"] {
+            assert_eq!(
+                reach.tables_for("request_gate:docs", relation),
+                ["docs".to_owned()],
+                "{relation} decides which columns of docs a subscriber reads"
+            );
+        }
+        assert_eq!(
+            reach.tables_for("docs:1", "owner"),
+            ["docs".to_owned()],
+            "the row relation still decides which rows"
         );
     }
 }

@@ -15,10 +15,11 @@ homepage.workspace = true
 workspace = true
 
 [dependencies]
+arc-swap = { workspace = true }
 connetto-core = { workspace = true, features = ["native-transport", "diesel-pg", "device-cert"] }
 # Derives the schema version it presents at handshake, hashing the translated
 # bundle rather than the source documents alone.
-connetto-schema = { workspace = true }
+connetto-translate = { workspace = true }
 # Each `postgres-N` compiles one server major's catalog into the drift guard's
 # live reader, which reads with the one matching the server it reaches.
 subql = { workspace = true, features = ["sqlite-cdc", "pg-sqlite-emu", "apply-patchset-sqlite", "pgoutput-emit", "apply-patchset-postgres-async", "executor-diesel-async-postgres", "pg-streaming", "visibility-openfga", "membership-term", "postgres-14", "postgres-15", "postgres-16", "postgres-17", "postgres-18"] }

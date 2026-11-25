@@ -751,7 +751,7 @@ async fn flip_stack(fixture: &Fixture) -> Server {
     // The composition the shipped binary builds, over one fresh store.
     let (channel, store) = fixture.fga_store().await;
     let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-        connetto_schema::Documents::new(
+        connetto_translate::Documents::new(
             FLIP_DDL,
             &FLIP_POLICY_STATEMENTS.join(";\n"),
             connetto_test_harness::FIXTURE_ROLES,

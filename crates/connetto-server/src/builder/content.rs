@@ -279,12 +279,23 @@ pub(crate) async fn build<D: crate::schema::ConnettoSchema>(
     owner_url: &str,
     reader_url: &str,
     reader_pool_size: u32,
+    unset: connetto_core::auth::UnsetSettings,
+    kind_roles: connetto_core::auth::KindRoles,
     hooks: FileHooks<D::Id>,
 ) -> Result<FileHalf, ContentBuildError> {
     let Some(settings) = settings else {
         return Ok(FileHalf::none());
     };
     settings.validate()?;
+    // The server binds the caller under connetto's default names, which is
+    // what its session manager is left configured with, reads an absent half
+    // as the schema declares, and asks the deployment's visibility function
+    // as the caller's kind.
+    let caller_settings = files::CallerSettings {
+        unset,
+        kind_roles: Some(kind_roles),
+        ..files::CallerSettings::default()
+    };
     let (signer, public) = ticket_keypair(&settings)?;
     let admin = build_pool(owner_url, settings.owner_pool_size).await?;
     let reader = build_pool(reader_url, reader_pool_size).await?;
@@ -296,9 +307,7 @@ pub(crate) async fn build<D: crate::schema::ConnettoSchema>(
         store: open_store(&settings.store)?,
         verifier: TicketVerifier::new(public),
         grace: settings.grace,
-        // The server binds the caller under connetto's default names, which
-        // is what its session manager is left configured with.
-        caller_settings: files::CallerSettings::default(),
+        caller_settings: caller_settings.clone(),
         quotas: files::QuotaSettings {
             identity_quota: settings.quota_identity,
             storage_ceiling: settings.storage_ceiling,
@@ -316,7 +325,7 @@ pub(crate) async fn build<D: crate::schema::ConnettoSchema>(
     let reconciled = files::reconcile_store::<D::Files>(
         &admin,
         &open_store(&settings.store)?,
-        &files::CallerSettings::default(),
+        &caller_settings,
         settings.grace,
     )
     .await?;
@@ -394,6 +403,8 @@ pub(crate) async fn build<D: crate::schema::ConnettoSchema>(
     _owner_url: &str,
     _reader_url: &str,
     _reader_pool_size: u32,
+    _unset: connetto_core::auth::UnsetSettings,
+    _kind_roles: connetto_core::auth::KindRoles,
     _hooks: FileHooks<D::Id>,
 ) -> Result<FileHalf, ContentBuildError> {
     if settings.is_some() {
@@ -562,6 +573,8 @@ mod tests {
             "postgres://unused",
             "postgres://unused",
             1,
+            connetto_core::auth::UnsetSettings::ALWAYS_BOUND,
+            connetto_core::KindRoles::default(),
             no_hooks(),
         )
         .await
@@ -655,6 +668,8 @@ mod tests {
             &admin_url,
             &reader_url,
             2,
+            connetto_core::auth::UnsetSettings::ALWAYS_BOUND,
+            connetto_core::KindRoles::default(),
             no_hooks(),
         )
         .await

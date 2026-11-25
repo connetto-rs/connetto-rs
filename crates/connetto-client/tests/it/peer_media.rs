@@ -133,8 +133,8 @@ async fn a_build_with_no_caller_mapping_refuses_every_requester() {
     let script = Script::default();
     script.say(support::handshake_ack());
     let schema = SyncSchema::new(
-        connetto_schema::translate::<String, connetto_core::bots::TextIds>(
-            connetto_schema::Documents::new(
+        connetto_translate::translate::<String, connetto_core::bots::TextIds>(
+            connetto_translate::Documents::new(
                 PHOTO_SCHEMA,
                 PHOTO_POLICIES,
                 connetto_test_harness::FIXTURE_ROLES,

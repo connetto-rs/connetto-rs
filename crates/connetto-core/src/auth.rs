@@ -45,6 +45,218 @@ pub fn absent_marker() -> &'static str {
     &MARKER
 }
 
+/// Which of the caller's two settings the deployment declares a request may
+/// leave unset, so a caller not holding that half binds `''` instead of
+/// [`absent_marker`], and whether the identity is a `uuid`.
+///
+/// The marker fails any cast a policy applies to the setting, a `uuid` cast
+/// among them, so a deployment whose policies read a setting through
+/// `NULLIF(current_setting(.., true), '')` declares it may be unset, and
+/// Postgres and the replica both read the `''` as absent. Both settings are
+/// always bound by default. The bot list is always held, so it has no flag.
+///
+/// An identity declared a `uuid` lets a policy compare it with a `uuid`
+/// column through a cast, which the translators accept only for a value
+/// declared canonical for the type. Only an identity that may be unset can be
+/// declared so, since the marker an always bound identity takes is no `uuid`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct UnsetSettings {
+    user: UserSetting,
+    subjects: bool,
+}
+
+/// How the deployment declares the identity setting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+enum UserSetting {
+    /// Always bound, text.
+    #[default]
+    AlwaysBound,
+    /// May be unset, text.
+    MayBeUnset,
+    /// May be unset, a canonical `uuid` when set.
+    UuidMayBeUnset,
+}
+
+impl UnsetSettings {
+    /// Both settings always bound, an unheld half taking [`absent_marker`].
+    pub const ALWAYS_BOUND: Self = Self {
+        user: UserSetting::AlwaysBound,
+        subjects: false,
+    };
+
+    /// The same declaration, with the user setting a request may leave unset.
+    /// An identity already declared a `uuid` stays one.
+    #[must_use]
+    pub const fn with_user(self) -> Self {
+        Self {
+            user: match self.user {
+                UserSetting::UuidMayBeUnset => UserSetting::UuidMayBeUnset,
+                UserSetting::AlwaysBound | UserSetting::MayBeUnset => UserSetting::MayBeUnset,
+            },
+            ..self
+        }
+    }
+
+    /// The same declaration, with the user setting a request may leave unset
+    /// and holding a canonical `uuid` whenever it is set, which every identity
+    /// the deployment resolves must then be.
+    #[must_use]
+    pub const fn with_uuid_user(self) -> Self {
+        Self {
+            user: UserSetting::UuidMayBeUnset,
+            ..self
+        }
+    }
+
+    /// The same declaration, with the subjects setting a request may leave
+    /// unset.
+    #[must_use]
+    pub const fn with_subjects(self) -> Self {
+        Self {
+            subjects: true,
+            ..self
+        }
+    }
+
+    /// Whether a request may leave the user setting unset.
+    #[must_use]
+    pub const fn user_may_be_unset(&self) -> bool {
+        !matches!(self.user, UserSetting::AlwaysBound)
+    }
+
+    /// Whether the user setting holds a `uuid` whenever it is set.
+    #[must_use]
+    pub const fn user_is_uuid(&self) -> bool {
+        matches!(self.user, UserSetting::UuidMayBeUnset)
+    }
+
+    /// Whether a request may leave the subjects setting unset.
+    #[must_use]
+    pub const fn subjects_may_be_unset(&self) -> bool {
+        self.subjects
+    }
+
+    /// The value the user setting takes for a caller holding no identity.
+    #[must_use]
+    pub fn absent_user(&self) -> &'static str {
+        absent_value(self.user_may_be_unset())
+    }
+
+    /// The value the subjects setting takes for a caller holding no key.
+    #[must_use]
+    pub fn absent_subjects(&self) -> &'static str {
+        absent_value(self.subjects)
+    }
+}
+
+/// `''` for a setting that may be unset, [`absent_marker`] otherwise.
+fn absent_value(may_be_unset: bool) -> &'static str {
+    if may_be_unset { "" } else { absent_marker() }
+}
+
+/// The kind of caller a request comes from, each of which acts as its own
+/// database role (R108).
+///
+/// The kinds are flat, so no kind implies another, and a policy for every
+/// caller names no role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CallerKind {
+    /// A caller holding no login, reading what share keys and public rows open.
+    Anon,
+    /// A signed-in user.
+    Authenticated,
+    /// A bot installation acting as itself.
+    BotInstallation,
+    /// An app acting as itself.
+    Bot,
+    /// An agent acting for a user under a consent.
+    Delegated,
+}
+
+impl CallerKind {
+    /// Every kind, in the order a bundle and its version list them.
+    pub const ALL: [Self; 5] = [
+        Self::Anon,
+        Self::Authenticated,
+        Self::BotInstallation,
+        Self::Bot,
+        Self::Delegated,
+    ];
+
+    /// The role a deployment that renames nothing creates for this kind.
+    #[must_use]
+    pub const fn default_role(self) -> &'static str {
+        match self {
+            Self::Anon => "anon",
+            Self::Authenticated => "authenticated",
+            Self::BotInstallation => "bot_installation",
+            Self::Bot => "bot",
+            Self::Delegated => "delegated",
+        }
+    }
+
+    /// The kind's position in [`ALL`](Self::ALL).
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// The database role each [`CallerKind`] acts as.
+///
+/// A deployment that shares a role name with another API on the same
+/// database, such as Supabase's own `anon`, renames connetto's kinds, since
+/// that API's grants would otherwise reach connetto's callers.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct KindRoles {
+    roles: [std::sync::Arc<str>; 5],
+}
+
+impl Default for KindRoles {
+    fn default() -> Self {
+        Self {
+            roles: CallerKind::ALL.map(|kind| kind.default_role().into()),
+        }
+    }
+}
+
+impl KindRoles {
+    /// The roles of a deployment that renames nothing, shared by every
+    /// borrower.
+    #[must_use]
+    pub fn defaults() -> &'static Self {
+        static DEFAULTS: std::sync::LazyLock<KindRoles> =
+            std::sync::LazyLock::new(KindRoles::default);
+        &DEFAULTS
+    }
+
+    /// The same roles, `kind` acting as `role`.
+    #[must_use]
+    pub fn with_role(mut self, kind: CallerKind, role: impl Into<std::sync::Arc<str>>) -> Self {
+        self.roles[kind.index()] = role.into();
+        self
+    }
+
+    /// The role `kind` acts as.
+    #[must_use]
+    pub fn role(&self, kind: CallerKind) -> &str {
+        &self.roles[kind.index()]
+    }
+
+    /// The role `kind` acts as, shared rather than copied.
+    #[must_use]
+    pub fn shared_role(&self, kind: CallerKind) -> std::sync::Arc<str> {
+        std::sync::Arc::clone(&self.roles[kind.index()])
+    }
+
+    /// Every kind with the role it acts as, in [`CallerKind::ALL`] order.
+    pub fn iter(&self) -> impl Iterator<Item = (CallerKind, &str)> {
+        CallerKind::ALL
+            .into_iter()
+            .map(|kind| (kind, self.role(kind)))
+    }
+}
+
 /// Session-scoped identity: a user id and nothing else.
 ///
 /// Tenant and role belong in the authorization model rather than on the
@@ -246,6 +458,17 @@ impl<Id, Key> Principal<Id, Key> {
         self.identity.as_ref()
     }
 
+    /// The kind this caller acts as, signed in when a login resolved and
+    /// anonymous otherwise.
+    #[must_use]
+    pub const fn kind(&self) -> CallerKind {
+        if self.identity.is_some() {
+            CallerKind::Authenticated
+        } else {
+            CallerKind::Anon
+        }
+    }
+
     /// The bot list a login bound on this run, when one resolved it.
     #[must_use]
     pub fn bot_list(&self) -> Option<&crate::bots::BotList> {
@@ -331,6 +554,17 @@ impl ContentCaller {
     #[must_use]
     pub fn identity(&self) -> Option<&str> {
         self.identity.as_deref()
+    }
+
+    /// The kind this caller acts as, signed in when a login resolved and
+    /// anonymous otherwise.
+    #[must_use]
+    pub const fn kind(&self) -> CallerKind {
+        if self.identity.is_some() {
+            CallerKind::Authenticated
+        } else {
+            CallerKind::Anon
+        }
     }
 
     /// The login's session, `None` for a caller holding no login.

@@ -1828,9 +1828,11 @@ fn split_bundle() -> SyncSchema {
         SchemaBundle::new(
             SOURCE,
             "",
-            SPLIT_DDL,
-            vec![("t".to_owned(), "physical_t".to_owned())],
-            vec!["t".to_owned()],
+            connetto_core::ReplicaCopy::new(
+                SPLIT_DDL,
+                vec![("t".to_owned(), "physical_t".to_owned())],
+                vec!["t".to_owned()],
+            ),
             None::<&str>,
         )
         .expect("the source declares major 1"),
@@ -1859,9 +1861,11 @@ fn bundle_at(major: u32) -> SyncSchema {
         SchemaBundle::new(
             format!("-- connetto:major {major}"),
             "",
-            DDL,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                DDL,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             None::<&str>,
         )
         .expect("the source declares its major"),
@@ -1926,12 +1930,14 @@ fn renamed_major_two() -> SyncSchema {
         SchemaBundle::new(
             "-- connetto:major 2",
             "",
-            "CREATE TABLE t (id INTEGER PRIMARY KEY); \
-             CREATE VIEW next_t AS SELECT * FROM t; \
-             CREATE TRIGGER next_t_insert INSTEAD OF INSERT ON next_t \
-             BEGIN INSERT INTO t (id) VALUES (NEW.id); END;",
-            vec![("next_t".to_owned(), "t".to_owned())],
-            vec!["next_t".to_owned()],
+            connetto_core::ReplicaCopy::new(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY); \
+         CREATE VIEW next_t AS SELECT * FROM t; \
+         CREATE TRIGGER next_t_insert INSTEAD OF INSERT ON next_t \
+         BEGIN INSERT INTO t (id) VALUES (NEW.id); END;",
+                vec![("next_t".to_owned(), "t".to_owned())],
+                vec!["next_t".to_owned()],
+            ),
             None::<&str>,
         )
         .expect("the source declares major 2"),

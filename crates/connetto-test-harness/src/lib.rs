@@ -77,11 +77,21 @@ pub use roster::{RosterAuth, WITHHELD_ID};
 pub const FIXTURE_READER: &str = "app_reader";
 
 /// The roles document a fixture deployment's translations read, creating
-/// [`FIXTURE_READER`] and granting it every table the fixture's documents
-/// declare, the grants the replica translation holds each table to.
+/// [`FIXTURE_READER`] and the five default kind roles it switches to, and
+/// granting the kinds every table the fixture's documents declare, the
+/// grants each kind's replica translation holds each table to.
 pub const FIXTURE_ROLES: &str = "CREATE ROLE app_reader LOGIN;\n\
      GRANT USAGE ON SCHEMA public TO app_reader;\n\
-     GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_reader;";
+     CREATE ROLE anon NOLOGIN;\n\
+     CREATE ROLE authenticated NOLOGIN;\n\
+     CREATE ROLE bot_installation NOLOGIN;\n\
+     CREATE ROLE bot NOLOGIN;\n\
+     CREATE ROLE delegated NOLOGIN;\n\
+     GRANT anon, authenticated, bot_installation, bot, delegated TO app_reader \
+       WITH INHERIT FALSE, SET TRUE;\n\
+     GRANT USAGE ON SCHEMA public TO anon, authenticated, bot_installation, bot, delegated;\n\
+     GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public \
+       TO anon, authenticated, bot_installation, bot, delegated;";
 
 diesel::table! {
     /// The cluster's roles, read to skip a role a roles document creates twice.
@@ -869,13 +879,13 @@ pub async fn provision_cap_policies(
     policies_sql: &str,
 ) {
     let cap =
-        connetto_schema::cap_policies::<connetto_core::bots::TextIds>(schema_sql, policies_sql)
+        connetto_translate::cap_policies::<connetto_core::bots::TextIds>(schema_sql, policies_sql)
             .unwrap_or_else(|err| panic!("the cap document generates: {err}"));
     if !cap.is_empty() {
         // The document is not idempotent, and the registry tables it caps
         // persist across the tests that share one Postgres, so a re-provision
         // would refuse the re-create. Drop the rules it (re)creates first.
-        let tables = connetto_schema::schema_tables(&connetto_schema::with_registry::<
+        let tables = connetto_translate::schema_tables(&connetto_translate::with_registry::<
             connetto_core::bots::TextIds,
         >(schema_sql))
         .expect("the schema with the registry parses");
@@ -969,13 +979,17 @@ pub async fn start_replication_on(pool: &Pool<AsyncPgConnection>, tables: &[&str
     )
     .await;
     provision_writers(pool).await;
+    exec(pool, connetto_server::epoch::POLICY_CHANGES_DDL).await;
     let mut published: Vec<&str> = tables.to_vec();
+    if !published.contains(&connetto_server::epoch::POLICY_CHANGES_TABLE) {
+        published.push(connetto_server::epoch::POLICY_CHANGES_TABLE);
+    }
     for registry in connetto_core::bots::REGISTRY_TABLES {
         if !published.contains(registry) {
             published.push(registry);
         }
     }
-    for table in connetto_schema::BOOKKEEPING_TABLES {
+    for table in connetto_translate::BOOKKEEPING_TABLES {
         if !published.contains(table) {
             published.push(table);
         }
@@ -1200,6 +1214,7 @@ impl Fixture {
         provision_audit(&admin).await;
         provision_bot_tables(&admin).await;
         exec(&admin, connetto_server::epoch::EPOCH_DDL).await;
+        exec(&admin, connetto_server::epoch::POLICY_CHANGES_DDL).await;
         Self {
             admin_url,
             admin,
@@ -2087,7 +2102,7 @@ pub async fn spawn_server(
     if !replication_tables.is_empty() {
         let admin_pool = pool_for(&admin_url).await;
         let table_refs: Vec<&str> = replication_tables.iter().map(String::as_str).collect();
-        start_replication_on(&admin_pool, &table_refs).await;
+        Box::pin(start_replication_on(&admin_pool, &table_refs)).await;
     }
     // The materializer alone reads the policies beside the engine catalog, because a folded read rule reads the policy text the engine holds.
     let upkeep = auth.upkeep();
@@ -2158,7 +2173,7 @@ fn spawn_ingest_task(
         let connect = |resume: connetto_server::ResumePoint| {
             let (url, ddl, manager) =
                 (admin_url.clone(), catalog_ddl.clone(), Arc::clone(&manager));
-            async move {
+            Box::pin(async move {
                 let config =
                     PgStreamingConfig::new(url.clone(), SLOT.to_owned(), PUBLICATION.to_owned())
                         .start(resume.get());
@@ -2172,11 +2187,16 @@ fn spawn_ingest_task(
                 .await
                 .map_err(|err| err.to_string())?;
                 manager
+                    .follow_live_rules(Arc::clone(source.rules().database()))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let source = source.start().await.map_err(|error| error.to_string())?;
+                manager
                     .watch_guard(source.refusals())
                     .await
                     .map_err(|err| format!("settling earlier refusals: {err}"))?;
                 Ok::<_, String>(source)
-            }
+            })
         };
         let _ = manager
             .ingest_with_reconnect(connect, &ReconnectPolicy::default(), |event| {
@@ -2905,6 +2925,64 @@ pub fn insert_changeset(
     ChangeSet::<SimpleTable, String, Vec<u8>>::new()
         .insert(insert)
         .build()
+}
+
+/// A snapshot source answering every read with one seeded `orders` row, for a
+/// session manager whose test subscribes rarely or never.
+pub struct SeedSnapshot;
+
+impl connetto_server::SnapshotSource for SeedSnapshot {
+    type Error = std::convert::Infallible;
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
+    async fn estimate(
+        &self,
+        _select_sql: &str,
+        _binds: &[connetto_core::messages::SqliteValue],
+        _caller: &Principal,
+    ) -> Result<connetto_server::SnapshotEstimate, Self::Error> {
+        Ok(connetto_server::SnapshotEstimate {
+            rows: 0.0,
+            width: 0,
+        })
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
+    async fn snapshot_page(
+        &self,
+        _select_sql: &str,
+        _binds: &[connetto_core::messages::SqliteValue],
+        _caller: &Principal,
+        _page: &connetto_server::PageSpec,
+    ) -> Result<connetto_server::SnapshotPage, Self::Error> {
+        let insert = Insert::<_, String, Vec<u8>>::from(wire_tables::orders_table())
+            .set(0, Value::Integer(1))
+            .expect("set id")
+            .set(1, Value::Real(1.0))
+            .expect("set price")
+            .set(2, Value::Integer(3))
+            .expect("set quantity")
+            .set(3, Value::Text("seed".to_owned()))
+            .expect("set status");
+        let patchset = sqlite_diff_rs::PatchSet::<SimpleTable, String, Vec<u8>>::new()
+            .insert(insert)
+            .build();
+        Ok(connetto_server::SnapshotPage {
+            patchset,
+            cursor: Cursor::new(Vec::new()),
+            next: None,
+            filled: false,
+            widest_row: 0,
+            rows: 0,
+            bytes: 0,
+        })
+    }
 }
 
 /// The rows the given snapshot patch frames actually carry, decoded from each

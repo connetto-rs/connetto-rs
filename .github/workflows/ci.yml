@@ -359,7 +359,7 @@ jobs:
           - name: rest
             packages: >-
               -p connetto-core
-              -p connetto-schema
+              -p connetto-translate
               -p connetto-ca
               -p connetto-test-harness
               -p connetto-demo-stack
@@ -747,6 +747,15 @@ jobs:
         run: |
           echo "${CHROMEWEBDRIVER}" >> "${GITHUB_PATH}"
           echo "CHROMEDRIVER=${CHROMEWEBDRIVER}/chromedriver" >> "${GITHUB_ENV}"
+          mkdir -p "${RUNNER_TEMP}/browser-diagnostics"
+          echo "CHROMEDRIVER_ARGS=--verbose --append-log --log-path=${RUNNER_TEMP}/browser-diagnostics/chromedriver.log" >> "${GITHUB_ENV}"
+          echo "WASM_BINDGEN_TEST_WEBDRIVER_JSON=${RUNNER_TEMP}/browser-diagnostics/webdriver.json" >> "${GITHUB_ENV}"
+          cat > "${RUNNER_TEMP}/browser-diagnostics/webdriver.json" <<'JSON'
+          {
+            "goog:loggingPrefs": {"browser": "ALL"},
+            "goog:chromeOptions": {"args": ["--enable-logging=stderr"]}
+          }
+          JSON
 
       - uses: $/.github/actions/pull-test-images
 
@@ -755,6 +764,15 @@ jobs:
           CONNETTO_SERVER_BIN: ${{ github.workspace }}/browser-bins/demo-server
           CONNETTO_TOPOLOGY_BIN: ${{ github.workspace }}/browser-bins/verified-topology
         run: browser-bins/connetto-browser-stack --shard ${{ matrix.shard }}/4
+
+      - name: Upload browser failure diagnostics
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: browser-diagnostics-${{ matrix.shard }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/browser-diagnostics
+          retention-days: 7
+          if-no-files-found: ignore
 
       - name: Prune target cache
         if: always()

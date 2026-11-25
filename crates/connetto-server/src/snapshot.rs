@@ -202,6 +202,12 @@ pub trait RowSource<Id = String, Key = String> {
     /// Failure to reach the row, as distinct from not finding one.
     type Error: core::fmt::Display;
 
+    /// The catalog declaring the columns of the rows it reads.
+    type Catalog: sql_traits::prelude::DatabaseLike;
+
+    /// The catalog a view of a row it read decodes the row's cells against.
+    fn catalog(&self) -> &Self::Catalog;
+
     /// The row `key` names in `table`, or [`None`] when the caller sees none.
     async fn read_row(
         &self,
@@ -235,7 +241,7 @@ mod pg {
     use super::{
         RowSource, SnapshotError, SourceRow, page_sql, projection_exposes, table_from_select,
     };
-    use crate::capability::CallerBinding;
+    use crate::capability::{BindingSettings, CallerBinding};
     use crate::catalog_shapes::CatalogShapes;
     use crate::key_filter::KeyFilter;
     use crate::session::{
@@ -251,8 +257,8 @@ mod pg {
         catalog: DB,
         /// Every catalog table's columns, which a row read projects.
         shapes: CatalogShapes,
-        /// The setting a policy reads the caller's identity from.
-        user_setting: std::sync::Arc<str>,
+        /// How a policy reads the caller.
+        binding: BindingSettings,
         /// The publication the change stream reads, when the deployment named
         /// it, so a membership term's table can be verified as replicated at
         /// registration (R27). Without one, every membership term is refused.
@@ -284,7 +290,23 @@ mod pg {
         /// already name things its own way can rename both.
         #[must_use]
         pub fn with_user_setting(mut self, setting: impl Into<std::sync::Arc<str>>) -> Self {
-            self.user_setting = setting.into();
+            self.binding = self.binding.with_user(setting.into());
+            self
+        }
+
+        /// Bind `unset` the way the deployment's policies read an absent
+        /// caller, `''` for a setting they may find unset.
+        #[must_use]
+        pub fn with_unset_settings(mut self, unset: connetto_core::auth::UnsetSettings) -> Self {
+            self.binding = self.binding.with_unset(unset);
+            self
+        }
+
+        /// Switch every caller's transaction to the role `kind_roles` names
+        /// for the caller's kind. A source on the owner pool names none.
+        #[must_use]
+        pub fn with_kind_roles(mut self, kind_roles: connetto_core::KindRoles) -> Self {
+            self.binding = self.binding.with_kind_roles(kind_roles);
             self
         }
 
@@ -327,7 +349,7 @@ mod pg {
                 pool,
                 catalog,
                 shapes,
-                user_setting: connetto_core::auth::DEFAULT_USER_SETTING.into(),
+                binding: BindingSettings::default(),
                 publication: None,
             })
         }
@@ -605,6 +627,11 @@ mod pg {
         Key: CapabilityKey,
     {
         type Error = SnapshotError;
+        type Catalog = DB;
+
+        fn catalog(&self) -> &DB {
+            &self.catalog
+        }
 
         async fn read_row(
             &self,
@@ -633,7 +660,7 @@ mod pg {
                 filter.predicate(),
             );
             let query = filter.bind(sql_query(sql).into_boxed::<diesel::pg::Pg>());
-            let binding = CallerBinding::of(caller, std::sync::Arc::clone(&self.user_setting));
+            let binding = CallerBinding::of(caller, &self.binding);
             let mut conn = self
                 .pool
                 .get()
@@ -692,7 +719,7 @@ mod pg {
             caller: &Principal<Id, Key>,
         ) -> Result<SnapshotEstimate, Self::Error> {
             let table = table_from_select(select_sql)?;
-            let binding = CallerBinding::of(caller, std::sync::Arc::clone(&self.user_setting));
+            let binding = CallerBinding::of(caller, &self.binding);
             // The plan is asked for as the caller, because row-level security
             // changes what the planner expects to return.
             let query = attach_binds(
@@ -776,7 +803,7 @@ mod pg {
                 query,
             } = plan;
             let max_rows = page.max_rows.max(1);
-            let binding = CallerBinding::of(caller, std::sync::Arc::clone(&self.user_setting));
+            let binding = CallerBinding::of(caller, &self.binding);
             // Both ends of this number are traps, so one helper owns them: zero
             // reads as no limit at all, and the setting's own range is a signed
             // 32-bit integer (R81).
@@ -895,7 +922,7 @@ mod pg {
             member_keys: &[String],
             caller: &Principal<Id, Key>,
         ) -> Result<Option<TermSeedRead>, SnapshotError> {
-            let binding = CallerBinding::of(caller, std::sync::Arc::clone(&self.user_setting));
+            let binding = CallerBinding::of(caller, &self.binding);
             let seed = seed_sql.to_owned();
             let probe_table = member_table.to_owned();
             let publication = self.publication.clone();

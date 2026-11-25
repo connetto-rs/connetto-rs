@@ -17,7 +17,7 @@ use connetto_core::messages::Grant;
 #[cfg(feature = "native-auth")]
 use connetto_core::traits::RefreshTokenStore;
 use connetto_core::traits::{MaybeSend, ReplicaKeyStore, Transport};
-use connetto_core::{DialError, NativeStream, WebSocketTransport, dial};
+use connetto_core::{CallerKind, DialError, NativeStream, WebSocketTransport, dial};
 
 #[cfg(feature = "device-identity")]
 use crate::ClientEvent;
@@ -102,9 +102,8 @@ impl BoxedDialer<NativeTransport> {
 /// # use connetto_client::{NativeClientBuilder, SyncSchema};
 /// # use connetto_core::schema::SchemaBundle;
 /// # let bundle = SchemaBundle::new(
-/// #     "-- connetto:major 1", "POLICIES", "DDL",
-/// #     Vec::<(String, String)>::new(),
-/// #     Vec::<String>::new(),
+/// #     "-- connetto:major 1", "POLICIES",
+/// #     connetto_core::ReplicaCopy::new("DDL", Vec::<(String, String)>::new(), Vec::<String>::new()),
 /// #     None::<&str>,
 /// # ).expect("the source declares major 1");
 /// // `connect` runs the build and returns a future; await it in your runtime.
@@ -120,9 +119,8 @@ impl BoxedDialer<NativeTransport> {
 /// # use connetto_client::{NativeClientBuilder, SyncSchema};
 /// # use connetto_core::schema::SchemaBundle;
 /// # let bundle = SchemaBundle::new(
-/// #     "-- connetto:major 1", "POLICIES", "DDL",
-/// #     Vec::<(String, String)>::new(),
-/// #     Vec::<String>::new(),
+/// #     "-- connetto:major 1", "POLICIES",
+/// #     connetto_core::ReplicaCopy::new("DDL", Vec::<(String, String)>::new(), Vec::<String>::new()),
 /// #     None::<&str>,
 /// # ).expect("the source declares major 1");
 /// let builder = NativeClientBuilder::new(
@@ -136,9 +134,8 @@ impl BoxedDialer<NativeTransport> {
 /// # use connetto_client::{AccountChoice, NativeClientBuilder, SyncSchema};
 /// # use connetto_core::schema::SchemaBundle;
 /// # let bundle = SchemaBundle::new(
-/// #     "-- connetto:major 1", "POLICIES", "DDL",
-/// #     Vec::<(String, String)>::new(),
-/// #     Vec::<String>::new(),
+/// #     "-- connetto:major 1", "POLICIES",
+/// #     connetto_core::ReplicaCopy::new("DDL", Vec::<(String, String)>::new(), Vec::<String>::new()),
 /// #     None::<&str>,
 /// # ).expect("the source declares major 1");
 /// let builder = NativeClientBuilder::new(
@@ -198,7 +195,8 @@ where
         }
     }
 
-    /// Sign in, moving the build to the signed-in stage.
+    /// Sign in, moving the build to the signed-in stage, whose replica is the
+    /// signed-in copy.
     ///
     /// A bare [`Auth`](crate::Auth) does not compile here, because natively a
     /// credential needs a store and the platform fork states one.
@@ -207,9 +205,8 @@ where
     /// # use connetto_client::{Auth, NativeClientBuilder, SyncSchema};
     /// # use connetto_core::schema::SchemaBundle;
     /// # let bundle = SchemaBundle::new(
-    /// #     "-- connetto:major 1", "POLICIES", "DDL",
-    /// #     Vec::<(String, String)>::new(),
-    /// #     Vec::<String>::new(),
+    /// #     "-- connetto:major 1", "POLICIES",
+    /// #     connetto_core::ReplicaCopy::new("DDL", Vec::<(String, String)>::new(), Vec::<String>::new()),
     /// #     None::<&str>,
     /// # ).expect("the source declares major 1");
     /// let builder = NativeClientBuilder::new(
@@ -219,8 +216,9 @@ where
     /// builder.signed_in(Auth::new("https://auth.example.com", "github"));
     /// ```
     #[must_use]
-    pub fn signed_in<S: NativeSignIn>(self, sign_in: S) -> NativeSignedIn<T, C, S::Storage> {
+    pub fn signed_in<S: NativeSignIn>(mut self, sign_in: S) -> NativeSignedIn<T, C, S::Storage> {
         let (kind, storage) = sign_in.into_parts();
+        self.base.schema = self.base.schema.acting_as(CallerKind::Authenticated);
         NativeSignedIn {
             base: self.base,
             kind,
@@ -361,9 +359,8 @@ where
     /// # use connetto_client::{Auth, MemoryKeyStore, NativeClientBuilder, SyncSchema};
     /// # use connetto_core::schema::SchemaBundle;
     /// # let bundle = SchemaBundle::new(
-    /// #     "-- connetto:major 1", "POLICIES", "DDL",
-    /// #     Vec::<(String, String)>::new(),
-    /// #     Vec::<String>::new(),
+    /// #     "-- connetto:major 1", "POLICIES",
+    /// #     connetto_core::ReplicaCopy::new("DDL", Vec::<(String, String)>::new(), Vec::<String>::new()),
     /// #     None::<&str>,
     /// # ).expect("the source declares major 1");
     /// let builder = NativeClientBuilder::new(
@@ -414,9 +411,8 @@ where
     /// # use connetto_client::{Auth, MemoryRefreshStore, NativeClientBuilder, SyncSchema};
     /// # use connetto_core::schema::SchemaBundle;
     /// # let bundle = SchemaBundle::new(
-    /// #     "-- connetto:major 1", "POLICIES", "DDL",
-    /// #     Vec::<(String, String)>::new(),
-    /// #     Vec::<String>::new(),
+    /// #     "-- connetto:major 1", "POLICIES",
+    /// #     connetto_core::ReplicaCopy::new("DDL", Vec::<(String, String)>::new(), Vec::<String>::new()),
     /// #     None::<&str>,
     /// # ).expect("the source declares major 1");
     /// let builder = NativeClientBuilder::new(
@@ -1611,6 +1607,18 @@ where
         self.device.as_ref().and_then(EnrolHandle::certificate)
     }
 
+    /// Watch completed automatic enrolment decisions, or return `None` without a device identity.
+    ///
+    /// The initial value is `None` until a decision completes, and late observers receive the latest result.
+    /// Updates may coalesce, and the watch closes when the enrolment task ends.
+    #[cfg(feature = "device-identity")]
+    #[must_use]
+    pub fn watch_enrolment(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<Option<crate::EnrolmentDecision>>> {
+        self.device.as_ref().map(EnrolHandle::watch_enrolment)
+    }
+
     /// The account's devices, for the lost-device list, each descriptor read
     /// as the application's `D` (R74 step 5).
     ///
@@ -2782,9 +2790,11 @@ mod tests {
             SchemaBundle::new(
                 SOURCE,
                 "",
-                "CREATE TABLE t (id INTEGER PRIMARY KEY)",
-                Vec::<(String, String)>::new(),
-                Vec::<String>::new(),
+                connetto_core::ReplicaCopy::new(
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY)",
+                    Vec::<(String, String)>::new(),
+                    Vec::<String>::new(),
+                ),
                 None::<&str>,
             )
             .expect("the source declares major 1"),

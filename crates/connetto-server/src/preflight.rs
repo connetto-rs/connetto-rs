@@ -86,6 +86,78 @@ pub enum Artifact<'a> {
     /// neither a superuser nor `BYPASSRLS`, so such a read would come back
     /// short and the rows it missed would be lost without an error.
     ReadInFull(&'a str),
+    /// The role every connection must both log in as and act as, compared
+    /// with `session_user` and `current_user`.
+    ///
+    /// A role setting (`ALTER ROLE ... SET role`) switches `current_user` on
+    /// every connection of the login role, and the policies and grants that
+    /// bind a statement are those of `current_user`, so a connection matching
+    /// on its login role alone could still run under another role's rules.
+    ActingRole(&'a str),
+    /// A role a kind of caller acts as, probed from a connection logged in as
+    /// the reader role, which switches to it for each caller's transaction.
+    ///
+    /// The kind role must exist, must not log in, be a superuser, bypass
+    /// row-level security or belong to `pg_read_all_data` or
+    /// `pg_write_all_data`, and the reader must hold it with `SET` and without
+    /// inheriting it, since Postgres applies a policy's `TO` clause to every
+    /// role whose privileges the acting role holds.
+    KindRole(&'a str),
+    /// A table, by name, resolved through the connection's own `search_path`,
+    /// whose policies and grants must bind `role`.
+    ///
+    /// Postgres skips a table's policies for its owner unless the table forces
+    /// row-level security, and the owner holds every privilege on the table,
+    /// so a role that owns the table or inherits its owner's privileges
+    /// (`pg_has_role(role, owner, 'USAGE')`) reads and writes around the rules
+    /// both translators model.
+    PolicyBoundTable {
+        /// The role the table's policies must bind.
+        role: &'a str,
+        /// The table whose policies must bind it.
+        table: &'a str,
+    },
+}
+
+/// Why a kind role cannot be acted as, each named as the deployment would fix
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KindRoleFault {
+    /// The role can log in, so a client could reach Postgres as the kind
+    /// without connetto.
+    LogsIn,
+    /// The role is a superuser, which no policy or grant binds.
+    Superuser,
+    /// The role bypasses row-level security.
+    BypassesRls,
+    /// The role belongs to `pg_read_all_data`, which reads every table.
+    ReadsAllData,
+    /// The role belongs to `pg_write_all_data`, which writes every table.
+    WritesAllData,
+    /// The reader inherits the role's privileges, so the kind's policies would
+    /// apply to every caller before any switch.
+    InheritedByReader,
+    /// The reader cannot `SET ROLE` to the role, so no caller of the kind
+    /// could be served.
+    NotSettable,
+}
+
+impl core::fmt::Display for KindRoleFault {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::LogsIn => "it can log in (ALTER ROLE ... NOLOGIN)",
+            Self::Superuser => "it is a superuser (ALTER ROLE ... NOSUPERUSER)",
+            Self::BypassesRls => "it bypasses row-level security (ALTER ROLE ... NOBYPASSRLS)",
+            Self::ReadsAllData => "it belongs to pg_read_all_data",
+            Self::WritesAllData => "it belongs to pg_write_all_data",
+            Self::InheritedByReader => {
+                "the reader role inherits it (GRANT ... TO the reader WITH INHERIT FALSE)"
+            }
+            Self::NotSettable => {
+                "the reader role cannot switch to it (GRANT ... TO the reader WITH SET TRUE)"
+            }
+        })
+    }
 }
 
 /// What a probe found.
@@ -107,6 +179,15 @@ enum Found {
     Filtered(String),
     /// The connecting role lacks schema usage or table read permission.
     ReadDenied(String),
+    /// The connection logs in or acts as another role than the one required.
+    OtherRole {
+        session_user: String,
+        current_user: String,
+    },
+    /// The role owns the table or inherits its owner's privileges.
+    OwnerPrivileges { role: String, owner: String },
+    /// The kind role is there and unfit to act as.
+    KindUnfit(Vec<KindRoleFault>),
 }
 
 impl Artifact<'_> {
@@ -115,7 +196,9 @@ impl Artifact<'_> {
         match self {
             Self::ReplicationSlot(_) => "replication slot",
             Self::Publication(_) | Self::PreviousImages { .. } => "publication",
-            Self::Table(_) | Self::ReadInFull(_) => "table",
+            Self::Table(_) | Self::ReadInFull(_) | Self::PolicyBoundTable { .. } => "table",
+            Self::ActingRole(_) => "role",
+            Self::KindRole(_) => "kind role",
             Self::PublishedTable { .. } => "replicated table",
             Self::CappedTable(_) => "synced table",
             Self::TableColumn { .. } => "column",
@@ -125,10 +208,15 @@ impl Artifact<'_> {
     /// The name the deployment gave it.
     const fn name(&self) -> &str {
         match self {
-            Self::ReplicationSlot(name) | Self::Publication(name) | Self::Table(name) => name,
+            Self::ReplicationSlot(name)
+            | Self::Publication(name)
+            | Self::Table(name)
+            | Self::ActingRole(name)
+            | Self::KindRole(name) => name,
             Self::PublishedTable { table, .. }
             | Self::CappedTable(table)
             | Self::ReadInFull(table)
+            | Self::PolicyBoundTable { table, .. }
             | Self::TableColumn { table, .. } => table,
             Self::PreviousImages { publication } => publication,
         }
@@ -294,6 +382,66 @@ impl Artifact<'_> {
                     Some(_) => Found::Fit,
                 });
             }
+            Self::ActingRole(expected) => {
+                // Diesel has no constructor for the `SESSION_USER` and
+                // `CURRENT_USER` value expressions.
+                let (session_user, current_user) = diesel::select((
+                    diesel::dsl::sql::<Text>("SESSION_USER::text"),
+                    diesel::dsl::sql::<Text>("CURRENT_USER::text"),
+                ))
+                .get_result::<(String, String)>(conn)
+                .await?;
+                return Ok(if session_user == *expected && current_user == *expected {
+                    Found::Fit
+                } else {
+                    Found::OtherRole {
+                        session_user,
+                        current_user,
+                    }
+                });
+            }
+            Self::KindRole(kind) => {
+                let attributes: Option<KindAttributes> = sql_query(
+                    "SELECT r.rolcanlogin AS logs_in, r.rolsuper AS superuser, \
+                     r.rolbypassrls AS bypasses_rls, \
+                     pg_has_role(r.oid, 'pg_read_all_data', 'MEMBER') AS reads_all_data, \
+                     pg_has_role(r.oid, 'pg_write_all_data', 'MEMBER') AS writes_all_data, \
+                     pg_has_role(CURRENT_USER, r.oid, 'USAGE') AS inherited_by_reader, \
+                     pg_has_role(CURRENT_USER, r.oid, 'SET') AS settable \
+                     FROM pg_roles r WHERE r.rolname = $1",
+                )
+                .bind::<Text, _>(*kind)
+                .get_result(conn)
+                .await
+                .optional()?;
+                return Ok(attributes.map_or(Found::Absent, |attributes| {
+                    let faults = attributes.faults();
+                    if faults.is_empty() {
+                        Found::Fit
+                    } else {
+                        Found::KindUnfit(faults)
+                    }
+                }));
+            }
+            Self::PolicyBoundTable { role, table } => {
+                let held = pg_class::table
+                    .filter(pg_class::oid.nullable().eq(to_regclass(table)))
+                    .select((
+                        role_holds(*role, pg_class::relowner, "USAGE"),
+                        pg_get_userbyid(pg_class::relowner),
+                    ))
+                    .get_result::<(bool, String)>(conn)
+                    .await
+                    .optional()?;
+                return Ok(match held {
+                    None => Found::Absent,
+                    Some((true, owner)) => Found::OwnerPrivileges {
+                        role: (*role).to_owned(),
+                        owner,
+                    },
+                    Some((false, _)) => Found::Fit,
+                });
+            }
             Self::ReplicationSlot(_) => {
                 "SELECT EXISTS (SELECT 1 FROM pg_replication_slots \
                  WHERE slot_name = $1 AND database = current_database()) AS present"
@@ -336,6 +484,8 @@ diesel::table! {
         relname -> Text,
         /// Namespace identity.
         relnamespace -> Oid,
+        /// Owning role identity.
+        relowner -> Oid,
     }
 }
 
@@ -369,6 +519,17 @@ diesel::define_sql_function! {
 diesel::define_sql_function! {
     /// Whether the connecting role holds a schema privilege.
     fn has_schema_privilege(schema: diesel::sql_types::Oid, privilege: Text) -> Bool;
+}
+
+diesel::define_sql_function! {
+    /// Whether `role` holds another role's privileges, as `USAGE` asks.
+    #[sql_name = "pg_has_role"]
+    fn role_holds(role: Text, held: diesel::sql_types::Oid, privilege: Text) -> Bool;
+}
+
+diesel::define_sql_function! {
+    /// The name of a role.
+    fn pg_get_userbyid(role: diesel::sql_types::Oid) -> Text;
 }
 
 /// Why the server refused to start.
@@ -463,6 +624,44 @@ pub enum PreflightError {
         /// The connecting database role.
         role: String,
     },
+    /// A connection logs in or acts as another role than the required one.
+    #[error(
+        "the connection logs in as role {session_user} and acts as role {current_user}, \
+         but must log in and act as role {expected}"
+    )]
+    ActingAs {
+        /// The role the connection must log in and act as.
+        expected: String,
+        /// The role the connection logged in as.
+        session_user: String,
+        /// The role the connection acts as.
+        current_user: String,
+    },
+    /// A kind role exists and cannot be acted as, naming every fault.
+    #[error(
+        "kind role {role} cannot be acted as: {}",
+        faults.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+    )]
+    KindRole {
+        /// The kind role.
+        role: String,
+        /// Every reason it cannot be acted as.
+        faults: Vec<KindRoleFault>,
+    },
+    /// The connecting role owns a table or inherits its owner's privileges,
+    /// so the table's policies and grants do not bind it.
+    #[error(
+        "role {role} owns table {table} or inherits the privileges of its owner {owner}, \
+         so the table's policies and grants do not bind it"
+    )]
+    OwnerPrivileges {
+        /// The table whose policies must bind the role.
+        table: String,
+        /// The connecting database role.
+        role: String,
+        /// The table's owner.
+        owner: String,
+    },
 }
 
 #[derive(QueryableByName)]
@@ -514,6 +713,47 @@ struct ReadAccess {
     role: String,
 }
 
+/// The attributes of a kind role and the reader's hold on it.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one field per probe column: each is a separate fault"
+)]
+#[derive(QueryableByName)]
+struct KindAttributes {
+    #[diesel(sql_type = Bool)]
+    logs_in: bool,
+    #[diesel(sql_type = Bool)]
+    superuser: bool,
+    #[diesel(sql_type = Bool)]
+    bypasses_rls: bool,
+    #[diesel(sql_type = Bool)]
+    reads_all_data: bool,
+    #[diesel(sql_type = Bool)]
+    writes_all_data: bool,
+    #[diesel(sql_type = Bool)]
+    inherited_by_reader: bool,
+    #[diesel(sql_type = Bool)]
+    settable: bool,
+}
+
+impl KindAttributes {
+    /// Every fault the attributes show, in declaration order.
+    fn faults(&self) -> Vec<KindRoleFault> {
+        [
+            (self.logs_in, KindRoleFault::LogsIn),
+            (self.superuser, KindRoleFault::Superuser),
+            (self.bypasses_rls, KindRoleFault::BypassesRls),
+            (self.reads_all_data, KindRoleFault::ReadsAllData),
+            (self.writes_all_data, KindRoleFault::WritesAllData),
+            (self.inherited_by_reader, KindRoleFault::InheritedByReader),
+            (!self.settable, KindRoleFault::NotSettable),
+        ]
+        .into_iter()
+        .filter_map(|(faulty, fault)| faulty.then_some(fault))
+        .collect()
+    }
+}
+
 /// Refuse unless every artifact is there and fit to serve, naming the first
 /// that is not.
 ///
@@ -531,6 +771,12 @@ struct ReadAccess {
 /// [`PreflightError::ReadFiltered`] naming a table row-level security filters
 /// for the connecting role,
 /// [`PreflightError::ReadDenied`] naming a table the connecting role cannot select,
+/// [`PreflightError::ActingAs`] naming the roles a connection logs in and acts
+/// as when either is not the required one,
+/// [`PreflightError::OwnerPrivileges`] naming a table a role owns or whose
+/// owner's privileges it inherits,
+/// [`PreflightError::KindRole`] naming a kind role and why it cannot be acted
+/// as,
 /// [`PreflightError::Probe`] when the check could not be answered, and
 /// [`PreflightError::Pool`] when no connection was available.
 pub async fn require(
@@ -583,6 +829,29 @@ pub async fn require(
                 return Err(PreflightError::ReadDenied {
                     table: artifact.name().to_owned(),
                     role,
+                });
+            }
+            Found::OtherRole {
+                session_user,
+                current_user,
+            } => {
+                return Err(PreflightError::ActingAs {
+                    expected: artifact.name().to_owned(),
+                    session_user,
+                    current_user,
+                });
+            }
+            Found::OwnerPrivileges { role, owner } => {
+                return Err(PreflightError::OwnerPrivileges {
+                    table: artifact.name().to_owned(),
+                    role,
+                    owner,
+                });
+            }
+            Found::KindUnfit(faults) => {
+                return Err(PreflightError::KindRole {
+                    role: artifact.name().to_owned(),
+                    faults,
                 });
             }
         }

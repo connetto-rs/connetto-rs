@@ -128,7 +128,7 @@ pub use bluetooth::{
 };
 pub use courier_audit::{CourierAuditError, CourierAuditWait};
 #[cfg(feature = "device-identity")]
-pub use enrolment::{CertificateError, DeviceEntry};
+pub use enrolment::{CertificateError, DeviceEntry, EnrolmentDecision, EnrolmentOutcome};
 #[cfg(feature = "peer")]
 pub use hotspot::{HotspotError, HotspotOffer, HotspotSecurity, JoinError, WifiPayloadError};
 pub use presence::SharedDeparture;
@@ -1183,6 +1183,9 @@ pub(crate) struct ClientConfig {
     /// What brings an existing device-private tier to this build's major,
     /// `None` for a build declaring no major (R31).
     tier_plan: Option<TierPlan>,
+    /// Which caller settings the deployment's policies may find unset, from
+    /// the storage schema, deciding what an absent identity renders as.
+    unset: connetto_core::auth::UnsetSettings,
 }
 
 impl ClientConfig {
@@ -1208,6 +1211,7 @@ impl ClientConfig {
             relay_mirror: false,
             content_hooks: ContentHooks::NONE,
             tier_plan: None,
+            unset: connetto_core::auth::UnsetSettings::ALWAYS_BOUND,
         }
     }
 
@@ -1219,6 +1223,7 @@ impl ClientConfig {
         }
         self.connection_ddl =
             (!schema.connection_ddl().is_empty()).then(|| Arc::from(schema.connection_ddl()));
+        self.unset = schema.unset_settings();
         self
     }
 
@@ -1239,22 +1244,19 @@ impl ClientConfig {
     /// generated view and its three `INSTEAD OF` triggers call it and would
     /// otherwise fail to resolve on the first read.
     ///
-    /// An unheld identity renders as [`absent_marker`], the same shape the
-    /// server binds, rather than as `""`. An empty string is a real identity
-    /// that a row can carry, so a replica answering `""` would show its holder
-    /// rows the server hides.
-    ///
-    /// [`absent_marker`]: connetto_core::auth::absent_marker
+    /// An unheld identity renders as the server binds it, read from the
+    /// storage schema folded in before this: `""` where the deployment
+    /// declared the identity may be unset, and the absent marker otherwise.
+    /// Where the deployment declared nothing, an empty string is a real
+    /// identity that a row can carry, so a replica answering `""` would show
+    /// its holder rows the server hides.
     #[must_use]
     pub fn with_caller(
         mut self,
         function: impl Into<String>,
         identity: Option<impl Into<String>>,
     ) -> Self {
-        let identity = identity.map_or_else(
-            || connetto_core::auth::absent_marker().to_owned(),
-            Into::into,
-        );
+        let identity = identity.map_or_else(|| self.unset.absent_user().to_owned(), Into::into);
         self.caller = Some((function.into(), identity));
         self
     }
@@ -2606,23 +2608,16 @@ pub(crate) fn register_bot_list(
     .map_err(|e| ClientError::Session(format!("registering the bot list function: {e}")))
 }
 
-/// The SQLite function a translated schema's write guards call to let
-/// connetto's own writes land underneath the policy triggers.
+/// Registers [`connetto_core::WRITE_EXEMPTION_FUNCTION`] and
+/// [`outbox::UNRECORDED_FUNCTION`] backed by `flags`, on every replica
+/// connection whether or not the schema names them.
 ///
-/// pg2sqlite's write guards are fail-closed: a translation built with
-/// `with_write_exemption_function` names one function, and a backing-table
-/// write is admitted only while that function returns true. connetto holds it
-/// true exactly while it holds the write exemption, which is every write
-/// connetto authors itself: applying server-authoritative patches, rolling a
-/// refused mutation back, evicting uncovered rows, and its own bookkeeping.
-/// The application's writes always see it false, so the policy judges them.
-/// Register [`connetto_core::WRITE_EXEMPTION_FUNCTION`] and
-/// [`outbox::UNRECORDED_FUNCTION`] backed by `flags`.
-///
-/// A build that translates its schema with policies passes the same name to
-/// `Pg2SqliteOptions::with_write_exemption_function`. connetto registers the
-/// function on every replica connection it opens, whether or not the schema
-/// names it.
+/// A schema translated with `Pg2SqliteOptions::with_rls_exemption_function`
+/// under that name lifts its row-level security while the function answers
+/// true, for writes and reads alike, as PostgreSQL lifts it for the table
+/// owner. connetto holds it true exactly while it holds the write exemption,
+/// for every write it authors itself, and the application always sees it
+/// false.
 ///
 /// Nondeterministic on purpose: their values change between statements (the
 /// guards flip them), so SQLite must not hoist or cache them the way the
@@ -4749,11 +4744,10 @@ struct Wire<T> {
     held_notices: Vec<CourierNotice>,
 }
 
-/// Which handshake of a [`ConnettoConnection`] a wire came from, counted from
-/// one, so no two wires of the same connection share a number.
+/// An opaque handshake identity, comparable only within the same client.
 #[cfg(feature = "device-identity")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ConnectionNumber(u64);
+pub struct ConnectionNumber(u64);
 
 #[cfg(all(test, feature = "device-identity"))]
 impl ConnectionNumber {
@@ -9955,10 +9949,9 @@ where
         self.wire.as_ref().map(|wire| wire.connection_id.as_str())
     }
 
-    /// The number of the handshake that attached the live wire, or `None`
-    /// while no server is reachable.
+    /// The attached connection's handshake identity, or `None` without a server transport.
     #[cfg(feature = "device-identity")]
-    pub(crate) fn connection_number(&self) -> Option<ConnectionNumber> {
+    pub fn connection_number(&self) -> Option<ConnectionNumber> {
         self.wire.as_ref().map(|wire| wire.number)
     }
 
@@ -12323,7 +12316,7 @@ where
             connetto_core::CALLER_FUNCTION,
             identity
                 .caller
-                .unwrap_or_else(|| connetto_core::auth::absent_marker().to_owned()),
+                .unwrap_or_else(|| self.config.unset.absent_user().to_owned()),
         )?;
         register_subjects(&mut self.db, SUBJECTS_FUNCTION, identity.subjects)?;
         let tables: Vec<String> = sqlite_catalog::table

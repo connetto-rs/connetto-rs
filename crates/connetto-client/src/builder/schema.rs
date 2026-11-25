@@ -3,9 +3,9 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
-use connetto_core::Major;
-use connetto_core::schema::SchemaBundle;
 use connetto_core::schema::UUID_FUNCTION;
+use connetto_core::schema::{ReplicaCopy, SchemaBundle};
+use connetto_core::{CallerKind, Major};
 
 use crate::PolicyTables;
 use crate::SqlFunctions;
@@ -30,15 +30,21 @@ pub enum TierStepRefused {
 }
 
 /// A translated schema and the client-side registrations its DDL reaches, as
-/// one value.
+/// one value, opening the copy of the kind the client acts as.
+///
+/// A build starts anonymous and signing in moves it to the signed-in copy,
+/// since each replica file holds one kind only.
 ///
 /// Every build registers `uuidv4()`, because a synced column `DEFAULT` may
-/// call it and a device without a server still has to mint the id. The
-/// application adds its own functions with
+/// call it and a device without a server still has to mint the id. It also
+/// registers each helper any kind's DDL calls as a table-valued function.
+/// The application adds its own functions with
 /// [`with_sql_functions`](Self::with_sql_functions).
 #[derive(Clone)]
 pub struct SyncSchema {
     bundle: SchemaBundle,
+    /// The kind whose copy this client opens.
+    kind: CallerKind,
     policy_tables: PolicyTables,
     sql_functions: SqlFunctions,
     unrecorded: HashSet<String>,
@@ -53,26 +59,54 @@ pub struct SyncSchema {
 }
 
 impl SyncSchema {
-    /// Wrap a translated schema and register `uuidv4()`.
+    /// Wrap a translated schema, opening the anonymous copy, and register
+    /// `uuidv4()` and its helpers.
     #[must_use]
     pub fn new(bundle: SchemaBundle) -> Self {
-        let policy_tables = PolicyTables::from_translation(
-            bundle
-                .policy_tables()
-                .iter()
-                .map(|(logical, physical)| (logical.as_str(), physical.as_str())),
-            bundle.policy_views().iter().cloned(),
-        );
+        let kind = CallerKind::Anon;
+        let policy_tables = policy_tables_of(bundle.copy(kind));
+        let sql_functions = uuidv4_installer().merged(helper_installer(&bundle));
         Self {
             bundle,
+            kind,
             policy_tables,
-            sql_functions: uuidv4_installer(),
+            sql_functions,
             unrecorded: HashSet::new(),
             mirror_ddl: None,
             shared_store: true,
             relay: false,
             tier_steps: BTreeMap::new(),
         }
+    }
+
+    /// The same schema opening `kind`'s copy, which the build stage that
+    /// fixes the client's kind calls, signing in for the signed-in copy.
+    #[must_use]
+    pub fn acting_as(mut self, kind: CallerKind) -> Self {
+        self.kind = kind;
+        self.policy_tables = policy_tables_of(self.copy());
+        if self.relay {
+            self.mirror_ddl = self.mirror_of();
+        }
+        self
+    }
+
+    /// The kind whose copy this client opens.
+    #[must_use]
+    pub const fn kind(&self) -> CallerKind {
+        self.kind
+    }
+
+    /// The copy this client opens.
+    fn copy(&self) -> &ReplicaCopy {
+        self.bundle.copy(self.kind)
+    }
+
+    /// Both tiers as one main-schema DDL, absent without a tier.
+    fn mirror_of(&self) -> Option<String> {
+        self.bundle
+            .local_tier_ddl()
+            .map(|tier| format!("{}\n{tier}", self.copy().replica_ddl()))
     }
 
     /// Add the application's own function installers alongside `uuidv4()`.
@@ -141,7 +175,7 @@ impl SyncSchema {
     #[must_use]
     pub fn shared_layout(&self) -> Option<&connetto_core::schema::SharedLayout> {
         if self.shared_store && self.mirror_ddl.is_none() {
-            self.bundle.shared_layout()
+            self.copy().shared_layout()
         } else {
             None
         }
@@ -149,7 +183,7 @@ impl SyncSchema {
 
     /// The physical tables whose rows live in the shared file.
     pub fn shared_tables(&self) -> impl Iterator<Item = &str> {
-        self.bundle
+        self.copy()
             .shared_tables()
             .iter()
             .map(|logical| self.policy_tables.physical(logical).unwrap_or(logical))
@@ -158,7 +192,14 @@ impl SyncSchema {
     /// Connection-scoped statements for the unshared layout.
     #[must_use]
     pub fn connection_ddl(&self) -> &str {
-        self.bundle.connection_ddl()
+        self.copy().connection_ddl()
+    }
+
+    /// Which caller settings the deployment's policies may find unset, which
+    /// decides what an absent caller half renders as on the replica.
+    #[must_use]
+    pub fn unset_settings(&self) -> connetto_core::auth::UnsetSettings {
+        self.bundle.unset_settings()
     }
 
     /// The same schema as a relay tab's mirror runs it, both tiers in the
@@ -171,9 +212,7 @@ impl SyncSchema {
     #[must_use]
     pub fn relay_mirror(mut self) -> Self {
         self.shared_store = false;
-        if let Some(tier) = self.bundle.local_tier_ddl() {
-            self.mirror_ddl = Some(format!("{}\n{tier}", self.bundle.replica_ddl()));
-        }
+        self.mirror_ddl = self.mirror_of();
         self.relay = true;
         self
     }
@@ -190,7 +229,7 @@ impl SyncSchema {
     pub fn replica_ddl(&self) -> &str {
         self.mirror_ddl
             .as_deref()
-            .unwrap_or_else(|| self.bundle.replica_ddl())
+            .unwrap_or_else(|| self.copy().replica_ddl())
     }
 
     /// The translated device-private tier DDL, absent when the build has none
@@ -245,5 +284,36 @@ fn uuidv4_installer() -> SqlFunctions {
             diesel::sqlite::SqliteFunctionBehavior::INNOCUOUS,
             || uuid::Uuid::new_v4().into_bytes(),
         )
+    }))
+}
+
+/// The RLS split `copy` renames its tables through.
+fn policy_tables_of(copy: &ReplicaCopy) -> PolicyTables {
+    PolicyTables::from_translation(
+        copy.policy_tables()
+            .iter()
+            .map(|(logical, physical)| (logical.as_str(), physical.as_str())),
+        copy.policy_views().iter().cloned(),
+    )
+}
+
+/// The installer that registers every helper any kind's DDL calls as a
+/// table-valued function, each once, none when no copy calls one.
+fn helper_installer(bundle: &SchemaBundle) -> SqlFunctions {
+    let mut functions = Vec::new();
+    for kind in CallerKind::ALL {
+        for function in bundle.copy(kind).helper_functions() {
+            if !functions.contains(function) {
+                functions.push(function.clone());
+            }
+        }
+    }
+    if functions.is_empty() {
+        return SqlFunctions::new();
+    }
+    SqlFunctions::new().with(Arc::new(move |conn| {
+        functions
+            .iter()
+            .try_for_each(|function| function.register(conn))
     }))
 }

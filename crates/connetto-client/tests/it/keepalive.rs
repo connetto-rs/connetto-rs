@@ -16,14 +16,11 @@ use connetto_client::{
     Moment, ReconnectPolicy, SyncStatus, SyncTuning, SystemClock, TransportFactory,
 };
 use connetto_core::messages::{
-    BulkMessage, ControlMessage, FatalError, FatalErrorReason, HandshakeAck, Pong, SnapshotBegin,
-    SnapshotEnd, SnapshotPatch,
+    BulkMessage, ControlMessage, FatalError, FatalErrorReason, HandshakeAck, Pong,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, loopback};
 use tempfile::tempdir;
-
-use super::support::labelled_order_payload;
 
 const DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY, label TEXT);";
 
@@ -115,26 +112,7 @@ impl TransportFactory for Scripted {
                             }
                         }
                         IncomingFrame::Control(ControlMessage::Subscribe(sub)) => {
-                            server
-                                .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
-                                    sub_id: sub.sub_id.clone(),
-                                }))
-                                .await
-                                .expect("snapshot begin");
-                            server
-                                .send_bulk(BulkMessage::SnapshotPatch(SnapshotPatch {
-                                    sub_id: sub.sub_id.clone(),
-                                    patchset_zstd: labelled_order_payload(1),
-                                }))
-                                .await
-                                .expect("snapshot patch");
-                            server
-                                .send_control(ControlMessage::SnapshotEnd(SnapshotEnd {
-                                    sub_id: sub.sub_id.clone(),
-                                    cursor: Cursor::new(vec![1]),
-                                }))
-                                .await
-                                .expect("snapshot end");
+                            super::support::send_seed_snapshot(&mut server, &sub.sub_id).await;
                         }
                         _ => {}
                     }
@@ -633,26 +611,7 @@ async fn a_busy_link_is_never_probed() {
                             pings_task.fetch_add(1, Ordering::Relaxed);
                         }
                         IncomingFrame::Control(ControlMessage::Subscribe(sub)) => {
-                            server
-                                .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
-                                    sub_id: sub.sub_id.clone(),
-                                }))
-                                .await
-                                .expect("snapshot begin");
-                            server
-                                .send_bulk(BulkMessage::SnapshotPatch(SnapshotPatch {
-                                    sub_id: sub.sub_id.clone(),
-                                    patchset_zstd: labelled_order_payload(1),
-                                }))
-                                .await
-                                .expect("snapshot patch");
-                            server
-                                .send_control(ControlMessage::SnapshotEnd(SnapshotEnd {
-                                    sub_id: sub.sub_id.clone(),
-                                    cursor: Cursor::new(vec![1]),
-                                }))
-                                .await
-                                .expect("snapshot end");
+                            super::support::send_seed_snapshot(&mut server, &sub.sub_id).await;
                         }
                         _ => {}
                     }
@@ -722,6 +681,7 @@ impl TransportFactory for Unanswered {
 /// redialed, which the reconnect attempts say.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_handshake_without_an_ack_is_abandoned_and_redialed() {
+    connetto_core::logging::install(std::io::stdout, "connetto_client::builder=debug");
     let dials = Arc::new(AtomicU32::new(0));
     let (running, pump) = ClientBuilder::new(
         super::support::bundle(DDL),
@@ -825,9 +785,10 @@ async fn a_first_attach_refused_for_a_rebased_writer_starts_offline_and_redials(
 /// pending.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_probe_runs_while_the_gate_is_locked() {
+    connetto_core::logging::install(std::io::stdout, "connetto_client::builder=debug");
     let pings = Arc::new(AtomicU32::new(0));
     let mechanism = super::support::LockedMechanism::new();
-    let connecting = tokio::spawn({
+    let mut connecting = tokio::spawn({
         let pings = Arc::clone(&pings);
         let mechanism = mechanism.clone();
         async move {
@@ -854,19 +815,26 @@ async fn the_probe_runs_while_the_gate_is_locked() {
             .with_gate(Gate::default().with_recheck(Some(Duration::ZERO)))
             .with_gate_mechanism(mechanism)
             .connect_with_pump()
-            .await
-            .expect("the approved build connects");
+            .await?;
             tokio::spawn(pump);
-            (running.client().clone(), dir)
+            Ok::<_, connetto_client::ClientError>((running.client().clone(), dir))
         }
     });
     // The gated launch asks once before the build returns, and it is approved.
-    mechanism.until_asked(1).await;
+    tokio::select! {
+        () = mechanism.until_asked(1) => {}
+        result = &mut connecting => match result {
+            Ok(Ok(_)) => panic!("build completed before launch approval"),
+            Ok(Err(error)) => panic!("build failed before launch approval {error}"),
+            Err(error) => panic!("build task failed before launch approval {error}"),
+        },
+    }
     mechanism.resolve(GateAskOutcome::Approved);
     let (client, _dir) = tokio::time::timeout(BOUND, connecting)
         .await
         .expect("the build returns once the launch prompt resolves")
-        .expect("the connect task");
+        .expect("the connect task")
+        .expect("the approved build connects");
     let mut events = client.events();
     // A zero grace re-checks this return, so the gate locks and its prompt
     // stays pending while the silence runs out.

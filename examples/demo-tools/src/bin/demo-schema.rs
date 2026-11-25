@@ -43,7 +43,7 @@ fn main() -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::FAILURE;
     };
-    match connetto_schema::export_tier(&schema, &tier, &dir, check) {
+    match connetto_translate::export_tier(&schema, &tier, &dir, check) {
         Ok(outcome) => {
             if !check {
                 println!("wrote {}", outcome.path.display());

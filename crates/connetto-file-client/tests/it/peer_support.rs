@@ -293,8 +293,8 @@ pub async fn replica_with(
     http: RecordingHttp,
 ) -> (ConnettoClient<Scripted>, Device) {
     let schema = SyncSchema::new(
-        connetto_schema::translate::<String, connetto_core::bots::TextIds>(
-            connetto_schema::Documents::new(
+        connetto_translate::translate::<String, connetto_core::bots::TextIds>(
+            connetto_translate::Documents::new(
                 PHOTO_SCHEMA,
                 PHOTO_POLICIES,
                 connetto_test_harness::FIXTURE_ROLES,
@@ -795,9 +795,11 @@ pub async fn captured_photo(
         SchemaBundle::new(
             "-- connetto:major 1",
             "",
-            PLAIN_PHOTOS,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                PLAIN_PHOTOS,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             None::<&str>,
         )
         .expect("the source declares major 1"),

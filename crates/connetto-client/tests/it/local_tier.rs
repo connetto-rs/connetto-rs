@@ -219,9 +219,11 @@ async fn connect_with_tier(
         SchemaBundle::new(
             SOURCE,
             "",
-            SQLITE_DDL,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                SQLITE_DDL,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             Some(NOTES_DDL),
         )
         .expect("the source declares major 1"),

@@ -135,6 +135,31 @@ fn builder_schema(
     pg_policies: &str,
     writable: &str,
 ) -> ServerBuilder {
+    builder_with(
+        fixture,
+        port,
+        idp,
+        fga,
+        ServerSchema::new(
+            pg_ddl.to_owned(),
+            pg_policies.to_owned(),
+            connetto_test_harness::FIXTURE_ROLES,
+            connetto_test_harness::FIXTURE_READER,
+        ),
+        writable,
+    )
+}
+
+/// [`builder_schema`] over a whole `schema`, for a test that declares more of
+/// it than its documents.
+fn builder_with(
+    fixture: &Fixture,
+    port: u16,
+    idp: &MockOauth,
+    fga: (&str, &str),
+    schema: ServerSchema,
+    writable: &str,
+) -> ServerBuilder {
     let url = fixture.admin_url().to_owned();
     let reader = with_user_url(&url, "app_reader", "app_reader");
     let keys = TempDir::new().expect("a key dir");
@@ -154,12 +179,7 @@ fn builder_schema(
     );
     ServerBuilder::new(
         Database::new(url, reader),
-        ServerSchema::new(
-            pg_ddl.to_owned(),
-            pg_policies.to_owned(),
-            connetto_test_harness::FIXTURE_ROLES,
-            connetto_test_harness::FIXTURE_READER,
-        ),
+        schema,
         token,
         OpenFga::new(fga.0.to_owned(), fga.1.to_owned()),
     )
@@ -172,7 +192,7 @@ fn builder_schema(
 
 /// Seed the `owned` table with one row under `user_id` and the row-level
 /// policy the RLS second-opinion tests read against.
-async fn seed_owned_rls(pool: &Pool<AsyncPgConnection>, user_id: &str) {
+async fn seed_owned_rls(pool: &Pool<AsyncPgConnection>, fixture: &Fixture, user_id: &str) {
     for stmt in [
         "DROP TABLE IF EXISTS owned CASCADE",
         "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_reader') \
@@ -198,6 +218,9 @@ async fn seed_owned_rls(pool: &Pool<AsyncPgConnection>, user_id: &str) {
     )
     .await;
     provision_cap_policies(pool, OWNED_PG_DDL, OWNED_POLICIES).await;
+    fixture
+        .setup_roles(connetto_test_harness::FIXTURE_ROLES)
+        .await;
 }
 
 /// The integer in a scalar aggregate answer.
@@ -324,6 +347,18 @@ async fn logged(message: &str, field: &str, needle: &str) -> bool {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     true
+}
+
+/// The next frame, bounded, which has to be the bulk frame carrying `what`.
+async fn expect_bulk(client: &mut WebSocketTransport<TcpStream>, what: &str) {
+    let frame = tokio::time::timeout(BOUND, client.recv())
+        .await
+        .expect("the transport answers")
+        .unwrap_or_else(|err| panic!("{what} never arrives: {err}"));
+    assert!(
+        matches!(frame, Some(IncomingFrame::Bulk(_))),
+        "{what} arrives as a patch: {frame:?}"
+    );
 }
 
 /// Wait for the disagreement counter to move past `before` and prove the
@@ -623,7 +658,11 @@ async fn provision_big(pool: &Pool<AsyncPgConnection>) {
         NO_POLICIES,
     )
     .await;
-    exec(pool, "GRANT SELECT ON big TO app_reader").await;
+    exec(
+        pool,
+        "GRANT SELECT ON big TO app_reader, anon, authenticated, bot_installation, bot, delegated",
+    )
+    .await;
     exec(pool, "ALTER TABLE big REPLICA IDENTITY FULL").await;
     exec(
         pool,
@@ -1106,15 +1145,20 @@ async fn the_oplog_config_bounds_the_reconnect_log() {
     stream.abort();
 }
 
-/// With the second opinion installed, a row the build-time policy and the
-/// live table answer differently about is counted and named, and the
-/// delivery the answering executor allowed still happens. The opinion
-/// counts, it does not block.
+/// The helper the second-opinion test's policy calls, admitting row 1.
+const OPEN_HELPER: &str = "CREATE OR REPLACE FUNCTION public.owned_open(id integer) \
+    RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT id > 0';";
+/// The second-opinion test's policy clause, the owner rule narrowed by [`OPEN_HELPER`].
+const OPEN_POLICY: &str = "owner = current_setting('app.user_id', true) AND public.owned_open(id)";
+
+/// With the second opinion installed, a row the followed rules and the live
+/// table answer differently about is counted and named, and the delivery the
+/// answering executor allowed still happens. The opinion counts, it does not
+/// block.
 ///
-/// The divergence is seeded the way drift gets real. The build translated
-/// the policy as written, the live table's policy is altered after the
-/// build, so the live read hides the row the build-time policy still shows
-/// the watcher.
+/// The update commits ahead of a new helper body in one transaction. A body
+/// change leaves the table's replicated schema alone, so the server answers the
+/// update under the rules it follows while the live read already hides the row.
 #[tokio::test]
 async fn a_second_opinion_divergence_is_counted_not_blocked() {
     let _keyring = isolated_session_keyring();
@@ -1127,7 +1171,13 @@ async fn a_second_opinion_divergence_is_counted_not_blocked() {
     // The identity the deterministic resolver derives before any login.
     let user_id =
         connetto_server::authn::identity::deterministic_uuid(idp.issuer(), "e2e-user").to_string();
-    seed_owned_rls(&pool, &user_id).await;
+    seed_owned_rls(&pool, &fixture, &user_id).await;
+    exec(&pool, OPEN_HELPER).await;
+    exec(
+        &pool,
+        &format!("ALTER POLICY owned_p ON owned USING ({OPEN_POLICY})"),
+    )
+    .await;
     fixture.start_replication(&["owned"]).await;
     fixture.provision_auth_tables().await;
 
@@ -1136,13 +1186,17 @@ async fn a_second_opinion_divergence_is_counted_not_blocked() {
         .expect("bind a listener");
     let port = listener.local_addr().expect("local address").port();
     let fga_url = fixture.fga_url().await.to_owned();
+    let policies = format!(
+        "{OPEN_HELPER}\nALTER TABLE owned ENABLE ROW LEVEL SECURITY;\n\
+         CREATE POLICY owned_p ON owned USING ({OPEN_POLICY});"
+    );
     let builder = builder_schema(
         &fixture,
         port,
         &idp,
         (&fga_url, &store),
         OWNED_PG_DDL,
-        OWNED_POLICIES,
+        &policies,
         "owned",
     )
     .second_opinion(true);
@@ -1170,18 +1224,15 @@ async fn a_second_opinion_divergence_is_counted_not_blocked() {
         ControlMessage::SnapshotBegin(snapshot) if snapshot.sub_id == "owned" => {}
         other => panic!("the snapshot opened with {other:?} instead"),
     }
-    let frame = tokio::time::timeout(BOUND, client.recv())
-        .await
-        .expect("the transport answers")
-        .expect("the snapshot row arrives");
-    assert!(
-        matches!(frame, Some(IncomingFrame::Bulk(_))),
-        "the seed row is delivered: {frame:?}"
-    );
+    expect_bulk(&mut client, "the seed row").await;
     match next_control(&mut client).await {
         ControlMessage::SnapshotEnd(snapshot) if snapshot.sub_id == "owned" => {}
         other => panic!("the snapshot closed with {other:?} instead"),
     }
+
+    // The table's relation arrives with this change, not with the transaction below.
+    exec(&pool, "UPDATE owned SET body = 'warm' WHERE id = 1").await;
+    expect_bulk(&mut client, "the first update").await;
 
     let before = connetto_server::counters::snapshot();
     // The capture opens before the drift, so the divergence's record is
@@ -1189,25 +1240,23 @@ async fn a_second_opinion_divergence_is_counted_not_blocked() {
     with_capture(
         "a_second_opinion_divergence_is_counted_not_blocked",
         |_capture| async move {
-            // The live policy drifts from the one the build translated, so the
-            // live table hides the row the build-time policy still shows.
-            exec(&pool, "ALTER POLICY owned_p ON owned USING (false)").await;
-            exec(&pool, "UPDATE owned SET body = 'poked' WHERE id = 1").await;
+            connetto_test_harness::exec(
+                &pool,
+                "BEGIN; \
+                 UPDATE owned SET body = 'poked' WHERE id = 1; \
+                 CREATE OR REPLACE FUNCTION public.owned_open(id integer) \
+                 RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT id > 1'; \
+                 COMMIT",
+            )
+            .await;
             divergence_counted(before, &user_id).await;
         },
     )
     .await;
-    // The opinion does not block delivery. The build-time policy still
-    // allows the row, so the update reaches the watcher even though the
-    // live table now hides it.
-    let frame = tokio::time::timeout(BOUND, client.recv())
-        .await
-        .expect("the transport answers")
-        .expect("the update is delivered");
-    assert!(
-        matches!(frame, Some(IncomingFrame::Bulk(_))),
-        "the update patch arrives: {frame:?}"
-    );
+    // The opinion does not block delivery. The followed rules still allow
+    // the row, so the update reaches the watcher even though the live table
+    // now hides it.
+    expect_bulk(&mut client, "the drifted update").await;
     stream.abort();
     http.abort();
 }
@@ -1233,7 +1282,7 @@ async fn a_per_viewer_statistic_keeps_the_viewers_rows_over_the_production_wirin
         connetto_server::authn::identity::deterministic_uuid(idp.issuer(), "alice").to_string();
     let bob_id =
         connetto_server::authn::identity::deterministic_uuid(idp.issuer(), "bob").to_string();
-    seed_owned_rls(&pool, &alice_id).await;
+    seed_owned_rls(&pool, &fixture, &alice_id).await;
     exec(
         &pool,
         &format!("INSERT INTO owned VALUES (2, '{bob_id}', 'bob seed')"),
@@ -1304,6 +1353,152 @@ async fn a_per_viewer_statistic_keeps_the_viewers_rows_over_the_production_wirin
     stream.abort();
     http.abort();
 }
+
+/// A table owned through a `uuid`, whose policy reads the identity through
+/// `NULLIF` so a caller holding none compares against NULL.
+const UUID_OWNED_PG_DDL: &str = "-- connetto:major 1\n\
+     CREATE TABLE uuid_owned (id INT PRIMARY KEY, owner UUID, body TEXT);";
+
+/// The policy a deployment writes when the identity may be unset.
+const UUID_OWNED_POLICIES: &str = "ALTER TABLE uuid_owned ENABLE ROW LEVEL SECURITY;\n\
+     CREATE POLICY uuid_owned_p ON uuid_owned \
+     USING (owner = NULLIF(current_setting('app.user_id', true), '')::uuid);";
+
+/// The number of rows the snapshot of `sub_id` delivers.
+async fn snapshot_count(client: &mut WebSocketTransport<TcpStream>, sub_id: &str) -> usize {
+    client
+        .send_control(ControlMessage::Subscribe(Subscribe {
+            sub_id: sub_id.to_owned(),
+            spec: SubscriptionSpec::new("SELECT * FROM uuid_owned"),
+        }))
+        .await
+        .expect("send the subscription");
+    match next_control(client).await {
+        ControlMessage::SnapshotBegin(snapshot) if snapshot.sub_id == sub_id => {}
+        other => panic!("the snapshot opened with {other:?} instead"),
+    }
+    let mut rows = 0;
+    loop {
+        let frame = tokio::time::timeout(BOUND, client.recv())
+            .await
+            .expect("the transport answers")
+            .expect("the transport stays open");
+        match frame {
+            Some(IncomingFrame::Bulk(BulkMessage::SnapshotPatch(patch))) => {
+                let raw = zstd::decode_all(patch.patchset_zstd.as_slice())
+                    .expect("decompress the patchset");
+                // An empty page carries no header to tell the two formats apart.
+                rows += match sqlite_diff_rs::ParsedDiffSet::parse(&raw).expect("parse the page") {
+                    sqlite_diff_rs::ParsedDiffSet::Patchset(set) => set.iter().count(),
+                    sqlite_diff_rs::ParsedDiffSet::Changeset(set) => set.iter().count(),
+                };
+            }
+            Some(IncomingFrame::Control(ControlMessage::SnapshotEnd(end))) => {
+                assert_eq!(end.sub_id, sub_id);
+                return rows;
+            }
+            other => panic!("expected a page or the end of the read, got {other:?}"),
+        }
+    }
+}
+
+/// A deployment declaring the identity may be unset reads a caller holding
+/// none as `''`, so its policy's `NULLIF(..)::uuid` compares against NULL and
+/// answers no row where the absent marker would fail the cast. The same
+/// documents without the declaration refuse to build, since the policy then
+/// reads a setting that is always bound as if it were not.
+#[tokio::test]
+async fn an_identity_declared_unset_reads_an_anonymous_caller_as_nobody() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+
+    let idp = MockOauth::start().await;
+    let (_channel, store) = fixture.fga_store().await;
+    let alice_id =
+        connetto_server::authn::identity::deterministic_uuid(idp.issuer(), "alice").to_string();
+    for stmt in [
+        "DROP TABLE IF EXISTS uuid_owned CASCADE",
+        "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_reader') \
+         THEN CREATE ROLE app_reader LOGIN PASSWORD 'app_reader'; END IF; END $$",
+        UUID_OWNED_PG_DDL,
+        "GRANT USAGE ON SCHEMA public TO app_reader",
+        "GRANT SELECT ON uuid_owned TO app_reader",
+        "GRANT SELECT ON auth_events TO app_reader",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled, \
+         _connetto_session_writers TO app_reader",
+        &format!("INSERT INTO uuid_owned VALUES (1, '{alice_id}', 'alice seed')"),
+    ] {
+        exec(&pool, stmt).await;
+    }
+    for stmt in UUID_OWNED_POLICIES.split_inclusive(';') {
+        exec(&pool, stmt).await;
+    }
+    provision_cap_policies(&pool, UUID_OWNED_PG_DDL, UUID_OWNED_POLICIES).await;
+    fixture.start_replication(&["uuid_owned"]).await;
+    fixture.provision_auth_tables().await;
+    fixture
+        .setup_roles(connetto_test_harness::FIXTURE_ROLES)
+        .await;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a listener");
+    let port = listener.local_addr().expect("local address").port();
+    let fga_url = fixture.fga_url().await.to_owned();
+    let schema = ServerSchema::new(
+        UUID_OWNED_PG_DDL,
+        UUID_OWNED_POLICIES,
+        connetto_test_harness::FIXTURE_ROLES,
+        connetto_test_harness::FIXTURE_READER,
+    );
+    refused(
+        builder_with(
+            &fixture,
+            port,
+            &idp,
+            (&fga_url, &store),
+            schema.clone(),
+            "uuid_owned",
+        )
+        .build()
+        .await,
+        "a NULLIF over an always-bound identity",
+    );
+    let builder = builder_with(
+        &fixture,
+        port,
+        &idp,
+        (&fga_url, &store),
+        schema
+            .with_unset_settings(connetto_core::auth::UnsetSettings::ALWAYS_BOUND.with_uuid_user()),
+        "uuid_owned",
+    );
+    let base = format!("http://127.0.0.1:{port}");
+    let parts = builder.build().await.expect("the deployment assembles");
+    let stream = tokio::spawn(parts.change_stream);
+    let http = tokio::spawn(async move { axum::serve(listener, parts.router).await });
+    wait_ready(&base).await;
+
+    let addr = format!("127.0.0.1:{port}");
+    let mut anonymous = anonymous_session(&addr, "nobody").await;
+    assert_eq!(
+        snapshot_count(&mut anonymous, "anonymous").await,
+        0,
+        "a caller holding no identity reads no owned row, and the read succeeds"
+    );
+    let (alice_access, minted_alice, _) = mint_tokens(&base, "alice").await;
+    assert_eq!(minted_alice, alice_id);
+    let mut alice = live_session_as(&addr, &alice_access, "alice-uuid").await;
+    assert_eq!(
+        snapshot_count(&mut alice, "alice").await,
+        1,
+        "alice reads the row she owns"
+    );
+    stream.abort();
+    http.abort();
+}
 /// A row inserted straight into Postgres moves the live count of every
 /// subscriber, including one that subscribes after the count first booted.
 /// The table carries no row policies of its own, but the cap connetto
@@ -1324,7 +1519,7 @@ async fn a_backend_row_moves_the_count_of_a_late_subscriber() {
 
     let idp = MockOauth::start().await;
     let (_channel, store) = fixture.fga_store().await;
-    seed_no_rls_orders(&pool).await;
+    seed_no_rls_orders(&pool, &fixture).await;
     fixture.start_replication(&["orders"]).await;
     fixture.provision_auth_tables().await;
 
@@ -1386,7 +1581,7 @@ async fn a_backend_row_moves_the_count_of_a_late_subscriber() {
 
 /// The `orders` table without row-level security, the demo's shape, with the
 /// reader role granted on it and on the writer bookkeeping.
-async fn seed_no_rls_orders(pool: &Pool<AsyncPgConnection>) {
+async fn seed_no_rls_orders(pool: &Pool<AsyncPgConnection>, fixture: &Fixture) {
     for stmt in [
         "DROP TABLE IF EXISTS orders CASCADE",
         "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_reader') \
@@ -1401,6 +1596,9 @@ async fn seed_no_rls_orders(pool: &Pool<AsyncPgConnection>) {
         exec(pool, stmt).await;
     }
     provision_cap_policies(pool, PG_DDL, NO_POLICIES).await;
+    fixture
+        .setup_roles(connetto_test_harness::FIXTURE_ROLES)
+        .await;
 }
 
 /// Logging out revokes the session the live connection belongs to, the
@@ -1785,7 +1983,7 @@ async fn a_second_boot_reconciles_the_installed_model() {
     let (_channel, store) = fixture.fga_store().await;
     let user_id =
         connetto_server::authn::identity::deterministic_uuid(idp.issuer(), "e2e-user").to_string();
-    seed_owned_rls(&pool, &user_id).await;
+    seed_owned_rls(&pool, &fixture, &user_id).await;
     fixture.start_replication(&["owned"]).await;
     fixture.provision_auth_tables().await;
 
@@ -1920,7 +2118,7 @@ async fn build_owned_with(policies: &str) -> (Result<ServerParts, BuildError>, (
     let (channel, store) = fixture.fga_store().await;
     let user_id =
         connetto_server::authn::identity::deterministic_uuid(idp.issuer(), "e2e-user").to_string();
-    seed_owned_rls(&pool, &user_id).await;
+    seed_owned_rls(&pool, &fixture, &user_id).await;
     fixture.start_replication(&["owned"]).await;
     fixture.provision_auth_tables().await;
     let fga_url = fixture.fga_url().await.to_owned();
@@ -2431,6 +2629,62 @@ async fn an_audit_reader_filtered_by_row_security_refuses_startup() {
         BuildError::Preflight(PreflightError::ReadFiltered { table, role }) => {
             assert_eq!(table, "auth_events");
             assert_eq!(role, "app_reader");
+        }
+        other => panic!("unexpected startup result {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_reader_url_acting_as_another_role_refuses_startup() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+    exec(&pool, "CREATE ROLE reader_switched NOLOGIN").await;
+    exec(
+        &pool,
+        "GRANT reader_switched TO app_reader WITH INHERIT FALSE",
+    )
+    .await;
+    exec(&pool, "ALTER ROLE app_reader SET role = 'reader_switched'").await;
+    let (builder, _idp, _keys) = builder_over(&fixture, 0).await;
+    match refused(
+        builder.build().await,
+        "the reader URL must act as the reader role",
+    ) {
+        BuildError::Preflight(PreflightError::ActingAs {
+            expected,
+            session_user,
+            current_user,
+        }) => {
+            assert_eq!(expected, "app_reader");
+            assert_eq!(session_user, "app_reader");
+            assert_eq!(current_user, "reader_switched");
+        }
+        other => panic!("unexpected startup result {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_reader_owning_a_synced_table_refuses_startup() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+    exec(&pool, "ALTER TABLE orders OWNER TO app_reader").await;
+    let (builder, _idp, _keys) = builder_over(&fixture, 0).await;
+    match refused(
+        builder.build().await,
+        "the synced table's policies must bind the reader",
+    ) {
+        BuildError::Preflight(PreflightError::OwnerPrivileges { table, role, owner }) => {
+            assert_eq!(table, "orders");
+            assert_eq!(role, "app_reader");
+            assert_eq!(owner, "app_reader");
         }
         other => panic!("unexpected startup result {other:?}"),
     }
@@ -3228,9 +3482,9 @@ pub(super) async fn apply_content_deployment(pool: &Pool<AsyncPgConnection>) {
         "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_reader') \
          THEN CREATE ROLE app_reader LOGIN PASSWORD 'app_reader'; END IF; END $$",
         "GRANT USAGE ON SCHEMA public TO app_reader",
-        "GRANT SELECT ON photos TO app_reader",
+        "GRANT SELECT ON photos TO app_reader, anon, authenticated, bot_installation, bot, delegated",
         "GRANT SELECT ON _cfs_chunk_registry, _cfs_manifests, _cfs_manifest_chunks \
-         TO app_reader",
+         TO app_reader, anon, authenticated, bot_installation, bot, delegated",
     ] {
         exec(pool, stmt).await;
     }

@@ -198,9 +198,11 @@ fn build(major: u32, ddl: &str, tier: Option<&str>) -> SyncSchema {
         SchemaBundle::new(
             format!("{MAJOR_DIRECTIVE} {major}"),
             "",
-            ddl,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                ddl,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             tier,
         )
         .expect("the source declares its major"),
@@ -221,9 +223,11 @@ fn bundle_two() -> SchemaBundle {
     SchemaBundle::new(
         format!("{MAJOR_DIRECTIVE} 2"),
         "",
-        SQLITE_DDL_V2,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
+        connetto_core::ReplicaCopy::new(
+            SQLITE_DDL_V2,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+        ),
         Some(TIER_V2),
     )
     .expect("the source declares its major")

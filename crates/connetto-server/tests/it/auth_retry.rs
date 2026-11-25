@@ -949,7 +949,7 @@ async fn an_auth_outage_during_the_refusal_verdict_refuses_once_and_folds_once()
     // still moves it. The first commit still sits in the source's queue, so
     // the drain takes every item, not just the first.
     source
-        .execute_sql("INSERT INTO stamps (id, at) VALUES (2, '2026-01-02 00:00:00+00')")
+        .execute_sql("INSERT INTO stamps (id, at) VALUES (2, '2026-01-02 00:00:00.000000+00:00')")
         .expect("execute dml");
     let mut later_events = Vec::new();
     while let Some(item) = source.next_item().await.expect("poll source") {

@@ -57,6 +57,7 @@ where
     session: Option<SessionConfig>,
     oplog: O,
     upkeep: Option<Arc<dyn StoreUpkeep>>,
+    rules: Option<Arc<dyn crate::rules::RulesFollower>>,
     signer: S,
     withdrawal_source: Option<Snap>,
     second_opinion: Option<Arc<dyn SecondOpinion<D::Id, String>>>,
@@ -93,6 +94,7 @@ where
             session: None,
             oplog: InMemoryOplog::default(),
             upkeep: None,
+            rules: None,
             signer: NoSigner,
             withdrawal_source: None,
             second_opinion: None,
@@ -148,6 +150,7 @@ where
             guard,
             session,
             upkeep,
+            rules,
             signer,
             withdrawal_source,
             second_opinion,
@@ -165,6 +168,7 @@ where
             session,
             oplog,
             upkeep,
+            rules,
             signer,
             withdrawal_source,
             second_opinion,
@@ -177,6 +181,13 @@ where
     #[must_use]
     pub fn with_upkeep(mut self, upkeep: Arc<dyn StoreUpkeep>) -> Self {
         self.upkeep = Some(upkeep);
+        self
+    }
+
+    /// Follow the deployment's live authorization rules.
+    #[must_use]
+    pub fn with_rules(mut self, rules: Arc<dyn crate::rules::RulesFollower>) -> Self {
+        self.rules = Some(rules);
         self
     }
 
@@ -199,6 +210,7 @@ where
             session,
             oplog,
             upkeep,
+            rules,
             withdrawal_source,
             second_opinion,
             bot_registry,
@@ -215,6 +227,7 @@ where
             session,
             oplog,
             upkeep,
+            rules,
             signer,
             withdrawal_source,
             second_opinion,
@@ -270,6 +283,7 @@ where
             guard,
             session,
             self.upkeep,
+            self.rules,
             self.signer,
             self.withdrawal_source,
             self.second_opinion,

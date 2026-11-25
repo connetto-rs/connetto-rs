@@ -147,7 +147,12 @@ pub async fn provision(
     };
     fixture.setup(&[deployment.schema]).await;
     fixture.setup(&[DEPLOYMENT_SQL]).await;
-    fixture.setup(&[connetto_server::epoch::EPOCH_DDL]).await;
+    fixture
+        .setup(&[
+            connetto_server::epoch::EPOCH_DDL,
+            connetto_server::epoch::POLICY_CHANGES_DDL,
+        ])
+        .await;
     provision_auth_tables(&fixture).await;
     fixture.setup_roles(deployment.roles).await;
     fixture.setup(&[deployment.bookkeeping]).await;

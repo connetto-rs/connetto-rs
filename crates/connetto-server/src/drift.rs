@@ -22,6 +22,8 @@ use subql::{
 };
 use thiserror::Error;
 
+use crate::rules::LiveDatabase;
+
 /// The change source every connect builds, the stream behind subql's guard.
 pub type GuardedSource =
     DriftGuard<PgStreamingCdcSource, ParserDB, BlockingLiveReader<PgLiveCatalog>, TokioTimer>;
@@ -43,9 +45,7 @@ pub enum GuardConnectError {
     Guard(String),
 }
 
-/// Open the change stream at `config` behind subql's drift guard, which
-/// judges every table of `ddl` against the live database at `database_url`
-/// before the first item and every `interval` after.
+/// Open a stream and read its live rules before constructing its drift guard.
 ///
 /// # Errors
 ///
@@ -56,26 +56,101 @@ pub async fn connect_guarded(
     database_url: &str,
     publication: &str,
     interval: Duration,
-) -> Result<GuardedSource, GuardConnectError> {
-    let catalog = ParserDB::parse::<PostgreSqlDialect>(ddl)
-        .map_err(|err| GuardConnectError::Catalog(format!("{err:?}")))?;
+) -> Result<PendingGuard, GuardConnectError> {
+    let catalog = guard_catalog(ddl)?;
     let inner = PgStreamingCdcSource::connect(config, catalog.clone())
         .await
         .map_err(|err| GuardConnectError::Open(err.to_string()))?;
-    let url = database_url.to_owned();
-    // diesel's Postgres connection blocks, so it is opened off the runtime.
-    let connection = tokio::task::spawn_blocking(move || diesel::PgConnection::establish(&url))
+    let (reader, rules) = read_rules_for(&catalog, database_url, publication).await?;
+    Ok(PendingGuard {
+        inner,
+        catalog,
+        reader,
+        rules,
+        interval,
+    })
+}
+
+/// A connected stream whose live rules must be followed before its guard starts.
+pub struct PendingGuard {
+    inner: PgStreamingCdcSource,
+    catalog: ParserDB,
+    reader: BlockingLiveReader<PgLiveCatalog>,
+    rules: subql::LiveRules<LiveDatabase>,
+    interval: Duration,
+}
+
+impl PendingGuard {
+    /// The baseline read on this connection.
+    #[must_use]
+    pub const fn rules(&self) -> &subql::LiveRules<LiveDatabase> {
+        &self.rules
+    }
+
+    /// Start guarding the stream from its accepted live baseline.
+    ///
+    /// # Errors
+    /// Returns the stream or live schema failure.
+    pub async fn start(self) -> Result<GuardedSource, GuardConnectError> {
+        let marker = subql::catalog_helpers::table_id::<Postgres, _>(
+            &self.catalog,
+            crate::epoch::POLICY_CHANGES_TABLE,
+        )
+        .ok_or_else(|| GuardConnectError::Catalog("rules marker is absent".to_owned()))?;
+        DriftGuard::new(
+            self.inner,
+            self.catalog,
+            self.reader,
+            self.interval,
+            TokioTimer::new(),
+            Some(subql::RulesFollowing::new(self.rules, Some(marker))),
+        )
         .await
-        .map_err(|err| GuardConnectError::LiveShape(err.to_string()))?
-        .map_err(|err| GuardConnectError::LiveShape(err.to_string()))?;
-    let reader = BlockingLiveReader::new(PgLiveCatalog::new(connection, publication));
-    DriftGuard::new(inner, catalog, reader, interval, TokioTimer::new())
-        .await
-        .map_err(|err| match err {
-            DriftGuardError::Inner(err) => GuardConnectError::Open(err.to_string()),
-            DriftGuardError::Shape(err) => GuardConnectError::LiveShape(err.to_string()),
+        .map_err(|error| match error {
+            DriftGuardError::Inner(error) => GuardConnectError::Open(error.to_string()),
+            DriftGuardError::Shape(error) => GuardConnectError::LiveShape(error.to_string()),
             other => GuardConnectError::Guard(other.to_string()),
         })
+    }
+}
+
+pub(crate) async fn read_rules(
+    ddl: &str,
+    database_url: &str,
+    publication: &str,
+) -> Result<subql::LiveRules<LiveDatabase>, GuardConnectError> {
+    let catalog = guard_catalog(ddl)?;
+    read_rules_for(&catalog, database_url, publication)
+        .await
+        .map(|(_, rules)| rules)
+}
+
+async fn read_rules_for(
+    catalog: &ParserDB,
+    database_url: &str,
+    publication: &str,
+) -> Result<
+    (
+        BlockingLiveReader<PgLiveCatalog>,
+        subql::LiveRules<LiveDatabase>,
+    ),
+    GuardConnectError,
+> {
+    let url = database_url.to_owned();
+    let connection = tokio::task::spawn_blocking(move || diesel::PgConnection::establish(&url))
+        .await
+        .map_err(|error| GuardConnectError::LiveShape(error.to_string()))?
+        .map_err(|error| GuardConnectError::LiveShape(error.to_string()))?;
+    let mut reader = BlockingLiveReader::new(PgLiveCatalog::new(connection, publication));
+    let rules = subql::read_live_rules(catalog, &mut reader)
+        .await
+        .map_err(|error| GuardConnectError::LiveShape(error.to_string()))?;
+    Ok((reader, rules))
+}
+
+fn guard_catalog(ddl: &str) -> Result<ParserDB, GuardConnectError> {
+    ParserDB::parse::<PostgreSqlDialect>(ddl)
+        .map_err(|error| GuardConnectError::Catalog(format!("{error:?}")))
 }
 
 /// A schema item a change source yields in place of row changes.
@@ -84,23 +159,23 @@ pub async fn connect_guarded(
 /// only a test drives, yields items connetto has no use for.
 pub trait StreamSignal: Send {
     /// The drift signal this item carries, if any.
-    fn drift(self) -> Option<DriftSignal>;
+    fn drift(self) -> Option<DriftSignal<LiveDatabase>>;
 }
 
-impl StreamSignal for DriftSignal {
-    fn drift(self) -> Option<DriftSignal> {
+impl StreamSignal for DriftSignal<LiveDatabase> {
+    fn drift(self) -> Option<DriftSignal<LiveDatabase>> {
         Some(self)
     }
 }
 
 impl StreamSignal for PgRelation {
-    fn drift(self) -> Option<DriftSignal> {
+    fn drift(self) -> Option<DriftSignal<LiveDatabase>> {
         None
     }
 }
 
 impl StreamSignal for core::convert::Infallible {
-    fn drift(self) -> Option<DriftSignal> {
+    fn drift(self) -> Option<DriftSignal<LiveDatabase>> {
         match self {}
     }
 }
@@ -199,7 +274,10 @@ impl PolicyReaders {
     /// A table the catalog cannot place is left out, since no event of it
     /// reaches the engine.
     #[must_use]
-    pub fn of(reads: &[rls2fga::types::PolicyReads], catalog: &ParserDB) -> Self {
+    pub fn of<DB: sql_traits::prelude::DatabaseLike>(
+        reads: &[rls2fga::types::PolicyReads],
+        catalog: &DB,
+    ) -> Self {
         // rls2fga names a table by the schema and name the database stores.
         let id = |table: &rls2fga::types::TableId| {
             let target = TargetName::new(table.name(), true);
@@ -246,4 +324,34 @@ pub fn weakens_identity(reasons: &[Incompatibility]) -> bool {
     reasons
         .iter()
         .any(|reason| matches!(reason, Incompatibility::IdentityWeakened { .. }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::guard_catalog;
+    use sqlparser::dialect::PostgreSqlDialect;
+    use subql::ParserDB;
+    use subql::backend::Postgres;
+    use subql::catalog_helpers::table_id;
+
+    #[test]
+    fn marker_uses_shared_engine_table_numbers() {
+        let documents = crate::schema::engine_ddl::<crate::defaults::ConnettoDefaults>(
+            "CREATE TABLE public.zebra (id INTEGER PRIMARY KEY); CREATE TABLE public.apple (id INTEGER PRIMARY KEY);",
+            false,
+        );
+        let original = ParserDB::parse::<PostgreSqlDialect>(&documents).expect("catalog");
+        let guarded = guard_catalog(&documents).expect("guard catalog");
+        for table in [
+            "public.zebra",
+            "public.apple",
+            crate::epoch::POLICY_CHANGES_TABLE,
+        ] {
+            assert_eq!(
+                table_id::<Postgres, _>(&original, table),
+                table_id::<Postgres, _>(&guarded, table)
+            );
+        }
+        assert!(table_id::<Postgres, _>(&guarded, crate::epoch::POLICY_CHANGES_TABLE).is_some());
+    }
 }

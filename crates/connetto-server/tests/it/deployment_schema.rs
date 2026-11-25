@@ -680,7 +680,7 @@ async fn recreate_registry_over_uuid(pool: &Pool<AsyncPgConnection>) {
             exec(pool, statement).await;
         }
     }
-    let registry_cap = connetto_schema::cap_policies::<connetto_core::bots::UuidIds>("", "")
+    let registry_cap = connetto_translate::cap_policies::<connetto_core::bots::UuidIds>("", "")
         .expect("the registry's own cap document");
     connetto_test_harness::exec(pool, &registry_cap).await;
     let registry = connetto_core::bots::REGISTRY_TABLES.join(", ");
@@ -734,6 +734,9 @@ async fn a_deployment_schema_of_its_own_serves_through_the_builder() {
         exec(&pool, stmt).await;
     }
     recreate_registry_over_uuid(&pool).await;
+    fixture
+        .setup_roles(connetto_test_harness::FIXTURE_ROLES)
+        .await;
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind a listener");

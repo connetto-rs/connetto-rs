@@ -66,7 +66,7 @@ native-auth = [
   "dep:android_system_properties",
   "dep:webbrowser",
   "dep:open",
-  "dep:connetto-schema",
+  "dep:connetto-translate",
   "dep:getrandom",
 ]
 # A media port over a bare peer node, for the proofs of a media consumer
@@ -163,7 +163,7 @@ zeroize = { version = "1", default-features = false, features = ["alloc"] }
 ring = { version = "0.17", features = ["std"], optional = true }
 # The binary derives the schema version it declares from the translated
 # bundle, the same step the server runs. Native only, with the binary.
-connetto-schema = { workspace = true, optional = true }
+connetto-translate = { workspace = true, optional = true }
 # The peer link the device serves and dials (R76). Its discovery feature is
 # on, so a peer build always browses and autolinks what it finds (R76 slice
 # 3), and its bluetooth feature carries the beacon and the exchange (R76
@@ -175,6 +175,8 @@ connetto-exchange = { workspace = true, optional = true }
 # A peer apply tells a write guard's policy refusal apart from any other
 # failed write by the message the translated guards raise (R77).
 pg2sqlite = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main", default-features = false, optional = true }
+# Registers the helpers a translated replica calls as table-valued functions.
+pg2sqlite-runtime = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main", features = ["diesel"] }
 # The page codec, one per target, both selected here rather than by a feature
 # because `ReplicaCipher::Encrypted` cannot be honest without it: in a SQLite
 # with no codec, `PRAGMA key` is an unrecognised pragma that succeeds silently
@@ -307,7 +309,7 @@ parking_lot = "0.12"
 # The bot registration tests mint and verify the Ed25519 key the exchange signs with.
 ring = { version = "0.17", features = ["std"] }
 # The shared fake transport the suites here drive `connect` and `resume` with.
-connetto-core = { workspace = true, features = ["test-support"] }
+connetto-core = { workspace = true, features = ["logging", "test-support"] }
 # The loop tests run the real server in-process. Its write target is the real
 # Postgres path now (pg-async), so the harness supplies the fixture. The CDC
 # source stays the SQLite emulator, so reads are Docker-free and only the
@@ -316,7 +318,7 @@ connetto-server = { path = "../connetto-server", features = ["test-seams", "rose
 connetto-test-harness = { path = "../connetto-test-harness" }
 # The loop and handshake tests derive the schema version the server compares
 # against, through the same translated-bundle step the server itself runs.
-connetto-schema = { workspace = true }
+connetto-translate = { workspace = true }
 # The write-path loop tests read the server's Postgres target back through a
 # typed diesel-async query, so the async DSL must be nameable directly.
 diesel-async = { version = "0.10", default-features = false, features = [
@@ -348,6 +350,9 @@ pg2sqlite = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main",
 # stored as a Postgres `uuid` on the server and carried across the token
 # endpoint, which needs serde both ways.
 rosetta-uuid = { version = "0.2.0", features = ["diesel", "sqlite", "postgres", "serde"] }
+# The typed aggregate proof watches the maximum of a `timestamptz` column
+# decoded into `rosetta_utc::TimestampUTC`.
+rosetta-utc = { version = "0.2.0", features = ["diesel", "sqlite"] }
 # The native-auth test serves connetto-server's auth router on a real port and
 # drives the browser round-trip with a redirect-following-disabled HTTP client.
 axum = { workspace = true }

@@ -121,8 +121,8 @@ fn upstream_bundle() -> connetto_core::schema::SchemaBundle {
         ),
     );
     let demo = connetto_test_harness::stack::DEMO_DEPLOYMENT;
-    connetto_schema::translate::<String, connetto_core::bots::TextIds>(
-        connetto_schema::Documents::new(&ddl, &policies, demo.roles, demo.reader_role),
+    connetto_translate::translate::<String, connetto_core::bots::TextIds>(
+        connetto_translate::Documents::new(&ddl, &policies, demo.roles, demo.reader_role),
     )
     .unwrap_or_else(|err| panic!("translating the upstream schema: {err}"))
 }

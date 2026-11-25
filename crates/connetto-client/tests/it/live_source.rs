@@ -63,9 +63,11 @@ async fn offline_client(dir: &TempDir) -> ConnettoClient<Script> {
         SchemaBundle::new(
             "-- connetto:major 1",
             "",
-            DDL,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                DDL,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             Some(TIER_DDL),
         )
         .expect("the source declares major 1"),

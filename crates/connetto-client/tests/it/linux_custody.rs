@@ -97,9 +97,11 @@ async fn open(url: &str, fresh: bool) -> ConnettoConnection<FakeTransport> {
             SchemaBundle::new(
                 SOURCE,
                 "",
-                "",
-                Vec::<(String, String)>::new(),
-                Vec::<String>::new(),
+                connetto_core::ReplicaCopy::new(
+                    "",
+                    Vec::<(String, String)>::new(),
+                    Vec::<String>::new(),
+                ),
                 Some(TIER_DDL),
             )
             .expect("the source declares major 1"),

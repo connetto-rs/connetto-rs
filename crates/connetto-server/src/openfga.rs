@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::schema::ConnettoSchema;
-use connetto_core::auth::Principal;
+use connetto_core::auth::{KindRoles, Principal};
 use diesel::QueryableByName;
 use diesel::pg::Pg;
 use diesel::query_builder::{BoxedSqlQuery, SqlQuery};
@@ -44,8 +44,7 @@ use openfga_client::tonic::codegen::{Body as ResponseBody, Bytes, StdError, http
 use rls2fga::generator::tuple_generator::{TupleCondition, TupleRow};
 use rls2fga::translator::Translator;
 use rls2fga::types::{
-    NoteSeverity, Record, RecordContextValue, RelationShapes, ReplayScope, RowDecision,
-    TranslationNote,
+    NoteSeverity, Record, RecordContextValue, RelationShapes, ReplayScope, TranslationNote,
 };
 use subql::ParserDB;
 use subql::backend::{Postgres, Value};
@@ -143,9 +142,9 @@ pub struct SubjectNaming {
     /// parameter spelled like a grantee column. Reading that as a grantee would
     /// announce a move to one bearer and leave the row on every other device.
     gated_keys: BTreeMap<String, String>,
-    /// The PostgreSQL role every request acts as, the deployment's reader
-    /// role, which every check states as the caller's acting role.
-    acting_role: String,
+    /// The PostgreSQL role each kind of caller acts as, which every check
+    /// states as the caller's acting role.
+    kind_roles: KindRoles,
 }
 
 impl SubjectNaming {
@@ -167,7 +166,7 @@ impl SubjectNaming {
     fn resolve<Key: CapabilityKey>(
         shapes: &Shapes<ParserDB>,
         relations: &[RelationShapes],
-        acting_role: &str,
+        kind_roles: &KindRoles,
     ) -> Self {
         let subjects_parameter = shapes
             .required_parameters()
@@ -184,8 +183,12 @@ impl SubjectNaming {
         let mut gated_keys = BTreeMap::new();
         if let Some(parameter) = subjects_parameter.as_deref() {
             for entry in relations {
-                if let Some(decision) = entry.decision.as_ref() {
-                    collect_gated_keys(decision, parameter, &mut gated_keys);
+                if let Some(gate) = entry
+                    .caller_gate
+                    .as_ref()
+                    .filter(|gate| gate.request_parameter == parameter)
+                {
+                    gated_keys.insert(entry.relation.as_str().to_owned(), gate.context_key.clone());
                 }
             }
         }
@@ -194,7 +197,7 @@ impl SubjectNaming {
             subjects_parameter,
             bot_list_parameter,
             gated_keys,
-            acting_role: acting_role.to_owned(),
+            kind_roles: kind_roles.clone(),
         }
     }
 
@@ -275,31 +278,6 @@ impl SubjectNaming {
     }
 }
 
-/// Every relation `decision` grants through a comparison the caller's own
-/// `parameter` completes, with the context key its records carry the row's side
-/// under.
-///
-/// Walked rather than read off the top, because a policy with several arms
-/// composes its decision and the gated arm sits under the composition.
-fn collect_gated_keys(decision: &RowDecision, parameter: &str, out: &mut BTreeMap<String, String>) {
-    match decision {
-        RowDecision::RequestGated {
-            relation,
-            context_key,
-            request_parameter,
-            ..
-        } if request_parameter == parameter => {
-            out.insert(relation.as_str().to_owned(), context_key.clone());
-        }
-        RowDecision::Any(children) | RowDecision::All(children) => {
-            for child in children {
-                collect_gated_keys(child, parameter, out);
-            }
-        }
-        _ => {}
-    }
-}
-
 /// One watcher as the model names it.
 ///
 /// Built per watcher per event from a shared principal and a shared naming, so
@@ -346,9 +324,11 @@ where
     }
 
     /// rls2fga gates every relation on the acting role, PUBLIC policies
-    /// included, so a check that left it out would be denied.
+    /// included, so a check that left it out would be denied. The role is the
+    /// caller's kind, which belongs to the connection rather than to the
+    /// person, so it rides every check instead of being stored as a fact.
     fn acting_role(&self) -> Option<&str> {
-        Some(&self.naming.acting_role)
+        Some(self.naming.kind_roles.role(self.principal.kind()))
     }
 
     fn request_value(&self, parameter: &str, out: &mut RequestValues) -> bool {
@@ -377,8 +357,25 @@ where
 ///
 /// `T` is the transport, which production wraps in [`Counted`].
 pub struct FgaAuth<Id, Key, T> {
-    inner: RowPolicy<ParserDB, OpenFgaPolicy<ParserDB, T, ModelSubject<Id, Key>, Postgres>>,
+    generation: Arc<arc_swap::ArcSwap<FgaGeneration<Id, Key, T>>>,
+}
+
+impl<Id, Key, T> Clone for FgaAuth<Id, Key, T> {
+    fn clone(&self) -> Self {
+        Self {
+            generation: Arc::clone(&self.generation),
+        }
+    }
+}
+
+type FgaRowPolicy<Id, Key, T> =
+    RowPolicy<ParserDB, OpenFgaPolicy<ParserDB, T, ModelSubject<Id, Key>, Postgres>>;
+
+struct FgaGeneration<Id, Key, T> {
+    inner: Arc<FgaRowPolicy<Id, Key, T>>,
     naming: Arc<SubjectNaming>,
+    outputs: Option<Arc<rls2fga::translator::Outputs>>,
+    upkeep: Option<Arc<FgaUpkeepData<Id, Key, T>>>,
 }
 
 impl<Id, Key, T> FgaAuth<Id, Key, T> {
@@ -395,9 +392,30 @@ impl<Id, Key, T> FgaAuth<Id, Key, T> {
         naming: Arc<SubjectNaming>,
     ) -> Self {
         Self {
-            inner: RowPolicy::new(shapes, delegate),
-            naming,
+            generation: Arc::new(arc_swap::ArcSwap::from_pointee(FgaGeneration {
+                inner: Arc::new(RowPolicy::new(shapes, delegate)),
+                naming,
+                outputs: None,
+                upkeep: None,
+            })),
         }
+    }
+
+    /// Attach the translation outputs used by store replays.
+    #[must_use]
+    pub fn with_outputs(self, outputs: &Arc<rls2fga::translator::Outputs>) -> Self {
+        self.generation.rcu(|current| FgaGeneration {
+            inner: Arc::clone(&current.inner),
+            naming: Arc::clone(&current.naming),
+            outputs: Some(Arc::clone(outputs)),
+            upkeep: current.upkeep.clone(),
+        });
+        self
+    }
+
+    /// Replace the complete generation observed by authorization and upkeep.
+    pub fn replace_from(&self, replacement: &Self) {
+        self.generation.store(replacement.generation.load_full());
     }
 
     /// The upkeep for this executor, over the index it answers from.
@@ -409,7 +427,7 @@ impl<Id, Key, T> FgaAuth<Id, Key, T> {
     #[must_use]
     pub fn upkeep(
         &self,
-        reach: GrantReach,
+        reach: Arc<GrantReach>,
         translator: Translator,
         facts: FactSource,
     ) -> Arc<dyn StoreUpkeep>
@@ -423,25 +441,38 @@ impl<Id, Key, T> FgaAuth<Id, Key, T> {
         T::Future: Send,
         Self: Sized,
     {
-        let key_tables = self
+        let current = self.generation.load_full();
+        let key_tables = current
             .naming
             .gated_relations()
             .flat_map(|relation| reach.tables_for_relation(relation))
             .cloned()
             .collect::<BTreeSet<String>>()
             .into_iter()
-            .collect();
-        Arc::new(FgaUpkeep {
-            shapes: Arc::clone(self.inner.shapes()),
-            delegate: self.inner.inner().clone(),
+            .collect::<Vec<_>>()
+            .into();
+        let upkeep = Arc::new(FgaUpkeepData {
+            shapes: Arc::clone(current.inner.shapes()),
+            delegate: current.inner.inner().clone(),
             reach,
-            naming: Arc::clone(&self.naming),
+            naming: Arc::clone(&current.naming),
             translator,
             facts,
             key_tables,
+        });
+        self.generation.store(Arc::new(FgaGeneration {
+            inner: Arc::clone(&current.inner),
+            naming: Arc::clone(&current.naming),
+            outputs: current.outputs.clone(),
+            upkeep: Some(upkeep),
+        }));
+        Arc::new(FgaUpkeep {
+            generation: Arc::clone(&self.generation),
         })
     }
+}
 
+impl<Id, Key, T> FgaGeneration<Id, Key, T> {
     /// Name one watcher as the model names it.
     fn named(&self, principal: &Arc<Principal<Id, Key>>) -> ModelSubject<Id, Key> {
         ModelSubject {
@@ -477,8 +508,12 @@ where
     where
         R: RowView<Backend = Postgres> + Sync + ?Sized,
     {
-        let named: Vec<_> = watchers.iter().map(|caller| self.named(caller)).collect();
-        async move { self.inner.may_see(row, &named, verdicts).await }
+        let generation = self.generation.load_full();
+        let named: Vec<_> = watchers
+            .iter()
+            .map(|caller| generation.named(caller))
+            .collect();
+        async move { generation.inner.may_see(row, &named, verdicts).await }
     }
 
     fn may_write<R>(
@@ -489,15 +524,16 @@ where
     where
         R: RowView<Backend = Postgres> + Sync + ?Sized,
     {
-        let named = self.named(watcher);
-        async move { self.inner.may_write(write, &named).await }
+        let generation = self.generation.load_full();
+        let named = generation.named(watcher);
+        async move { generation.inner.may_write(write, &named).await }
     }
 }
 
 impl<Id, Key, T> core::fmt::Debug for FgaAuth<Id, Key, T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("FgaAuth")
-            .field("naming", &self.naming)
+            .field("naming", &self.generation.load().naming)
             .finish_non_exhaustive()
     }
 }
@@ -530,6 +566,18 @@ pub enum SetupError {
     /// A tuple query, or the load it fed, failed.
     #[error("loading the authorization store: {0}")]
     Store(String),
+    /// The database could not supply the translation's facts.
+    #[error("reading authorization facts: {0}")]
+    Database(String),
+    /// The authorization service could not answer.
+    #[error("reaching authorization service: {0}")]
+    AuthorizationUnavailable(String),
+    /// The authorization endpoint did not parse or could not be connected to.
+    #[error("reaching the authorization endpoint: {0}")]
+    Endpoint(String),
+    /// The authorization store rejected or could not complete an operation.
+    #[error(transparent)]
+    Authorization(OpenFgaError),
     /// The index refused the questions the model would need.
     #[error(transparent)]
     Index(#[from] OpenFgaError),
@@ -592,6 +640,9 @@ impl FactSource {
     }
 }
 
+mod live;
+pub use live::LiveTranslation;
+
 /// One translation, read once, so nothing downstream reads a second.
 ///
 /// Every piece the executor needs comes from here: the recipes, the row
@@ -610,7 +661,10 @@ pub struct Translated {
     model: rls2fga::generator::json_model::AuthorizationModel,
     tuples: Vec<rls2fga::generator::tuple_generator::TupleQuery>,
     policy_tables: Vec<String>,
-    reach: GrantReach,
+    reach: Arc<GrantReach>,
+    outputs: Arc<rls2fga::translator::Outputs>,
+    resolve_subjects: fn(&Shapes<ParserDB>, &[RelationShapes], &KindRoles) -> SubjectNaming,
+    kind_roles: KindRoles,
     /// The tables each policy reads, which a weakened replica identity
     /// refuses together with the table it weakened on (R107 decision 10).
     policy_reads: Vec<rls2fga::types::PolicyReads>,
@@ -622,7 +676,7 @@ impl Translated {
     ///
     /// The schema, the policies, the cap they generate and the roles are
     /// parsed as one catalog, translated under the same
-    /// [`connetto_schema::deployment`] the client build reads, so the model
+    /// [`connetto_translate::deployment`] the client build reads, so the model
     /// and the replica are told one thing about each session setting.
     ///
     /// `devices` carries the deployment's device identity, so the model's
@@ -636,7 +690,7 @@ impl Translated {
     /// reader role, and [`SetupError::Untranslated`] naming every expression
     /// left unhandled.
     pub fn of<Key: CapabilityKey, D: ConnettoSchema>(
-        documents: connetto_schema::Documents<'_>,
+        documents: connetto_translate::Documents<'_>,
         devices: bool,
     ) -> Result<Self, SetupError> {
         // The model holds a bot to its list exactly as Postgres does, over the
@@ -645,8 +699,12 @@ impl Translated {
             .map_err(|err| SetupError::Catalog(err.to_string()))?;
         let catalog = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(&sql)
             .map_err(|err| SetupError::Catalog(err.to_string()))?;
-        let deployment = connetto_schema::deployment::<Key>(documents.reader_role())
-            .map_err(|err| SetupError::Catalog(err.to_string()))?;
+        let deployment = connetto_translate::deployment::<Key>(
+            documents.reader_role(),
+            documents.kind_roles(),
+            documents.unset_settings(),
+        )
+        .map_err(|err| SetupError::Catalog(err.to_string()))?;
         let translator = rls2fga::translator::TranslatorBuilder::new(deployment)
             .with_min_confidence(rls2fga::types::ConfidenceLevel::B)
             .build();
@@ -654,7 +712,7 @@ impl Translated {
         let translation = translator
             .translate(&catalog)
             .map_err(|err| SetupError::Unplannable(err.to_string()))?;
-        warn_outside_policies(&catalog, documents.reader_role());
+        warn_outside_policies(&catalog, documents.kind_roles());
         let relations = translation.relations().to_vec();
         let naming = translation.row_naming().to_vec();
         let resulting = translation.resulting_rows().to_vec();
@@ -723,7 +781,7 @@ impl Translated {
         let subjects = Arc::new(SubjectNaming::resolve::<Key>(
             &shapes,
             &relations,
-            documents.reader_role(),
+            documents.kind_roles(),
         ));
 
         Ok(Self {
@@ -733,7 +791,10 @@ impl Translated {
             model,
             tuples,
             policy_tables,
-            reach,
+            reach: Arc::new(reach),
+            outputs: Arc::new(outputs),
+            resolve_subjects: SubjectNaming::resolve::<Key>,
+            kind_roles: documents.kind_roles().clone(),
             policy_reads,
         })
     }
@@ -831,7 +892,7 @@ impl Translated {
                 continuation_token: String::new(),
             })
             .await
-            .map_err(|status| SetupError::Model(status.message().to_owned()))?
+            .map_err(live::model_status)?
             .into_inner();
         if let Some(held) = latest.authorization_models.into_iter().next()
             && held.type_definitions == wanted.type_definitions
@@ -842,7 +903,10 @@ impl Translated {
         }
         let id = rls2fga::client::write_authorization_model(client, store_id, &self.model)
             .await
-            .map_err(|err| SetupError::Model(err.to_string()))?;
+            .map_err(|error| match error {
+                rls2fga::client::WriteModelError::Refused(status) => live::model_status(status),
+                other => SetupError::Model(other.to_string()),
+            })?;
         Ok(ModelState::Written(ProtoModel { id, ..wanted }))
     }
 
@@ -873,15 +937,11 @@ impl Translated {
         // and `first` shadow the slice methods the model lookup above uses.
         use diesel_async::RunQueryDsl as _;
 
-        let outputs = self
-            .translator
-            .translate(self.shapes.catalog())
-            .map_err(|err| SetupError::Unplannable(err.to_string()))?
-            .outputs_accepting_gaps();
+        let outputs = &self.outputs;
         let mut conn = pool
             .get()
             .await
-            .map_err(|err| SetupError::Store(err.to_string()))?;
+            .map_err(|error| SetupError::Database(error.to_string()))?;
         // Whole-shape queries are loaded through OpenFgaPolicy::materialise at boot.
         // Running them here too would duplicate the work with no correctness gain.
         let whole_shape_sqls: std::collections::HashSet<&str> = self
@@ -900,16 +960,16 @@ impl Translated {
                 let wide: Vec<WideRow> = sql_query(&query.sql)
                     .load(&mut *conn)
                     .await
-                    .map_err(|err| SetupError::Store(err.to_string()))?;
+                    .map_err(live::query_error)?;
                 TupleRows::Conditional(wide)
             } else {
                 let plain: Vec<PlainRow> = sql_query(&query.sql)
                     .load(&mut *conn)
                     .await
-                    .map_err(|err| SetupError::Store(err.to_string()))?;
+                    .map_err(live::query_error)?;
                 TupleRows::Plain(plain)
             };
-            rows.read_into(&outputs, &mut records)?;
+            rows.read_into(outputs, &mut records)?;
         }
         Ok(records)
     }
@@ -948,8 +1008,8 @@ impl Translated {
         policy
             .write_records(&records)
             .await
-            .map_err(|err| SetupError::Store(err.to_string()))?;
-        materialise_groups(&self.shapes, &self.translator, pool, policy).await?;
+            .map_err(SetupError::Authorization)?;
+        materialise_groups(&self.shapes, &self.outputs, pool, policy).await?;
         Ok(records.len())
     }
 
@@ -984,19 +1044,14 @@ impl Translated {
     {
         let pool = &facts.0;
         let records = self.keyed_records(pool).await?;
-        let outputs = self
-            .translator
-            .translate(self.shapes.catalog())
-            .map_err(|err| SetupError::Unplannable(err.to_string()))?
-            .outputs_accepting_gaps();
         let replayer = ConnettoReplayer {
             pool,
-            outputs: &outputs,
+            outputs: &self.outputs,
         };
         let moved = policy
             .reconcile_store(&records, &replayer)
             .await
-            .map_err(|err| SetupError::Store(err.to_string()))?;
+            .map_err(live::reconcile_error)?;
         Ok(moved.iter().fold((0, 0), |(added, removed), region| {
             (added + region.added.len(), removed + region.removed.len())
         }))
@@ -1011,10 +1066,22 @@ impl Translated {
     /// nothing downstream can hold a second opinion about the deployment's
     /// policies.
     #[must_use]
-    pub fn into_parts(self) -> (Arc<Shapes<ParserDB>>, Translator, GrantReach) {
+    pub fn into_parts(self) -> (Arc<Shapes<ParserDB>>, Translator, Arc<GrantReach>) {
         let translator = self.translator;
         let reach = self.reach;
         (self.shapes, translator, reach)
+    }
+
+    /// The outputs retained from this translation.
+    #[must_use]
+    pub fn outputs_arc(&self) -> Arc<rls2fga::translator::Outputs> {
+        Arc::clone(&self.outputs)
+    }
+
+    /// The grant reach retained from this translation.
+    #[must_use]
+    pub fn reach_arc(&self) -> Arc<GrantReach> {
+        Arc::clone(&self.reach)
     }
 }
 /// Run the whole-shape materialise pass for the boot sequence.
@@ -1028,7 +1095,7 @@ impl Translated {
 /// [`SetupError::Store`] when a member query fails or the store refuses a write.
 async fn materialise_groups<T>(
     shapes: &Shapes<ParserDB>,
-    translator: &Translator,
+    outputs: &rls2fga::translator::Outputs,
     pool: &Pool<AsyncPgConnection>,
     policy: &OpenFgaPolicy<ParserDB, T, ModelSubject<String, String>, Postgres>,
 ) -> Result<(), SetupError>
@@ -1039,18 +1106,11 @@ where
     <T::ResponseBody as ResponseBody>::Error: Into<StdError> + Send,
     T::Future: Send,
 {
-    let outputs = translator
-        .translate(shapes.catalog())
-        .map_err(|err| SetupError::Unplannable(err.to_string()))?
-        .outputs_accepting_gaps();
-    let replayer = ConnettoReplayer {
-        pool,
-        outputs: &outputs,
-    };
+    let replayer = ConnettoReplayer { pool, outputs };
     policy
         .materialise(shapes.materialisations(), &replayer)
         .await
-        .map_err(|err| SetupError::Store(err.to_string()))
+        .map_err(live::reconcile_error)
         .map(drop)
 }
 
@@ -1198,24 +1258,26 @@ fn warn_operator_notes(notes: &[TranslationNote]) {
     }
 }
 
-/// Warn of every policy the reader role is not subject to, naming the policy
-/// and its table.
+/// Warn of every policy no kind role is subject to, naming the policy and its
+/// table.
 ///
-/// Every caller acts as the reader role, so such a policy, one for an
+/// Every caller acts as its kind's role, so such a policy, one for an
 /// administration tool that logs in outside connetto for instance, serves
 /// none of connetto's callers, and both the model and the replica leave it
-/// out. Whether the role is subject to it is sql-traits' answer, the one
-/// both translations settle the `TO` clause with.
-fn warn_outside_policies(catalog: &ParserDB, reader_role: &str) {
+/// out. Whether a role is subject to it is sql-traits' answer, the one both
+/// translations settle the `TO` clause with.
+fn warn_outside_policies(catalog: &ParserDB, kind_roles: &KindRoles) {
     use sql_traits::prelude::{DatabaseLike as _, PolicyLike as _};
 
-    let Some(reader) = catalog.role(reader_role) else {
-        return;
-    };
-    for policy in catalog
-        .policies()
-        .filter(|policy| !policy.applies_to_role(reader, catalog))
-    {
+    let roles: Vec<_> = kind_roles
+        .iter()
+        .filter_map(|(_, role)| catalog.role(role))
+        .collect();
+    for policy in catalog.policies().filter(|policy| {
+        !roles
+            .iter()
+            .any(|role| policy.applies_to_role(role, catalog))
+    }) {
         tracing::warn!(
             subject = %policy.name(),
             table = %policy.table_name,
@@ -1351,6 +1413,14 @@ fn store_failure(err: &OpenFgaError) -> UpkeepError {
     }
 }
 
+/// A replay that could not run, which the session holds and asks again.
+fn replay_failure(error: SetupError) -> UpkeepError {
+    UpkeepError::Replay(match error {
+        SetupError::Database(detail) | SetupError::Store(detail) => detail,
+        other => other.to_string(),
+    })
+}
+
 /// One authorization fact that moved, and who it concerned.
 ///
 /// What the watcher hands the session layer: the tables whose read answer
@@ -1449,27 +1519,30 @@ pub trait StoreUpkeep: Send + Sync {
 
     /// The tables whose read answer depends on a relation gated on the
     /// caller's own keys, the set a change of the caller's keys reaches.
-    fn key_tables(&self) -> &[String];
+    fn key_tables(&self) -> Arc<[String]>;
 }
 
 /// The upkeep behind [`FgaAuth`], over the same index it answers from.
 struct FgaUpkeep<Id, Key, T> {
+    generation: Arc<arc_swap::ArcSwap<FgaGeneration<Id, Key, T>>>,
+}
+
+struct FgaUpkeepData<Id, Key, T> {
     shapes: Arc<Shapes<ParserDB>>,
-    /// Re-derives the outputs a replayed query's rows are read through, which
-    /// is the same translation the boot used.
+    /// Replays callers constructed without retained translation outputs.
     translator: Translator,
     /// Runs a replayed query as the deployment and never as a caller, since it
     /// asks what the database now states for everyone.
     facts: FactSource,
     delegate: OpenFgaPolicy<ParserDB, T, ModelSubject<Id, Key>, Postgres>,
     /// What each kind of fact reaches, walked once at startup.
-    reach: GrantReach,
+    reach: Arc<GrantReach>,
     /// How the model spells a person, so a subject can be read back as the
     /// identity a live session carries.
     naming: Arc<SubjectNaming>,
     /// The tables whose read answer depends on a relation gated on the
     /// caller's own keys, walked once at startup and read per key change.
-    key_tables: Vec<String>,
+    key_tables: Arc<[String]>,
 }
 
 impl<Id, Key, T> StoreUpkeep for FgaUpkeep<Id, Key, T>
@@ -1486,8 +1559,14 @@ where
         &'a self,
         event: &'a subql::PgChangeEvent,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<GrantMove>, UpkeepError>> + Send + 'a>> {
+        let generation = self.generation.load_full();
         Box::pin(async move {
-            let (diff, requeries) = match self.shapes.diff(event) {
+            let Some(upkeep) = generation.upkeep.as_ref() else {
+                return Err(UpkeepError::Unanswerable(
+                    "authorization generation has no upkeep".to_owned(),
+                ));
+            };
+            let (diff, requeries) = match upkeep.shapes.diff(event) {
                 Ok(moved) => moved,
                 // A truncate names no row, so nothing single-row moved and
                 // there is nothing here to apply. Everything else means the
@@ -1501,7 +1580,8 @@ where
                 }
                 Err(err) => return Err(UpkeepError::Diff(err.to_string())),
             };
-            self.delegate
+            upkeep
+                .delegate
                 .apply(&diff)
                 .await
                 .map_err(|err| store_failure(&err))?;
@@ -1510,18 +1590,24 @@ where
             // Until they have run the store still states what the change took
             // away, and in the allow direction that is a row handed to
             // somebody whose access has already gone.
-            let replayed = self.reconcile(requeries).await?;
+            let replayed = upkeep
+                .reconcile(requeries, generation.outputs.as_deref())
+                .await?;
             // Read after the store is level, never before: a replacement
             // snapshot produced against the old facts would hand back exactly
             // the rows the change took away.
-            let mut moves = self.moved(event, &diff, &replayed.granted);
+            let mut moves = upkeep.moved(event, &diff, &replayed.granted);
             moves.extend(replayed.moves);
             Ok(moves)
         })
     }
 
-    fn key_tables(&self) -> &[String] {
-        &self.key_tables
+    fn key_tables(&self) -> Arc<[String]> {
+        let generation = self.generation.load();
+        generation
+            .upkeep
+            .as_ref()
+            .map_or_else(|| Arc::from([]), |upkeep| Arc::clone(&upkeep.key_tables))
     }
 }
 
@@ -1685,7 +1771,7 @@ struct ConnettoReplayer<'a> {
 }
 
 impl Replayer for ConnettoReplayer<'_> {
-    type Error = UpkeepError;
+    type Error = SetupError;
 
     fn replay(
         &self,
@@ -1697,34 +1783,33 @@ impl Replayer for ConnettoReplayer<'_> {
         let sql = member.sql().to_owned();
         let has_condition = member.condition().is_some();
         async move {
-            let mut conn = pool
+            let mut connection = pool
                 .get()
                 .await
-                .map_err(|err| UpkeepError::Replay(err.to_string()))?;
+                .map_err(|error| SetupError::Database(error.to_string()))?;
             let rows = if has_condition {
                 TupleRows::Conditional(
                     sql_query(&sql)
-                        .load::<WideRow>(&mut *conn)
+                        .load::<WideRow>(&mut *connection)
                         .await
-                        .map_err(|err| UpkeepError::Replay(err.to_string()))?,
+                        .map_err(live::query_error)?,
                 )
             } else {
                 TupleRows::Plain(
                     sql_query(&sql)
-                        .load::<PlainRow>(&mut *conn)
+                        .load::<PlainRow>(&mut *connection)
                         .await
-                        .map_err(|err| UpkeepError::Replay(err.to_string()))?,
+                        .map_err(live::query_error)?,
                 )
             };
             let mut records = Vec::new();
-            rows.read_into(outputs, &mut records)
-                .map_err(|err| UpkeepError::Replay(err.to_string()))?;
+            rows.read_into(outputs, &mut records)?;
             Ok(records)
         }
     }
 }
 
-impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
+impl<Id, Key, T> FgaUpkeepData<Id, Key, T> {
     /// Replay every query this difference asks for and reconcile the store
     /// against what came back, reporting what that may have moved.
     ///
@@ -1745,7 +1830,11 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
     ///
     /// [`UpkeepError::Replay`] when the query cannot be run or its rows cannot
     /// be read, and [`UpkeepError::Write`] when the reconcile is refused.
-    async fn reconcile(&self, requeries: Requeries<'_, Postgres>) -> Result<Replayed, UpkeepError>
+    async fn reconcile(
+        &self,
+        requeries: Requeries<'_, Postgres>,
+        live_outputs: Option<&rls2fga::translator::Outputs>,
+    ) -> Result<Replayed, UpkeepError>
     where
         Id: Display + Send + Sync,
         Key: CapabilityKey,
@@ -1760,20 +1849,23 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
         if requeries.is_empty() {
             return Ok(Replayed::default());
         }
-        let outputs = self
-            .translator
-            .translate(self.shapes.catalog())
-            .map_err(|err| UpkeepError::Replay(err.to_string()))?
-            .outputs_accepting_gaps();
+        let translated;
+        let outputs = if let Some(outputs) = live_outputs {
+            outputs
+        } else {
+            translated = self
+                .translator
+                .translate(self.shapes.catalog())
+                .map_err(|error| UpkeepError::Replay(error.to_string()))?
+                .outputs_accepting_gaps();
+            &translated
+        };
         let pool = &self.facts.0;
         let mut conn = pool
             .get()
             .await
             .map_err(|err| UpkeepError::Replay(err.to_string()))?;
-        let replayer = ConnettoReplayer {
-            pool,
-            outputs: &outputs,
-        };
+        let replayer = ConnettoReplayer { pool, outputs };
         let mut outcome = Replayed::default();
         for requery in requeries.as_slice() {
             match requery {
@@ -1795,8 +1887,8 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
                         )
                     };
                     let mut records = Vec::new();
-                    rows.read_into(&outputs, &mut records)
-                        .map_err(|err| UpkeepError::Replay(err.to_string()))?;
+                    rows.read_into(outputs, &mut records)
+                        .map_err(replay_failure)?;
                     let report = self
                         .delegate
                         .reconcile_records(k, &records)
@@ -1819,7 +1911,9 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
                         .await
                         // A query that cannot run is a replay failure, which an operator acts on differently.
                         .map_err(|err| match err {
-                            subql::visibility::openfga::ReconcileError::Replay(inner) => inner,
+                            subql::visibility::openfga::ReconcileError::Replay(inner) => {
+                                replay_failure(inner)
+                            }
                             subql::visibility::openfga::ReconcileError::Store(inner) => {
                                 store_failure(&inner)
                             }
@@ -1963,9 +2057,10 @@ mod tests {
     use subql::visibility::RowView;
 
     use super::{
-        BTreeMap, Body, FactSource, FgaAuth, GrantHolder, GrantMove, GrpcService, ModelSubject,
-        OpenFgaError, OpenFgaPolicy, OpenFgaServiceClient, ParserDB, Principal, ProtoModel,
-        Reconciled, SubjectNaming, Translated, UpkeepError, VisibilityPolicy, WithdrawnFact,
+        BTreeMap, Body, FactSource, FgaAuth, GrantHolder, GrantMove, GrantReach, GrpcService,
+        ModelSubject, OpenFgaError, OpenFgaPolicy, OpenFgaServiceClient, ParserDB, Principal,
+        ProtoModel, Reconciled, SubjectNaming, Translated, Translator, UpkeepError,
+        VisibilityPolicy, WithdrawnFact,
     };
 
     /// The shape every connetto table carries: one permissive policy whose
@@ -2001,7 +2096,7 @@ mod tests {
 
     fn translated(policies: &str) -> Translated {
         Translated::of::<String, crate::defaults::ConnettoDefaults>(
-            connetto_schema::Documents::new(
+            connetto_translate::Documents::new(
                 SCHEMA,
                 policies,
                 connetto_test_harness::FIXTURE_ROLES,
@@ -2097,6 +2192,13 @@ mod tests {
                 _ => Ok(Value::Missing),
             }
         }
+
+        fn list_at(
+            &self,
+            _column: subql::ColumnId,
+        ) -> Result<subql::backend::ArrayCell<Postgres>, subql::ValueError> {
+            Ok(subql::backend::ArrayCell::Missing)
+        }
     }
 
     /// A transport that never answers, so a question that reaches it gets no
@@ -2171,6 +2273,75 @@ mod tests {
             id: "model".to_owned(),
             ..translated.described().expect("the description converts")
         }
+    }
+
+    #[tokio::test]
+    async fn authorization_question_keeps_its_generation_across_replacement() {
+        use subql::visibility::Verdict;
+
+        let executor = |policy| {
+            let translated = translated(policy);
+            let model = installed(&translated);
+            let naming = translated.naming();
+            let (shapes, translator, _reach) = translated.into_parts();
+            let outputs = Arc::new(
+                translator
+                    .translate(shapes.catalog())
+                    .expect("the policy translates")
+                    .outputs_accepting_gaps(),
+            );
+            let delegate = OpenFgaPolicy::new(
+                Arc::clone(&shapes),
+                OpenFgaServiceClient::new(Never),
+                "store",
+                &model,
+            )
+            .expect("the policy index is usable");
+            FgaAuth::new(shapes, delegate, naming).with_outputs(&outputs)
+        };
+        let auth: FgaAuth<String, String, Never> = executor(OWN_SHAPE);
+        let generation = auth.generation.load_full();
+        let notes =
+            catalog_helpers::table_id::<Postgres, _>(generation.inner.shapes().catalog(), "notes")
+                .expect("notes is in the catalog");
+        let row = SessionOrderRow {
+            table: notes,
+            owner: "alice",
+        };
+        let watchers = [Arc::new(caller_alice())];
+        let mut verdicts = [Verdict::Deny];
+        let question = auth.may_see(&row, &watchers, &mut verdicts);
+        let replacement = executor("CREATE POLICY notes_p ON notes FOR ALL USING (false)");
+        let replacement_generation = replacement.generation.load_full();
+        let replacement_outputs = Arc::clone(
+            replacement_generation
+                .outputs
+                .as_ref()
+                .expect("live outputs are attached"),
+        );
+        auth.replace_from(&replacement);
+        tokio::time::timeout(std::time::Duration::from_secs(1), question)
+            .await
+            .expect("the old question is local")
+            .expect("the question succeeds");
+        assert_eq!(verdicts, [Verdict::Allow]);
+        verdicts = [Verdict::Deny];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            auth.may_see(&row, &watchers, &mut verdicts),
+        )
+        .await
+        .expect("the new question is local")
+        .expect("the question succeeds");
+        assert_eq!(verdicts, [Verdict::Deny]);
+        assert!(Arc::ptr_eq(
+            auth.generation
+                .load()
+                .outputs
+                .as_ref()
+                .expect("outputs survive replacement"),
+            &replacement_outputs,
+        ));
     }
 
     /// A row named by the engine's table order, the registry tables included, must be
@@ -2249,7 +2420,7 @@ mod tests {
     /// really writes.
     fn share_records(viewer: &'static str) -> (Arc<SubjectNaming>, Vec<Record>) {
         let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
-            connetto_schema::Documents::new(
+            connetto_translate::Documents::new(
                 SHARE_SCHEMA,
                 SHARE_POLICY,
                 connetto_test_harness::FIXTURE_ROLES,
@@ -2515,7 +2686,7 @@ mod tests {
     #[test]
     fn a_table_with_no_policy_at_all_grants_everybody_without_a_round_trip() {
         let shapes = Translated::of::<String, crate::defaults::ConnettoDefaults>(
-            connetto_schema::Documents::new(
+            connetto_translate::Documents::new(
                 "CREATE TABLE orders (id INT PRIMARY KEY, quantity BIGINT NOT NULL);",
                 "",
                 connetto_test_harness::FIXTURE_ROLES,
@@ -2540,7 +2711,7 @@ mod tests {
     #[test]
     fn a_policy_with_no_translation_refuses_startup() {
         let refused = Translated::of::<String, crate::defaults::ConnettoDefaults>(
-            connetto_schema::Documents::new(
+            connetto_translate::Documents::new(
                 SCHEMA,
                 "CREATE FUNCTION mystery_function(who TEXT) RETURNS BOOLEAN LANGUAGE plpgsql \
                  AS $$ BEGIN RETURN who IS NOT NULL; END $$; \
@@ -2563,7 +2734,7 @@ mod tests {
     #[test]
     fn a_reader_role_the_roles_document_never_creates_refuses_startup() {
         let refused = Translated::of::<String, crate::defaults::ConnettoDefaults>(
-            connetto_schema::Documents::new(
+            connetto_translate::Documents::new(
                 "CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT);",
                 "",
                 "CREATE ROLE someone_else LOGIN;",
@@ -2595,7 +2766,7 @@ mod tests {
         }
 
         let refused = Translated::of::<OnIdentity, crate::defaults::ConnettoDefaults>(
-            connetto_schema::Documents::new(
+            connetto_translate::Documents::new(
                 "CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT);",
                 "",
                 connetto_test_harness::FIXTURE_ROLES,
@@ -2604,7 +2775,14 @@ mod tests {
             true,
         );
         assert!(matches!(refused, Err(super::SetupError::Catalog(_))));
-        assert!(crate::CallerMappings::of::<OnIdentity>("app_reader").is_err());
+        assert!(
+            crate::CallerMappings::of::<OnIdentity>(
+                "app_reader",
+                connetto_core::KindRoles::defaults(),
+                connetto_core::auth::UnsetSettings::ALWAYS_BOUND,
+            )
+            .is_err()
+        );
     }
 
     /// A share written as a row of a join table, whose facts travel as a query
@@ -2645,7 +2823,7 @@ mod tests {
     #[test]
     fn a_share_written_as_a_join_table_row_boots_since_the_upstream_repair() {
         let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
-            connetto_schema::Documents::new(
+            connetto_translate::Documents::new(
                 SHARE_SCHEMA,
                 SHARE_POLICY,
                 connetto_test_harness::FIXTURE_ROLES,
@@ -2660,20 +2838,13 @@ mod tests {
         );
     }
 
-    /// The narrowing has a floor, and it is not where connetto used to draw it.
-    ///
-    /// A grant read out of a list column is settled from one row, so the old
-    /// guard waved it through, and yet no row image can answer it and it
-    /// carries no query to fall back on, so nothing can ever withdraw it.
-    /// **That is the leak the old question missed**, and `R86` is why it is
-    /// caught: subql reports the shape as one it cannot keep current, and the
-    /// boot refuses on that report rather than on a derivation.
-    ///
-    /// The shape this test used to name, a share row carrying a predicate only
-    /// SQL can evaluate, now boots. It has a query to replay and a slice of its
-    /// own, so the reconcile keeps it current.
-    #[test]
-    fn a_grant_read_from_a_list_column_refuses_startup() {
+    /// A grant read out of a list column is decided from the row's own list, so
+    /// the boot serves it, a row whose list names the caller shows to them, and
+    /// the same row once its list drops the caller is withdrawn from them.
+    #[tokio::test]
+    async fn a_grant_read_from_a_list_column_follows_the_rows_list() {
+        use subql::visibility::Verdict;
+
         const SCHEMA: &str = "
             CREATE TABLE papers(id INTEGER PRIMARY KEY, owner TEXT, viewers TEXT[]);
             ALTER TABLE papers ENABLE ROW LEVEL SECURITY;
@@ -2681,40 +2852,59 @@ mod tests {
         const POLICY: &str = "CREATE POLICY papers_p ON papers FOR SELECT USING (\
             current_setting('app.user_id', true) = ANY(viewers))";
 
-        let Err(super::SetupError::Unwithdrawable(named)) =
-            Translated::of::<String, crate::defaults::ConnettoDefaults>(
-                connetto_schema::Documents::new(
-                    SCHEMA,
-                    POLICY,
-                    connetto_test_harness::FIXTURE_ROLES,
-                    connetto_test_harness::FIXTURE_READER,
+        let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
+            connetto_translate::Documents::new(
+                SCHEMA,
+                POLICY,
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
+            ),
+            true,
+        )
+        .expect("a grant decided from the row's list boots");
+        let model = installed(&translated);
+        let naming = translated.naming();
+        let outputs = translated.outputs_arc();
+        let (shapes, _translator, _reach) = translated.into_parts();
+        let delegate = OpenFgaPolicy::new(
+            Arc::clone(&shapes),
+            OpenFgaServiceClient::new(Never),
+            "store",
+            &model,
+        )
+        .expect("the policy index is usable");
+        let auth: FgaAuth<String, String, Never> =
+            FgaAuth::new(Arc::clone(&shapes), delegate, naming).with_outputs(&outputs);
+        let papers = catalog_helpers::table_id::<Postgres, _>(shapes.catalog(), "papers")
+            .expect("papers is in the catalog");
+        let watchers = [Arc::new(caller_alice())];
+        for (viewers, expected) in [
+            (r#"["bob","alice"]"#, Verdict::Allow),
+            (r#"["bob",null]"#, Verdict::Deny),
+        ] {
+            let row = [
+                Value::Int(1),
+                Value::String("bob".to_owned()),
+                Value::String(viewers.to_owned()),
+            ];
+            let mut verdicts = [Verdict::Deny];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                auth.may_see(
+                    &crate::row_view::ValuesRow::new(shapes.catalog(), papers, &row),
+                    &watchers,
+                    &mut verdicts,
                 ),
-                true,
             )
-        else {
-            panic!(
-                "nothing can withdraw this grant, so it must stop the server rather than \
-                 serve access the database has taken away"
-            );
-        };
-        assert!(
-            named.contains("papers"),
-            "the refusal names the table an operator has to change: {named}"
-        );
-        // The refusal is as wide as the gap is today rather than as wide as it
-        // has to be, so the message says the boot will start working again. An
-        // operator reading only the sentence concludes the shape is permanently
-        // unsupported and rewrites a schema that did not need it.
-        let shown = super::SetupError::Unwithdrawable(named).to_string();
-        assert!(
-            shown.contains("upstream repair"),
-            "the message an operator sees has to say the refusal narrows later, not only \
-             the rustdoc they never read: {shown}"
-        );
+            .await
+            .expect("the row's list answers without the store")
+            .expect("the question succeeds");
+            assert_eq!(verdicts, [expected], "viewers {viewers}");
+        }
     }
 
-    /// The other side of the same floor: a share carrying a residual predicate
-    /// boots now, because its replay has a slice to reconcile.
+    /// A share carrying a residual predicate boots, because its replay has a
+    /// slice to reconcile.
     #[test]
     fn a_share_with_a_residual_predicate_boots_since_the_reconcile() {
         const SCHEMA: &str = "
@@ -2729,7 +2919,7 @@ mod tests {
               AND s.weight > (SELECT avg(weight) FROM paper_shares)))";
 
         let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
-            connetto_schema::Documents::new(
+            connetto_translate::Documents::new(
                 SCHEMA,
                 POLICY,
                 connetto_test_harness::FIXTURE_ROLES,
@@ -2762,7 +2952,7 @@ mod tests {
               AND s.viewer = current_setting('app.user_id', true) \
               AND s.weight > (SELECT avg(weight) FROM item_share)))";
         let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
-            connetto_schema::Documents::new(
+            connetto_translate::Documents::new(
                 SCHEMA,
                 POLICY,
                 connetto_test_harness::FIXTURE_ROLES,
@@ -2813,7 +3003,7 @@ mod tests {
 
         let Err(super::SetupError::Unplannable(detail)) =
             Translated::of::<String, crate::defaults::ConnettoDefaults>(
-                connetto_schema::Documents::new(
+                connetto_translate::Documents::new(
                     SCHEMA,
                     POLICY,
                     connetto_test_harness::FIXTURE_ROLES,
@@ -2839,10 +3029,6 @@ mod tests {
     /// keep different names, and the set names the gated one alone.
     #[tokio::test]
     async fn key_tables_names_the_tables_gated_on_the_callers_keys() {
-        use diesel_async::AsyncPgConnection;
-        use diesel_async::pooled_connection::AsyncDieselConnectionManager;
-        use diesel_async::pooled_connection::bb8::Pool;
-
         const SCHEMA: &str = "
             CREATE TABLE papers(id INTEGER PRIMARY KEY, owner TEXT);
             ALTER TABLE papers ENABLE ROW LEVEL SECURITY;
@@ -2853,44 +3039,120 @@ mod tests {
             owner = ANY(string_to_array(current_setting('app.subjects', true), ','))); \
             CREATE POLICY journal_p ON journal FOR SELECT USING (\
             author = current_setting('app.user_id', true))";
-
-        let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
-            connetto_schema::Documents::new(
-                SCHEMA,
-                POLICIES,
-                connetto_test_harness::FIXTURE_ROLES,
-                connetto_test_harness::FIXTURE_READER,
-            ),
-            true,
-        )
-        .expect("both policies are one rls2fga classifies");
-        let naming = translated.naming();
-        let model = installed(&translated);
-        let (shapes, translator, reach) = translated.into_parts();
-        let delegate: OpenFgaPolicy<ParserDB, Never, ModelSubject<String, String>, Postgres> =
-            OpenFgaPolicy::new(
-                Arc::clone(&shapes),
-                OpenFgaServiceClient::new(Never),
-                "store",
-                &model,
+        let translated = |policies| {
+            Translated::of::<String, crate::defaults::ConnettoDefaults>(
+                connetto_translate::Documents::new(
+                    SCHEMA,
+                    policies,
+                    connetto_test_harness::FIXTURE_ROLES,
+                    connetto_test_harness::FIXTURE_READER,
+                ),
+                true,
             )
-            .expect("the index is usable");
-        let auth: FgaAuth<String, String, Never> = FgaAuth::new(shapes, delegate, naming);
-        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
-            "postgres://nobody@127.0.0.1:9/none".to_owned(),
-        );
-        let pool = Pool::builder()
-            .max_size(1)
-            .build(manager)
-            .await
-            .expect("the pool builds even though it connects nowhere");
-        let upkeep = auth.upkeep(reach, translator, FactSource::owner(pool));
+            .expect("every policy here is one rls2fga classifies")
+        };
+
+        let (auth, reach, translator) = unanswered(translated(POLICIES));
+        let upkeep = auth.upkeep(reach, translator, unreachable_facts().await);
         assert_eq!(
-            upkeep.key_tables(),
+            upkeep.key_tables().as_ref(),
             ["papers".to_owned()],
             "the papers arm is the one the caller's own keys complete, so a \
              change of the set reaches papers and no other table"
         );
+        let previous = auth.generation.load_full();
+        let previous_tables = upkeep.key_tables();
+        let (replacement, reach, translator) = unanswered(translated(
+            "CREATE POLICY journal_p ON journal FOR SELECT USING (author = ANY(string_to_array(current_setting('app.subjects', true), ',')))",
+        ));
+        let facts = previous
+            .upkeep
+            .as_ref()
+            .expect("upkeep is installed")
+            .facts
+            .clone();
+        let replacement_upkeep = replacement.upkeep(reach, translator, facts);
+        let next = replacement.generation.load_full();
+        auth.replace_from(&replacement);
+        assert!(Arc::ptr_eq(&auth.generation.load_full(), &next));
+        assert!(!Arc::ptr_eq(&previous, &next));
+        assert_eq!(upkeep.key_tables().as_ref(), ["journal".to_owned()]);
+        assert_eq!(replacement_upkeep.key_tables(), upkeep.key_tables());
+        assert_eq!(previous_tables.as_ref(), ["papers".to_owned()]);
+        assert_eq!(
+            previous
+                .upkeep
+                .as_ref()
+                .expect("previous upkeep remains")
+                .key_tables
+                .as_ref(),
+            ["papers".to_owned()]
+        );
+    }
+
+    /// An upkeep whose executor was replaced by one built without upkeep refuses
+    /// every event for good and gates no table on the caller's keys.
+    #[tokio::test]
+    async fn an_upkeep_left_without_one_refuses_every_event() {
+        let (auth, reach, translator) = unanswered(translated(OWN_SHAPE));
+        let upkeep = auth.upkeep(reach, translator, unreachable_facts().await);
+        let (bare, _, _) = unanswered(translated(OWN_SHAPE));
+        auth.replace_from(&bare);
+        assert!(upkeep.key_tables().is_empty());
+        let mut data = pg_walstream::RowData::with_capacity(2);
+        data.push(Arc::from("id"), pg_walstream::ColumnValue::text("1"));
+        data.push(Arc::from("owner"), pg_walstream::ColumnValue::text("ada"));
+        let change = pg_walstream::ChangeEvent::insert(
+            "public",
+            "notes",
+            0,
+            data,
+            pg_walstream::Lsn::new(1),
+        );
+        let event = subql::PgChangeEvent::new(
+            change,
+            subql::PgCommitPosition::new(subql::PgLsn(1), subql::PgXid(1), 1),
+        );
+        assert!(matches!(
+            upkeep.keep_current(&event).await,
+            Err(UpkeepError::Unanswerable(_))
+        ));
+    }
+
+    /// An executor over `translated` whose store never answers, beside the
+    /// reach and translator its upkeep takes.
+    fn unanswered(
+        translated: Translated,
+    ) -> (FgaAuth<String, String, Never>, Arc<GrantReach>, Translator) {
+        let naming = translated.naming();
+        let model = installed(&translated);
+        let (shapes, translator, reach) = translated.into_parts();
+        let delegate = OpenFgaPolicy::new(
+            Arc::clone(&shapes),
+            OpenFgaServiceClient::new(Never),
+            "store",
+            &model,
+        )
+        .expect("the index is usable");
+        (FgaAuth::new(shapes, delegate, naming), reach, translator)
+    }
+
+    /// Facts read through a pool whose database nobody listens on.
+    async fn unreachable_facts() -> FactSource {
+        use diesel_async::AsyncPgConnection;
+        use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+        use diesel_async::pooled_connection::bb8::Pool;
+
+        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            "postgres://nobody@127.0.0.1:9/none".to_owned(),
+        );
+        FactSource::owner(
+            Pool::builder()
+                .max_size(1)
+                .build(manager)
+                .await
+                .expect("the pool builds even though it connects nowhere"),
+        )
     }
 
     /// An unreachable store holds the event for a retry, a model refusal ends the stream.

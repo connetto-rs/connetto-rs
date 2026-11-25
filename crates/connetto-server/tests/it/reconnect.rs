@@ -21,6 +21,7 @@
 //! Reads and seeds go through typed diesel queries, matching the other tests;
 //! DML against the emulated backend stays as SQL strings.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,11 +38,9 @@ use connetto_server::{
     SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, TimelineHistory,
     Unseen, UnseenIds, loopback, pg_write_target,
 };
-use connetto_test_harness::wire_tables::orders_table;
-use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
+use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, SeedSnapshot, WITHHELD_ID};
 use diesel::prelude::*;
 use diesel::sql_query;
-use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 use subql::backend::{CdcEvent, Postgres};
 use subql::visibility::VisibilityPolicy;
 use subql::{
@@ -58,65 +57,6 @@ const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 
 fn test_verifier() -> std::sync::Arc<dyn HandshakeAuthority> {
     std::sync::Arc::new(TestGrantChecker)
-}
-
-/// A snapshot source returning one seed row. Only the full-resync path delivers
-/// it, and that test asserts the frame sequence rather than applying it.
-struct SeedSnapshot;
-
-impl SnapshotSource for SeedSnapshot {
-    type Error = std::convert::Infallible;
-
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "the trait method is async and this body finishes without awaiting"
-    )]
-    async fn estimate(
-        &self,
-        _select_sql: &str,
-        _binds: &[connetto_core::messages::SqliteValue],
-        _caller: &connetto_core::Principal,
-    ) -> Result<SnapshotEstimate, Self::Error> {
-        Ok(SnapshotEstimate {
-            rows: 0.0,
-            width: 0,
-        })
-    }
-
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "the trait method is async and this body finishes without awaiting"
-    )]
-    async fn snapshot_page(
-        &self,
-        _select_sql: &str,
-        _binds: &[connetto_core::messages::SqliteValue],
-        _auth: &connetto_core::Principal,
-        _page: &PageSpec,
-    ) -> Result<SnapshotPage, Self::Error> {
-        let table = orders_table();
-        let insert = Insert::<_, String, Vec<u8>>::from(table)
-            .set(0, Value::Integer(1))
-            .expect("set id")
-            .set(1, Value::Real(1.0))
-            .expect("set price")
-            .set(2, Value::Integer(3))
-            .expect("set quantity")
-            .set(3, Value::Text("seed".to_owned()))
-            .expect("set status");
-        let patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new()
-            .insert(insert)
-            .build();
-        Ok(SnapshotPage {
-            patchset,
-            cursor: Cursor::new(Vec::new()),
-            next: None,
-            filled: false,
-            widest_row: 0,
-            rows: 0,
-            bytes: 0,
-        })
-    }
 }
 
 diesel::table! {
@@ -1011,6 +951,24 @@ impl Oplog for ScriptedOplog {
     async fn readmit(&self, tables: &[String]) -> Result<(), Refused> {
         self.inner
             .readmit(tables)
+            .await
+            .map_err(|never| match never {})
+    }
+
+    async fn rules_fingerprints(&self) -> Result<BTreeMap<String, String>, Refused> {
+        self.inner
+            .rules_fingerprints()
+            .await
+            .map_err(|never| match never {})
+    }
+
+    async fn record_rules(
+        &self,
+        tables: &[String],
+        fingerprints: &BTreeMap<String, String>,
+    ) -> Result<(), Refused> {
+        self.inner
+            .record_rules(tables, fingerprints)
             .await
             .map_err(|never| match never {})
     }
@@ -2279,7 +2237,8 @@ async fn a_fenced_snapshot_replays_a_missed_ceiling_crossing_as_the_unmarked_wit
 /// A `timestamptz` column, the value Postgres holds that the SQLite wire cannot carry.
 const STAMPS_PG: &str = "CREATE TABLE stamps (id INT PRIMARY KEY, at TIMESTAMPTZ NOT NULL);";
 
-/// One insert of order `id` at instant `at`, as the emulator stamps it.
+/// One insert of order `id` at `at`, written as the replica stores the instant,
+/// as the emulator stamps it.
 async fn stamp(source: &mut PgSqliteEmuSource, id: i64, at: &str) -> PgChangeEvent {
     one_change(
         source,
@@ -2302,7 +2261,7 @@ async fn a_fenced_snapshot_that_missed_an_unencodable_transaction_is_refused() {
         RosterAuth::granting("client-a").withholding(WITHHELD_ID),
     );
     let mut source = PgSqliteEmuSource::open_in_memory(STAMPS_PG).expect("open emu source");
-    let held = stamp(&mut source, 1, "2026-01-01 00:00:00+00").await;
+    let held = stamp(&mut source, 1, "2026-01-01 00:00:00.000000+00:00").await;
     let missed = stamp(&mut source, 2, "infinity").await;
     // The value the wire cannot carry, so the fold owes no patch for it and
     // the oplog keeps the event as a marker without a payload.

@@ -76,7 +76,7 @@ async fn term_manager(
         String,
         connetto_server::defaults::ConnettoDefaults,
     >(
-        connetto_schema::Documents::new(
+        connetto_translate::Documents::new(
             &ddl,
             POLICIES,
             connetto_test_harness::FIXTURE_ROLES,
@@ -92,8 +92,12 @@ async fn term_manager(
         Materializer::builder(&ddl)
             .with_translator(translator)
             .with_caller(
-                CallerMappings::of::<String>(connetto_test_harness::FIXTURE_READER)
-                    .expect("the deployment description builds"),
+                CallerMappings::of::<String>(
+                    connetto_test_harness::FIXTURE_READER,
+                    connetto_core::KindRoles::defaults(),
+                    connetto_core::auth::UnsetSettings::ALWAYS_BOUND,
+                )
+                .expect("the deployment description builds"),
             )
             .build()
             .expect("materializer"),

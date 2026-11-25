@@ -13,7 +13,6 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
 use connetto_client::{
     ClientEvent, KeyValue, KeyringAuth, LiveQuery, NativeClient, NativeTransport, SyncSchema,
     provisional::ProvisionalRow,
@@ -35,7 +34,7 @@ pub const APP_BOB: &str = "r77-peer-exchange-bob";
 pub const BOUND: Duration = Duration::from_secs(60);
 /// The instant the orders rows name, arbitrary since the proofs do not read
 /// it back.
-pub const ORDER_INSTANT: i64 = 0;
+pub const ORDER_INSTANT: jiff::Timestamp = jiff::Timestamp::UNIX_EPOCH;
 
 diesel::table! {
     /// The team's note rows, the view the client writes through and reads
@@ -61,8 +60,8 @@ diesel::table! {
         owner_id -> Text,
         /// Item count.
         quantity -> BigInt,
-        /// When the order was written, the replica's text-typed instant.
-        created_at -> diesel::sql_types::TimestamptzSqlite,
+        /// When the order was written, the replica's canonical UTC text.
+        created_at -> rosetta_utc::diesel_impls::TimestampUTC,
     }
 }
 
@@ -79,7 +78,7 @@ diesel::table! {
 /// The translated bundle the builds present.
 pub fn bundle() -> SyncSchema {
     SyncSchema::new(
-        connetto_schema::translate::<String, TextIds>(connetto_schema::Documents::new(
+        connetto_translate::translate::<String, TextIds>(connetto_translate::Documents::new(
             DEMO_DEPLOYMENT.schema,
             DEMO_DEPLOYMENT.policies,
             DEMO_DEPLOYMENT.roles,
@@ -435,8 +434,7 @@ pub async fn write_order<C>(client: &NativeClient<NativeTransport, C>, owner: &s
                 .values((
                     orders::owner_id.eq(owner),
                     orders::quantity.eq(quantity),
-                    orders::created_at.eq(DateTime::<Utc>::from_timestamp(ORDER_INSTANT, 0)
-                        .expect("the instant is in range")),
+                    orders::created_at.eq(rosetta_utc::TimestampUTC::from(ORDER_INSTANT)),
                 ))
                 .execute(conn.conn())
                 .expect("the order is captured")

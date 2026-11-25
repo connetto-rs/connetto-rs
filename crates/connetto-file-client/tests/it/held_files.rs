@@ -118,9 +118,11 @@ fn build(major: u32, ddl: &str) -> SyncSchema {
         SchemaBundle::new(
             format!("{MAJOR_DIRECTIVE} {major}"),
             "",
-            ddl,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                ddl,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             None::<&str>,
         )
         .expect("the source declares its major"),
@@ -291,6 +293,7 @@ async fn connect_pumped(
     device: &str,
     dir: &std::path::Path,
 ) -> Result<(Core, CorePump), ClientError> {
+    connetto_core::logging::install(std::io::stdout, "connetto_client::builder=debug");
     let held = credential(device);
     ClientBuilder::new(schema, router.dialer())
         .with_content(Content::new())

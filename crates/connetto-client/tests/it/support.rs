@@ -91,8 +91,8 @@ impl StoreUpkeep for KeyIndependentUpkeep {
         Box::pin(async { Ok(Vec::new()) })
     }
 
-    fn key_tables(&self) -> &[String] {
-        &[]
+    fn key_tables(&self) -> Arc<[String]> {
+        Arc::from([])
     }
 }
 
@@ -110,9 +110,11 @@ pub fn bundle(ddl: &str) -> SyncSchema {
         SchemaBundle::new(
             SOURCE,
             "",
-            ddl,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                ddl,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            ),
             None::<&str>,
         )
         .expect("the source declares major 1"),
@@ -483,12 +485,14 @@ pub fn key_gated_notes() -> SyncSchema {
         SchemaBundle::new(
             "-- connetto:major 1",
             "",
-            "CREATE TABLE notes (id INTEGER PRIMARY KEY, owner TEXT NOT NULL); \
-         CREATE VIEW visible AS SELECT * FROM notes \
-         WHERE owner = current_app_user() \
-            OR instr(',' || current_app_subjects() || ',', ',' || owner || ',') > 0;",
-            Vec::<(String, String)>::new(),
-            vec!["visible".to_owned()],
+            connetto_core::ReplicaCopy::new(
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY, owner TEXT NOT NULL); \
+                 CREATE VIEW visible AS SELECT * FROM notes \
+                 WHERE owner = current_app_user() \
+        OR instr(',' || current_app_subjects() || ',', ',' || owner || ',') > 0;",
+                Vec::<(String, String)>::new(),
+                vec!["visible".to_owned()],
+            ),
             None::<&str>,
         )
         .expect("the source declares major 1"),
@@ -516,4 +520,30 @@ pub async fn relay_tab() -> (
         .expect("the relay acknowledges the tab");
     let (client, pump) = connetto_client::ConnettoClient::with_pump(conn);
     (client, script, tokio::spawn(pump))
+}
+
+/// Answer subscription `sub_id` with a complete snapshot of one `orders (id,
+/// label)` row, `(1, 'seed')`, as a scripted server does.
+pub async fn send_seed_snapshot<T: Transport>(server: &mut T, sub_id: &str) {
+    use connetto_core::messages::{BulkMessage, SnapshotBegin, SnapshotEnd, SnapshotPatch};
+    server
+        .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
+            sub_id: sub_id.to_owned(),
+        }))
+        .await
+        .expect("snapshot begin");
+    server
+        .send_bulk(BulkMessage::SnapshotPatch(SnapshotPatch {
+            sub_id: sub_id.to_owned(),
+            patchset_zstd: labelled_order_payload(1),
+        }))
+        .await
+        .expect("snapshot patch");
+    server
+        .send_control(ControlMessage::SnapshotEnd(SnapshotEnd {
+            sub_id: sub_id.to_owned(),
+            cursor: connetto_core::Cursor::new(vec![1]),
+        }))
+        .await
+        .expect("snapshot end");
 }

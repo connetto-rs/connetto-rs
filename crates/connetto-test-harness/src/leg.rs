@@ -208,8 +208,8 @@ pub async fn run_leg() -> Result<()> {
     let roles_sql = tokio::fs::read_to_string(demo.join("roles.sql"))
         .await
         .context("reading the demo roles")?;
-    let bundle = connetto_schema::translate::<String, connetto_schema::TextIds>(
-        connetto_schema::Documents::new(
+    let bundle = connetto_translate::translate::<String, connetto_translate::TextIds>(
+        connetto_translate::Documents::new(
             &schema_sql,
             &policies_sql,
             &roles_sql,

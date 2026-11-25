@@ -9,12 +9,15 @@
 //! spawning is the platform layer's job. Every stage ends in the client and
 //! its pump future, or in the connected, unstarted connection a caller
 //! drives frame by frame.
+//!
+//! `RUST_LOG=connetto_client::builder=debug` enables durable startup-stage records.
 
 use core::fmt::Display;
 use core::pin::Pin;
 use core::time::Duration;
 use std::sync::Arc;
 
+use connetto_core::CallerKind;
 use connetto_core::auth::{CapabilityKey, CapabilitySubject};
 use connetto_core::custody::Custody;
 use connetto_core::messages::Grant;
@@ -460,9 +463,8 @@ where
 /// use connetto_client::{ClientBuilder, SyncSchema};
 /// use connetto_core::{LoopbackError, LoopbackTransport, SchemaBundle};
 /// # let bundle = SchemaBundle::new(
-/// #     "-- connetto:major 1", "POLICIES", "DDL",
-/// #     Vec::<(String, String)>::new(),
-/// #     Vec::<String>::new(),
+/// #     "-- connetto:major 1", "POLICIES",
+/// #     connetto_core::ReplicaCopy::new("DDL", Vec::<(String, String)>::new(), Vec::<String>::new()),
 /// #     None::<&str>,
 /// # ).expect("the source declares major 1");
 /// // `connect_with_pump` returns a future. Await it on your platform's
@@ -482,9 +484,8 @@ where
 /// # use connetto_client::{ClientBuilder, Gate, MemoryKeyStore, SyncSchema};
 /// # use connetto_core::{LoopbackError, LoopbackTransport, SchemaBundle};
 /// # let bundle = SchemaBundle::new(
-/// #     "-- connetto:major 1", "POLICIES", "DDL",
-/// #     Vec::<(String, String)>::new(),
-/// #     Vec::<String>::new(),
+/// #     "-- connetto:major 1", "POLICIES",
+/// #     connetto_core::ReplicaCopy::new("DDL", Vec::<(String, String)>::new(), Vec::<String>::new()),
 /// #     None::<&str>,
 /// # ).expect("the source declares major 1");
 /// let builder = ClientBuilder::new(
@@ -498,9 +499,8 @@ where
 /// # use connetto_client::{ClientBuilder, Gate, SyncSchema};
 /// # use connetto_core::{LoopbackError, LoopbackTransport, SchemaBundle};
 /// # let bundle = SchemaBundle::new(
-/// #     "-- connetto:major 1", "POLICIES", "DDL",
-/// #     Vec::<(String, String)>::new(),
-/// #     Vec::<String>::new(),
+/// #     "-- connetto:major 1", "POLICIES",
+/// #     connetto_core::ReplicaCopy::new("DDL", Vec::<(String, String)>::new(), Vec::<String>::new()),
 /// #     None::<&str>,
 /// # ).expect("the source declares major 1");
 /// let builder = ClientBuilder::new(
@@ -566,13 +566,14 @@ where
     }
 
     /// Sign in with a credential the caller already holds, moving the build
-    /// to the signed-in stage.
+    /// to the signed-in stage, whose replica is the signed-in copy.
     ///
     /// The platform layers fork the provider sign-in into their own stores
     /// before reaching this builder, and hand the result here as a held
     /// credential.
     #[must_use]
-    pub fn signed_in(self, credential: HeldCredential) -> CoreSignedIn<T, C> {
+    pub fn signed_in(mut self, credential: HeldCredential) -> CoreSignedIn<T, C> {
+        self.base.schema = self.base.schema.acting_as(CallerKind::Authenticated);
         CoreSignedIn {
             base: self.base,
             credential,
@@ -961,9 +962,23 @@ where
     /// [`ClientError`] on a key, dial, database, or handshake failure, and
     /// [`ClientError::ReplicaKeyMissing`] when the store holds no key for an
     /// existing replica, or for a fresh one on a platform that cannot mint.
+    #[tracing::instrument(
+        name = "client_startup",
+        level = "debug",
+        skip_all,
+        fields(startup_id = tracing::field::Empty)
+    )]
     pub async fn connect_with_pump(
         self,
     ) -> Result<(CoreClient<T, C::Handle>, CorePump), ClientError> {
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let startup_span = tracing::Span::current();
+            if let Some(startup_identifier) = startup_span.id() {
+                startup_span.record("startup_id", startup_identifier.into_u64());
+            }
+        }
+        let log_error = |error: &ClientError| tracing::error!(%error);
+        tracing::debug!(stage = "resolve", "client startup");
         let DurableResolved {
             base,
             name,
@@ -977,9 +992,11 @@ where
             custody,
             gate,
             share_key_store,
-        } = self.resolve().await?;
+        } = self.resolve().await.inspect_err(log_error)?;
+        tracing::debug!(stage = "replica_open", "client startup");
         let replica =
-            open_encrypted_replica(&located.url, &key, !located.exists, ddl.as_ref(), shared)?;
+            open_encrypted_replica(&located.url, &key, !located.exists, ddl.as_ref(), shared)
+                .inspect_err(log_error)?;
         run_core(
             &replica,
             base,
@@ -997,6 +1014,7 @@ where
             },
         )
         .await
+        .inspect_err(log_error)
     }
 
     async fn resolve(self) -> Result<DurableResolved<T, C>, ClientError> {
@@ -1400,6 +1418,7 @@ where
     T::Error: Display,
     S: ReplicaStorage,
 {
+    tracing::debug!(stage = "connection_open", "client startup");
     let mut conn = if fresh {
         ConnettoConnection::open(replica, schema.replica_ddl(), config, None)
     } else {
@@ -1413,22 +1432,28 @@ where
         conn.initialize_share_key_store(store);
     }
     if persistent {
+        tracing::debug!(stage = "share_keys", "client startup");
         conn.prepare_share_keys().await?;
     }
+    tracing::debug!(stage = "dial", "client startup");
     match dialer.connect().await {
-        Ok(transport) => match conn.attach(transport).await {
-            // A handshake that drew no answer, or a writer the attach moved
-            // to a fresh one (R70 decision 21), starts a running client
-            // offline, its reconnect loop redialing.
-            Err(err)
-                if (matches!(err, ClientError::HandshakeUnanswered) || err.is_writer_rebase())
-                    && first_dial == FirstDial::MayFail =>
-            {
-                tracing::warn!(error = %err, "the first attach failed, starting offline");
+        Ok(transport) => {
+            tracing::debug!(stage = "attach", "client startup");
+            match conn.attach(transport).await {
+                // A handshake that drew no answer, or a writer the attach moved
+                // to a fresh one (R70 decision 21), starts a running client
+                // offline, its reconnect loop redialing.
+                Err(err)
+                    if (matches!(err, ClientError::HandshakeUnanswered)
+                        || err.is_writer_rebase())
+                        && first_dial == FirstDial::MayFail =>
+                {
+                    tracing::warn!(error = %err, "the first attach failed, starting offline");
+                }
+                Err(err) => return Err(err),
+                Ok(()) => {}
             }
-            Err(err) => return Err(err),
-            Ok(()) => {}
-        },
+        }
         Err(err) => {
             if err.is_permanent() || first_dial == FirstDial::Required {
                 return Err(dial_error(err));
@@ -1527,11 +1552,14 @@ where
     // Content attaches before the gate arms, since its heal pass reads the
     // replica through the client.
     let content = match content {
-        Some(content) => Some(
-            content
-                .attach(client.clone(), inputs.root_key, inputs.place)
-                .await?,
-        ),
+        Some(content) => {
+            tracing::debug!(stage = "content", "client startup");
+            Some(
+                content
+                    .attach(client.clone(), inputs.root_key, inputs.place)
+                    .await?,
+            )
+        }
         None => None,
     };
     if let Some((gate, mechanism)) = inputs.gate {
@@ -1539,12 +1567,17 @@ where
         // browser's boot waits on its unlock, so nothing the application
         // starts meets the lock. A launch whose sign-in already read the
         // secrets behind the platform's verification asks nothing more.
-        if !mechanism.is_open() && mechanism.ask().await == GateAskOutcome::Dismissed {
-            return Err(ClientError::Locked);
+        if !mechanism.is_open() {
+            tracing::debug!(stage = "gate_prompt", "client startup");
+            if mechanism.ask().await == GateAskOutcome::Dismissed {
+                return Err(ClientError::Locked);
+            }
         }
+        tracing::debug!(stage = "gate_enable", "client startup");
         client.enable_verified_gate(gate.recheck(), mechanism).await;
     }
     let pump: CorePump = Box::pin(pump);
+    tracing::debug!(stage = "complete", "client startup");
     Ok((
         CoreClient {
             client,

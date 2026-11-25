@@ -21,7 +21,7 @@ use super::{
     SnapshotSource,
 };
 use crate::audit::ConnettoAuditSchema;
-use crate::materializer::{ReadConnector, Registration};
+use crate::materializer::ReadConnector;
 use crate::oplog::Oplog;
 use crate::reexec::{FailedRead, ReadBudget};
 use crate::schema::ConnettoSchema;
@@ -449,6 +449,7 @@ where
             let registration = materializer
                 .register_translated(
                     consumer,
+                    None,
                     D::Audit::COURIER_RECEIPT_FILTER_SQL,
                     &[
                         SqliteValue::Integer(question.writer),
@@ -459,10 +460,7 @@ where
                     None,
                 )
                 .map_err(|_| failure)?;
-            let subscription = match registration {
-                Registration::Row(subscription) => subscription,
-                Registration::Computed(capture) => capture.subscription_id,
-            };
+            let subscription = registration.subscription_id();
             entry.insert(Filter {
                 consumer,
                 subscription,

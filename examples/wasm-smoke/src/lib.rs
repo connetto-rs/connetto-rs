@@ -22,7 +22,7 @@ pub const DEMO_POLICIES_SQL: &str = connetto_demo_deployment::POLICIES_SQL;
 
 // The logical-to-physical table map and view list the build's translation
 // produced, as `POLICY_TABLES` and `POLICY_VIEWS`.
-include!(concat!(env!("OUT_DIR"), "/connetto-schema.rs"));
+include!(concat!(env!("OUT_DIR"), "/connetto-translate.rs"));
 
 pub use connetto_demo_deployment::{AUTH_BASE, auth_landing};
 
@@ -108,9 +108,11 @@ pub mod build {
             SchemaBundle::new(
                 "-- connetto:major 1",
                 "",
-                ddl,
-                Vec::<(String, String)>::new(),
-                Vec::<String>::new(),
+                connetto_core::ReplicaCopy::new(
+                    ddl,
+                    Vec::<(String, String)>::new(),
+                    Vec::<String>::new(),
+                ),
                 None::<&str>,
             )
             .expect("the source declares major 1"),

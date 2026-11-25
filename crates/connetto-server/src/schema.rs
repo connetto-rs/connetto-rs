@@ -161,8 +161,8 @@ pub trait ConnettoSchema: Send + Sync + 'static {
 /// Composes the application, registry, bookkeeping and private audit catalog.
 #[must_use]
 pub fn engine_ddl<D: ConnettoSchema>(pg_ddl: &str, devices: bool) -> String {
-    let mut ddl = connetto_schema::with_bookkeeping::<<D::Bots as ConnettoBotSchema>::IdSql>(
-        &connetto_schema::with_registry::<<D::Bots as ConnettoBotSchema>::IdSql>(pg_ddl),
+    let mut ddl = connetto_translate::with_bookkeeping::<<D::Bots as ConnettoBotSchema>::IdSql>(
+        &connetto_translate::with_registry::<<D::Bots as ConnettoBotSchema>::IdSql>(pg_ddl),
         devices,
     );
     ddl.push('\n');
@@ -170,6 +170,8 @@ pub fn engine_ddl<D: ConnettoSchema>(pg_ddl: &str, devices: bool) -> String {
     if !ddl.trim_end().ends_with(';') {
         ddl.push_str("\n;");
     }
+    ddl.push('\n');
+    ddl.push_str(crate::epoch::POLICY_CHANGES_DDL);
     ddl
 }
 
@@ -180,12 +182,12 @@ pub fn engine_ddl<D: ConnettoSchema>(pg_ddl: &str, devices: bool) -> String {
 ///
 /// # Errors
 ///
-/// As [`connetto_schema::cap_policies`].
+/// As [`connetto_translate::cap_policies`].
 pub fn catalog<D: ConnettoSchema>(
-    documents: connetto_schema::Documents<'_>,
+    documents: connetto_translate::Documents<'_>,
     devices: bool,
-) -> Result<String, connetto_schema::SchemaError> {
-    let cap = connetto_schema::cap_policies::<<D::Bots as ConnettoBotSchema>::IdSql>(
+) -> Result<String, connetto_translate::SchemaError> {
+    let cap = connetto_translate::cap_policies::<<D::Bots as ConnettoBotSchema>::IdSql>(
         documents.schema(),
         documents.policies(),
     )?;

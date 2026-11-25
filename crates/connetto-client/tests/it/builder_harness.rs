@@ -200,8 +200,8 @@ async fn builder_anonymous_connect_reads_a_synced_row() {
         .await;
 
     let schema = SyncSchema::new(
-        connetto_schema::translate::<String, connetto_core::bots::TextIds>(
-            connetto_schema::Documents::new(
+        connetto_translate::translate::<String, connetto_core::bots::TextIds>(
+            connetto_translate::Documents::new(
                 PG_DDL,
                 "",
                 connetto_test_harness::FIXTURE_ROLES,
@@ -270,8 +270,8 @@ async fn builder_held_credential_reads_the_callers_own_row() {
             .with_policies(POLICIES)
             .with_session(
                 SessionConfig::new().with_schema_version(Some(
-                    connetto_schema::translate::<String, connetto_core::bots::TextIds>(
-                        connetto_schema::Documents::new(
+                    connetto_translate::translate::<String, connetto_core::bots::TextIds>(
+                        connetto_translate::Documents::new(
                             PG_DDL,
                             POLICIES,
                             connetto_test_harness::FIXTURE_ROLES,
@@ -293,8 +293,8 @@ async fn builder_held_credential_reads_the_callers_own_row() {
         .await;
 
     let schema = SyncSchema::new(
-        connetto_schema::translate::<String, connetto_core::bots::TextIds>(
-            connetto_schema::Documents::new(
+        connetto_translate::translate::<String, connetto_core::bots::TextIds>(
+            connetto_translate::Documents::new(
                 PG_DDL,
                 POLICIES,
                 connetto_test_harness::FIXTURE_ROLES,
@@ -381,8 +381,8 @@ async fn builder_observes_only_committed_courier_receipts_visible_to_its_identit
         connetto_test_harness::provision_audit(fixture.admin()).await;
         insert_courier_receipt(&fixture, &AUTHOR).await;
         let schema = SyncSchema::new(
-            connetto_schema::translate::<String, connetto_core::bots::TextIds>(
-                connetto_schema::Documents::new(
+            connetto_translate::translate::<String, connetto_core::bots::TextIds>(
+                connetto_translate::Documents::new(
                     PG_DDL,
                     "",
                     connetto_test_harness::FIXTURE_ROLES,
@@ -469,8 +469,8 @@ async fn builder_durable_replica_reopens_offline_and_reports_its_custody() {
     let dir = tempdir().expect("a temp dir");
     let store = SharedKeyStore::new();
     let schema = SyncSchema::new(
-        connetto_schema::translate::<String, connetto_core::bots::TextIds>(
-            connetto_schema::Documents::new(
+        connetto_translate::translate::<String, connetto_core::bots::TextIds>(
+            connetto_translate::Documents::new(
                 NOTES_DDL,
                 "",
                 connetto_test_harness::FIXTURE_ROLES,

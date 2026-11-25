@@ -69,6 +69,7 @@ pub mod reach;
 pub mod reexec;
 pub mod reserve;
 pub mod row_view;
+pub mod rules;
 pub mod schema;
 pub mod session;
 pub mod slot;

@@ -22,24 +22,14 @@ const READER: &str =
 
 fn schema(major: u32) -> SyncSchema {
     SyncSchema::new(
-        SchemaBundle::new(
-            format!("{} {major}\n{NOTES}", connetto_core::MAJOR_DIRECTIVE),
-            "",
-            format!(
-                "{NOTES} CREATE TABLE vocabulary_store (id INTEGER PRIMARY KEY, label TEXT NOT NULL); CREATE VIEW vocabulary AS SELECT * FROM vocabulary_store;"
-            ),
-            [("vocabulary", "vocabulary_store")],
-            ["vocabulary"],
-            None::<&str>,
-        )
-        .unwrap()
-        .with_shared_tables(["vocabulary"])
-        .with_shared_layout(SharedLayout::new(
+        SchemaBundle::new(format!("{} {major}\n{NOTES}", connetto_core::MAJOR_DIRECTIVE), "", connetto_core::ReplicaCopy::new(format!(
+            "{NOTES} CREATE TABLE vocabulary_store (id INTEGER PRIMARY KEY, label TEXT NOT NULL); CREATE VIEW vocabulary AS SELECT * FROM vocabulary_store;"
+        ), [("vocabulary", "vocabulary_store")], ["vocabulary"]).with_shared_tables(["vocabulary"]).with_shared_layout(SharedLayout::new(
             format!("{NOTES} {WORDS} {READER}"),
             format!("{NOTES} {READER}"),
             format!("{WORDS} {READER}"),
             READER,
-        )),
+        )), None::<&str>).unwrap(),
     )
 }
 
@@ -607,19 +597,21 @@ async fn a_failed_layout_rolls_back_both_records_and_both_files_data() {
         SchemaBundle::new(
             "-- connetto:major 2",
             "",
-            NOTES,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
+            connetto_core::ReplicaCopy::new(
+                NOTES,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+            )
+            .with_shared_tables(["vocabulary"])
+            .with_shared_layout(SharedLayout::new(
+                "SELECT missing_layout_function()",
+                "",
+                "",
+                "",
+            )),
             None::<&str>,
         )
-        .unwrap()
-        .with_shared_tables(["vocabulary"])
-        .with_shared_layout(SharedLayout::new(
-            "SELECT missing_layout_function()",
-            "",
-            "",
-            "",
-        )),
+        .unwrap(),
     );
     assert!(matches!(
         open(directory.path(), &keys, "alice", broken).await,

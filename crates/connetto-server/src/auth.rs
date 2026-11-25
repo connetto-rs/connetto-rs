@@ -26,7 +26,7 @@ mod rls {
     use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
     use subql::{DatabaseLike, ParserDB, TableLike};
 
-    use crate::capability::CallerBinding;
+    use crate::capability::{BindingSettings, CallerBinding};
     use crate::key_filter::{KeyError, KeyFilter};
     use connetto_core::auth::CapabilityKey;
     use connetto_core::quote_ident;
@@ -124,8 +124,8 @@ mod rls {
     pub struct RlsAuth<Id = String, Key = String> {
         pool: Pool<AsyncPgConnection>,
         catalog: ParserDB,
-        /// The setting a policy reads the caller's identity from.
-        user_setting: std::sync::Arc<str>,
+        /// How a policy reads the caller.
+        binding: BindingSettings,
         caller: PhantomData<fn() -> (Id, Key)>,
     }
 
@@ -151,7 +151,23 @@ mod rls {
         /// already name things its own way can rename both.
         #[must_use]
         pub fn with_user_setting(mut self, setting: impl Into<std::sync::Arc<str>>) -> Self {
-            self.user_setting = setting.into();
+            self.binding = self.binding.with_user(setting.into());
+            self
+        }
+
+        /// Bind `unset` the way the deployment's policies read an absent
+        /// caller, `''` for a setting they may find unset.
+        #[must_use]
+        pub fn with_unset_settings(mut self, unset: connetto_core::auth::UnsetSettings) -> Self {
+            self.binding = self.binding.with_unset(unset);
+            self
+        }
+
+        /// Switch every caller's transaction to the role `kind_roles` names
+        /// for the caller's kind, as the server's reader-side paths do.
+        #[must_use]
+        pub fn with_kind_roles(mut self, kind_roles: connetto_core::KindRoles) -> Self {
+            self.binding = self.binding.with_kind_roles(kind_roles);
             self
         }
 
@@ -164,7 +180,7 @@ mod rls {
             let catalog = ParserDB::parse::<PostgreSqlDialect>(pg_ddl)
                 .map_err(|err| RlsAuthError::Catalog(format!("{err:?}")))?;
             Ok(Self {
-                user_setting: connetto_core::auth::DEFAULT_USER_SETTING.into(),
+                binding: BindingSettings::default(),
                 pool,
                 catalog,
                 caller: PhantomData,
@@ -225,7 +241,7 @@ mod rls {
             caller: &Principal<Id, Key>,
         ) -> Result<bool, RlsAuthError> {
             let query = filter.bind(sql_query(sql.to_owned()).into_boxed::<diesel::pg::Pg>());
-            let binding = CallerBinding::of(caller, std::sync::Arc::clone(&self.user_setting));
+            let binding = CallerBinding::of(caller, &self.binding);
             let mut conn = self
                 .pool
                 .get()
@@ -264,7 +280,7 @@ mod rls {
                 filter.predicate(),
             );
             let query = filter.bind(sql_query(sql).into_boxed::<diesel::pg::Pg>());
-            let binding = CallerBinding::of(caller, std::sync::Arc::clone(&self.user_setting));
+            let binding = CallerBinding::of(caller, &self.binding);
             let mut conn = self
                 .pool
                 .get()

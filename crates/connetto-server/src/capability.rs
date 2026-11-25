@@ -19,10 +19,10 @@ use core::fmt::Display;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use connetto_core::SessionId;
 use connetto_core::auth::{
-    CapabilityKey, CapabilitySubject, ContentCaller, Principal, absent_marker,
+    CapabilityKey, CapabilitySubject, ContentCaller, DEFAULT_USER_SETTING, Principal, UnsetSettings,
 };
+use connetto_core::{KindRoles, SessionId};
 use diesel::sql_types::{Bool, Text};
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use subql::ColumnId;
@@ -140,8 +140,53 @@ pub(crate) fn meter_key<Id: Display, Key: CapabilityKey>(
         .unwrap_or_else(|| run.to_string())
 }
 
+/// How a deployment's policies read the caller: the setting naming the
+/// identity, which of the identity and the subjects may be left unset, and
+/// the role each kind of caller acts as.
+///
+/// One value for every path that binds a caller, so the snapshot, the write
+/// and the visibility check cannot disagree on any of them. A source reading
+/// on the owner pool, past every policy, names no kind roles and stays the
+/// role it logged in as.
+#[derive(Debug, Clone)]
+pub(crate) struct BindingSettings {
+    user: Arc<str>,
+    unset: UnsetSettings,
+    kind_roles: Option<KindRoles>,
+}
+
+impl Default for BindingSettings {
+    fn default() -> Self {
+        Self {
+            user: DEFAULT_USER_SETTING.into(),
+            unset: UnsetSettings::ALWAYS_BOUND,
+            kind_roles: None,
+        }
+    }
+}
+
+impl BindingSettings {
+    /// The same settings, reading the identity from `user`.
+    pub(crate) fn with_user(mut self, user: Arc<str>) -> Self {
+        self.user = user;
+        self
+    }
+
+    /// The same settings, `unset` naming the ones a caller may leave unset.
+    pub(crate) const fn with_unset(mut self, unset: UnsetSettings) -> Self {
+        self.unset = unset;
+        self
+    }
+
+    /// The same settings, each kind acting as the role `kind_roles` names.
+    pub(crate) fn with_kind_roles(mut self, kind_roles: KindRoles) -> Self {
+        self.kind_roles = Some(kind_roles);
+        self
+    }
+}
+
 /// The caller rendered for one RLS transaction, under the setting names this
-/// deployment binds them to.
+/// deployment binds them to and the role its kind acts as.
 ///
 /// Built outside the transaction (the values are owned so the apply future
 /// stays `Send`) and applied as its first statement. Every path that runs SQL
@@ -149,49 +194,79 @@ pub(crate) fn meter_key<Id: Display, Key: CapabilityKey>(
 /// visibility check cannot answer differently about what the caller holds.
 pub(crate) struct CallerBinding {
     caller: ContentCaller,
-    user_setting: Arc<str>,
+    settings: BindingSettings,
     setting: &'static str,
     separator: char,
     bot_list: String,
+    /// The caller's kind role, `None` on a source that names no kind roles.
+    role: Option<Arc<str>>,
 }
 
+/// The value of PostgreSQL's `role` setting that returns a transaction to
+/// its login role, which `RESET ROLE` sets.
+const NO_ROLE: &str = "none";
+
 impl CallerBinding {
-    /// Render `caller` under the deployment's key binding, naming the identity
-    /// setting `user_setting`.
+    /// Render `caller` under the deployment's key binding and `settings`.
     pub(crate) fn of<Id: Display, Key: CapabilityKey>(
         caller: &Principal<Id, Key>,
-        user_setting: Arc<str>,
+        settings: &BindingSettings,
     ) -> Self {
         Self {
             caller: rendered_caller(caller),
-            user_setting,
+            settings: settings.clone(),
             setting: Key::SETTING,
             separator: Key::SEPARATOR,
             bot_list: bot_list_for(caller),
+            role: settings
+                .kind_roles
+                .as_ref()
+                .map(|roles| roles.shared_role(caller.kind())),
         }
     }
 
-    /// Bind all three values for the rest of the transaction, in one statement.
-    ///
-    /// All the settings are always bound, a half the caller does not hold
-    /// taking [`absent_marker`], and the bot list the one value
-    /// [`bot_list_for`] reads for the caller. Leaving one unbound would read
-    /// as `''` rather than NULL to the next caller on a pooled connection,
-    /// which is the blank identity chapter 08 forbids.
-    pub(crate) async fn apply(self, conn: &mut AsyncPgConnection) -> diesel::QueryResult<()> {
-        let user_setting = self.user_setting.to_string();
-        let subjects = self
-            .caller
-            .packed_subjects(self.separator)
-            .unwrap_or_else(|| absent_marker().to_owned());
+    /// The role the transaction acts as, the login role when the source
+    /// names no kind roles.
+    fn role(&self) -> &str {
+        self.role.as_deref().unwrap_or(NO_ROLE)
+    }
+
+    /// The identity and the packed subjects to bind, a half the caller does
+    /// not hold taking the value its declaration reads as absent.
+    fn values(&self) -> (String, String) {
+        let unset = self.settings.unset;
         let user = self
             .caller
             .identity()
-            .map_or_else(|| absent_marker().to_owned(), ToOwned::to_owned);
+            .unwrap_or_else(|| unset.absent_user())
+            .to_owned();
+        let subjects = self
+            .caller
+            .packed_subjects(self.separator)
+            .unwrap_or_else(|| unset.absent_subjects().to_owned());
+        (user, subjects)
+    }
+
+    /// Bind all three values and switch to the caller's kind role for the
+    /// rest of the transaction, in one statement.
+    ///
+    /// All the settings are always bound. A half the caller does not hold
+    /// takes `''` when the deployment declared it may be unset, and the
+    /// absent marker otherwise. The bot list is the one value
+    /// [`bot_list_for`] reads for the caller. Leaving one unbound would read
+    /// as `''` to the next caller on a pooled connection, which a policy not
+    /// declared to expect it must never see. The role is set as `SET LOCAL
+    /// ROLE` sets it, so PostgreSQL holds every later statement to the kind's
+    /// grants and policies until the transaction ends or
+    /// [`reset_role`] returns it to the reader.
+    pub(crate) async fn apply(self, conn: &mut AsyncPgConnection) -> diesel::QueryResult<()> {
+        let (user, subjects) = self.values();
+        let role = self.role().to_owned();
         diesel::select((
-            set_config(user_setting, user, true),
+            set_config(self.settings.user.to_string(), user, true),
             set_config(self.setting, subjects, true),
             set_config(connetto_core::BOT_LIST_SETTING, self.bot_list, true),
+            set_config("role", role, true),
         ))
         .execute(conn)
         .await
@@ -208,18 +283,12 @@ impl CallerBinding {
         fn quoted(value: &str) -> String {
             value.replace('\'', "''")
         }
-        let marker = absent_marker();
-        let subjects = self
-            .caller
-            .packed_subjects(self.separator)
-            .unwrap_or_else(|| marker.to_owned());
+        let (user, subjects) = self.values();
         [
-            (
-                &*self.user_setting,
-                self.caller.identity().unwrap_or(marker),
-            ),
+            (&*self.settings.user, user.as_str()),
             (self.setting, subjects.as_str()),
             (connetto_core::BOT_LIST_SETTING, self.bot_list.as_str()),
+            ("role", self.role()),
         ]
         .into_iter()
         .map(|(setting, value)| {
@@ -236,6 +305,15 @@ impl CallerBinding {
     pub(crate) fn binds_a_caller(&self) -> bool {
         self.caller.identity().is_some() || !self.caller.subjects().is_empty()
     }
+}
+
+/// Return the transaction to the reader role it logged in as, the role
+/// connetto's bookkeeping is granted to, keeping the caller's settings bound.
+pub(crate) async fn reset_role(conn: &mut AsyncPgConnection) -> diesel::QueryResult<()> {
+    diesel::select(set_config("role", NO_ROLE, true))
+        .execute(conn)
+        .await
+        .map(drop)
 }
 
 /// The write verbs a share certifies, beside the reading every share certifies.
@@ -559,7 +637,7 @@ impl<P, R, Id> CapabilityIssuer<P, R, Id> {
             table: table.to_owned(),
         };
         let row = row.ok_or_else(unauthorized)?;
-        let view = ValuesRow::new(row.table_id, &row.values);
+        let view = ValuesRow::new(self.rows.catalog(), row.table_id, &row.values);
         let watchers = [Arc::new(caller.clone())];
         let mut verdicts = Vec::new();
         Verdict::reset(&mut verdicts, watchers.len());
@@ -767,6 +845,89 @@ mod tests {
             bot_list_for(&bot),
             "t:read,t:insert",
             "a caller holding a list carries its own text"
+        );
+    }
+
+    /// A caller holding nothing binds `''` for exactly the halves the
+    /// deployment declared may be unset, and the absent marker for the rest.
+    #[test]
+    fn an_absent_half_binds_as_its_declaration_reads_it() {
+        let anonymous: Principal =
+            Principal::unidentified(SessionId::from_uuid(uuid::Uuid::from_bytes([7; 16])));
+        let marker = connetto_core::auth::absent_marker();
+        let bound = |unset: UnsetSettings| {
+            CallerBinding::of(&anonymous, &BindingSettings::default().with_unset(unset))
+                .setup_statements()
+        };
+        let statement =
+            |setting: &str, value: &str| format!("SELECT set_config('{setting}', '{value}', true)");
+        for (unset, user, subjects) in [
+            (UnsetSettings::ALWAYS_BOUND, marker, marker),
+            (UnsetSettings::ALWAYS_BOUND.with_user(), "", marker),
+            (UnsetSettings::ALWAYS_BOUND.with_subjects(), marker, ""),
+            (
+                UnsetSettings::ALWAYS_BOUND.with_user().with_subjects(),
+                "",
+                "",
+            ),
+        ] {
+            assert_eq!(
+                bound(unset),
+                [
+                    statement(DEFAULT_USER_SETTING, user),
+                    statement(<String as CapabilityKey>::SETTING, subjects),
+                    statement(
+                        connetto_core::BOT_LIST_SETTING,
+                        connetto_core::BOT_LIST_WILDCARD
+                    ),
+                    statement("role", NO_ROLE),
+                ],
+                "{unset:?}"
+            );
+        }
+    }
+
+    /// A caller is bound as its kind's role, anonymous until a login
+    /// resolves, and a source without kind roles stays the role it logged in
+    /// as.
+    #[test]
+    fn the_binding_acts_as_the_callers_kind_role() {
+        use connetto_core::CallerKind;
+        use connetto_core::auth::{AuthContext, Subject, VerifiedSession};
+
+        let session = SessionId::from_uuid(uuid::Uuid::from_bytes([9; 16]));
+        let anonymous: Principal = Principal::unidentified(session);
+        let mut signed_in: Principal = Principal::unidentified(session);
+        signed_in
+            .accept(Subject::Identity(VerifiedSession {
+                context: AuthContext::new("alice"),
+                session_id: session,
+                bot_list: None,
+            }))
+            .expect("one identity is accepted");
+        let renamed = KindRoles::defaults()
+            .clone()
+            .with_role(CallerKind::Authenticated, "app_signed_in");
+        let role = |caller: &Principal, settings: &BindingSettings| {
+            CallerBinding::of(caller, settings)
+                .setup_statements()
+                .last()
+                .cloned()
+                .expect("the role is bound last")
+        };
+        let kinds = BindingSettings::default().with_kind_roles(renamed);
+        assert_eq!(
+            role(&anonymous, &kinds),
+            "SELECT set_config('role', 'anon', true)"
+        );
+        assert_eq!(
+            role(&signed_in, &kinds),
+            "SELECT set_config('role', 'app_signed_in', true)"
+        );
+        assert_eq!(
+            role(&signed_in, &BindingSettings::default()),
+            "SELECT set_config('role', 'none', true)",
+            "an owner-pool source binds no kind"
         );
     }
 }

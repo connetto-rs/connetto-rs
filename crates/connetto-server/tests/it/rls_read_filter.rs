@@ -56,7 +56,7 @@ async fn ask(
         .expect("the catalog parses");
     let table_id = catalog_helpers::table_id::<Postgres, _>(&catalog, table)
         .expect("the table is in the catalog");
-    let row = ValuesRow::new(table_id, key);
+    let row = ValuesRow::new(&catalog, table_id, key);
     let watchers = [Arc::new(principal)];
     let mut verdicts = Vec::new();
     Verdict::reset(&mut verdicts, watchers.len());

@@ -12,6 +12,7 @@
     reason = "the test walks its scenario in order and a split would hide the sequence"
 )]
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use connetto_core::PROTOCOL_VERSION;
@@ -825,6 +826,7 @@ async fn fresh_oplog(pool: &Pool<AsyncPgConnection>, table: &str, config: OplogC
         table.to_owned(),
         PgOplog::commit_table(table),
         PgOplog::xid_table(table),
+        PgOplog::rules_table(table),
     ] {
         sql_query(format!("DROP TABLE IF EXISTS {drop}"))
             .execute(&mut *conn)
@@ -968,6 +970,79 @@ async fn pg_oplog_keeps_the_later_of_two_recorded_commits() {
     for drop in [
         "connetto_oplog_commits".to_owned(),
         PgOplog::commit_table("connetto_oplog_commits"),
+    ] {
+        sql_query(format!("DROP TABLE IF EXISTS {drop}"))
+            .execute(&mut *conn)
+            .await
+            .expect("drop oplog table");
+    }
+}
+
+/// Rules records land where the change stream resumes, carrying their own verb,
+/// and each table's fingerprint is replaced without touching the others.
+#[tokio::test]
+async fn pg_oplog_records_rules_at_the_resume_position_and_upserts_fingerprints() {
+    const TABLE: &str = "connetto_oplog_rules";
+    let fixture = Fixture::acquire().await;
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(fixture.admin_url());
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    let oplog = fresh_oplog(&pool, TABLE, OplogConfig::default().with_max_entries(100)).await;
+
+    let first = BTreeMap::from([("orders".to_owned(), "first".to_owned())]);
+    oplog
+        .record_rules(&["orders".to_owned()], &first)
+        .await
+        .expect("record before any commit");
+    assert_eq!(oplog.rules_fingerprints().await.expect("read"), first);
+    assert_eq!(
+        oplog.current_position().await.expect("position"),
+        None,
+        "a log that never recorded a commit gets no record, since every resume from it resyncs"
+    );
+
+    let (row, commit) = single_row(1);
+    oplog.append(&row).await.expect("append");
+    oplog.record_commit(commit).await.expect("record commit");
+    let second = BTreeMap::from([
+        ("orders".to_owned(), "second".to_owned()),
+        ("readers".to_owned(), "first".to_owned()),
+    ]);
+    oplog
+        .record_rules(&["orders".to_owned(), "readers".to_owned()], &second)
+        .await
+        .expect("record");
+    let records = oplog.entries_since(row.position()).await.expect("read");
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| (record.table(), record.is_rules()))
+            .collect::<Vec<_>>(),
+        [("orders", true), ("readers", true)]
+    );
+    assert!(
+        records
+            .iter()
+            .all(|record| record.position().commit_lsn() == commit.end_lsn()),
+        "rules records sit at the commit the stream resumes after"
+    );
+    assert_eq!(oplog.rules_fingerprints().await.expect("read"), second);
+
+    let mut conn = pool.get().await.expect("get connection");
+    let ops: Vec<OpRow> = sql_query(format!(
+        "SELECT op FROM {TABLE} ORDER BY commit_lsn, xid, ordinal"
+    ))
+    .load(&mut *conn)
+    .await
+    .expect("read the verbs back");
+    assert_eq!(
+        ops.iter().map(|row| row.op).collect::<Vec<_>>(),
+        [ChangeOp::Insert, ChangeOp::Rules, ChangeOp::Rules]
+    );
+    for drop in [
+        TABLE.to_owned(),
+        PgOplog::commit_table(TABLE),
+        PgOplog::xid_table(TABLE),
+        PgOplog::rules_table(TABLE),
     ] {
         sql_query(format!("DROP TABLE IF EXISTS {drop}"))
             .execute(&mut *conn)
@@ -1272,6 +1347,7 @@ async fn snapshot_runs_the_translated_diesel_shape_with_binds() {
     let reg = materializer
         .register_sqlite(
             1,
+            connetto_core::CallerKind::Authenticated,
             "SELECT `translated`.`id`, `translated`.`quantity` FROM `translated` \
              WHERE (`translated`.`quantity` > ?) ORDER BY `translated`.`id`",
             &binds,

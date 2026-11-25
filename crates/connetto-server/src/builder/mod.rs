@@ -37,15 +37,12 @@ use crate::device_cert::{
 };
 use crate::manager_builder::ManagerBuilder;
 use crate::materializer::Materializer;
-use crate::openfga::{
-    Counted, FactSource, FgaAuth, ModelState, ModelSubject, SetupError, Translated,
-};
+use crate::openfga::{Counted, FactSource, FgaAuth, SetupError, Translated};
 use crate::oplog::{OplogConfig, PgOplog};
 use crate::portability::{
     DataRequestError, DataRequester, DownloadReceipt, PersonEnded, PortabilityError,
     PortabilityList, PortabilityState, ReaderCheckError, ValidatedList, reader_in_recovery,
 };
-use crate::reach::GrantReach;
 use crate::reserve::{ReaderGate, ReaderReserve};
 use crate::schema::ConnettoSchema;
 use crate::session::{
@@ -62,12 +59,9 @@ use diesel_async::AsyncConnection as _;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
-use openfga_client::client::OpenFgaServiceClient;
 use openfga_client::tonic::transport::{Channel, Endpoint};
-use rls2fga::translator::Translator;
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::Postgres;
-use subql::visibility::openfga::OpenFgaPolicy;
 use subql::{ParserDB, PgStreamingConfig};
 use tokio::io::AsyncWrite;
 
@@ -305,20 +299,24 @@ impl Database {
 }
 
 /// The deployment's source documents, catalog DDL, read policies and roles,
-/// and the reader role the roles document creates.
+/// the reader role the roles document creates, and the role each kind of
+/// caller acts as.
 #[derive(Clone, Debug)]
 pub struct ServerSchema {
     pg_ddl: String,
     pg_policies: String,
     pg_roles: String,
     reader_role: String,
+    kind_roles: connetto_core::KindRoles,
     devices: bool,
+    unset: connetto_core::auth::UnsetSettings,
 }
 
 impl ServerSchema {
     /// Name the catalog DDL, the policies that decide which view a logical
-    /// name resolves to, the roles document creating the reader role and its
-    /// grants, and the reader role the server reads and writes as.
+    /// name resolves to, the roles document creating the reader role, the
+    /// kind roles and their grants, and the reader role the server logs in
+    /// as. Each kind acts as its default role.
     #[must_use]
     pub fn new(
         pg_ddl: impl Into<String>,
@@ -331,19 +329,32 @@ impl ServerSchema {
             pg_policies: pg_policies.into(),
             pg_roles: pg_roles.into(),
             reader_role: reader_role.into(),
+            kind_roles: connetto_core::KindRoles::default(),
             devices: false,
+            unset: connetto_core::auth::UnsetSettings::ALWAYS_BOUND,
         }
     }
 
     /// The documents both translators read, as the client build reads them.
     #[must_use]
-    pub fn documents(&self) -> connetto_schema::Documents<'_> {
-        connetto_schema::Documents::new(
+    pub fn documents(&self) -> connetto_translate::Documents<'_> {
+        connetto_translate::Documents::new(
             &self.pg_ddl,
             &self.pg_policies,
             &self.pg_roles,
             &self.reader_role,
         )
+        .with_kind_roles(&self.kind_roles)
+        .with_unset_settings(self.unset)
+    }
+
+    /// Each kind acting as the role `kind_roles` names, the roles the client
+    /// build passed to [`connetto_translate::emit`], for a deployment whose
+    /// database another API already holds a default kind name on.
+    #[must_use]
+    pub fn with_kind_roles(mut self, kind_roles: connetto_core::KindRoles) -> Self {
+        self.kind_roles = kind_roles;
+        self
     }
 
     /// Hold the device enrolment table in the catalog, the device identity
@@ -351,6 +362,17 @@ impl ServerSchema {
     #[must_use]
     pub fn with_devices(mut self, devices: bool) -> Self {
         self.devices = devices;
+        self
+    }
+
+    /// Declare which caller settings the deployment's policies may find unset,
+    /// the declaration the client build passed to
+    /// [`connetto_translate::emit`]. The server binds `''` for an absent caller
+    /// half declared so, and the two sides advertise one schema version only
+    /// when they agree.
+    #[must_use]
+    pub const fn with_unset_settings(mut self, unset: connetto_core::auth::UnsetSettings) -> Self {
+        self.unset = unset;
         self
     }
 
@@ -371,9 +393,9 @@ impl ServerSchema {
     ///
     /// # Errors
     ///
-    /// [`connetto_schema::SchemaError::Translate`] when either document does
+    /// [`connetto_translate::SchemaError::Translate`] when either document does
     /// not parse.
-    pub fn catalog<D: ConnettoSchema>(&self) -> Result<String, connetto_schema::SchemaError> {
+    pub fn catalog<D: ConnettoSchema>(&self) -> Result<String, connetto_translate::SchemaError> {
         crate::schema::catalog::<D>(self.documents(), self.devices)
     }
 }
@@ -415,7 +437,7 @@ pub const DEFAULT_AUTH_CALL_BUDGET: Duration = Duration::from_secs(5);
 #[derive(Clone, Debug)]
 pub struct OpenFga {
     url: String,
-    store: String,
+    pub(crate) store: String,
     call_budget: Duration,
 }
 
@@ -442,13 +464,21 @@ impl OpenFga {
 
     /// The endpoint every authorization call goes through, each call and each
     /// connection attempt bounded by the call budget.
-    fn endpoint(&self) -> Result<Endpoint, BuildError> {
+    pub(crate) fn endpoint(&self) -> Result<Endpoint, SetupError> {
         Ok(Channel::from_shared(self.url.clone())
-            .map_err(|err| {
-                BuildError::AuthorizationEndpoint(format!("parsing the endpoint: {err}"))
-            })?
+            .map_err(|err| SetupError::Endpoint(format!("parsing the endpoint: {err}")))?
             .timeout(self.call_budget)
             .connect_timeout(self.call_budget))
+    }
+
+    /// A connection to the authorization service.
+    pub(crate) async fn connect(&self) -> Result<Channel, SetupError> {
+        self.endpoint()?.connect().await.map_err(|err| {
+            SetupError::Endpoint(format!(
+                "connecting to the authorization service at {}: {err}",
+                self.url
+            ))
+        })
     }
 }
 
@@ -558,7 +588,7 @@ pub enum BuildError {
     Materializer(#[from] crate::materializer::MaterializerError),
     /// The replica schema documents did not translate.
     #[error(transparent)]
-    Schema(#[from] connetto_schema::SchemaError),
+    Schema(#[from] connetto_translate::SchemaError),
     /// A registered download query was refused.
     #[error("download query {name:?} refused")]
     Portability {
@@ -590,6 +620,12 @@ pub enum BuildError {
     /// The change feed could not be checked before serving.
     #[error(transparent)]
     StreamCheck(#[from] StreamCheckError),
+    /// The boot database rules could not be read.
+    #[error(transparent)]
+    LiveRules(#[from] crate::drift::GuardConnectError),
+    /// The boot authorization generation could not be installed.
+    #[error(transparent)]
+    FollowRules(#[from] SessionError),
     /// The file half refused to build.
     #[error(transparent)]
     Content(#[from] ContentBuildError),
@@ -621,6 +657,9 @@ pub enum StreamConnectError {
     /// The guarded CDC stream would not open.
     #[error(transparent)]
     Guard(#[from] crate::drift::GuardConnectError),
+    /// The live rules could not be followed before streaming.
+    #[error("following live rules: {0}")]
+    Rules(#[source] SessionError),
     /// The refusals an earlier process persisted could not be settled.
     #[error("settling earlier refusals: {0}")]
     Refusals(#[source] SessionError),
@@ -1959,19 +1998,25 @@ where
         let portability = portability
             .map(|list| {
                 let documents = schema.documents();
-                let replica = connetto_schema::translate::<String, RegistryIds<D>>(
-                    connetto_schema::Documents::new(
+                let replica = connetto_translate::translate::<String, RegistryIds<D>>(
+                    connetto_translate::Documents::new(
                         documents.schema(),
                         "",
                         documents.roles(),
                         documents.reader_role(),
-                    ),
+                    )
+                    .with_unset_settings(schema.unset)
+                    .with_kind_roles(&schema.kind_roles),
                 )?;
                 crate::portability::validate(
                     list,
                     &schema.engine_ddl::<D>(),
                     &replica,
-                    &CallerMappings::of::<String>(&schema.reader_role)?,
+                    &CallerMappings::of::<String>(
+                        &schema.reader_role,
+                        &schema.kind_roles,
+                        schema.unset,
+                    )?,
                     serves_content,
                 )
             })
@@ -1979,7 +2024,8 @@ where
 
         let pool = build_pool(&database.owner_url, owner_pool_size).await?;
         require_schema_tables::<D>(&pool, bans, device_identity.is_some()).await?;
-        require_cap_policies::<D>(&pool, &schema.pg_ddl).await?;
+        let synced = synced_tables::<D>(&schema.pg_ddl)?;
+        require_cap_policies(&pool, &synced).await?;
         let (oplog, lag_watch) = prepare_change_log(
             &pool,
             &slot,
@@ -1993,6 +2039,13 @@ where
         completion.lag_watch = lag_watch.as_ref().map(BackgroundTask::completion);
         let reader_pool_size = reader_reserve.total();
         let reader_pool = build_pool(&database.reader_url, reader_pool_size).await?;
+        require_reader_role(
+            &reader_pool,
+            &schema.reader_role,
+            &schema.kind_roles,
+            &synced,
+        )
+        .await?;
         if portability
             .as_ref()
             .is_some_and(ValidatedList::needs_owner_snapshot)
@@ -2053,6 +2106,8 @@ where
                     pool.clone(),
                     guard.read_limits(Tier::Identified),
                     reader.files.take(),
+                    schema.unset,
+                    schema.kind_roles.clone(),
                 )
                 .map(Arc::new)
             })
@@ -2071,7 +2126,7 @@ where
         let sweep = reader.sweep;
         // Scoped, so the write side's storage ends here rather than staying in
         // the future across the wiring below.
-        let manager = {
+        let (manager, boot_rules) = {
             // Boxed, since it carries every translation across the store writes.
             let write_side = Box::pin(build_write_side::<D>(
                 Pools {
@@ -2079,7 +2134,7 @@ where
                     reader: reader.pool,
                 },
                 &schema,
-                &feed.publication,
+                &feed,
                 &openfga,
                 second_opinion,
                 writable,
@@ -2104,16 +2159,18 @@ where
                     .with_courier(courier),
             )
             .with_upkeep(write_side.upkeep)
+            .with_rules(write_side.rules)
             .with_signer(reader.signer)
             .with_withdrawal_source(write_side.withdrawals)
             .with_bot_registry(pg_bot_registry::<D>(pool.clone()));
-            match write_side.second {
+            let manager = match write_side.second {
                 Some(second) => manager.with_second_opinion(Arc::new(second)),
                 None => manager,
             }
-            .build()
+            .build();
+            (manager, write_side.boot_rules)
         };
-        wire_manager(&manager, &service, &guard, &pool, &feed).await?;
+        wire_manager(&manager, &service, &guard, &pool, &feed, boot_rules).await?;
         let status =
             device_identity.map(|config| install_device_identity::<D>(&manager, &service, config));
 
@@ -2249,26 +2306,61 @@ async fn require_schema_tables<D: ConnettoSchema>(
     Ok(())
 }
 
+/// The tables the cap and the reader checks cover.
+///
+/// The same table list the generator walks, [`connetto_translate::schema_tables`]
+/// over the schema document with the registry tables connetto appends to it.
+fn synced_tables<D: ConnettoSchema>(pg_ddl: &str) -> Result<Vec<String>, BuildError> {
+    let combined =
+        connetto_translate::with_registry::<<D::Bots as ConnettoBotSchema>::IdSql>(pg_ddl);
+    Ok(connetto_translate::schema_tables(&combined)?)
+}
+
 /// Refuse a deployment whose synced tables are not held to the bot cap.
 ///
-/// Walks the same table list the generator walks, [`connetto_schema::schema_tables`]
-/// over the schema document, and asks Postgres for each whether it carries
-/// row-level security and the four `AS RESTRICTIVE` cap policies. Those are
-/// applied by the deployment from the generated cap document, and connetto
-/// creates no server objects of its own, so a table not capped is a
-/// deployment omission rather than something connetto can fix.
-async fn require_cap_policies<D: ConnettoSchema>(
-    pool: &PgPool,
-    pg_ddl: &str,
-) -> Result<(), BuildError> {
-    // The cap reaches the registry tables connetto appends to the document.
-    let combined = connetto_schema::with_registry::<<D::Bots as ConnettoBotSchema>::IdSql>(pg_ddl);
-    let tables = connetto_schema::schema_tables(&combined)?;
-    let required: Vec<Artifact<'_>> = tables
+/// Asks Postgres for each synced table whether it carries row-level security
+/// and the four `AS RESTRICTIVE` cap policies. Those are applied by the
+/// deployment from the generated cap document, and connetto creates no server
+/// objects of its own, so a table not capped is a deployment omission rather
+/// than something connetto can fix.
+async fn require_cap_policies(pool: &PgPool, synced: &[String]) -> Result<(), BuildError> {
+    let required: Vec<Artifact<'_>> = synced
         .iter()
-        .map(|t| Artifact::CappedTable(t.as_str()))
+        .map(|table| Artifact::CappedTable(table.as_str()))
         .collect();
     preflight::require(pool, &required).await?;
+    Ok(())
+}
+
+/// Refuse a reader URL that is not the reader role, a kind role the reader
+/// cannot safely act as, or a reader or kind role the policies and grants of
+/// a synced table do not bind.
+///
+/// Both translators model the rules that bind each kind role, so a reader
+/// connection that logs in or acts as another role, a kind role that logs in,
+/// bypasses the rules or that the reader inherits, or a role that owns a
+/// synced table or inherits its owner's privileges, would read and write
+/// around them. A missing kind role refuses too, since connetto creates no
+/// server objects.
+async fn require_reader_role(
+    reader_pool: &PgPool,
+    reader_role: &str,
+    kind_roles: &connetto_core::KindRoles,
+    synced: &[String],
+) -> Result<(), BuildError> {
+    let roles: Vec<&str> = std::iter::once(reader_role)
+        .chain(kind_roles.iter().map(|(_, role)| role))
+        .collect();
+    let required: Vec<Artifact<'_>> = std::iter::once(Artifact::ActingRole(reader_role))
+        .chain(kind_roles.iter().map(|(_, role)| Artifact::KindRole(role)))
+        .chain(synced.iter().flat_map(|table| {
+            roles.iter().map(|role| Artifact::PolicyBoundTable {
+                role,
+                table: table.as_str(),
+            })
+        }))
+        .collect();
+    preflight::require(reader_pool, &required).await?;
     Ok(())
 }
 
@@ -2326,11 +2418,11 @@ async fn prepare_change_log(
         // decision 11). The writer and settled tables always stand.
         Artifact::PublishedTable {
             publication,
-            table: connetto_schema::BOOKKEEPING_TABLES[0],
+            table: connetto_translate::BOOKKEEPING_TABLES[0],
         },
         Artifact::PublishedTable {
             publication,
-            table: connetto_schema::BOOKKEEPING_TABLES[1],
+            table: connetto_translate::BOOKKEEPING_TABLES[1],
         },
     ];
     // The enrolment table stands only with device identity, so its publication
@@ -2338,7 +2430,7 @@ async fn prepare_change_log(
     if device_identity {
         artifacts.push(Artifact::PublishedTable {
             publication,
-            table: connetto_schema::BOOKKEEPING_TABLES[2],
+            table: connetto_translate::BOOKKEEPING_TABLES[2],
         });
     }
     artifacts.push(Artifact::PreviousImages { publication });
@@ -2467,11 +2559,15 @@ async fn build_reader_side<D: ConnettoSchema>(
         &database.owner_url,
         &database.reader_url,
         reader_pool_size,
+        schema.unset,
+        schema.kind_roles.clone(),
         hooks,
     )
     .await?;
     let snapshot = PgSnapshotSource::from_ddl(pool.clone(), &schema.engine_ddl::<D>())?
-        .with_publication(publication);
+        .with_publication(publication)
+        .with_unset_settings(schema.unset)
+        .with_kind_roles(schema.kind_roles.clone());
     Ok(ReaderSide {
         pool,
         signer,
@@ -2524,7 +2620,7 @@ fn is_loopback_origin(origin: &str) -> bool {
 fn require_one_numbering(model: &ParserDB, engine_ddl: &str) -> Result<(), BuildError> {
     let engine = ParserDB::parse::<PostgreSqlDialect>(engine_ddl)
         .map_err(|err| SetupError::Catalog(format!("{err:?}")))?;
-    for table in connetto_schema::schema_tables(engine_ddl)? {
+    for table in connetto_translate::schema_tables(engine_ddl)? {
         let in_model = subql::catalog_helpers::table_id::<Postgres, _>(model, &table);
         let in_engine = subql::catalog_helpers::table_id::<Postgres, _>(&engine, &table);
         if in_model != in_engine {
@@ -2557,10 +2653,14 @@ async fn translate_authorization<D: ConnettoSchema>(
             .iter()
             .map(|table| Artifact::PublishedTable { publication, table }),
     );
+    required.push(Artifact::PublishedTable {
+        publication,
+        table: crate::epoch::POLICY_CHANGES_TABLE,
+    });
     // The owner pool reads the facts off the tables the policies read, and
     // the withdrawals and the bot registry off the synced tables, each for
     // every caller at once, so row-level security must filter none of them.
-    let mut read_in_full = connetto_schema::schema_tables(&engine_ddl)?;
+    let mut read_in_full = connetto_translate::schema_tables(&engine_ddl)?;
     read_in_full.extend(translated.policy_tables().iter().cloned());
     read_in_full.sort_unstable();
     read_in_full.dedup();
@@ -2569,69 +2669,8 @@ async fn translate_authorization<D: ConnettoSchema>(
     Ok(translated)
 }
 
-/// The change path's executor, the rules put on the authorization service,
-/// and the facts behind them filled if they are new.
-///
-/// The first write to the service, so every refusal runs before this.
-/// Two clients over one endpoint, questions through [`Counted`] which is
-/// where the counter lives and the setup calls outside it.
-async fn install_authorization<D: ConnettoSchema>(
-    translated: Translated,
-    facts: &FactSource,
-    openfga: &OpenFga,
-) -> Result<(ServerAuth<D::Id>, Translator, GrantReach), BuildError> {
-    let channel = openfga.endpoint()?.connect().await.map_err(|err| {
-        BuildError::AuthorizationEndpoint(format!(
-            "connecting to the authorization service at {}: {err}",
-            openfga.url
-        ))
-    })?;
-
-    let mut setup = OpenFgaServiceClient::new(channel.clone());
-    let model = translated.install_model(&mut setup, &openfga.store).await?;
-    // Both the Written and the Adopted pass use the loader, the uncounted
-    // client keeping boot writes out of the authorization-call counter.
-    let loader = OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
-        translated.shapes_arc(),
-        setup,
-        openfga.store.clone(),
-        model.model(),
-    )
-    .map_err(SetupError::from)?;
-    match &model {
-        ModelState::Written(_) => {
-            let n = translated.load_into(facts, &loader).await?;
-            tracing::info!(
-                model = model.id(),
-                facts = n,
-                "authorization rules are new, loading the facts behind them"
-            );
-        }
-        ModelState::Adopted(_) => {
-            let (added, removed) = translated.reconcile_store(facts, &loader).await?;
-            tracing::info!(
-                model = model.id(),
-                added,
-                removed,
-                "authorization rules already installed, the store reconciled with the database"
-            );
-        }
-    }
-
-    let naming = translated.naming();
-    let (shapes, translator, reach) = translated.into_parts();
-    let delegate = OpenFgaPolicy::new(
-        Arc::clone(&shapes),
-        OpenFgaServiceClient::new(Counted::new(channel)),
-        openfga.store.clone(),
-        model.model(),
-    )
-    .map_err(SetupError::from)?;
-    Ok((FgaAuth::new(shapes, delegate, naming), translator, reach))
-}
-
-/// The manager's write side, the authorization model installed, the
-/// materializer, the second opinion when asked, the upkeep and the write
+/// The manager's write side, the live rules' authorization model installed,
+/// the materializer, the second opinion when asked, the upkeep and the write
 /// target.
 ///
 /// Everything that can refuse the deployment is built before the
@@ -2640,13 +2679,20 @@ async fn install_authorization<D: ConnettoSchema>(
 async fn build_write_side<D: ConnettoSchema>(
     pools: Pools,
     schema: &ServerSchema,
-    publication: &str,
+    feed: &Feed,
     openfga: &OpenFga,
     second_opinion: bool,
     writable: RuntimeWritableCatalog,
     engine_connector: PgReadConnector,
 ) -> Result<WriteSide<D>, BuildError> {
-    let translated = translate_authorization::<D>(&pools.owner, schema, publication).await?;
+    let documents = translate_authorization::<D>(&pools.owner, schema, &feed.publication).await?;
+    // The server runs the live rules, and the documents refuse an
+    // untranslatable start (decision 18).
+    let read =
+        crate::drift::read_rules(&feed.pg_ddl, &feed.database_url, &feed.publication).await?;
+    let (translated, boot_rules) =
+        crate::rules::BootRules::read(documents, Arc::clone(read.database()))
+            .map_err(BuildError::Authorization)?;
     let catalog = schema.catalog::<D>()?;
     // The engine and the upkeep each classify membership against the deployment's policies, so each takes a translator.
     let materializer = Materializer::builder(&catalog)
@@ -2654,37 +2700,60 @@ async fn build_write_side<D: ConnettoSchema>(
         .with_write_catalog(writable)
         .with_translator(translated.translator().clone())
         .with_policy_reads(translated.policy_reads())
-        .with_caller(CallerMappings::of::<String>(&schema.reader_role)?)
+        .with_caller(CallerMappings::of::<String>(
+            &schema.reader_role,
+            &schema.kind_roles,
+            schema.unset,
+        )?)
         .with_read_connector(engine_connector)
         .build()?;
-    // The second opinion reads as the reader role, so it takes its pool before the write target consumes it.
+    // The second opinion reads as the caller's kind role, so it takes its pool before the write target consumes it.
     let second = if second_opinion {
         Some(
             RlsAuth::<D::Id, String>::from_ddl(pools.reader.clone(), &schema.engine_ddl::<D>())
-                .map_err(|err| BuildError::SecondOpinion(err.to_string()))?,
+                .map_err(|err| BuildError::SecondOpinion(err.to_string()))?
+                .with_unset_settings(schema.unset)
+                .with_kind_roles(schema.kind_roles.clone()),
         )
     } else {
         None
     };
-    let write = pg_write_target::<D>(pools.reader, &schema.engine_ddl::<D>())?;
+    let write = pg_write_target::<D>(pools.reader, &schema.engine_ddl::<D>())?
+        .with_unset_settings(schema.unset)
+        .with_kind_roles(schema.kind_roles.clone());
     // Move-out withdrawals read on the owner pool, where the membership that ended no longer hides the rows (R27 decision 6).
-    let withdrawals = PgSnapshotSource::from_ddl(pools.owner.clone(), &schema.engine_ddl::<D>())?;
+    let withdrawals = PgSnapshotSource::from_ddl(pools.owner.clone(), &schema.engine_ddl::<D>())?
+        .with_unset_settings(schema.unset);
     // A changed policy makes an existing replica stale, so a client holding one is told through the advertised version.
-    let bundle = connetto_schema::translate::<String, <D::Bots as ConnettoBotSchema>::IdSql>(
+    let bundle = connetto_translate::translate::<String, <D::Bots as ConnettoBotSchema>::IdSql>(
         schema.documents(),
     )?;
     let facts = FactSource::owner(pools.owner);
-    let (auth, translator, reach) = install_authorization::<D>(translated, &facts, openfga).await?;
-    let upkeep = auth.upkeep(reach, translator, facts);
+    let (auth, upkeep) =
+        crate::rules::install_authorization::<D::Id>(&translated, &facts, openfga, &mut None)
+            .await
+            .map_err(|error| match error {
+                SetupError::Endpoint(why) => BuildError::AuthorizationEndpoint(why),
+                other => BuildError::Authorization(other),
+            })?;
+    let rules = Arc::new(crate::rules::Coordinator::new(
+        auth.clone(),
+        translated,
+        boot_rules.database(),
+        openfga.clone(),
+        facts,
+    ));
     Ok(WriteSide {
         auth,
         materializer,
         second,
         upkeep,
+        rules,
         write,
         withdrawals,
         version: bundle.version(),
         major: bundle.major(),
+        boot_rules,
     })
 }
 
@@ -2763,14 +2832,15 @@ async fn settle_epoch<D: ConnettoSchema>(
     Ok(())
 }
 
-/// The manager's post-boot wiring, the live-close hooks and the epoch
-/// settlement.
+/// The manager's post-boot wiring, the live-close hooks, the epoch settlement
+/// and the boot's live rules.
 async fn wire_manager<D: ConnettoSchema>(
     manager: &Arc<ServerManager<D>>,
     service: &AuthService<D>,
     guard: &Arc<RequestGuard<D::Id>>,
     pool: &PgPool,
     feed: &Feed,
+    boot_rules: crate::rules::BootRules,
 ) -> Result<(), BuildError> {
     // Revoking a session closes its live connection rather than refusing its next handshake, so the close rides a spawned task.
     let revoke_manager = Arc::clone(manager);
@@ -2794,6 +2864,7 @@ async fn wire_manager<D: ConnettoSchema>(
         .check_before_stream(&feed.database_url, pool, &feed.slot)
         .await?;
     settle_epoch(manager, service, pool, check, crate::epoch::Found::AtBoot).await?;
+    manager.settle_boot_rules(boot_rules).await?;
     Ok(())
 }
 
@@ -2839,10 +2910,13 @@ struct WriteSide<D: ConnettoSchema> {
     materializer: Materializer<ParserDB, RuntimeWritableCatalog, PgReadConnector>,
     second: Option<RlsAuth<D::Id, String>>,
     upkeep: Arc<dyn crate::openfga::StoreUpkeep>,
+    rules: Arc<dyn crate::rules::RulesFollower>,
     write: PgWriteTarget<D>,
     withdrawals: PgSnapshotSource,
     version: SchemaVersion,
     major: Major,
+    /// The boot's read of the live rules, which the manager settles before the stream starts.
+    boot_rules: crate::rules::BootRules,
 }
 
 /// The change-stream future, one reconnecting ingestion that closes every
@@ -2881,6 +2955,11 @@ fn change_stream<D: ConnettoSchema>(
                     .start(resume.get());
                 let source =
                     crate::drift::connect_guarded(config, &ddl, &url, &publication, every).await?;
+                manager
+                    .follow_live_rules(Arc::clone(source.rules().database()))
+                    .await
+                    .map_err(StreamConnectError::Rules)?;
+                let source = source.start().await?;
                 manager
                     .watch_guard(source.refusals())
                     .await
@@ -2979,8 +3058,11 @@ fn assemble_parts<D: ConnettoSchema>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::openfga::ModelSubject;
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
+    use openfga_client::client::OpenFgaServiceClient;
+    use subql::visibility::openfga::OpenFgaPolicy;
     use tower::{Layer, ServiceExt};
 
     #[tokio::test]
@@ -3067,13 +3149,13 @@ mod tests {
         let budget = Duration::from_millis(200);
         let openfga = OpenFga::new(format!("http://{address}"), "store").with_call_budget(budget);
         let translated = Translated::of::<String, crate::defaults::ConnettoDefaults>(
-            connetto_schema::Documents::new(
+            connetto_translate::Documents::new(
                 "CREATE TABLE papers (id INTEGER PRIMARY KEY, owner TEXT); \
                  ALTER TABLE papers ENABLE ROW LEVEL SECURITY;",
                 "CREATE POLICY papers_p ON papers FOR SELECT USING \
                  (owner = current_setting('app.user_id', true))",
-                "CREATE ROLE app_reader LOGIN;",
-                "app_reader",
+                connetto_test_harness::FIXTURE_ROLES,
+                connetto_test_harness::FIXTURE_READER,
             ),
             true,
         )

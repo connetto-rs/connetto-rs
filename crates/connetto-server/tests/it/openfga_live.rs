@@ -110,7 +110,7 @@ async fn the_row_settles_the_verdict_and_it_costs_no_round_trip() {
     let (channel, store) = fixture.fga_store().await;
 
     let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-        connetto_schema::Documents::new(
+        connetto_translate::Documents::new(
             SCHEMA,
             &policies(),
             connetto_test_harness::FIXTURE_ROLES,
@@ -159,7 +159,7 @@ async fn the_row_settles_the_verdict_and_it_costs_no_round_trip() {
     let notes = catalog_helpers::table_id::<Postgres, _>(shapes.catalog(), "r5b_notes")
         .expect("in the catalog");
     let row = [Value::Int(1), Value::String("alice".to_owned())];
-    let view = ValuesRow::new(notes, &row);
+    let view = ValuesRow::new(shapes.catalog(), notes, &row);
     let watchers = [caller("alice"), caller("bob")];
     let mut verdicts = Vec::new();
     Verdict::reset(&mut verdicts, watchers.len());
@@ -204,7 +204,7 @@ async fn a_note_that_does_not_refuse_is_logged_for_the_operator() {
         "a_note_that_does_not_refuse_is_logged_for_the_operator",
         |capture| async move {
             let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-                connetto_schema::Documents::new(
+                connetto_translate::Documents::new(
                     &schema,
                     &policies,
                     connetto_test_harness::FIXTURE_ROLES,
@@ -237,21 +237,21 @@ async fn a_note_that_does_not_refuse_is_logged_for_the_operator() {
     );
 }
 
-/// A policy for the reader role decides who sees a row, and a policy for a
+/// A policy for the signed-in kind decides who sees a row, and a policy for a
 /// role outside connetto serves no caller, is left out of the model and is
 /// reported to the operator naming the policy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_reader_policy_decides_and_an_outside_role_policy_is_reported_and_left_out() {
+async fn a_kind_policy_decides_and_an_outside_role_policy_is_reported_and_left_out() {
     let fixture = Fixture::acquire().await;
     let (channel, store) = fixture.fga_store().await;
     let (translated, lines) = with_capture(
-        "a_reader_policy_decides_and_an_outside_role_policy_is_reported_and_left_out",
+        "a_kind_policy_decides_and_an_outside_role_policy_is_reported_and_left_out",
         |capture| async move {
             let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-                connetto_schema::Documents::new(
+                connetto_translate::Documents::new(
                     SCHEMA,
                     "ALTER TABLE r5b_notes ENABLE ROW LEVEL SECURITY;\n\
-                     CREATE POLICY r5b_notes_reader ON r5b_notes FOR ALL TO app_reader \
+                     CREATE POLICY r5b_notes_reader ON r5b_notes FOR ALL TO authenticated \
                        USING (owner = current_setting('app.user_id', true));\n\
                      CREATE POLICY r5b_notes_staff ON r5b_notes FOR ALL TO support_staff \
                        USING (true);",
@@ -279,7 +279,7 @@ async fn a_reader_policy_decides_and_an_outside_role_policy_is_reported_and_left
     );
     assert!(
         !warned("r5b_notes_reader"),
-        "the reader's own policy is not: {lines:?}"
+        "the signed-in kind's own policy is not: {lines:?}"
     );
 
     let mut setup = OpenFgaServiceClient::new(channel.clone());
@@ -302,9 +302,13 @@ async fn a_reader_policy_decides_and_an_outside_role_policy_is_reported_and_left
     let watchers = [caller("alice"), caller("bob")];
     let mut verdicts = Vec::new();
     Verdict::reset(&mut verdicts, watchers.len());
-    auth.may_see(&ValuesRow::new(notes, &row), &watchers, &mut verdicts)
-        .await
-        .expect("the composition answered");
+    auth.may_see(
+        &ValuesRow::new(shapes.catalog(), notes, &row),
+        &watchers,
+        &mut verdicts,
+    )
+    .await
+    .expect("the composition answered");
     assert_eq!(
         verdicts,
         [Verdict::Allow, Verdict::Deny],
@@ -322,7 +326,7 @@ async fn unchanged_rules_are_adopted_rather_than_rewritten() {
     let mut client = OpenFgaServiceClient::new(channel);
 
     let first = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-        connetto_schema::Documents::new(
+        connetto_translate::Documents::new(
             SCHEMA,
             &policies(),
             connetto_test_harness::FIXTURE_ROLES,
@@ -335,7 +339,7 @@ async fn unchanged_rules_are_adopted_rather_than_rewritten() {
     .await
     .expect("written");
     let second = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-        connetto_schema::Documents::new(
+        connetto_translate::Documents::new(
             SCHEMA,
             &policies(),
             connetto_test_harness::FIXTURE_ROLES,
@@ -397,7 +401,7 @@ async fn an_adopted_boot_reconciles_a_store_left_at_another_point() {
     let (channel, store) = fixture.fga_store().await;
 
     let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-        connetto_schema::Documents::new(
+        connetto_translate::Documents::new(
             SCHEMA,
             &policies(),
             connetto_test_harness::FIXTURE_ROLES,
@@ -442,7 +446,7 @@ async fn an_adopted_boot_reconciles_a_store_left_at_another_point() {
     drop(conn);
 
     let adopted = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-        connetto_schema::Documents::new(
+        connetto_translate::Documents::new(
             SCHEMA,
             &policies(),
             connetto_test_harness::FIXTURE_ROLES,
@@ -493,7 +497,7 @@ async fn an_adopted_boot_that_cannot_reconcile_refuses() {
     let (channel, store) = fixture.fga_store().await;
 
     let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-        connetto_schema::Documents::new(
+        connetto_translate::Documents::new(
             SCHEMA,
             &policies(),
             connetto_test_harness::FIXTURE_ROLES,
@@ -524,7 +528,7 @@ async fn an_adopted_boot_that_cannot_reconcile_refuses() {
         )
         .await;
     assert!(
-        matches!(unknown, Err(SetupError::Store(_))),
+        matches!(unknown, Err(SetupError::Authorization(_))),
         "a store the service does not hold cannot be read: {unknown:?}"
     );
 
@@ -563,7 +567,7 @@ async fn a_table_with_row_level_security_and_no_policy_grants_nobody() {
 
     let policies = "ALTER TABLE r5b_notes ENABLE ROW LEVEL SECURITY;";
     let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-        connetto_schema::Documents::new(
+        connetto_translate::Documents::new(
             SCHEMA,
             policies,
             connetto_test_harness::FIXTURE_ROLES,
@@ -592,7 +596,7 @@ async fn a_table_with_row_level_security_and_no_policy_grants_nobody() {
     let notes = catalog_helpers::table_id::<Postgres, _>(shapes.catalog(), "r5b_notes")
         .expect("in the catalog");
     let row = [Value::Int(1), Value::String("alice".to_owned())];
-    let view = ValuesRow::new(notes, &row);
+    let view = ValuesRow::new(shapes.catalog(), notes, &row);
     let watchers = [caller("alice")];
     let mut verdicts = Vec::new();
     Verdict::reset(&mut verdicts, watchers.len());
@@ -640,7 +644,7 @@ async fn a_changed_owner_reaches_the_store_before_the_row_is_delivered() {
     let (channel, store) = fixture.fga_store().await;
 
     let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-        connetto_schema::Documents::new(
+        connetto_translate::Documents::new(
             SCHEMA,
             &policies(),
             connetto_test_harness::FIXTURE_ROLES,
@@ -704,7 +708,7 @@ async fn a_changed_owner_reaches_the_store_before_the_row_is_delivered() {
         .await
         .expect("the difference reached the store");
 
-    let view = ValuesRow::new(notes, &after);
+    let view = ValuesRow::new(shapes.catalog(), notes, &after);
     let watchers = [caller("alice"), caller("carol")];
     let mut verdicts = Vec::new();
     Verdict::reset(&mut verdicts, watchers.len());
@@ -777,7 +781,7 @@ async fn cross_executor(
     let (channel, store) = fixture.fga_store().await;
     let schema = cross_schema();
     let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-        connetto_schema::Documents::new(
+        connetto_translate::Documents::new(
             &schema,
             &CROSS_POLICY_STATEMENTS.join(";\n"),
             connetto_test_harness::FIXTURE_ROLES,
@@ -840,7 +844,7 @@ async fn a_withdrawn_grant_is_refused_at_once_for_both_questions() {
     let docs = catalog_helpers::table_id::<Postgres, _>(shapes.catalog(), "r7_docs")
         .expect("in the catalog");
     let row: [Value<Postgres>; 2] = [Value::Int(1), Value::Int(1)];
-    let view = ValuesRow::new(docs, &row);
+    let view = ValuesRow::new(shapes.catalog(), docs, &row);
     let alice = [caller("alice")];
 
     let mut verdicts = Vec::new();
@@ -983,7 +987,7 @@ async fn a_uuid_primary_key_is_named_so_an_owned_write_is_authorized() {
     let (channel, store) = fixture.fga_store().await;
 
     let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-        connetto_schema::Documents::new(
+        connetto_translate::Documents::new(
             ORDERS_SCHEMA,
             &orders_policies(),
             connetto_test_harness::FIXTURE_ROLES,
@@ -1028,7 +1032,7 @@ async fn a_uuid_primary_key_is_named_so_an_owned_write_is_authorized() {
     // The key as the type-directed codec produces it: the row names itself
     // `r40_orders:ab4af609-...` and alice owns it, so the write is allowed.
     let typed: [Value<Postgres>; 2] = [Value::Uuid(id), Value::String("alice".to_owned())];
-    let typed_view = ValuesRow::new(orders, &typed);
+    let typed_view = ValuesRow::new(shapes.catalog(), orders, &typed);
     assert!(
         auth.may_write(
             RowWrite::Insert {
@@ -1050,7 +1054,7 @@ async fn a_uuid_primary_key_is_named_so_an_owned_write_is_authorized() {
         Value::Bytes(id.as_bytes().to_vec()),
         Value::String("alice".to_owned()),
     ];
-    let untyped_view = ValuesRow::new(orders, &untyped);
+    let untyped_view = ValuesRow::new(shapes.catalog(), orders, &untyped);
     let refused = auth
         .may_write(
             RowWrite::Insert {
@@ -1123,7 +1127,7 @@ async fn replay_executor(
     let (channel, store) = fixture.fga_store().await;
     let schema = REPLAY_SCHEMA_STATEMENTS.join(";\n") + ";";
     let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-        connetto_schema::Documents::new(
+        connetto_translate::Documents::new(
             &schema,
             REPLAY_POLICY,
             connetto_test_harness::FIXTURE_ROLES,
@@ -1185,7 +1189,7 @@ async fn a_replayed_share_is_withdrawn_when_its_row_goes() {
     let papers = catalog_helpers::table_id::<Postgres, _>(shapes.catalog(), "r86_papers")
         .expect("in the catalog");
     let row: [Value<Postgres>; 2] = [Value::Int(1), Value::String("zoe".to_owned())];
-    let view = ValuesRow::new(papers, &row);
+    let view = ValuesRow::new(shapes.catalog(), papers, &row);
     let alice = [caller("alice")];
     let carol = [caller("carol")];
 
@@ -1559,7 +1563,7 @@ async fn a_composite_key_share_is_withdrawn_through_the_re_run() {
     // the startup guard. Before rls2fga 98bda106 this returned Err.
     let schema = composite_schema();
     let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-        connetto_schema::Documents::new(
+        connetto_translate::Documents::new(
             &schema,
             COMPOSITE_POLICY,
             connetto_test_harness::FIXTURE_ROLES,
@@ -1612,8 +1616,8 @@ async fn a_composite_key_share_is_withdrawn_through_the_re_run() {
         .expect("in the catalog");
     let t1_p1 = ck_paper_row(1, 1, "owner1");
     let t2_p1 = ck_paper_row(2, 1, "owner2");
-    let view1 = ValuesRow::new(papers, &t1_p1);
-    let view2 = ValuesRow::new(papers, &t2_p1);
+    let view1 = ValuesRow::new(shapes.catalog(), papers, &t1_p1);
+    let view2 = ValuesRow::new(shapes.catalog(), papers, &t2_p1);
     let v1 = [caller("viewer1")];
     let v2 = [caller("viewer2")];
 
@@ -1754,7 +1758,7 @@ async fn keyed_replay_executor(
     let (channel, store) = fixture.fga_store().await;
     let schema = KEYED_REPLAY_SCHEMA_STATEMENTS.join(";\n") + ";";
     let translated = Translated::of::<String, connetto_server::defaults::ConnettoDefaults>(
-        connetto_schema::Documents::new(
+        connetto_translate::Documents::new(
             &schema,
             KEYED_REPLAY_POLICY,
             connetto_test_harness::FIXTURE_ROLES,
