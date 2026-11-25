@@ -249,7 +249,7 @@ dependencies = [
  "regex",
  "rustc-hash",
  "shlex",
- "syn 2.0.119",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -468,7 +468,6 @@ dependencies = [
  "js-sys",
  "libsqlite3-sys",
  "parking_lot",
- "pg2sqlite",
  "pg2sqlite-runtime",
  "rmp",
  "rmp-serde",
@@ -2124,23 +2123,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
-name = "pg2sqlite"
-version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#0e88668e2114fb32ba22f65ea6349a1081d83069"
-dependencies = [
- "pg2sqlite-runtime",
- "sql-traits",
- "sql-values 0.6.0",
- "sqlparser",
- "sqlparser-plpgsql",
- "sqlstate",
- "thiserror 2.0.21",
-]
-
-[[package]]
 name = "pg2sqlite-runtime"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#0e88668e2114fb32ba22f65ea6349a1081d83069"
+source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#a18fe8fea04c37fe371197c542fe66bb3e271246"
 dependencies = [
  "diesel",
  "diesel-dynamic-schema",
@@ -2295,6 +2280,12 @@ dependencies = [
  "ar_archive_writer",
  "cc",
 ]
+
+[[package]]
+name = "quine-mc_cluskey"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07589615d719a60c8dd8a4622e7946465dfef20d1a428f969e3443e7386d5f45"
 
 [[package]]
 name = "quinn"
@@ -3187,8 +3178,9 @@ dependencies = [
 [[package]]
 name = "sqlparser-expr-eval"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sqlparser-expr-eval?branch=main#1e87038c58ca7ed3bc931a5f2efa08dc3ff54388"
+source = "git+https://github.com/connetto-rs/sqlparser-expr-eval?branch=main#61e238a1d20604912acdf1056f285f69de612069"
 dependencies = [
+ "quine-mc_cluskey",
  "rpds",
  "sql-values 0.6.0",
  "sqlparser",
@@ -3219,7 +3211,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.7.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#af9872c5344b31c10dbf953ee684db61ff276394"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#4a5bba20dcc3a6e6185cfe53f09f28cab2810c84"
 dependencies = [
  "proc-macro2",
  "quote",

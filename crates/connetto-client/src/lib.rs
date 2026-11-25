@@ -10143,8 +10143,8 @@ where
     {
         self.db.transaction(f).map_err(|err| {
             if let diesel::result::Error::DatabaseError(_, info) = &err
-                && let Some(pg2sqlite::prelude::GuardRefusal::Privilege { table }) =
-                    pg2sqlite::prelude::guard_refusal(info.message())
+                && let Some(pg2sqlite_runtime::write_guard::GuardRefusal::Privilege { table }) =
+                    pg2sqlite_runtime::write_guard::guard_refusal(info.message())
             {
                 return ClientError::NotGranted {
                     table: table.to_owned(),

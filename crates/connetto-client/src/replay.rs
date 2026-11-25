@@ -693,7 +693,7 @@ fn execute_peer(conn: &mut SqliteConnection, (sql, binds): Rendered) -> Result<b
         Ok(_) => Ok(true),
         Err(err) if omit_on_constraint(&err) => Ok(false),
         Err(diesel::result::Error::DatabaseError(_, info))
-            if pg2sqlite::prelude::guard_refusal(info.message()).is_some() =>
+            if pg2sqlite_runtime::write_guard::guard_refusal(info.message()).is_some() =>
         {
             Ok(false)
         }

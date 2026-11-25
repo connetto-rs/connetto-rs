@@ -316,4 +316,64 @@ mod tests {
         assert_eq!(grants.read(CallerKind::Anon, orders, Some(&[0, 2])), Ok(()));
         assert_eq!(grants.read(CallerKind::Authenticated, orders, None), Ok(()));
     }
+
+    #[test]
+    fn a_select_on_every_column_reads_the_whole_table() {
+        let (grants, orders) =
+            grants("GRANT SELECT (id, price, quantity, status) ON orders TO anon;");
+        assert_eq!(grants.read(CallerKind::Anon, orders, None), Ok(()));
+    }
+
+    #[test]
+    fn an_update_needs_select_on_the_columns_it_reads() {
+        let update = PlannedWrite::Update {
+            old: Vec::new(),
+            new: Vec::new(),
+            assigned: vec![3],
+            read: vec![0],
+        };
+        let (grants, orders) = grants(
+            "GRANT UPDATE (status) ON orders TO anon;\nGRANT SELECT (status) ON orders TO anon;\nGRANT UPDATE (status) ON orders TO authenticated;\nGRANT SELECT (id) ON orders TO authenticated;",
+        );
+        assert_eq!(
+            grants.write(CallerKind::Anon, orders, &update),
+            Err(NotGranted::Named {
+                table: "orders".to_owned(),
+                kind: CallerKind::Anon,
+            }),
+        );
+        assert_eq!(
+            grants.write(CallerKind::Authenticated, orders, &update),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_delete_needs_delete_and_select_on_the_columns_it_reads() {
+        let delete = PlannedWrite::Delete {
+            old: Vec::new(),
+            read: vec![0],
+        };
+        let (lacking, orders) = grants(
+            "GRANT SELECT (id) ON orders TO anon;\nGRANT DELETE ON orders TO authenticated;\nGRANT SELECT (price) ON orders TO authenticated;",
+        );
+        let refused = |kind| {
+            Err(NotGranted::Named {
+                table: "orders".to_owned(),
+                kind,
+            })
+        };
+        assert_eq!(
+            lacking.write(CallerKind::Anon, orders, &delete),
+            refused(CallerKind::Anon),
+        );
+        assert_eq!(
+            lacking.write(CallerKind::Authenticated, orders, &delete),
+            refused(CallerKind::Authenticated),
+        );
+
+        let (holding, orders) =
+            grants("GRANT DELETE ON orders TO anon;\nGRANT SELECT (id) ON orders TO anon;");
+        assert_eq!(holding.write(CallerKind::Anon, orders, &delete), Ok(()));
+    }
 }

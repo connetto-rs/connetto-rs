@@ -192,6 +192,31 @@ async fn a_kind_is_refused_a_write_it_cannot_make_before_the_database() {
     server.stop().await;
 }
 
+/// A write to a table no kind may read is refused as plain `Unauthorized`,
+/// which names neither the table nor the kind.
+#[tokio::test]
+async fn a_write_to_a_table_no_kind_may_read_keeps_the_plain_refusal() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    setup(&fixture, false).await;
+    fixture
+        .exec("REVOKE ALL ON orders FROM anon, authenticated, bot_installation, bot, delegated")
+        .await;
+    let server = Running::start(&fixture, NEVER, false).await;
+
+    let mut anonymous = server.connect_anonymous("hidden-writer").await;
+    let ControlMessage::MutationReject(reject) =
+        insert_order(&mut anonymous, 100, Some("written")).await
+    else {
+        panic!("the write to a hidden table was not refused");
+    };
+    assert_eq!(reject.reason, MutationRejectReason::Unauthorized);
+    assert!(!order_ids(&fixture).await.contains(&100));
+    drop(anonymous);
+    server.stop().await;
+}
+
 /// An insert's `NULL` in a column the kind holds no `INSERT` on is no
 /// assignment, so the row lands with the column's default, while a value there
 /// is refused as `PostgreSQL` refuses it.
@@ -321,6 +346,53 @@ async fn a_revoke_at_the_marker_ends_only_that_kinds_subscriptions() {
         BTreeSet::from([2]),
     );
     drop((anonymous, signed_in));
+    server.stop().await;
+    fixture
+        .exec("DROP EVENT TRIGGER connetto_policy_changes_trigger")
+        .await;
+}
+
+/// A `REVOKE` the marker row carries ends that kind's live aggregate on the
+/// table with the refusal naming the table and the kind. The caller is signed
+/// in, since an aggregate over a row-secured table reads as its viewer and an
+/// anonymous caller has none.
+#[tokio::test]
+async fn a_revoke_at_the_marker_ends_that_kinds_aggregate() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    setup(&fixture, false).await;
+    fixture.exec(POLICY_CHANGES_TRIGGER_DDL).await;
+    let server = Running::start(&fixture, NEVER, false).await;
+
+    let mut signed_in = server.connect_signed_in("revoked-counter").await;
+    subscribe_to(&mut signed_in, "count", "SELECT COUNT(*) FROM keep").await;
+    let columns = next_control(&mut signed_in).await;
+    assert!(
+        matches!(columns, ControlMessage::AggregateColumns(_)),
+        "the aggregate opens with its columns: {columns:?}",
+    );
+    let answer = next_control(&mut signed_in).await;
+    assert!(
+        matches!(&answer, ControlMessage::AggregateUpdate(update) if update.sub_id == "count"),
+        "the aggregate answers: {answer:?}",
+    );
+
+    fixture
+        .exec("REVOKE SELECT ON keep FROM authenticated")
+        .await;
+    let refusal = loop {
+        match next_control(&mut signed_in).await {
+            ControlMessage::FullResyncRequired(resync) if resync.sub_id == "count" => {}
+            ControlMessage::AggregateUpdate(update) if update.sub_id == "count" => {}
+            other => break other,
+        }
+    };
+    assert_eq!(
+        refusal,
+        not_granted("count", "keep", CallerKind::Authenticated)
+    );
+    drop(signed_in);
     server.stop().await;
     fixture
         .exec("DROP EVENT TRIGGER connetto_policy_changes_trigger")
