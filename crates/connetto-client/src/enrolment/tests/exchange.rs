@@ -313,16 +313,11 @@ async fn a_renewal_on_the_link_moves_the_authors_certificate_end() {
     );
     let renewed_end = crate::exchange::unix_secs(renewed.leaf.not_after());
     assert!(renewed_end > crate::exchange::unix_secs(anna.certificate_end));
-    anna.node
-        .serve(
-            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-            connetto_peer::Identity {
-                certificate: renewed.certificate,
-                issuer: renewed.issuer,
-                key: Arc::new(key),
-            },
-        )
-        .expect("anna serves her renewed certificate");
+    anna.node.present(connetto_peer::Identity {
+        certificate: renewed.certificate,
+        issuer: renewed.issuer,
+        key: Arc::new(key),
+    });
     poll_until(|| certificate_end(&ben.conn, &anna.key_id) == Some(renewed_end)).await;
     anna.stop().await;
     ben.stop().await;

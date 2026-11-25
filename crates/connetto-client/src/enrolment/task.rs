@@ -1379,8 +1379,11 @@ impl<L: Link> Run<L> {
             issuer,
             key,
         };
-        match self.peer.serve(self.peer_listen, identity) {
+        match self.peer.listen(self.peer_listen) {
             Ok(bound) => {
+                // Presented after the bind, so a port that will not bind
+                // leaves the node presenting nothing.
+                self.peer.present(identity);
                 #[cfg(all(feature = "peer", target_os = "android"))]
                 if let Some(java) = self.java.clone() {
                     match MulticastLock::acquire(java) {

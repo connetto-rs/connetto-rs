@@ -2075,7 +2075,6 @@ pub(crate) fn run(
 mod tests {
     use super::*;
     use std::collections::VecDeque;
-    use std::net::SocketAddr;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use connetto_core::device_cert::{
@@ -2213,7 +2212,7 @@ mod tests {
         }
     }
 
-    /// A node that trusts `root_der` and serves `identity` on loopback.
+    /// A node that trusts `root_der` and presents `identity`.
     fn serving_node(root_der: Vec<u8>, identity: Identity) -> Node {
         let (tx, _rx) = mpsc::unbounded_channel::<PeerEvent>();
         let node = Node::new(
@@ -2225,8 +2224,7 @@ mod tests {
             tx,
         )
         .expect("the roots hold keys");
-        node.serve(SocketAddr::from(([127, 0, 0, 1], 0)), identity)
-            .expect("the listener binds");
+        node.present(identity);
         node
     }
 

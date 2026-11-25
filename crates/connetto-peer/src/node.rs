@@ -20,7 +20,7 @@ use rustls::{AlertDescription, ClientConfig, ServerConfig, version};
 use serde_bytes::ByteBuf;
 use socket2::SockRef;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{TcpListener, TcpSocket, TcpStream};
+use tokio::net::{TcpListener, TcpSocket};
 use tokio::sync::{mpsc, watch};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::{debug, warn};
@@ -51,8 +51,8 @@ pub(crate) const WRITE_BOUND: Duration = Duration::from_secs(10);
 pub(crate) const PING_EVERY: Duration = Duration::from_secs(15);
 /// The silence that takes a link down.
 pub(crate) const SILENCE_LIMIT: Duration = Duration::from_secs(45);
-/// The inbound handshakes the listener runs at once, the unauthenticated
-/// network's bound on its sockets.
+/// The inbound handshakes the node runs at once across its transports, the
+/// unauthenticated network's bound on its connections.
 const MAX_INBOUND_HANDSHAKES: usize = 16;
 /// The exchange messages one link's queue holds, the backpressure a sender
 /// waits on while the link drains.
@@ -117,8 +117,12 @@ pub(crate) struct NodeState {
     /// the link's bounded queue without the links lock.
     pub(crate) senders: RwLock<HashMap<KeyId, LinkSenders>>,
     listener: RwLock<Option<ListenerSlot>>,
-    /// Whether the node still serves, checked under the links lock.
+    /// Whether the node still presents an identity, checked under the links
+    /// lock.
     pub(crate) serving: AtomicBool,
+    /// The places of the inbound handshakes running at once, shared by every
+    /// transport that hands the node its accepted connections.
+    inbound_handshakes: tokio::sync::Semaphore,
     /// Whether the node's peer links stand, checked before a dial's socket
     /// and under the links lock before a registration (R77 slice 8).
     pub(crate) links_on: AtomicBool,
@@ -154,7 +158,17 @@ pub(crate) enum SlotState {
     },
 }
 
-/// A linked peer and the remote address of the link the node keeps to it.
+/// What a link runs over, read from its connection's interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Medium {
+    /// Peer-to-peer Wi-Fi, two devices linked with no network between them.
+    PeerToPeer,
+    /// A network both devices joined, a shared Wi-Fi or a hotspot.
+    Network,
+}
+
+/// A linked peer and the remote address and medium of the link the node
+/// keeps to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerLink {
     /// What the peer's certificate names.
@@ -168,6 +182,9 @@ pub struct PeerLink {
     pub bot_list: Option<String>,
     /// The kept link's remote address, `None` while a duplicate close waits for its keeper.
     pub remote: Option<SocketAddr>,
+    /// What the kept link runs over, `None` while a duplicate close waits for
+    /// its keeper.
+    pub medium: Option<Medium>,
     /// The kept link's number, which a media send names, `None` while a
     /// duplicate close waits for its keeper.
     pub link: Option<u64>,
@@ -185,6 +202,8 @@ pub(crate) struct LinkSlot {
     pub(crate) peer: DeviceIdentity,
     /// The connection's remote address.
     remote: SocketAddr,
+    /// What the connection runs over.
+    medium: Medium,
     /// The peer's `SubjectPublicKeyInfo`, DER.
     pub(crate) public_key: Vec<u8>,
     /// The peer's leaf, DER.
@@ -322,6 +341,7 @@ impl Node {
             senders: RwLock::new(HashMap::new()),
             listener: RwLock::new(None),
             serving: AtomicBool::new(false),
+            inbound_handshakes: tokio::sync::Semaphore::new(MAX_INBOUND_HANDSHAKES),
             links_on: AtomicBool::new(true),
             dial_count: Mutex::new(0),
             next_seq: Mutex::new(0),
@@ -338,14 +358,9 @@ impl Node {
         })
     }
 
-    /// Present `identity` on `listen`, keeping the port and the live links
-    /// when the node already serves.
-    ///
-    /// # Errors
-    ///
-    /// [`io::Error`] when the port will not bind or the runtime cannot
-    /// drive the acceptor.
-    pub fn serve(&self, listen: SocketAddr, identity: Identity) -> io::Result<SocketAddr> {
+    /// Present `identity` to the peers the node links with, keeping the
+    /// live links, which receive a changed chain.
+    pub fn present(&self, identity: Identity) {
         *self.state.own_key.write() = Some(key_id(&*identity.key));
         let renewed = {
             let mut identity_slot = self.state.identity.write();
@@ -355,12 +370,23 @@ impl Node {
             *identity_slot = Some(identity);
             renewed
         };
-        if let Some(slot) = self.state.listener.read().as_ref() {
-            // The port and the live links stay, and a changed presented
-            // chain reaches them.
-            if renewed {
-                self.renew_links();
-            }
+        if renewed {
+            self.renew_links();
+        }
+        self.state.serving.store(true, Ordering::Release);
+    }
+
+    /// Accept TCP connections on `listen`, keeping the bound port when the
+    /// node already listens. The node answers them once it presents an
+    /// identity.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the port will not bind or the runtime cannot
+    /// drive the acceptor.
+    pub fn listen(&self, listen: SocketAddr) -> io::Result<SocketAddr> {
+        let mut listener_slot = self.state.listener.write();
+        if let Some(slot) = listener_slot.as_ref() {
             return Ok(slot.addr);
         }
         let std_listener = std::net::TcpListener::bind(listen)?;
@@ -370,13 +396,11 @@ impl Node {
         let listener = TcpListener::from_std(std_listener)?;
         let handle = tokio::runtime::Handle::try_current()
             .map_err(|_| io::Error::other("no tokio runtime drives the acceptor"))?;
-        let state = Arc::clone(&self.state);
-        handle.spawn(accept_loop(state, listener, stop_rx));
-        *self.state.listener.write() = Some(ListenerSlot {
+        handle.spawn(accept_loop(Arc::clone(&self.state), listener, stop_rx));
+        *listener_slot = Some(ListenerSlot {
             addr,
             stop: stop_tx,
         });
-        self.state.serving.store(true, Ordering::Release);
         Ok(addr)
     }
 
@@ -400,7 +424,8 @@ impl Node {
         }
     }
 
-    /// Close every link with `reason` and drop the listener.
+    /// Close every link with `reason`, stop presenting the identity and drop
+    /// the listener.
     pub fn stop(&self, reason: CloseReason) {
         stop_state(&self.state, reason);
     }
@@ -446,7 +471,7 @@ impl Node {
     }
 
     /// What the certificate the node presents names, `None` before it
-    /// serves.
+    /// presents one.
     #[must_use]
     pub fn identity(&self) -> Option<DeviceIdentity> {
         let identity = self.state.identity.read();
@@ -454,7 +479,7 @@ impl Node {
         Some(certificate.identity().clone())
     }
 
-    /// The bound address, while the node serves.
+    /// The bound address, while the node listens.
     #[must_use]
     pub fn local_addr(&self) -> Option<SocketAddr> {
         self.state.listener.read().as_ref().map(|slot| slot.addr)
@@ -476,6 +501,7 @@ impl Node {
                     public_key: slot.public_key.clone(),
                     bot_list: slot.bot_list.clone(),
                     remote: Some(slot.remote),
+                    medium: Some(slot.medium),
                     link: Some(slot.seq),
                 },
                 SlotState::AwaitingKeeper {
@@ -487,6 +513,7 @@ impl Node {
                     public_key: public_key.clone(),
                     bot_list: bot_list.clone(),
                     remote: None,
+                    medium: None,
                     link: None,
                 },
             })
@@ -575,7 +602,8 @@ impl Node {
         }
     }
 
-    /// Dial `addr`, answering the peer's identity once the link is live.
+    /// Dial `addr` over TCP, answering the peer's identity once the link is
+    /// live.
     ///
     /// # Errors
     ///
@@ -586,6 +614,45 @@ impl Node {
     /// When the peer's presented chain cannot be parsed as device
     /// certificates.
     pub async fn link(&self, addr: SocketAddr) -> Result<DeviceIdentity, LinkError> {
+        if !self.state.links_on.load(Ordering::Acquire) {
+            return Err(LinkError::LinksOff);
+        }
+        if self.state.identity.read().is_none() {
+            return Err(LinkError::NotServing);
+        }
+        let socket = match addr {
+            SocketAddr::V4(_) => TcpSocket::new_v4(),
+            SocketAddr::V6(_) => TcpSocket::new_v6(),
+        }
+        .map_err(LinkError::Unreachable)?;
+        if let Some(prep) = self.state.socket_prep.read().as_ref() {
+            prep.prepare(SockRef::from(&socket), addr)
+                .map_err(LinkError::Unreachable)?;
+        }
+        let tcp = tokio::time::timeout(CONNECT_TIMEOUT, socket.connect(addr))
+            .await
+            .map_err(|_| LinkError::Timeout)?
+            .map_err(LinkError::Unreachable)?;
+        self.link_over(tcp, addr, Medium::Network).await
+    }
+
+    /// Dial over `io`, a connection a transport opened to `remote` over
+    /// `medium`, answering the peer's identity once the link is live.
+    ///
+    /// # Errors
+    ///
+    /// [`LinkError`] naming the failed phase or the refusal.
+    ///
+    /// # Panics
+    ///
+    /// When the peer's presented chain cannot be parsed as device
+    /// certificates.
+    pub async fn link_over<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+        &self,
+        io: S,
+        remote: SocketAddr,
+        medium: Medium,
+    ) -> Result<DeviceIdentity, LinkError> {
         if !self.state.links_on.load(Ordering::Acquire) {
             return Err(LinkError::LinksOff);
         }
@@ -600,19 +667,6 @@ impl Node {
             *dial_count += 1;
             *dial_count
         };
-        let socket = match addr {
-            SocketAddr::V4(_) => TcpSocket::new_v4(),
-            SocketAddr::V6(_) => TcpSocket::new_v6(),
-        }
-        .map_err(LinkError::Unreachable)?;
-        if let Some(prep) = self.state.socket_prep.read().as_ref() {
-            prep.prepare(SockRef::from(&socket), addr)
-                .map_err(LinkError::Unreachable)?;
-        }
-        let tcp = tokio::time::timeout(CONNECT_TIMEOUT, socket.connect(addr))
-            .await
-            .map_err(|_| LinkError::Timeout)?
-            .map_err(LinkError::Unreachable)?;
         let config = client_config_for(
             &self.state.trust,
             self.state.verifier.clock(),
@@ -622,7 +676,7 @@ impl Node {
         );
         let connector = TlsConnector::from(config);
         let domain = ServerName::try_from(DIAL_NAME).expect("a valid dial name");
-        let tls = tokio::time::timeout(HANDSHAKE_TIMEOUT, connector.connect(domain, tcp))
+        let tls = tokio::time::timeout(HANDSHAKE_TIMEOUT, connector.connect(domain, io))
             .await
             .map_err(|_| LinkError::Timeout)?
             .map_err(map_tls)?;
@@ -658,11 +712,26 @@ impl Node {
                 dialer: key_id(&*identity.key),
                 dial,
                 presented: identity.certificate.clone(),
-                remote: addr,
+                remote,
+                medium,
             },
             tls,
         )?;
         Ok(peer)
+    }
+
+    /// Answer over `io`, a connection a transport accepted from `remote`
+    /// over `medium`, until the link registers or the peer is refused.
+    ///
+    /// The outcome reaches the node's events. A node presenting nothing, or
+    /// already running its bound of inbound handshakes, drops `io` at once.
+    pub async fn accept_over<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+        &self,
+        io: S,
+        remote: SocketAddr,
+        medium: Medium,
+    ) {
+        inbound(Arc::clone(&self.state), io, remote, medium).await;
     }
 
     /// Run the Bluetooth exchange as the host over `io`, handing the
@@ -1016,7 +1085,6 @@ async fn accept_loop(
     listener: TcpListener,
     mut stop: watch::Receiver<bool>,
 ) {
-    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND_HANDSHAKES));
     loop {
         tokio::select! {
             _ = stop.changed() => return,
@@ -1031,28 +1099,28 @@ async fn accept_loop(
                         continue;
                     }
                 };
-                let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
-                    drop(tcp);
-                    continue;
-                };
-                let identity = state.identity.read().clone();
-                let Some(identity) = identity else {
-                    drop(tcp);
-                    continue;
-                };
-                let state = Arc::clone(&state);
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    inbound(state, tcp, remote, identity).await;
-                });
+                tokio::spawn(inbound(Arc::clone(&state), tcp, remote, Medium::Network));
             }
         }
     }
 }
 
-/// The listener's side of a handshake, until the link registers or the
-/// peer is refused.
-async fn inbound(state: Arc<NodeState>, tcp: TcpStream, remote: SocketAddr, identity: Identity) {
+/// The listener's side of a handshake over `io`, in one of the node's
+/// inbound handshake places, until the link registers or the peer is
+/// refused. A node presenting nothing or with no free place drops `io`.
+async fn inbound<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    state: Arc<NodeState>,
+    io: S,
+    remote: SocketAddr,
+    medium: Medium,
+) {
+    let Ok(_place) = state.inbound_handshakes.try_acquire() else {
+        return;
+    };
+    let identity = state.identity.read().clone();
+    let Some(identity) = identity else {
+        return;
+    };
     let config = server_config_for(
         &state.trust,
         state.verifier.clock(),
@@ -1061,7 +1129,7 @@ async fn inbound(state: Arc<NodeState>, tcp: TcpStream, remote: SocketAddr, iden
         &identity,
     );
     let acceptor = TlsAcceptor::from(config);
-    let tls = match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
+    let tls = match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(io)).await {
         Ok(Ok(tls)) => tls,
         Ok(Err(err)) => {
             debug!(%err, "an inbound handshake was refused");
@@ -1118,6 +1186,7 @@ async fn inbound(state: Arc<NodeState>, tcp: TcpStream, remote: SocketAddr, iden
             dial,
             presented: identity.certificate.clone(),
             remote,
+            medium,
         },
         tls,
     );
@@ -1220,6 +1289,8 @@ struct Handshaken {
     presented: Vec<u8>,
     /// The connection's remote address.
     remote: SocketAddr,
+    /// What the connection runs over.
+    medium: Medium,
 }
 
 /// Send `slot` the presented chain when a renewal swapped it since the
@@ -1265,6 +1336,7 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         dial,
         presented,
         remote,
+        medium,
     } = handshaken;
     let peer = &peer;
     let peer_key = peer.key();
@@ -1327,6 +1399,7 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             let slot = LinkSlot {
                 peer: (*peer).clone(),
                 remote: SocketAddr::new(remote.ip().to_canonical(), remote.port()),
+                medium,
                 public_key,
                 leaf,
                 issuer,

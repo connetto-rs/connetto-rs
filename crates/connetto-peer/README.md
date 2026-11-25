@@ -6,7 +6,7 @@
 
 The mutual TLS link between certified devices. A `Node` presents one device's certificate and key and dials or accepts other certified devices over TLS 1.3. Every chain verifies against the roots the deployment ships, the attestation levels the device accepts, and the revocation lists it keeps, behind the wall clock a `Clock` supplies. Links carry a small frame protocol for liveness pings and revocation lists the peer lacks, close under the silence bound, and a deterministic duplicate rule keeps one link per peer key when both sides dial at once.
 
-The dials' sockets pass through the `SocketPrep` the node carries before their connect, set at runtime with `set_socket_prep`, so a joined network can bind them to itself.
+A link runs over any byte stream a transport hands in with `link_over` and `accept_over`, which name the connection's remote address and its `Medium`, peer-to-peer Wi-Fi or a network. TCP is the built-in transport, `listen` accepting and `link` dialling. TCP dials pass through the `SocketPrep` the node carries before their connect, set at runtime with `set_socket_prep`, so a joined network can bind them to itself.
 
 ```rust
 use std::net::SocketAddr;
@@ -47,7 +47,8 @@ let identity = Identity {
     key: Arc::new(Dummy),
 };
 let listen: SocketAddr = "127.0.0.1:0".parse().expect("a loopback address");
-let bound = node.serve(listen, identity).expect("the listener binds");
+node.present(identity);
+let bound = node.listen(listen).expect("the listener binds");
 assert_eq!(node.local_addr(), Some(bound));
 node.stop(CloseReason::Closed);
 # });
