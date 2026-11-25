@@ -6414,15 +6414,15 @@ where
 
         // Every exit breaks with its result rather than returning, so the teardown below always runs.
         let mut last_inbound = tokio::time::Instant::now();
-        let ended: Result<(), SessionError> = loop {
+        let (ended, reason) = loop {
             if state.closing {
-                break Ok(());
+                break (Ok(()), "requested");
             }
             // Between two frames, so the rows a snapshot missed precede every live patch still queued, which all commit later.
             if !state.missed.is_empty()
                 && let Err(err) = self.replay_missed(&mut transport, &mut state).await
             {
-                break Err(err);
+                break (Err(err), "missed_replay_failed");
             }
             // One task, two arms. The transport arm awaits a whole subscribe,
             // including its first page of rows, so the outbound arm cannot
@@ -6437,8 +6437,8 @@ where
                 incoming = state.input.recv(&mut transport) => {
                     match self.handle_incoming(&mut transport, incoming, &mut state).await {
                         Ok(true) => last_inbound = tokio::time::Instant::now(),
-                        Ok(false) => break Ok(()),
-                        Err(err) => break Err(err),
+                        Ok(false) => break (Ok(()), "peer_closed"),
+                        Err(err) => break (Err(err), "incoming_failed"),
                     }
                 }
                 outbound = async {
@@ -6447,19 +6447,19 @@ where
                         None => state.outbound_rx.recv().await,
                     }
                 } => {
-                    let Some(outbound) = outbound else { break Ok(()) };
+                    let Some(outbound) = outbound else { break (Ok(()), "outbound_closed") };
                     let handled = outbound.released_when_handled();
                     let outcome = self.handle_outbound(&mut transport, outbound, &mut state).await;
                     state.outbound.queue.release(handled);
                     match outcome {
                         Ok(true) => {}
-                        Ok(false) => break Ok(()),
-                        Err(err) => break Err(err),
+                        Ok(false) => break (Ok(()), "outbound_requested"),
+                        Err(err) => break (Err(err), "outbound_failed"),
                     }
                 }
                 () = next_key_expiry(&state.key_expiry, &self.config) => self.expire_keys(&mut state).await,
                 // Only an inbound frame moves `last_inbound`, so this is the client's silence.
-                () = tokio::time::sleep_until(last_inbound + self.config.idle_limit()) => break Ok(()),
+                () = tokio::time::sleep_until(last_inbound + self.config.idle_limit()) => break (Ok(()), "idle"),
             }
         };
 
@@ -6476,7 +6476,7 @@ where
         self.guard.forget_connection(session_id);
 
         self.unsubscribe_all(state).await;
-        tracing::info!("connection closed");
+        tracing::info!(reason, ?ended, silent_for = ?last_inbound.elapsed(), "connection closed");
         ended
     }
 

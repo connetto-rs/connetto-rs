@@ -59,11 +59,15 @@ type Manager = SessionManager<
 >;
 
 async fn next_frame(client: &mut LoopbackTransport, what: &str) -> IncomingFrame {
-    tokio::time::timeout(WAIT, client.recv())
+    let frame = tokio::time::timeout(WAIT, client.recv())
         .await
         .unwrap_or_else(|_| panic!("no frame within {WAIT:?} while waiting for {what}"))
         .expect("recv")
-        .unwrap_or_else(|| panic!("the connection closed while waiting for {what}"))
+        .unwrap_or_else(|| panic!("the connection closed while waiting for {what}"));
+    if let IncomingFrame::Control(control) = &frame {
+        tracing::debug!(what, ?control, "failover control received");
+    }
+    frame
 }
 
 /// The order ids a patch inserts or updates.
@@ -90,8 +94,10 @@ async fn connect(manager: &Arc<Manager>, cursor: Option<Cursor>) -> LoopbackTran
     let (server_end, mut client) = loopback();
     let serving = Arc::clone(manager);
     tokio::spawn(async move {
-        if let Err(err) = serving.serve(server_end).await {
-            eprintln!("session ended with an error: {err}");
+        let outcome = serving.serve(server_end).await;
+        tracing::debug!(?outcome, "failover session task ended");
+        if let Err(error) = outcome {
+            eprintln!("session ended with an error: {error}");
         }
     });
     let mut handshake =
@@ -150,7 +156,9 @@ async fn live(client: &mut LoopbackTransport, id: i64) -> Cursor {
     loop {
         match next_frame(client, &format!("the live patch for order {id}")).await {
             IncomingFrame::Bulk(BulkMessage::LivePatch(patch)) => {
-                if ids(&patch.patchset_zstd).contains(&id) {
+                let rows = ids(&patch.patchset_zstd);
+                tracing::debug!(?rows, cursor = ?patch.cursor, "failover live patch received");
+                if rows.contains(&id) {
                     return patch.cursor;
                 }
             }
@@ -316,6 +324,9 @@ async fn only_a_changed_timeline_closes_live_connections() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lossy_promotion_resyncs_the_lost_rows_and_resumes_the_rest() {
+    connetto_core::logging::init_stdout_with_default(
+        "connetto_server=debug,subql=debug,it::failover=debug",
+    );
     let pair = Pair::start().await;
     let board = Switchboard::to(pair.primary_address().await).await;
     let url = board.url();
@@ -374,9 +385,12 @@ async fn a_lossy_promotion_resyncs_the_lost_rows_and_resumes_the_rest() {
                     .map_err(|err| err.to_string())
                 }
             };
-            let _ = manager
-                .ingest_with_reconnect(connect, &policy, |_| {})
+            let outcome = manager
+                .ingest_with_reconnect(connect, &policy, |event| {
+                    tracing::debug!(?event, "failover ingestion event");
+                })
                 .await;
+            tracing::debug!(?outcome, "failover ingestion task ended");
         })
     };
 
