@@ -2012,15 +2012,13 @@ fn far_peer(
     )
     .expect("the roots hold keys");
     let key: Arc<dyn DeviceKey> = Arc::new(key);
-    node.serve(
-        std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-        connetto_peer::Identity {
-            certificate: held.certificate,
-            issuer: held.issuer,
-            key,
-        },
-    )
-    .expect("the far node serves");
+    node.present(connetto_peer::Identity {
+        certificate: held.certificate,
+        issuer: held.issuer,
+        key,
+    });
+    node.listen(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        .expect("the far node listens");
     (node, rx)
 }
 

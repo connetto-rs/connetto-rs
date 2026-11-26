@@ -396,12 +396,13 @@ pub fn whole_second() -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
 }
 
-/// Serve `peer` on loopback, answering the bound address.
+/// Present `peer` and listen on loopback, answering the bound address.
 ///
 /// # Panics
 ///
 /// When the loopback listener does not bind.
 pub fn serve(node: &Node, peer: &Peer) -> SocketAddr {
-    node.serve(SocketAddr::from(([127, 0, 0, 1], 0)), peer.identity())
+    node.present(peer.identity());
+    node.listen(SocketAddr::from(([127, 0, 0, 1], 0)))
         .expect("the listener binds")
 }

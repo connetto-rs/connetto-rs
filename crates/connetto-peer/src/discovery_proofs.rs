@@ -218,9 +218,7 @@ async fn a_renewal_re_registers_under_a_new_fingerprint() {
 
     // The renewal keeps the port and the link, and the advertisement moves
     // to the new fingerprint.
-    alice_node
-        .serve(a_addr, renewed.identity())
-        .expect("the renewal serves");
+    alice_node.present(renewed.identity());
     da.serve(a_addr.port(), renewed_fp);
 
     // Bob's browse sees the old instance gone and the new one found, in

@@ -15,7 +15,7 @@ use crate::frame::{PeerFrame, read_frame, write_frame};
 use crate::node::{EXCHANGE_QUEUE, SlotState, client_config_for};
 use crate::test_support::{DAY, Deployment, Issuer, Peer, events, node, serve, whole_second};
 use crate::{
-    CloseReason, LinkError, Liveness, Node, PeerEvent, PeerSendError, Refusal, SocketPrep,
+    CloseReason, LinkError, Liveness, Medium, Node, PeerEvent, PeerSendError, Refusal, SocketPrep,
     SystemClock, Trust,
 };
 use connetto_core::device_cert::{AttestationLevel, DeviceIdentity, Revoked, certificate_key_id};
@@ -999,7 +999,7 @@ async fn two_devices_dialing_each_other_keep_one_link_each() {
 
 /// Proof 9.
 #[tokio::test]
-async fn serving_again_with_a_new_certificate_keeps_port_and_link() {
+async fn presenting_again_with_a_new_certificate_keeps_port_and_link() {
     let now = whole_second();
     let deployment = Deployment::new(10, now);
     let issuer = deployment.add_issuer(now, [1; 16]);
@@ -1033,13 +1033,14 @@ async fn serving_again_with_a_new_certificate_keeps_port_and_link() {
     assert_eq!(next_events(&mut b_rx, 1).await, vec![linked_event(&alice)]);
     assert_eq!(next_events(&mut a_rx, 1).await, vec![linked_event(&bob)]);
 
-    // Alice renews, a new serial and window on the same key, and serves
-    // again. The port and the live link stay.
+    // Alice renews, a new serial and window on the same key, and presents
+    // it. The port and the live link stay.
     let renewed = deployment.reissue(&issuer, &alice, now, DAY, [17; 16]);
-    let served = a
-        .serve(SocketAddr::from(([127, 0, 0, 1], 0)), renewed.identity())
-        .expect("the re-serve keeps the listener");
-    assert_eq!(served, addr);
+    a.present(renewed.identity());
+    let listening = a
+        .listen(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .expect("the listener stays");
+    assert_eq!(listening, addr);
     assert_eq!(a.local_addr(), Some(addr));
 
     // The link still carries frames under the swapped certificate.
@@ -1974,13 +1975,10 @@ async fn a_renewal_certificate_keeps_the_link_past_the_old_deadline() {
         [PeerEvent::Linked { .. }]
     ));
 
-    // Bob renews on the same key and serves again, so Alice receives the
+    // Bob renews on the same key and presents it, so Alice receives the
     // renewed chain and moves the link's deadline a day out.
     let renewed = deployment.reissue(&issuer, &bob, now, DAY, [17; 16]);
-    let served = b
-        .serve(SocketAddr::from(([127, 0, 0, 1], 0)), renewed.identity())
-        .expect("the re-serve keeps the listener");
-    assert_eq!(served, b_addr);
+    b.present(renewed.identity());
 
     // Alice learns the renewed certificate's end, a day out (R78 slice 3a).
     assert_eq!(
@@ -2044,12 +2042,9 @@ async fn a_certificate_for_another_key_closes_with_protocol() {
     assert_eq!(next_events(&mut a_rx, 1).await, vec![linked_event(&bob)]);
     assert_eq!(next_events(&mut b_rx, 1).await, vec![linked_event(&alice)]);
 
-    // Bob serves again with a certificate for Carol's key, so the renewed
-    // chain names a different key than the link proved.
-    let served = b
-        .serve(SocketAddr::from(([127, 0, 0, 1], 0)), carol.identity())
-        .expect("the re-serve keeps the listener");
-    assert_eq!(served, b_addr);
+    // Bob presents a certificate for Carol's key, so the renewed chain
+    // names a different key than the link proved.
+    b.present(carol.identity());
 
     // Alice closes the link with Protocol.
     let event = await_event(&mut a_rx, Duration::from_secs(10), |event| {
@@ -2141,12 +2136,9 @@ async fn a_revoked_renewed_chain_closes_with_peer_revoked() {
     );
     a.keep_list(list.clone(), signer.clone());
 
-    // Bob serves the renewed certificate. Alice verifies the renewed chain
+    // Bob presents the renewed certificate. Alice verifies the renewed chain
     // and finds the serial revoked, so the link closes with PeerRevoked.
-    let served = b
-        .serve(SocketAddr::from(([127, 0, 0, 1], 0)), renewed.identity())
-        .expect("the re-serve keeps the listener");
-    assert_eq!(served, b_addr);
+    b.present(renewed.identity());
 
     let event = await_event(&mut a_rx, Duration::from_secs(10), |event| {
         matches!(
@@ -2831,6 +2823,11 @@ async fn linked_stands_its_live_peers_and_a_close_drops_one() {
             .all(|remote| remote.is_some_and(|remote| remote.ip().is_loopback())),
         "both remotes stand on the loopback"
     );
+    assert_eq!(
+        [a_links[0].medium, b_links[0].medium],
+        [Some(Medium::Network); 2],
+        "a TCP link runs over a network"
+    );
 
     // B stops, the link closes, and A's read drops B with the close.
     b.stop(CloseReason::Closed);
@@ -2897,6 +2894,7 @@ async fn a_duplicate_close_holds_the_peer_in_the_link_read() {
             public_key: gone.public_key_info(),
             bot_list: Some(gone.bot_list.clone()),
             remote: None,
+            medium: None,
             link: None,
         }],
         "the held peer stays in the read without an address"
@@ -3071,6 +3069,7 @@ async fn the_hello_bound_drops_a_held_peer_in_the_link_read() {
             public_key: gone.public_key_info(),
             bot_list: Some(gone.bot_list.clone()),
             remote: None,
+            medium: None,
             link: None,
         }],
         "the held peer stays in the read without an address"
@@ -3364,6 +3363,101 @@ async fn linked_nodes_deliver_each_exchange_message_in_order_naming_the_sender()
         &alice.identity,
         &mut a_rx,
         exchange_messages(8),
+    )
+    .await;
+
+    a.stop(CloseReason::Closed);
+    b.stop(CloseReason::Closed);
+}
+
+/// Two nodes presenting without a listener link over an in-memory stream a
+/// transport hands in, and the link read names the remote and the medium
+/// that transport gave (R112 decisions 3 and 4).
+#[tokio::test]
+async fn nodes_link_over_a_handed_in_stream_naming_its_remote_and_medium() {
+    let now = whole_second();
+    let deployment = Deployment::new(31, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let alice = deployment.device(
+        &issuer,
+        "alice",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let bob = deployment.device(
+        &issuer,
+        "bob",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+    let (a_tx, mut a_rx) = events();
+    let (b_tx, mut b_rx) = events();
+    let a = node(deployment.root_der(), a_tx);
+    let b = node(deployment.root_der(), b_tx);
+    let bob_seen_at = SocketAddr::from(([169, 254, 7, 2], 4242));
+    let alice_seen_at = SocketAddr::from(([169, 254, 7, 1], 4343));
+
+    let (unheard, _far_end) = tokio::io::duplex(1024);
+    assert!(
+        matches!(
+            a.link_over(unheard, bob_seen_at, Medium::PeerToPeer).await,
+            Err(LinkError::NotServing)
+        ),
+        "a node presenting nothing dials nobody"
+    );
+
+    a.present(alice.identity());
+    b.present(bob.identity());
+    assert_eq!(a.local_addr(), None, "presenting binds no listener");
+    let (dialer_end, acceptor_end) = tokio::io::duplex(64 * 1024);
+    let (dialed, ()) = tokio::join!(
+        a.link_over(dialer_end, bob_seen_at, Medium::PeerToPeer),
+        b.accept_over(acceptor_end, alice_seen_at, Medium::PeerToPeer),
+    );
+    assert_eq!(dialed.expect("the link completes"), bob.identity);
+    assert_eq!(next_events(&mut a_rx, 1).await, vec![linked_event(&bob)]);
+    assert_eq!(next_events(&mut b_rx, 1).await, vec![linked_event(&alice)]);
+    let named = |node: &Node| {
+        node.linked()
+            .into_iter()
+            .map(|link| (link.peer, link.remote, link.medium))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        named(&a),
+        [(
+            bob.identity.clone(),
+            Some(bob_seen_at),
+            Some(Medium::PeerToPeer)
+        )]
+    );
+    assert_eq!(
+        named(&b),
+        [(
+            alice.identity.clone(),
+            Some(alice_seen_at),
+            Some(Medium::PeerToPeer)
+        )]
+    );
+
+    exchange_reaches_in_order(
+        &a,
+        &alice.identity,
+        &bob.identity,
+        &mut b_rx,
+        exchange_messages(9),
+    )
+    .await;
+    exchange_reaches_in_order(
+        &b,
+        &bob.identity,
+        &alice.identity,
+        &mut a_rx,
+        exchange_messages(10),
     )
     .await;
 
