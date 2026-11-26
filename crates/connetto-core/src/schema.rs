@@ -187,12 +187,14 @@ pub struct SchemaBundle {
 }
 
 /// What one kind of caller's replica holds: the translated replica DDL, the
-/// policy table pairs the translation split, the policy views it emitted, the
-/// tables a device stores once for every account with the shared store's
-/// layout, the connection program, and the helpers the DDL calls.
+/// tables the kind may read, the policy table pairs the translation split,
+/// the policy views it emitted, the tables a device stores once for every
+/// account with the shared store's layout, the connection program, and the
+/// helpers the DDL calls.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplicaCopy {
     replica_ddl: String,
+    tables: Vec<String>,
     policy_tables: Vec<(String, String)>,
     policy_views: Vec<String>,
     shared_tables: Vec<String>,
@@ -549,6 +551,7 @@ impl ReplicaCopy {
     {
         Self {
             replica_ddl: replica_ddl.into(),
+            tables: Vec::new(),
             policy_tables: policy_tables
                 .into_iter()
                 .map(|(logical, physical)| (logical.into(), physical.into()))
@@ -559,6 +562,15 @@ impl ReplicaCopy {
             connection_ddl: String::new(),
             helper_functions: Vec::new(),
         }
+    }
+
+    /// The same copy naming every source table it carries, the ones the kind
+    /// may read. The version is unaffected, since the replica DDL it hashes
+    /// already declares them.
+    #[must_use]
+    pub fn with_tables<T: Into<String>>(mut self, tables: impl IntoIterator<Item = T>) -> Self {
+        self.tables = tables.into_iter().map(Into::into).collect();
+        self
     }
 
     /// The same copy naming the tables a device stores once for every
@@ -640,6 +652,13 @@ impl ReplicaCopy {
     #[must_use]
     pub fn shared_tables(&self) -> &[String] {
         &self.shared_tables
+    }
+
+    /// Every source table this copy carries, by its source name, the ones the
+    /// kind may read. A table the kind holds no `SELECT` on is left off.
+    #[must_use]
+    pub fn tables(&self) -> &[String] {
+        &self.tables
     }
 
     /// The shared store's translated layout, when the build shares a table.

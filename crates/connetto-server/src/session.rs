@@ -52,8 +52,8 @@ use connetto_core::messages::{
     RateLimited, RegisterBot, ReplaceShareKeys, RetireWriter, RevocationUpdate,
     RevokeDeviceRequest, SUBSCRIPTION_REFUSED, SUBSCRIPTION_REFUSED_SCHEMA, ShareKeysReplaced,
     SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch, SqliteValue, Subscribe,
-    SubscriptionSpec, WriterAnswer, WriterGrant, WriterOutcome, WriterRef, WriterRequest,
-    WriterSecret, bot_registration_message, writer_bind_message,
+    SubscriptionNotGranted, SubscriptionSpec, WriterAnswer, WriterGrant, WriterOutcome, WriterRef,
+    WriterRequest, WriterSecret, bot_registration_message, writer_bind_message,
 };
 use connetto_core::messages::{
     CourierAnswer, CourierBody, CourierNotice, CourierNoticeAck, CourierNoticeRow, CourierRange,
@@ -64,7 +64,7 @@ use connetto_core::traits::{
 
 use crate::device_cert::RevokeError;
 use connetto_core::{
-    Backoff, Cursor, Major, PROTOCOL_VERSION, RetryPolicy, SchemaVersion, SessionId,
+    Backoff, CallerKind, Cursor, Major, PROTOCOL_VERSION, RetryPolicy, SchemaVersion, SessionId,
 };
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::bb8::Pool;
@@ -100,6 +100,7 @@ use crate::courier::{
 };
 use crate::fence::{ReadFence, split_snapshot_cursor};
 use crate::guard::RequestGuard;
+use crate::kind_grants::NotGranted;
 use crate::materializer::{
     ComputedCapture, ComputedChange, Dispatched, MatchedPatch, Materializer, MaterializerError,
     PlannedWrite, ReadConnector, Registration, RuntimeWritableCatalog, SeedPlan, TermMove,
@@ -1036,12 +1037,12 @@ pub enum ReconnectEvent<'a> {
 /// lacks permission when the truth is that the server cannot tell makes it stop
 /// retrying and possibly discard the write, which turns a transient outage into
 /// permanent loss.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WriteVerdict {
     /// Every op is allowed.
     Allowed,
-    /// The policy refused one.
-    Denied,
+    /// The caller's kind or the policy refused one, for this reason.
+    Denied(MutationRejectReason),
     /// The policy could not be reached, so no answer exists yet.
     Undetermined,
 }
@@ -1660,9 +1661,68 @@ enum Outbound {
     Refuse {
         /// The client-facing label of the subscription.
         sub_id: String,
-        /// The fixed phrase the refusal carries.
-        detail: &'static str,
+        /// How the refusal is answered.
+        refusal: Refusal,
     },
+}
+
+/// How a refused or ended subscription is answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Refusal {
+    /// A fixed phrase, which names nothing (R38).
+    Fixed(&'static str),
+    /// The caller's kind may not read `table`, which some kind's client copy
+    /// carries, so the answer names both (R108).
+    NotGranted {
+        /// The table, by its catalog name.
+        table: String,
+        /// The caller's kind.
+        kind: CallerKind,
+    },
+}
+
+impl Refusal {
+    /// The refusal a failed registration carries, `fallback` for every cause
+    /// but a privilege the caller's kind lacks. A table no kind may read
+    /// answers the plain [`SUBSCRIPTION_REFUSED`], which names nothing.
+    fn of(error: &SubscribeRefusal, fallback: &'static str) -> Self {
+        match error {
+            SubscribeRefusal::Materializer(MaterializerError::NotGranted(NotGranted::Hidden {
+                ..
+            })) => Self::Fixed(SUBSCRIPTION_REFUSED),
+            SubscribeRefusal::Materializer(MaterializerError::NotGranted(NotGranted::Named {
+                table,
+                kind,
+            })) => Self::NotGranted {
+                table: table.clone(),
+                kind: *kind,
+            },
+            _ => Self::Fixed(fallback),
+        }
+    }
+
+    /// The frame answering the subscription labelled `sub_id`.
+    fn frame(self, sub_id: String) -> ControlMessage {
+        match self {
+            Self::Fixed(detail) => ControlMessage::NonFatalError(NonFatalError {
+                related_to: Some(sub_id),
+                detail: detail.to_owned(),
+            }),
+            Self::NotGranted { table, kind } => {
+                ControlMessage::SubscriptionNotGranted(SubscriptionNotGranted {
+                    sub_id,
+                    table,
+                    kind,
+                })
+            }
+        }
+    }
+}
+
+impl From<&'static str> for Refusal {
+    fn from(detail: &'static str) -> Self {
+        Self::Fixed(detail)
+    }
 }
 
 /// Route from a `subql` consumer id back to the owning session's outbound
@@ -4131,7 +4191,7 @@ where
                 );
                 let _ = route.tx.send(Outbound::Refuse {
                     sub_id: route.label.clone(),
-                    detail: SUBSCRIPTION_REFUSED,
+                    refusal: Refusal::Fixed(SUBSCRIPTION_REFUSED),
                 });
             }
             applied.refused.clear();
@@ -5057,7 +5117,7 @@ where
         for (label, tx) in rows {
             let _ = tx.send(Outbound::Refuse {
                 sub_id: label,
-                detail: SUBSCRIPTION_REFUSED_SCHEMA,
+                refusal: Refusal::Fixed(SUBSCRIPTION_REFUSED_SCHEMA),
             });
         }
         for subscription in subscriptions {
@@ -5125,8 +5185,12 @@ where
         boot: crate::rules::BootRules,
     ) -> Result<(), SessionError> {
         match boot {
-            crate::rules::BootRules::Unplannable { changed } => {
-                let refused = self.materializer.lock().await.rules_reach(&changed);
+            crate::rules::BootRules::Unplannable { changed, database } => {
+                let refused = {
+                    let mut materializer = self.materializer.lock().await;
+                    materializer.follow_grants(&*database);
+                    materializer.rules_reach(&changed)
+                };
                 self.refuse_rules_tables(&refused).await
             }
             crate::rules::BootRules::Followed {
@@ -6582,23 +6646,21 @@ where
                     .await?;
             }
             Outbound::RulesSnapshot { sub_id } => {
-                if self.register_again(state, &sub_id, true).await {
-                    self.resnapshot_row(
-                        transport,
-                        state,
-                        &sub_id,
-                        &FullResyncReason::AuthorizationChange,
-                        None,
-                    )
-                    .await?;
-                } else {
-                    self.refuse_subscription(
-                        transport,
-                        state,
-                        &sub_id,
-                        SUBSCRIPTION_REFUSED_SCHEMA,
-                    )
-                    .await?;
+                match self.register_again(state, &sub_id, true).await {
+                    Ok(()) => {
+                        self.resnapshot_row(
+                            transport,
+                            state,
+                            &sub_id,
+                            &FullResyncReason::AuthorizationChange,
+                            None,
+                        )
+                        .await?;
+                    }
+                    Err(refusal) => {
+                        self.refuse_subscription(transport, state, &sub_id, refusal)
+                            .await?;
+                    }
                 }
             }
             Outbound::ReservedResnapshot {
@@ -6625,8 +6687,8 @@ where
                 self.rebootstrap_computed(transport, state, sub_id, retired_id)
                     .await?;
             }
-            Outbound::Refuse { sub_id, detail } => {
-                self.refuse_subscription(transport, state, &sub_id, detail)
+            Outbound::Refuse { sub_id, refusal } => {
+                self.refuse_subscription(transport, state, &sub_id, refusal)
                     .await?;
             }
         }
@@ -6814,27 +6876,28 @@ where
             }
         }
         for label in rows {
-            let instruction = if self.register_again(state, &label, false).await {
-                if let Some(permit) = &reader_permit {
-                    let Some(row) = state.subs.get(&label) else {
-                        continue;
-                    };
-                    Outbound::ReservedResnapshot {
-                        owner: (row.reg.consumer_id, row.reg.sub_id),
-                        sub_id: label,
-                        permit: permit.clone(),
-                    }
-                } else {
-                    Outbound::Resnapshot {
-                        sub_id: label,
-                        reason: FullResyncReason::AuthorizationChange,
+            let instruction = match self.register_again(state, &label, false).await {
+                Ok(()) => {
+                    if let Some(permit) = &reader_permit {
+                        let Some(row) = state.subs.get(&label) else {
+                            continue;
+                        };
+                        Outbound::ReservedResnapshot {
+                            owner: (row.reg.consumer_id, row.reg.sub_id),
+                            sub_id: label,
+                            permit: permit.clone(),
+                        }
+                    } else {
+                        Outbound::Resnapshot {
+                            sub_id: label,
+                            reason: FullResyncReason::AuthorizationChange,
+                        }
                     }
                 }
-            } else {
-                Outbound::Refuse {
+                Err(refusal) => Outbound::Refuse {
                     sub_id: label,
-                    detail: SUBSCRIPTION_REFUSED,
-                }
+                    refusal,
+                },
             };
             let _ = state.outbound.send(instruction);
         }
@@ -6851,19 +6914,26 @@ where
     }
 
     /// Register one row subscription again under the session's current caller
-    /// when its seed holds the subject set, answering whether it can still be
-    /// served.
+    /// when its seed holds the subject set, or under the rules the server
+    /// follows now when `rules_changed`, answering how it is refused when it
+    /// can no longer be served.
     async fn register_again(
         &self,
         state: &mut SessionState<Id, Key>,
         label: &str,
         rules_changed: bool,
-    ) -> bool {
+    ) -> Result<(), Refusal> {
+        // A table refused under new rules says nothing about what the caller named.
+        let fallback = if rules_changed {
+            SUBSCRIPTION_REFUSED_SCHEMA
+        } else {
+            SUBSCRIPTION_REFUSED
+        };
         let Some(row) = state.subs.get(label) else {
-            return false;
+            return Err(Refusal::Fixed(fallback));
         };
         if !rules_changed && !row.reg.reads_subjects {
-            return true;
+            return Ok(());
         }
         let (old_consumer, old_sub) = (row.reg.consumer_id, row.reg.sub_id);
         let consumer_id = self.next_consumer_id();
@@ -6881,18 +6951,18 @@ where
                     }
                     row.reg = reg;
                 }
-                true
+                Ok(())
             }
             Ok(Err(capture)) => {
                 self.materializer
                     .lock()
                     .await
                     .unregister(capture.subscription_id);
-                false
+                Err(Refusal::Fixed(fallback))
             }
             Err(err) => {
-                tracing::warn!(sub_id = %label, error = %err, "a subscription could not be registered under the new share keys");
-                false
+                tracing::warn!(sub_id = %label, error = %err, "a subscription could not be registered again");
+                Err(Refusal::of(&err, fallback))
             }
         }
     }
@@ -6915,7 +6985,7 @@ where
         }
         let sub = owner.remove().sub;
         let consumer_id = self.next_consumer_id();
-        let refused = match self.register_subscription(consumer_id, &sub, state).await {
+        let (refused, refusal) = match self.register_subscription(consumer_id, &sub, state).await {
             Ok(registered) => {
                 let reads_subjects = registered.reads_subjects;
                 match registered.into_row(consumer_id) {
@@ -6933,18 +7003,18 @@ where
                     }
                     Ok(reg) => {
                         self.materializer.lock().await.unregister(reg.sub_id);
-                        "it registered as rows".to_owned()
+                        (
+                            "it registered as rows".to_owned(),
+                            Refusal::Fixed(SUBSCRIPTION_REFUSED),
+                        )
                     }
                 }
             }
-            Err(err) => err.to_string(),
+            Err(err) => (err.to_string(), Refusal::of(&err, SUBSCRIPTION_REFUSED)),
         };
-        tracing::warn!(sub_id = %sub.sub_id, error = %refused, "an aggregate could not be registered under the new share keys");
+        tracing::warn!(sub_id = %sub.sub_id, error = %refused, "an aggregate could not be registered again");
         transport
-            .send_control(ControlMessage::NonFatalError(NonFatalError {
-                related_to: Some(sub.sub_id),
-                detail: SUBSCRIPTION_REFUSED.to_owned(),
-            }))
+            .send_control(refusal.frame(sub.sub_id))
             .await
             .map_err(transport_err)
     }
@@ -8576,7 +8646,12 @@ where
         {
             return Ok(outcome);
         }
-        let plan = match self.materializer.lock().await.plan_write(payload) {
+        let plan = match self
+            .materializer
+            .lock()
+            .await
+            .plan_write(payload, author.kind())
+        {
             Ok(plan) => plan,
             Err(err) => {
                 return self
@@ -8586,11 +8661,9 @@ where
         };
         match self.every_op_authorized(&plan, author).await {
             WriteVerdict::Allowed => {}
-            WriteVerdict::Denied => {
+            WriteVerdict::Denied(reason) => {
                 let _ = self.guard.rejected_write(Self::caller(author));
-                return self
-                    .courier_settle_refusal(author, &settle, MutationRejectReason::Unauthorized)
-                    .await;
+                return self.courier_settle_refusal(author, &settle, reason).await;
             }
             // Settles nothing, so the range re-offers from this entry.
             WriteVerdict::Undetermined => {
@@ -8798,6 +8871,22 @@ where
         plan: &crate::materializer::WritePlan,
         caller: &Arc<Principal<Id, Key>>,
     ) -> WriteVerdict {
+        // The privileges come first, so a refusal PostgreSQL would answer
+        // names the table and the kind rather than reading as a policy denial.
+        let not_granted = self
+            .materializer
+            .lock()
+            .await
+            .write_not_granted(plan, caller.kind());
+        match not_granted {
+            Some(NotGranted::Named { table, kind }) => {
+                return WriteVerdict::Denied(MutationRejectReason::NotGranted { table, kind });
+            }
+            Some(NotGranted::Hidden { .. }) => {
+                return WriteVerdict::Denied(MutationRejectReason::Unauthorized);
+            }
+            None => {}
+        }
         for op in &plan.ops {
             let answer = match &op.write {
                 PlannedWrite::Insert { new, assigned } => {
@@ -8841,7 +8930,7 @@ where
             };
             match answer {
                 Ok(verdict) if verdict.allowed() => {}
-                Ok(_) => return WriteVerdict::Denied,
+                Ok(_) => return WriteVerdict::Denied(MutationRejectReason::Unauthorized),
                 Err(_) => return WriteVerdict::Undetermined,
             }
         }
@@ -9184,8 +9273,13 @@ where
         match outcome {
             SettledOutcome::Applied => self.ack(transport, seq).await,
             SettledOutcome::Rejected(reason) => {
-                if *reason == MutationRejectReason::Unauthorized {
-                    return self.reject_unauthorized(transport, seq, state).await;
+                if matches!(
+                    reason,
+                    MutationRejectReason::Unauthorized | MutationRejectReason::NotGranted { .. }
+                ) {
+                    return self
+                        .reject_refused(transport, seq, reason.clone(), state)
+                        .await;
                 }
                 self.reject(transport, seq, reason.clone()).await
             }
@@ -9353,7 +9447,7 @@ where
             .materializer
             .lock()
             .await
-            .plan_write(&patch.patchset_zstd)
+            .plan_write(&patch.patchset_zstd, state.principal.kind())
         {
             Ok(plan) => plan,
             Err(err) => {
@@ -9365,14 +9459,9 @@ where
         match self.every_op_authorized(&plan, &state.principal).await {
             WriteVerdict::Allowed => {}
             // A genuine denial settles, so a redelivery re-answers it.
-            WriteVerdict::Denied => {
+            WriteVerdict::Denied(reason) => {
                 return self
-                    .settle_and_refuse(
-                        transport,
-                        &settle,
-                        MutationRejectReason::Unauthorized,
-                        state,
-                    )
+                    .settle_and_refuse(transport, &settle, reason, state)
                     .await;
             }
             // The service could not be reached, so nothing settles and the
@@ -9705,23 +9794,24 @@ where
         }
     }
 
-    /// Refuse one write the policy rejected, and report it as an abuse signal.
+    /// Refuse one write the policy or the caller's kind rejected, and report
+    /// it as an abuse signal.
     ///
     /// Naming a row and being told no is the phase's definition of a signal.
     /// This is the one signal no rate limit sits above, so its threshold does
     /// all its own work.
-    async fn reject_unauthorized<T: Transport>(
+    async fn reject_refused<T: Transport>(
         &self,
         transport: &mut T,
         client_seq: u64,
+        reason: MutationRejectReason,
         state: &mut SessionState<Id, Key>,
     ) -> Result<(), SessionError> {
         let reaction = self.guard.rejected_write(Self::caller(&state.principal));
         if reaction == Reaction::Close {
             state.closing = true;
         }
-        self.reject(transport, client_seq, MutationRejectReason::Unauthorized)
-            .await
+        self.reject(transport, client_seq, reason).await
     }
 
     /// Refuse one write the database or the authorization service could not
@@ -10047,6 +10137,20 @@ where
                         related_to: Some(sub.sub_id),
                         detail: SUBSCRIPTION_REFUSED_SCHEMA.to_owned(),
                     }))
+                    .await
+                    .map_err(transport_err)?;
+                return Ok(());
+            }
+            Err(
+                err @ SubscribeRefusal::Materializer(MaterializerError::NotGranted(
+                    NotGranted::Named { .. },
+                )),
+            ) => {
+                // The kind lacks a privilege on a table every client copy
+                // already shows, which is no probe.
+                tracing::warn!(sub_id = %sub.sub_id, error = %err, "subscription reads what its caller's kind may not");
+                transport
+                    .send_control(Refusal::of(&err, SUBSCRIPTION_REFUSED).frame(sub.sub_id))
                     .await
                     .map_err(transport_err)?;
                 return Ok(());
@@ -11028,23 +11132,21 @@ where
     }
 
     /// Give up on one subscription: tear the registration down and answer with
-    /// `detail`, one of the fixed phrases (R38).
+    /// `refusal`, one of the fixed phrases (R38) or the privilege its caller's
+    /// kind lacks (R108).
     async fn refuse_subscription<T: Transport>(
         &self,
         transport: &mut T,
         state: &mut SessionState<Id, Key>,
         label: &str,
-        detail: &'static str,
+        refusal: impl Into<Refusal>,
     ) -> Result<(), SessionError> {
         for (consumer_id, sub_id) in take_row_subscription(state, label) {
             self.remove_route(consumer_id).await;
             self.materializer.lock().await.unregister(sub_id);
         }
         transport
-            .send_control(ControlMessage::NonFatalError(NonFatalError {
-                related_to: Some(label.to_owned()),
-                detail: detail.to_owned(),
-            }))
+            .send_control(refusal.into().frame(label.to_owned()))
             .await
             .map_err(transport_err)
     }

@@ -159,7 +159,7 @@ fn absent_value(may_be_unset: bool) -> &'static str {
 ///
 /// The kinds are flat, so no kind implies another, and a policy for every
 /// caller names no role.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum CallerKind {
     /// A caller holding no login, reading what share keys and public rows open.
     Anon,
@@ -199,6 +199,13 @@ impl CallerKind {
     #[must_use]
     pub const fn index(self) -> usize {
         self as usize
+    }
+}
+
+/// The kind by the name its default role carries.
+impl core::fmt::Display for CallerKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.default_role())
     }
 }
 

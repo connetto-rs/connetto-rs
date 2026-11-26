@@ -3,17 +3,19 @@
 //! the snapshot that never arrives, which is what the display hooks surface.
 //! The refusal stands on later calls, reaches scalar and computed handles as
 //! it does row handles, and touches only the handle it names. A non-fatal
-//! error with any other detail refuses nothing.
+//! error with any other detail refuses nothing. A refusal because the
+//! caller's kind may not read the table reaches the handle naming both.
 
 use std::time::Duration;
 
-use connetto_client::{ClientBuilder, LiveQuery};
-use connetto_core::Cursor;
+use connetto_client::{ClientBuilder, ClientError, LiveQuery};
 use connetto_core::messages::{
     BulkMessage, ControlMessage, HandshakeAck, NonFatalError, SUBSCRIPTION_REFUSED,
-    SUBSCRIPTION_REFUSED_SCHEMA, SnapshotBegin, SnapshotEnd, SnapshotPatch, WriterGrant,
+    SUBSCRIPTION_REFUSED_SCHEMA, SnapshotBegin, SnapshotEnd, SnapshotPatch, SubscriptionNotGranted,
+    WriterGrant,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
+use connetto_core::{CallerKind, Cursor};
 use connetto_server::{LoopbackTransport, loopback};
 use diesel::{ExpressionMethods, QueryDsl};
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -76,32 +78,40 @@ fn photo_row() -> Vec<u8> {
     zstd::encode_all(patchset.build().as_slice(), 3).expect("compress the row")
 }
 
+/// Answer the client's handshake on `server`, or `None` when the client sent
+/// something else or left.
+async fn accept_handshake(server: &mut LoopbackTransport) -> Option<()> {
+    let Ok(Some(IncomingFrame::Control(ControlMessage::Handshake(_)))) = server.recv().await else {
+        return None;
+    };
+    server
+        .send_control(ControlMessage::HandshakeAck(HandshakeAck {
+            connection_id: "refusal".to_owned(),
+            session_token: "refusal".to_owned(),
+            resume_token: "refusal".to_owned(),
+            current_cursor: Cursor::new(Vec::new()),
+            schema_version: None,
+            sunset_at_secs: None,
+            courier: false,
+            initial_credits: 64,
+            writer: Some(WriterGrant {
+                number: 1,
+                frontier: 0,
+            }),
+        }))
+        .await
+        .ok()
+}
+
 /// A server that answers the handshake, waits for one subscription per
 /// entry of `answers`, and then answers each in arrival order, a beat apart
 /// so a handle the test left waiting is waiting when the earlier answers land.
 fn scripted_server(answers: Vec<Answer>) -> LoopbackTransport {
     let (mut server, client_end) = loopback();
     tokio::spawn(async move {
-        let Ok(Some(IncomingFrame::Control(ControlMessage::Handshake(_)))) = server.recv().await
-        else {
+        if accept_handshake(&mut server).await.is_none() {
             return;
-        };
-        let _ = server
-            .send_control(ControlMessage::HandshakeAck(HandshakeAck {
-                connection_id: "refusal".to_owned(),
-                session_token: "refusal".to_owned(),
-                resume_token: "refusal".to_owned(),
-                current_cursor: Cursor::new(Vec::new()),
-                schema_version: None,
-                sunset_at_secs: None,
-                courier: false,
-                initial_credits: 64,
-                writer: Some(WriterGrant {
-                    number: 1,
-                    frontier: 0,
-                }),
-            }))
-            .await;
+        }
         let mut sub_ids = Vec::with_capacity(answers.len());
         while sub_ids.len() < answers.len() {
             match server.recv().await {
@@ -156,11 +166,44 @@ fn scripted_server(answers: Vec<Answer>) -> LoopbackTransport {
     client_end
 }
 
-/// A running client over a server answering its subscriptions per `answers`.
-async fn client_over(answers: Vec<Answer>) -> connetto_client::ConnettoClient<LoopbackTransport> {
+/// A server that answers the handshake and refuses the first subscription
+/// because the caller's `kind` may not read `table`.
+fn not_granting_server(table: &'static str, kind: CallerKind) -> LoopbackTransport {
+    let (mut server, client_end) = loopback();
+    tokio::spawn(async move {
+        if accept_handshake(&mut server).await.is_none() {
+            return;
+        }
+        loop {
+            match server.recv().await {
+                Ok(Some(IncomingFrame::Control(ControlMessage::Subscribe(sub)))) => {
+                    let _ = server
+                        .send_control(ControlMessage::SubscriptionNotGranted(
+                            SubscriptionNotGranted {
+                                sub_id: sub.sub_id,
+                                table: table.to_owned(),
+                                kind,
+                            },
+                        ))
+                        .await;
+                    break;
+                }
+                Ok(Some(_)) => {}
+                _ => return,
+            }
+        }
+        while let Ok(Some(_)) = server.recv().await {}
+    });
+    client_end
+}
+
+/// A running client over `server`.
+async fn client_on(
+    server: LoopbackTransport,
+) -> connetto_client::ConnettoClient<LoopbackTransport> {
     let (running, pump) = ClientBuilder::new(
         super::support::bundle(SQLITE_DDL),
-        super::support::Once::new(scripted_server(answers)),
+        super::support::Once::new(server),
     )
     .signed_in(super::support::held("token"))
     .connect_with_pump()
@@ -168,6 +211,37 @@ async fn client_over(answers: Vec<Answer>) -> connetto_client::ConnettoClient<Lo
     .expect("connect with pump");
     tokio::spawn(pump);
     running.client().clone()
+}
+
+/// A running client over a server answering its subscriptions per `answers`.
+async fn client_over(answers: Vec<Answer>) -> connetto_client::ConnettoClient<LoopbackTransport> {
+    client_on(scripted_server(answers)).await
+}
+
+/// A subscription the server refuses because the caller's kind may not read
+/// its table reaches the live handle as an error naming the table and the
+/// kind, and the refusal stands on a later call (R108).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kind_refusal_reaches_the_live_handle_with_the_table_and_the_kind() {
+    let client = client_on(not_granting_server("photos", CallerKind::Authenticated)).await;
+    let mut photos: LiveQuery<Photo> = client
+        .watch(photos::table.order_by(photos::id))
+        .await
+        .expect("watch");
+
+    for call in ["first", "later"] {
+        let refused = tokio::time::timeout(BOUND, photos.changed())
+            .await
+            .expect("the refusal must end the wait")
+            .expect_err("the server refused the subscription");
+        assert!(
+            matches!(
+                &refused,
+                ClientError::NotGranted { table, kind: CallerKind::Authenticated } if table == "photos"
+            ),
+            "the {call} call names the table and the kind: {refused:?}",
+        );
+    }
 }
 
 /// A subscription the server refused reaches the live handle's error: its

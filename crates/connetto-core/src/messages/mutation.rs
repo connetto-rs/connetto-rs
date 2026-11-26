@@ -14,6 +14,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::writer::{Provenance, WriterRef};
+use crate::CallerKind;
 use crate::schema::Major;
 
 /// Control-plane header announcing a mutation upload.
@@ -104,6 +105,16 @@ pub struct MutationApplied {
 pub enum MutationRejectReason {
     /// Session's `AuthContext` is not permitted to perform this operation.
     Unauthorized,
+    /// The caller's kind holds no privilege for this write on `table`, the
+    /// privilege `PostgreSQL` would check, columns included (R108). Named only
+    /// for a table some kind's client copy carries, and settled like
+    /// [`Unauthorized`](Self::Unauthorized).
+    NotGranted {
+        /// The table, by its catalog name.
+        table: String,
+        /// The caller's kind.
+        kind: CallerKind,
+    },
     /// Patchset targets columns or tables outside the current schema.
     SchemaMismatch,
     /// `PostgreSQL` constraint violation (unique, FK, check, not-null).
@@ -146,6 +157,9 @@ impl core::fmt::Display for MutationRejectReason {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Unauthorized => f.write_str("unauthorized"),
+            Self::NotGranted { table, kind } => {
+                write!(f, "the {kind} kind may not write {table}")
+            }
             Self::SchemaMismatch => f.write_str("schema mismatch"),
             Self::Constraint { detail } => write!(f, "constraint violation: {detail}"),
             Self::Malformed { detail } => write!(f, "malformed patchset: {detail}"),

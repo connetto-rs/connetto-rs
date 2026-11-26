@@ -34,7 +34,7 @@ use connetto_core::messages::{
 use connetto_core::messages::{BindDevice, WriterOutcome, writer_bind_message};
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{
-    Backoff, Cursor, Major, PROTOCOL_VERSION, RetryPolicy, SchemaVersion, quote_ident,
+    Backoff, CallerKind, Cursor, Major, PROTOCOL_VERSION, RetryPolicy, SchemaVersion, quote_ident,
 };
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
@@ -240,6 +240,17 @@ pub enum ClientError {
     /// a display reads what the wire said.
     #[error("subscription refused")]
     SubscriptionRefused,
+    /// The caller's kind holds no privilege for what was asked of `table`,
+    /// read or written (R108). The server answered so, or the kind's own
+    /// replica copy did before anything was sent. Signing in may act as a
+    /// kind that holds it.
+    #[error("the {kind} kind may not use {table}")]
+    NotGranted {
+        /// The table, by its catalog name.
+        table: String,
+        /// The kind refused.
+        kind: CallerKind,
+    },
     /// A local operation on the replica or its bookkeeping failed.
     #[error("session error: {0}")]
     Session(String),
@@ -1186,6 +1197,12 @@ pub(crate) struct ClientConfig {
     /// Which caller settings the deployment's policies may find unset, from
     /// the storage schema, deciding what an absent identity renders as.
     unset: connetto_core::auth::UnsetSettings,
+    /// The kind whose copy this connection opened (R108).
+    kind: CallerKind,
+    /// The tables another kind's copy carries and this kind's lacks, keyed
+    /// lowercased, each with its source name. A subscription reading one is
+    /// refused here, since the server would refuse it too.
+    withheld: HashMap<String, String>,
 }
 
 impl ClientConfig {
@@ -1212,6 +1229,8 @@ impl ClientConfig {
             content_hooks: ContentHooks::NONE,
             tier_plan: None,
             unset: connetto_core::auth::UnsetSettings::ALWAYS_BOUND,
+            kind: CallerKind::Anon,
+            withheld: HashMap::new(),
         }
     }
 
@@ -1224,6 +1243,8 @@ impl ClientConfig {
         self.connection_ddl =
             (!schema.connection_ddl().is_empty()).then(|| Arc::from(schema.connection_ddl()));
         self.unset = schema.unset_settings();
+        self.kind = schema.kind();
+        self.withheld = schema.withheld_tables();
         self
     }
 
@@ -1402,6 +1423,34 @@ enum Boot<'a> {
     Existing(&'a str),
 }
 
+/// How the server refused one subscription it has not served since.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refused {
+    /// With one of the wire's fixed phrases, which name nothing.
+    Fixed,
+    /// Because the caller's kind may not read `table` (R108).
+    NotGranted {
+        /// The table, by its catalog name.
+        table: String,
+        /// The caller's kind.
+        kind: CallerKind,
+    },
+}
+
+impl Refused {
+    /// The error a live handle riding the refused subscription returns.
+    #[must_use]
+    pub fn error(&self) -> ClientError {
+        match self {
+            Self::Fixed => ClientError::SubscriptionRefused,
+            Self::NotGranted { table, kind } => ClientError::NotGranted {
+                table: table.clone(),
+                kind: *kind,
+            },
+        }
+    }
+}
+
 /// One observable outcome of [`ConnettoConnection::pump_one`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientEvent {
@@ -1496,6 +1545,16 @@ pub enum ClientEvent {
         related_to: Option<String>,
         /// Human-readable detail.
         detail: String,
+    },
+    /// The server refused a subscription, or ended a live one, because the
+    /// caller's kind may not read `table` (R108). The session stays open.
+    SubscriptionNotGranted {
+        /// The refused subscription.
+        sub_id: String,
+        /// The table, by its catalog name.
+        table: String,
+        /// The caller's kind.
+        kind: CallerKind,
     },
     /// The server refused this request because the caller asked too often.
     ///
@@ -5222,7 +5281,7 @@ pub struct ConnettoConnection<T: Transport> {
     /// Subscriptions the server has refused with the one fixed phrase and has
     /// not served or released since. A reader that builds on the connection (a
     /// relay hub, at construction) reads them to refuse what the server would.
-    refused: HashSet<String>,
+    refused: HashMap<String, Refused>,
     /// Whether this connection already released every holding for a cursor
     /// past where its timeline ended (R73).
     history_cleared: bool,
@@ -5736,7 +5795,7 @@ where
             local_tables: HashSet::new(),
             hidden_tables: HashSet::new(),
             resyncing: HashSet::new(),
-            refused: HashSet::new(),
+            refused: HashMap::new(),
             history_cleared: false,
             cursor_subjects,
             open_snapshots: HashSet::new(),
@@ -10059,12 +10118,41 @@ where
         Ok(TabIdentity { caller, subjects })
     }
 
-    /// The application's local connection, for ordinary diesel reads and writes.
-    /// Writes here are captured for upload on the next [`push`](Self::push).
-    /// `CREATE`, `ALTER` and `DROP` of a synced table are refused here and go
-    /// through [`change_schema`](Self::change_schema).
+    /// The application's local connection, for ordinary diesel reads. Writes
+    /// here are captured for upload on the next [`push`](Self::push), and
+    /// [`write`](Self::write) is the one to make them through, since it names
+    /// what the kind's copy refused. `CREATE`, `ALTER` and `DROP` of a synced
+    /// table are refused here and go through
+    /// [`change_schema`](Self::change_schema).
     pub const fn conn(&mut self) -> &mut SqliteConnection {
         &mut self.db
+    }
+
+    /// Run the application's diesel write `f` as one transaction, captured
+    /// for upload on the next [`push`](Self::push).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::NotGranted`] with this connection's kind when the
+    /// kind's copy refused the write for a privilege it lacks on a table (R108),
+    /// and [`ClientError::Db`] for every other failure, a policy refusal
+    /// included. The transaction is rolled back either way.
+    pub fn write<O, F>(&mut self, f: F) -> Result<O, ClientError>
+    where
+        F: FnOnce(&mut SqliteConnection) -> diesel::QueryResult<O>,
+    {
+        self.db.transaction(f).map_err(|err| {
+            if let diesel::result::Error::DatabaseError(_, info) = &err
+                && let Some(pg2sqlite_runtime::write_guard::GuardRefusal::Privilege { table }) =
+                    pg2sqlite_runtime::write_guard::guard_refusal(info.message())
+            {
+                return ClientError::NotGranted {
+                    table: table.to_owned(),
+                    kind: self.config.kind,
+                };
+            }
+            ClientError::Db(err)
+        })
     }
 
     /// Run `sql`, DDL that creates, alters or drops synced tables, and
@@ -11337,12 +11425,34 @@ where
         // Recorded before it is sent, and recorded whether or not it can be
         // sent. A subscription declared with no server reachable is a
         // declaration, not a failure, and it takes effect on the first
-        // connection.
+        // connection. One reading a table this kind's copy lacks is no
+        // declaration at all, since no server would ever serve it, and one
+        // that does not parse is left to the server to answer.
+        if let Ok(tables) = crate::live::subscription_tables(&spec.query) {
+            self.refuse_withheld(&tables)?;
+        }
         self.change_subscriptions(|db| subscriptions::remember(db, sub_id, &spec, grace))?;
         if self.is_connected() {
             self.send_subscribe(sub_id, spec).await?;
         }
         Ok(())
+    }
+
+    /// Refuse a query reading `tables` when one is a table another kind's
+    /// copy carries and this kind's lacks, since no server would serve it.
+    pub(crate) fn refuse_withheld(&self, tables: &HashSet<String>) -> Result<(), ClientError> {
+        let withheld = tables
+            .iter()
+            .filter_map(|table| self.config.withheld.get(table))
+            .map(String::as_str)
+            .min();
+        match withheld {
+            Some(table) => Err(ClientError::NotGranted {
+                table: table.to_owned(),
+                kind: self.config.kind,
+            }),
+            None => Ok(()),
+        }
     }
 
     /// Put one `Subscribe` frame on the wire.
@@ -11639,7 +11749,7 @@ where
     /// The subscriptions the server has refused with the one fixed phrase and
     /// not served or released since, as of this connection's last frame.
     #[must_use]
-    pub fn refused_subscriptions(&self) -> &HashSet<String> {
+    pub fn refused_subscriptions(&self) -> &HashMap<String, Refused> {
         &self.refused
     }
 
@@ -12563,7 +12673,7 @@ where
                     && (err.detail == SUBSCRIPTION_REFUSED
                         || err.detail == SUBSCRIPTION_REFUSED_SCHEMA)
                 {
-                    self.refused.insert(id.clone());
+                    self.refused.insert(id.clone(), Refused::Fixed);
                 }
                 // A refusal names a provisional ask the server opened nothing of (R77).
                 #[cfg(feature = "peer")]
@@ -12577,6 +12687,21 @@ where
                 Ok(Some(ClientEvent::NonFatal {
                     related_to: err.related_to,
                     detail: err.detail,
+                }))
+            }
+            ControlMessage::SubscriptionNotGranted(refusal) => {
+                self.refused.insert(
+                    refusal.sub_id.clone(),
+                    Refused::NotGranted {
+                        table: refusal.table.clone(),
+                        kind: refusal.kind,
+                    },
+                );
+                self.refuse_declaration(Some(&refusal.sub_id));
+                Ok(Some(ClientEvent::SubscriptionNotGranted {
+                    sub_id: refusal.sub_id,
+                    table: refusal.table,
+                    kind: refusal.kind,
                 }))
             }
             ControlMessage::RateLimited(limited) => Ok(Some(self.rate_limited(limited))),

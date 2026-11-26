@@ -62,7 +62,7 @@ use crate::away::{
 use crate::dsl::SplitLast;
 use crate::reconnect::{NoReconnect, NoSleep, ReconnectPolicy, Sleeper, TransportFactory};
 use crate::{
-    ClientError, ClientEvent, ConnettoConnection, DrainTimer, KeepaliveTimer, ResendTimer,
+    ClientError, ClientEvent, ConnettoConnection, DrainTimer, KeepaliveTimer, Refused, ResendTimer,
     ShareKeyTimer, StorageUse, UnsyncedWork, WriterRef,
 };
 
@@ -629,9 +629,9 @@ struct Reaper {
     pending: StdMutex<Vec<String>>,
     wake: Arc<Notify>,
     stopped: OnceLock<String>,
-    /// The handles the server has refused, by sub id. They stay marked until
-    /// the server re-serves the sub or the handle drops.
-    refused: StdMutex<HashSet<String>>,
+    /// The handles the server has refused, by sub id, each with how. They
+    /// stay marked until the server re-serves the sub or the handle drops.
+    refused: StdMutex<HashMap<String, Refused>>,
     /// Wakes every handle waiting in `changed` so one that was refused returns
     /// the refusal instead of outliving its subscription.
     refuse_wake: Arc<Notify>,
@@ -640,12 +640,12 @@ struct Reaper {
 impl Reaper {
     /// Record that the server refused one handle's subscription, waking the
     /// handles that wait in `changed`.
-    fn record_refusal(&self, sub_id: &str) {
+    fn record_refusal(&self, sub_id: &str, refusal: Refused) {
         let mut refused = match self.refused.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if refused.insert(sub_id.to_owned()) {
+        if refused.insert(sub_id.to_owned(), refusal).is_none() {
             self.refuse_wake.notify_waiters();
         }
     }
@@ -659,11 +659,11 @@ impl Reaper {
         refused.remove(sub_id);
     }
 
-    /// Whether the server refused this handle's subscription.
-    fn refusal(&self, sub_id: &str) -> bool {
+    /// The error this handle returns, when the server refused its subscription.
+    fn refusal(&self, sub_id: &str) -> Option<ClientError> {
         match self.refused.lock() {
-            Ok(guard) => guard.contains(sub_id),
-            Err(poisoned) => poisoned.into_inner().contains(sub_id),
+            Ok(guard) => guard.get(sub_id).map(Refused::error),
+            Err(poisoned) => poisoned.into_inner().get(sub_id).map(Refused::error),
         }
     }
 }
@@ -698,22 +698,22 @@ impl LiveHandleCore {
             return Err(ClientError::Stopped(detail.clone()));
         }
         loop {
-            if self.reaper.refusal(&self.sub_id) {
-                return Err(ClientError::SubscriptionRefused);
+            if let Some(refusal) = self.reaper.refusal(&self.sub_id) {
+                return Err(refusal);
             }
             let refuse_wake = self.reaper.refuse_wake.notified();
             let res = tokio::select! {
                 res = self.changed.changed() => res,
                 () = refuse_wake => {
-                    if self.reaper.refusal(&self.sub_id) {
-                        return Err(ClientError::SubscriptionRefused);
+                    if let Some(refusal) = self.reaper.refusal(&self.sub_id) {
+                        return Err(refusal);
                     }
                     // Another handle took the wake, and this one was not refused.
                     continue;
                 }
             };
-            if self.reaper.refusal(&self.sub_id) {
-                return Err(ClientError::SubscriptionRefused);
+            if let Some(refusal) = self.reaper.refusal(&self.sub_id) {
+                return Err(refusal);
             }
             return res.map_err(|_| {
                 self.reaper.stopped.get().map_or_else(
@@ -1575,7 +1575,7 @@ where
                 pending: StdMutex::new(Vec::new()),
                 wake: Arc::clone(&wake),
                 stopped: OnceLock::new(),
-                refused: StdMutex::new(HashSet::new()),
+                refused: StdMutex::new(HashMap::new()),
                 refuse_wake: Arc::new(Notify::new()),
             }),
             events,
@@ -1757,6 +1757,9 @@ where
                     .to_owned(),
             ));
         }
+        // Refused before the first local read, which the replica would fail
+        // on a table this kind's copy lacks.
+        state.conn.refuse_withheld(&parsed.tables)?;
         let tables = parsed.tables;
         let seq = self.shared.next_live.fetch_add(1, Ordering::Relaxed);
         let sub_id = format!("live-{seq}");
@@ -2219,6 +2222,7 @@ where
         let (tx, mut rx) = watch::channel(0_u64);
 
         let mut state = self.shared.lock_interrupting().await;
+        state.conn.refuse_withheld(&parsed.tables)?;
 
         let local_count = parsed
             .tables
@@ -2542,10 +2546,9 @@ where
         }
     }
 
-    /// Run a closure against the shared connection: one-off diesel reads and
-    /// captured writes. Local writes committed here are auto-submitted by the
-    /// pump's next flush, and any live query reading the written tables
-    /// refreshes.
+    /// Run a closure against the shared connection, for one-off diesel reads
+    /// and connetto's own calls. Writes go through [`write`](Self::write),
+    /// which names what the kind's copy refused.
     ///
     /// # Errors
     ///
@@ -2564,6 +2567,23 @@ where
         // A write may have landed: let the pump flush and refresh promptly.
         self.shared.wake.notify_one();
         Ok(out)
+    }
+
+    /// Run the application's diesel write `f` on the shared connection as one
+    /// transaction. The pump's next flush submits it, and any live query
+    /// reading the written tables refreshes.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Locked`] while the gate is locked, and `f` does not run.
+    /// Otherwise what [`ConnettoConnection::write`] answers,
+    /// [`ClientError::NotGranted`] for a privilege the kind's copy lacks among
+    /// them.
+    pub async fn write<F, O>(&self, f: F) -> Result<O, ClientError>
+    where
+        F: FnOnce(&mut SqliteConnection) -> diesel::QueryResult<O>,
+    {
+        self.with_conn(|conn| conn.write(f)).await?
     }
 
     /// Commit a share key to the desired set and refresh local visibility.
@@ -3987,12 +4007,24 @@ where
             } = &event
                 && (detail == SUBSCRIPTION_REFUSED || detail == SUBSCRIPTION_REFUSED_SCHEMA)
             {
-                note_wire_outcome(state, &shared.reaper, wire_id, true);
+                note_wire_outcome(state, &shared.reaper, wire_id, Some(&Refused::Fixed));
+            }
+            if let ClientEvent::SubscriptionNotGranted {
+                sub_id,
+                table,
+                kind,
+            } = &event
+            {
+                let refused = Refused::NotGranted {
+                    table: table.clone(),
+                    kind: *kind,
+                };
+                note_wire_outcome(state, &shared.reaper, sub_id, Some(&refused));
             }
             if let ClientEvent::SnapshotEnd { sub_id } = &event {
                 // The server re-served the sub, whatever it refused before,
                 // so the handles riding it wait for data again.
-                note_wire_outcome(state, &shared.reaper, sub_id, false);
+                note_wire_outcome(state, &shared.reaper, sub_id, None);
             }
             if !apply_relayed_gate(&shared.gate, &event) {
                 let _ = shared.events.send(event);
@@ -4018,14 +4050,11 @@ fn note_wire_outcome<T: Transport>(
     state: &State<T>,
     reaper: &Reaper,
     wire_id: &str,
-    refused: bool,
+    refused: Option<&Refused>,
 ) {
-    let note = |reaper: &Reaper, sub_id: &str| {
-        if refused {
-            reaper.record_refusal(sub_id);
-        } else {
-            reaper.forget_refusal(sub_id);
-        }
+    let note = |reaper: &Reaper, sub_id: &str| match refused {
+        Some(refused) => reaper.record_refusal(sub_id, refused.clone()),
+        None => reaper.forget_refusal(sub_id),
     };
     for entry in &state.registry {
         if entry.wire_ids.iter().any(|id| id == wire_id) {

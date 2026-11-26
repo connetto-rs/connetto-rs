@@ -90,6 +90,7 @@ mod failover;
 
 mod idle_limit;
 mod inprocess_loop;
+mod kind_grants;
 mod lifecycle;
 mod live_rules;
 mod logging;

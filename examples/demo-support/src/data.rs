@@ -795,7 +795,8 @@ pub async fn follow_own_name<Source: LiveSource>(
 ///
 /// # Errors
 ///
-/// A client error when queueing the write fails, or the write's diesel error.
+/// A client error when the write is refused or fails, the kind and the table
+/// named when the kind's copy may not write team notes.
 pub async fn add_team_note<T>(
     client: &ConnettoClient<T>,
     team: &str,
@@ -807,17 +808,16 @@ where
     T::Error: core::fmt::Display,
 {
     let result = client
-        .with_conn(move |conn| {
+        .write(move |conn| {
             diesel::insert_into(team_notes::table)
                 .values((
                     team_notes::team_id.eq(team),
                     team_notes::author_id.eq(author),
                     team_notes::body.eq(body),
                 ))
-                .execute(conn.conn())
+                .execute(conn)
         })
-        .await
-        .and_then(|insert| insert.map_err(Into::into));
+        .await;
     if let Err(err) = &result {
         tracing::error!(error = %err, "team note insert failed");
     }
@@ -828,7 +828,8 @@ where
 ///
 /// # Errors
 ///
-/// A client error when queueing the write fails, or the write's diesel error.
+/// A client error when the write is refused or fails, the kind and the table
+/// named when the kind's copy may not write orders.
 pub async fn add_order<T>(
     client: &ConnettoClient<T>,
     identity: &str,
@@ -839,13 +840,12 @@ where
     T::Error: core::fmt::Display,
 {
     let result = client
-        .with_conn(move |conn| {
+        .write(move |conn| {
             diesel::insert_into(orders::table)
                 .values((orders::owner_id.eq(identity), orders::quantity.eq(quantity)))
-                .execute(conn.conn())
+                .execute(conn)
         })
-        .await
-        .and_then(|insert| insert.map_err(Into::into));
+        .await;
     if let Err(err) = &result {
         tracing::error!(error = %err, "order insert failed");
     }
@@ -856,7 +856,8 @@ where
 ///
 /// # Errors
 ///
-/// A client error when queueing the write fails, or the write's diesel error.
+/// A client error when the write is refused or fails, the kind and the table
+/// named when the kind's copy may not delete orders.
 pub async fn remove_newest_order<T>(
     client: &ConnettoClient<T>,
     id: Uuid,
@@ -866,11 +867,8 @@ where
     T::Error: core::fmt::Display,
 {
     let result = client
-        .with_conn(move |conn| {
-            diesel::delete(orders::table.filter(orders::id.eq(id))).execute(conn.conn())
-        })
-        .await
-        .and_then(|insert| insert.map_err(Into::into));
+        .write(move |conn| diesel::delete(orders::table.filter(orders::id.eq(id))).execute(conn))
+        .await;
     if let Err(err) = &result {
         tracing::error!(error = %err, "order remove failed");
     }
@@ -881,7 +879,7 @@ where
 ///
 /// # Errors
 ///
-/// A client error when queueing the write fails, or the write's diesel error.
+/// A client error when the write is refused or fails.
 pub async fn save_note<T>(client: &ConnettoClient<T>, body: &str) -> Result<usize, ClientError>
 where
     T: Transport + MaybeSend + 'static,
@@ -889,13 +887,12 @@ where
 {
     let id = fresh_note_id();
     let result = client
-        .with_conn(move |conn| {
+        .write(move |conn| {
             diesel::insert_into(notes::table)
                 .values((notes::id.eq(id), notes::body.eq(body)))
-                .execute(conn.conn())
+                .execute(conn)
         })
-        .await
-        .and_then(|insert| insert.map_err(Into::into));
+        .await;
     if let Err(err) = &result {
         tracing::error!(error = %err, "note save failed");
     }

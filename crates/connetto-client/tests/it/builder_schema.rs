@@ -2,7 +2,7 @@
 //! function a translated column default may call, so a device without a
 //! server still mints the id.
 
-use connetto_client::{ClientBuilder, SyncSchema, TierStepRefused};
+use connetto_client::{ClientBuilder, ClientError, SyncSchema, TierStepRefused};
 use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::FakeTransport;
 use connetto_core::{Major, TierBoundary, TierHistory};
@@ -140,7 +140,10 @@ CREATE POLICY docs_public ON docs USING (is_public(id)) WITH CHECK (is_public(id
         .execute(conn.conn())
         .expect_err("the helper refuses a row that is not public");
     assert!(
-        pg2sqlite::prelude::is_policy_refusal(&refused.to_string()),
+        matches!(
+            pg2sqlite::prelude::guard_refusal(&refused.to_string()),
+            Some(pg2sqlite::prelude::GuardRefusal::Policy { .. })
+        ),
         "the policy refused the row, not a missing function: {refused}"
     );
     diesel::delete(public_ids::table)
@@ -189,7 +192,10 @@ CREATE POLICY docs_signed_in ON docs TO authenticated USING (true) WITH CHECK (t
         .execute(conn.conn())
         .expect_err("no policy reaches the anonymous copy");
     assert!(
-        pg2sqlite::prelude::is_policy_refusal(&refused.to_string()),
+        matches!(
+            pg2sqlite::prelude::guard_refusal(&refused.to_string()),
+            Some(pg2sqlite::prelude::GuardRefusal::Policy { .. })
+        ),
         "the copy's row security refused the row: {refused}"
     );
 
@@ -203,6 +209,109 @@ CREATE POLICY docs_signed_in ON docs TO authenticated USING (true) WITH CHECK (t
         .load(conn.conn())
         .expect("read through the policy view");
     assert_eq!(visible, [1]);
+}
+
+/// A subscription to a table the kind's copy lacks, while another kind's copy
+/// carries it, is refused on the device before anything is recorded or sent,
+/// and the kind still subscribes to what its copy carries (R108).
+#[tokio::test]
+async fn a_kind_is_refused_a_subscription_to_a_table_its_copy_lacks() {
+    use connetto_core::CallerKind;
+
+    let roles = format!(
+        "{}\nREVOKE ALL ON secrets FROM anon;",
+        connetto_test_harness::FIXTURE_ROLES
+    );
+    let bundle = connetto_translate::translate::<String, connetto_core::bots::TextIds>(
+        connetto_translate::Documents::new(
+            "-- connetto:major 1
+CREATE TABLE notes (id INT PRIMARY KEY, body TEXT);
+CREATE TABLE secrets (id INT PRIMARY KEY, body TEXT);",
+            "",
+            &roles,
+            connetto_test_harness::FIXTURE_READER,
+        ),
+    )
+    .expect("translate the sources");
+    let mut conn = ClientBuilder::new(
+        SyncSchema::new(bundle),
+        super::support::NeverDial::<FakeTransport>::default(),
+    )
+    .open_driven()
+    .expect("open the anonymous copy");
+
+    let refused = conn
+        .subscribe("secrets", "SELECT * FROM Secrets")
+        .await
+        .expect_err("the anonymous copy lacks secrets");
+    assert!(
+        matches!(
+            &refused,
+            ClientError::NotGranted { table, kind: CallerKind::Anon } if table == "secrets"
+        ),
+        "the refusal names the table and the kind: {refused:?}",
+    );
+    conn.subscribe("notes", "SELECT * FROM notes")
+        .await
+        .expect("the anonymous copy carries notes");
+}
+
+/// A write to a table the kind's copy holds read-only is refused with the
+/// table and the kind, and the signed-in copy holding the privilege applies
+/// it.
+#[test]
+fn a_write_the_kind_may_not_make_is_refused_with_the_table_and_the_kind() {
+    use connetto_core::CallerKind;
+
+    let roles = format!(
+        "{}\nREVOKE INSERT, UPDATE, DELETE ON docs FROM anon;",
+        connetto_test_harness::FIXTURE_ROLES
+    );
+    let bundle = connetto_translate::translate::<String, connetto_core::bots::TextIds>(
+        connetto_translate::Documents::new(
+            "-- connetto:major 1
+CREATE TABLE docs (id INT PRIMARY KEY, label TEXT);",
+            "",
+            &roles,
+            connetto_test_harness::FIXTURE_READER,
+        ),
+    )
+    .expect("translate the sources");
+    let open = |schema: SyncSchema| {
+        ClientBuilder::new(
+            schema,
+            super::support::NeverDial::<FakeTransport>::default(),
+        )
+        .open_driven()
+        .expect("open the replica with the kind's copy")
+    };
+    let insert = |conn: &mut SqliteConnection| {
+        diesel::insert_into(docs::table)
+            .values((docs::id.eq(1), docs::label.eq("mine")))
+            .execute(conn)
+    };
+
+    let mut anonymous = open(SyncSchema::new(bundle.clone()));
+    let refused = anonymous
+        .write(insert)
+        .expect_err("the anonymous copy holds docs read-only");
+    assert!(
+        matches!(
+            &refused,
+            ClientError::NotGranted { table, kind: CallerKind::Anon } if table == "docs"
+        ),
+        "the refusal names the table and the kind: {refused:?}",
+    );
+
+    let mut signed_in = open(SyncSchema::new(bundle).acting_as(CallerKind::Authenticated));
+    signed_in
+        .write(insert)
+        .expect("the signed-in copy may write docs");
+    let written: Vec<i32> = docs::table
+        .select(docs::id)
+        .load(signed_in.conn())
+        .expect("read the written row");
+    assert_eq!(written, [1]);
 }
 
 fn major(value: u32) -> Major {
