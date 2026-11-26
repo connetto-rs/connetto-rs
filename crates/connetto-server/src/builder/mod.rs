@@ -387,9 +387,10 @@ impl ServerSchema {
     /// folded read rule reads the policy text the engine must hold. The cap
     /// is live beside the deployment's own rules, so a table it secures
     /// refuses a shared fold and answers through the per-viewer reads that
-    /// bind the caller the way a live read does. A membership term is planned
-    /// for the reader role, whose policies the engine settles from the roles
-    /// the catalog creates.
+    /// bind the caller the way a live read does, and a row subscription's read
+    /// rule folds the cap for the bot list its caller's registration states.
+    /// A membership term is planned for the reader role, whose policies the
+    /// engine settles from the roles the catalog creates.
     ///
     /// # Errors
     ///
@@ -2700,6 +2701,7 @@ async fn build_write_side<D: ConnettoSchema>(
         .with_write_catalog(writable)
         .with_translator(translated.translator().clone())
         .with_policy_reads(translated.policy_reads())
+        .with_bot_list_parameter(translated.naming().bot_list_parameter())
         .with_caller(CallerMappings::of::<String>(
             &schema.reader_role,
             &schema.kind_roles,

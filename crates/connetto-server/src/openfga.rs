@@ -208,6 +208,12 @@ impl SubjectNaming {
         self.subjects_parameter.is_some() || self.bot_list_parameter.is_some()
     }
 
+    /// The request parameter the cap's bot-list setting became, `None` when the model never reads it.
+    #[must_use]
+    pub fn bot_list_parameter(&self) -> Option<&str> {
+        self.bot_list_parameter.as_deref()
+    }
+
     /// The relations the model gates on the caller's own keys.
     pub fn gated_relations(&self) -> impl Iterator<Item = &str> + '_ {
         self.gated_keys.keys().map(String::as_str)
@@ -339,13 +345,10 @@ where
             }
             return true;
         }
-        // One value per entry, as the cap policy's `string_to_array` splits the bound text.
         if self.naming.bot_list_parameter.as_deref() == Some(parameter) {
             let list = crate::capability::bot_list_for(&self.principal);
-            if !list.is_empty() {
-                for entry in list.split(connetto_core::BOT_LIST_SEPARATOR) {
-                    out.push(entry);
-                }
+            for entry in crate::capability::bot_list_entries(&list) {
+                out.push(entry);
             }
             true
         } else {

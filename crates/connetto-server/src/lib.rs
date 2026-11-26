@@ -134,8 +134,9 @@ pub use manager_builder::ManagerBuilder;
 pub use materializer::MaterializerBuilder;
 pub use materializer::{
     CallerMappings, ComputedCapture, ComputedChange, Dispatched, Drained, FoldSeeded, MatchedPatch,
-    Materializer, MaterializerError, ReadConnector, Registration, RuntimeVersionColumn,
-    RuntimeWritableCatalog, RuntimeWritableCatalogBuilder, SeedPlan, SqliteRegistration,
+    Materializer, MaterializerError, ReadConnector, Registration, RequestCaller,
+    RuntimeVersionColumn, RuntimeWritableCatalog, RuntimeWritableCatalogBuilder, SeedPlan,
+    SqliteRegistration,
 };
 pub use oplog::{
     CHANGE_OP_TYPE, CatchupDecision, ChangeOp, ChangeOpSql, ChangeRecord, Commits, InMemoryOplog,

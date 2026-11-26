@@ -7634,7 +7634,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6e4d69d0fa3e7f6f9cf6b53a0e83e4fc99ba3586f65ce166cff30bd13bb4ad2"
 dependencies = [
  "heck 0.4.1",
- "itertools 0.15.0",
+ "itertools 0.13.0",
  "log",
  "multimap",
  "petgraph",
@@ -7653,7 +7653,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ad9c5423459fa2f729b8d9235fab810aa29628b171467744fc86d21460ad70d"
 dependencies = [
  "anyhow",
- "itertools 0.15.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -8395,7 +8395,7 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#46dd895579e08ddfbeaf83c65fd5bbebd766be69"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#5adb9b96b0c1078f147ad1d1b001b498433fff70"
 dependencies = [
  "openfga-client",
  "prost",
@@ -8411,7 +8411,7 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#46dd895579e08ddfbeaf83c65fd5bbebd766be69"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#5adb9b96b0c1078f147ad1d1b001b498433fff70"
 dependencies = [
  "serde",
  "sql-values 0.6.0",
@@ -9321,7 +9321,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -9565,7 +9565,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -9664,7 +9664,7 @@ dependencies = [
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/subql?branch=main#3541678e7089fce4ca1985957590af65c1d52e75"
+source = "git+https://github.com/connetto-rs/subql?branch=main#850af813300675e981e5fbd7bbd5433e978931e0"
 dependencies = [
  "arc-swap",
  "async-lock",
@@ -10584,7 +10584,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
