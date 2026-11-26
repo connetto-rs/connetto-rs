@@ -2501,7 +2501,7 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#46dd895579e08ddfbeaf83c65fd5bbebd766be69"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#5adb9b96b0c1078f147ad1d1b001b498433fff70"
 dependencies = [
  "rls2fga-types",
  "serde",
@@ -2515,7 +2515,7 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#46dd895579e08ddfbeaf83c65fd5bbebd766be69"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#5adb9b96b0c1078f147ad1d1b001b498433fff70"
 dependencies = [
  "serde",
  "sql-values 0.6.0",
@@ -3159,7 +3159,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/subql?branch=main#3541678e7089fce4ca1985957590af65c1d52e75"
+source = "git+https://github.com/connetto-rs/subql?branch=main#850af813300675e981e5fbd7bbd5433e978931e0"
 dependencies = [
  "arc-swap",
  "async-lock",

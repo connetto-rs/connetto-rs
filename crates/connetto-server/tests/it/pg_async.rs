@@ -1347,7 +1347,7 @@ async fn snapshot_runs_the_translated_diesel_shape_with_binds() {
     let reg = materializer
         .register_sqlite(
             1,
-            connetto_core::CallerKind::Authenticated,
+            connetto_server::RequestCaller::person(connetto_core::CallerKind::Authenticated),
             "SELECT `translated`.`id`, `translated`.`quantity` FROM `translated` \
              WHERE (`translated`.`quantity` > ?) ORDER BY `translated`.`id`",
             &binds,

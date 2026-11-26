@@ -9992,7 +9992,11 @@ where
         state: &SessionState<Id, Key>,
     ) -> Result<Registered, SubscribeRefusal> {
         let mut materializer = self.materializer.lock().await;
-        let kind = state.principal.kind();
+        let bot_list = crate::capability::bot_list_for(&state.principal);
+        let caller = crate::materializer::RequestCaller {
+            kind: state.principal.kind(),
+            bot_list: &bot_list,
+        };
         let pg_sql = materializer.translate_subscription_sql(&sub.spec.query)?;
         // The rule's caller-reading term only describes when the caller is stated.
         let subscriber = state
@@ -10013,7 +10017,7 @@ where
         let terms = materializer
             .describe_terms(
                 consumer_id,
-                kind,
+                caller,
                 &pg_sql,
                 &sub.spec.binds,
                 subscriber,
@@ -10030,7 +10034,7 @@ where
         let viewer = self.viewer_read_setup(state);
         let registration = materializer.register_translated(
             consumer_id,
-            Some(kind),
+            Some(caller),
             &pg_sql,
             &sub.spec.binds,
             seed,
@@ -12375,7 +12379,9 @@ mod tests {
             let terms = materializer
                 .describe_terms(
                     1,
-                    connetto_core::CallerKind::Authenticated,
+                    crate::materializer::RequestCaller::person(
+                        connetto_core::CallerKind::Authenticated,
+                    ),
                     &pg_sql,
                     &[],
                     None,

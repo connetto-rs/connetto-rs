@@ -120,6 +120,14 @@ pub(crate) fn bot_list_for<Id: Display, Key: CapabilityKey>(caller: &Principal<I
     )
 }
 
+/// The entries the cap policy's `string_to_array` reads off a bound bot list, none for the empty text.
+pub(crate) fn bot_list_entries(text: &str) -> impl Iterator<Item = &str> {
+    (!text.is_empty())
+        .then(|| text.split(connetto_core::BOT_LIST_SEPARATOR))
+        .into_iter()
+        .flatten()
+}
+
 /// The bucket a per-caller meter charges: whatever names this caller, else
 /// the run's own handle.
 ///
