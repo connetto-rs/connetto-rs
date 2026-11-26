@@ -25,10 +25,10 @@ jobs:
 
       # One scan of the root workspace, since every refquiem review replaces the
       # previous one on the pull request.
-      - uses: LucaCappelletti94/cargo-refquiem@827ed01a754ff72a074feef68b956bcbaeabac32 # v0.3.7
+      - uses: LucaCappelletti94/cargo-refquiem@bfa27f0ad8ec2578016bd55b6dedff6e14a0cdf2 # v0.4.0
         id: refquiem
         with:
-          version: 0.3.5
+          version: 0.4.0
           pr-number: ${{ github.event.pull_request.number }}
           mode: prepare
           payload: ${{ runner.temp }}/refquiem-payload
