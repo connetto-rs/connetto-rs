@@ -666,8 +666,6 @@ pub struct CallerMappings {
     /// The role each kind's reads run as, which subql plans each membership
     /// term for.
     kind_roles: KindRoles,
-    /// The role connetto's own filters run as.
-    reader_role: String,
 }
 
 impl CallerMappings {
@@ -692,7 +690,6 @@ impl CallerMappings {
             )?),
             subjects_setting: Key::SETTING,
             kind_roles: kind_roles.clone(),
-            reader_role: reader_role.to_owned(),
         })
     }
 
@@ -1213,10 +1210,10 @@ where
         &self.shapes
     }
 
-    /// A request for `sql`, planned for the role `requester`'s kind reads as
-    /// and stating its bot list, for the reader with no list when `requester`
-    /// is `None`, a filter of connetto's own, or for no role when the
-    /// deployment maps no caller.
+    /// A request for `sql` stating `requester`'s bot list, planned for the
+    /// role its kind reads as, or for no role when the deployment maps no
+    /// caller. A filter of connetto's own has no `requester` and states
+    /// neither a list nor a role.
     fn request(
         &self,
         consumer_id: u64,
@@ -1224,18 +1221,17 @@ where
         sql: &str,
     ) -> SubscriptionRequest<DefaultIds, Postgres> {
         let mut request = SubscriptionRequest::new(consumer_id, sql);
-        if let (Some(requester), Some(parameter)) = (requester, self.bot_list_parameter.as_deref())
-        {
+        let Some(requester) = requester else {
+            return request;
+        };
+        if let Some(parameter) = self.bot_list_parameter.as_deref() {
             request = request.request_value(
                 parameter,
                 crate::capability::bot_list_entries(requester.bot_list),
             );
         }
         match &self.caller {
-            Some(caller) => request.acting_role(match requester {
-                Some(requester) => caller.kind_roles.role(requester.kind),
-                None => caller.reader_role.as_str(),
-            }),
+            Some(caller) => request.acting_role(caller.kind_roles.role(requester.kind)),
             None => request,
         }
     }
@@ -2738,8 +2734,8 @@ where
 
     /// Register a pre-translated Postgres `SELECT`, optionally seeded with the
     /// caller's subjects and the values its membership terms currently admit,
-    /// planned for `caller`, or for the reader itself when `caller` is `None`,
-    /// for a filter of connetto's own.
+    /// planned for `caller`, or for no role when `caller` is `None`, a filter
+    /// of connetto's own.
     ///
     /// The seed rides the registration itself because subql maintains the
     /// membership sets from the change stream only after it. A membership term
@@ -3892,16 +3888,33 @@ mod membership_term_tests {
         assert!(matches!(registration, Registration::Row(_)));
     }
 
+    /// The motivating policies with the membership table under row-level
+    /// security whose rules leave every role every row.
+    fn open_members() -> String {
+        format!(
+            "{POLICIES}\nALTER TABLE project_members ENABLE ROW LEVEL SECURITY;\nCREATE POLICY project_members_open ON project_members FOR ALL USING (true) WITH CHECK (true);"
+        )
+    }
+
+    /// The seed of subscriber `alice`, a member of project 7.
+    fn alice_seed() -> TermSeed {
+        TermSeed {
+            subscriber: Some(PgValue::String("alice".to_owned())),
+            subjects: Vec::new(),
+            term_values: vec![(
+                vec!["project_id".to_owned()],
+                vec![(PgValue::String("alice".to_owned()), vec![PgValue::Int(7)])],
+            )],
+        }
+    }
+
     // The term is planned for the role the caller's kind acts as, so a
     // membership table whose read rules leave that role every row serves the
     // term as a table without row-level security does.
     #[test]
     fn a_membership_table_open_to_the_reader_serves_the_term() {
-        let open_members = format!(
-            "{POLICIES}\nALTER TABLE project_members ENABLE ROW LEVEL SECURITY;\nCREATE POLICY project_members_open ON project_members FOR ALL USING (true) WITH CHECK (true);"
-        );
         let unguarded = materializer_over(POLICIES);
-        let mut guarded = materializer_over(&open_members);
+        let mut guarded = materializer_over(&open_members());
         let pg_sql = guarded
             .translate_subscription_sql(CLIENT_SQL)
             .expect("the caller function reverse translates");
@@ -3912,26 +3925,42 @@ mod membership_term_tests {
             .describe_terms(1, PERSON, &pg_sql, &[], None, Vec::new())
             .unwrap_or_else(|err| panic!("an open membership table must serve, got {err}"));
         assert_eq!(described, expected);
-        let seed = TermSeed {
-            subscriber: Some(PgValue::String("alice".to_owned())),
-            subjects: Vec::new(),
-            term_values: vec![(
-                vec!["project_id".to_owned()],
-                vec![(PgValue::String("alice".to_owned()), vec![PgValue::Int(7)])],
-            )],
-        };
         let registration = guarded
             .register_translated(
                 1,
                 Some(PERSON),
                 &pg_sql,
                 &[],
-                Some(seed),
+                Some(alice_seed()),
                 ReadBudget::new(core::time::Duration::from_secs(5)),
                 None,
             )
             .unwrap_or_else(|err| panic!("an open membership table must register, got {err}"));
         assert!(matches!(registration, Registration::Row(_)));
+    }
+
+    // A registration without a caller, one of connetto's own filters, states
+    // no role, so subql refuses a term reading through row-level security even
+    // where the rules leave every role every row.
+    #[test]
+    fn a_registration_without_a_caller_states_no_role() {
+        let mut guarded = materializer_over(&open_members());
+        let pg_sql = guarded
+            .translate_subscription_sql(CLIENT_SQL)
+            .expect("the caller function reverse translates");
+        match guarded.register_translated(
+            1,
+            None,
+            &pg_sql,
+            &[],
+            Some(alice_seed()),
+            ReadBudget::new(core::time::Duration::from_secs(5)),
+            None,
+        ) {
+            Err(MaterializerError::Register(subql::RegisterError::MembershipTermRefused(_))) => {}
+            Err(err) => panic!("the term must be refused for want of a role, got {err}"),
+            Ok(_) => panic!("a term planned for no role registered through row-level security"),
+        }
     }
 
     // subql requires the subscriber for any filter naming a term, which is
